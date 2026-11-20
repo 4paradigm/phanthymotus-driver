@@ -32,7 +32,7 @@ def segment_distance(a, b, c, d):
     return min(distances)
 
 
-def grasp_targets(observation, scene, profile):
+def grasp_targets(observation, scene, profile, *, extra_retreat_mm=0, only_yaw=None):
     diameter_mm = scene['diameter_mm']
     if type(diameter_mm) not in (int, float) or not 0 < diameter_mm < 79.4:
         raise ValueError('Object diameter must be between 0 and 79.4 mm')
@@ -82,12 +82,13 @@ def grasp_targets(observation, scene, profile):
             yaw = math.degrees(math.atan2(down @ np.cross(closing,short), closing @ short))
             yaw_candidates = (yaw, yaw+180, yaw+90, yaw-90)
     failures, candidates = [], []
-    for yaw in yaw_candidates:
+    for yaw in yaw_candidates if only_yaw is None else (only_yaw,):
         goal_r = rotation(down, math.radians(yaw)) @ np.column_stack((np.cross(closing, down), closing, down))
         retreat = profile.get('shallow_retreat_mm', 0)
         if type(retreat) not in (int, float) or not 0 <= retreat < 150:
             raise ValueError('shallow_retreat_mm must be in [0, 150)')
         section_width = None
+        retreat_adjusted = False
         if scene.get('visible_surface_base_mm'):
             # Compare the hand housing sweep and pad section to observed points.
             local = (np.asarray(scene['visible_surface_base_mm'])/1000-centre) @ goal_r
@@ -102,12 +103,20 @@ def grasp_targets(observation, scene, profile):
                 if not blocked and len(section) >= 2 and section.min() < 0 < section.max():
                     width = float(np.ptp(section)*1000)
                     if 0 < width <= 79:
-                        section_width = width
-                        break
+                        if not extra_retreat_mm or retreat_adjusted:
+                            section_width = width
+                            break
+                        retreat += extra_retreat_mm
+                        retreat_adjusted = True
+                        continue
+                if retreat_adjusted:
+                    break
                 retreat += 10
             else:
                 failures.append(f"{yaw:.1f}°: no usable grasp section")
                 continue
+        if extra_retreat_mm and section_width is None:
+            continue
         grasp = centre - goal_r[:,2]*retreat/1000
         grasp_width = diameter_mm
         if scene.get('footprint_base_mm'):
@@ -123,7 +132,7 @@ def grasp_targets(observation, scene, profile):
         if not 0 < grasp_width <= 79:
             continue
         sdk_grasp = grasp + shift - pad_offset*goal_r[:,2]
-        ends = [sdk_grasp-.15*goal_r[:,2], sdk_grasp, sdk_grasp+.01*normal]
+        ends = [sdk_grasp-(.15-extra_retreat_mm/1000)*goal_r[:,2], sdk_grasp, sdk_grasp+.01*normal]
         candidates.append(dict(
             yaw_deg=yaw, observation_id=metadata['observation_id'],
             poses=[rigid(goal_r, point).tolist() for point in ends],

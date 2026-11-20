@@ -10,7 +10,7 @@ from uuid import uuid4
 import numpy as np
 from common.vendor_runtime import action_schema, tool
 from hardware import JOINT_LOWER, JOINT_UPPER, JOINT_MARGIN
-from .execution import OBSERVATION_TOLERANCE_DEG, SPEED_CONFIG
+from .execution import OBSERVATION_TOLERANCE_DEG, SPEED_CONFIG, PickExecution
 from .inputs import ObservationInputs, resolve_topics
 from franka.fr3.arm_ips import ArmIPInput, split_topics, mapping
 
@@ -72,6 +72,7 @@ class PickPlacePlugin:
         self.lock = threading.RLock()
         self.active = self.last_result = self.observation = None
         self.enabled = False
+        self.hand_initialized = False
         self.ssh_username = 'pnp'
         self.ssh_password = 'ros'
         self.arm_ip_input = ArmIPInput(ros2, self.apply_arm_ip_input)
@@ -97,6 +98,7 @@ class PickPlacePlugin:
                 if any(session.snapshot().get('is_grasped') for session in sessions):
                     raise RuntimeError('The gripper is holding an object; arm IP update rejected')
             self.addresses = dict(addresses)
+            self.hand_initialized = False
             self.arm_labels = {side: side
                                for side, name in (('left', '左手'), ('right', '右手')) if side in self.profiles}
             for side, profile in self.profiles.items():
@@ -135,7 +137,8 @@ class PickPlacePlugin:
                        'x-hooks': {'on_interrupt_motion': {'action': 'cancel'},
                                    'on_interrupt_all': {'action': 'cancel'}}})
         definition = tool(self.PREFIX, 'actuator',
-            'Pick and place with the FR3 wrist camera. Connect RGB, depth, object detections, and arm_ip_sync.',
+            'Pick and place with the FR3 wrist camera. Connect RGB, depth, object detections, and arm_ip_sync. '
+            'The first confirmed motion may home the hand. Remove any held object before starting.',
             schema, topic_in=[dict(format=fmt, desc=desc, **({'topic': self.inputs.topics[i]} if self.inputs.topics else {}))
                               for i, fmt, desc in ((1, 'image/depth-zlib', 'Depth image'),
                                   (0, 'image/jpeg', 'RGB image'), (2, 'data/json', 'VOP objects'))]
@@ -181,7 +184,10 @@ class PickPlacePlugin:
 
     def stop(self):
         self.cancel()
-        with self.lock: self.enabled = False; self.observation = None
+        with self.lock:
+            self.enabled = False
+            self.observation = None
+            self.hand_initialized = False
         self.inputs.stop()
         self.arm_ip_input.stop()
 
@@ -255,6 +261,7 @@ class PickPlacePlugin:
                     self.arm_configs[self.arm] = dict(self.config)
                     if arm != self.arm:
                         self.inputs.select_serial(profile.get('camera_serial', ''))
+                        self.hand_initialized = False
                     self.arm, self.address = arm, self.addresses[arm]
                     self.serial = profile.get('camera_serial', '')
                     self.planning_profile = copy.deepcopy(profile.get('planning'))
@@ -284,6 +291,7 @@ class PickPlacePlugin:
                     raise
                 if not was_enabled or previous_topics != tuple(self.inputs.topics):
                     self.observation = None
+                    self.hand_initialized = False
                 if self.observation:
                     try:
                         same_source=self.inputs.binding()==self.observation['metadata']['calibration']
@@ -335,7 +343,7 @@ class PickPlacePlugin:
             try:
                 self.inputs.prepare()
                 self.inputs.binding()
-            except (RuntimeError, ValueError) as exc:
+            except (RuntimeError, ValueError, TimeoutError) as exc:
                 return dict(state='error', code='CAMERA_NOT_READY', message=str(exc))
             active = dict(action_id='vision_pick_and_drop_observe_'+uuid4().hex, cancel=threading.Event(),
                           owner='vision_pick_and_drop_'+uuid4().hex, target=target, config=dict(self.config),
@@ -424,10 +432,55 @@ class PickPlacePlugin:
                     raise RuntimeError('Visual action cancelled')
                 if time.monotonic() >= deadline:
                     raise TimeoutError('Hand connection timed out')
+            if not self.hand_initialized:
+                self.initialize_hand(active, hand)
+                with self.lock:
+                    if active['cancel'].is_set():
+                        raise RuntimeError('Visual action cancelled')
+                    self.hand_initialized = True
             return hand
         except Exception:
             self.gripper_manager.release(self.address, active['owner'])
             raise
+
+    def initialize_hand(self, active, hand):
+        executor = PickExecution(active, None, hand, active['config'])
+        sample = executor.fresh(hand)
+        if not sample['is_grasped'] and sample['max_width'] > 0:
+            return
+        stage = active['stage']
+        active['stage'] = 'hand_homing'
+        previous = (self.last_result or {}).get('result', {})
+        if previous.get('holding_object_possible') or previous.get('recovery_required'):
+            active.update(holding_object_possible=previous.get('holding_object_possible', False),
+                          recovery_required=True)
+            raise RuntimeError('Resolve the previous failed transfer before homing the hand')
+        requested_at = time.monotonic_ns()
+        command = hand.command(active['owner'], 'homing', timeout_s=30)
+        try:
+            executor.wait(hand, command, 32, 'hand_command_id')
+        except Exception:
+            if active.get('hand_command_id'):
+                try:
+                    executor.stop_pending()
+                except Exception:
+                    active['recovery_required'] = True
+                    raise
+            raise
+
+        deadline = time.monotonic() + 1
+        while True:
+            executor.check()
+            sample = hand.snapshot()
+            if (sample.get('connected') and sample.get('control_ready')
+                    and sample.get('sdk_received_ns', 0) > requested_at
+                    and 0 <= sample['data_age_ms'] <= 220
+                    and not sample['is_grasped'] and sample['max_width'] > 0):
+                active['stage'] = stage
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError('Hand homing did not confirm a calibrated, released hand')
+            active['cancel'].wait(.02)
 
     def run_observation(self, active):
         hand = None
@@ -436,8 +489,11 @@ class PickPlacePlugin:
             with self.controller(active) as arm:
                 return 'completed', self.observe_on_controller(active, arm, hand)
         except Exception as exc:
-            return ('cancelled' if active['cancel'].is_set() else 'error',
-                    dict(ok=False, message=str(exc), stage=active['stage']))
+            result = dict(ok=False, message=str(exc), stage=active['stage'])
+            for key in ('holding_object_possible', 'recovery_required'):
+                if active.get(key):
+                    result[key] = True
+            return 'cancelled' if active['cancel'].is_set() else 'error', result
         finally:
             active.update(session=None, command_id=None)
             if hand is not None:
@@ -510,7 +566,8 @@ class PickPlacePlugin:
             self.active = None
 
     def run_transfer(self, active):
-        from .remote_execution import RemoteExecution
+        from .remote_execution import GraspMiss, RemoteExecution
+        from .hand_collision import TableClearanceError
         from .planning import grasp_targets
         from .scene import estimate
         from .transfer import moveit_targets
@@ -543,34 +600,89 @@ class PickPlacePlugin:
                 opening = min(executor.fresh(hand)['max_width'], .08)
                 errors = []
                 deadline = time.monotonic() + 120
+                ranked = []
                 for pick in candidates:
                     executor.check()
                     if time.monotonic() >= deadline:
-                        raise RuntimeError('MoveIt candidate planning deadline: ' + '; '.join(errors))
+                        break
                     executor.q = list(live['q'])
-                    width = pick['grasp_width_mm'] / 1000
                     try:
-                        if not 0 < width < opening:
+                        if not 0 < pick['grasp_width_mm'] / 1000 < opening:
                             raise ValueError('Target does not fit the calibrated opening')
                         targets = moveit_targets(photo, pick, scene, profile['handeye'], active['transfer'])
                         approach = executor.prepare('approach', targets['approach'], use_ik=True)
-                        descent = executor.prepare('descend', [targets['descent']], cartesian=True)
-                        lift = executor.prepare('lift', [targets['lift']], cartesian=True)
-                        carry = executor.prepare('move_to_place', targets['carry'], cartesian=True)
-                        place_lift = executor.prepare('place_lift', [targets['place_lift']], cartesian=True)
-                        home = executor.prepare('return_to_observation', list(map(math.radians, active['target'])), joint=True)
+                        points = approach[1]['points'] if approach[1] else []
+                        travel = float(np.abs(np.diff([p['positions'] for p in points], axis=0)).sum()) if points else 0.
+                        ranked.append((travel, pick, targets, approach, list(executor.q)))
                     except (RuntimeError, ValueError, TimeoutError) as exc:
-                        errors.append(f'{pick["yaw_deg"]:.1f} deg: {exc}')
-                        continue
-                    break
+                        errors.append(f'{pick["yaw_deg"]:.1f} deg approach: {exc}')
+
+                selected = None
+                for _, pick, targets, approach, approach_end in sorted(ranked, key=lambda item: item[0]):
+                    raw_descent = None
+                    for retreat_mm in range(6):
+                        executor.check()
+                        if time.monotonic() >= deadline:
+                            break
+                        executor.q = list(approach_end)
+                        try:
+                            candidate, goals = pick, targets
+                            if retreat_mm:
+                                candidate = grasp_targets(photo, scene, profile, extra_retreat_mm=retreat_mm,
+                                                          only_yaw=pick['yaw_deg'])[0]
+                                goals = moveit_targets(photo, candidate, scene, profile['handeye'], active['transfer'])
+                            width = candidate['grasp_width_mm'] / 1000
+                            if not 0 < width < opening:
+                                raise ValueError('Target does not fit the calibrated opening')
+                            options = {'descent_plan': raw_descent} if retreat_mm else {}
+                            descent = executor.prepare('descend', [goals['descent']], cartesian=True, **options)
+                            lift = executor.prepare('lift', [goals['lift']], cartesian=True)
+                            carry = executor.prepare('move_to_place', goals['carry'], cartesian=True)
+                            place_lift = executor.prepare('place_lift', [goals['place_lift']], cartesian=True)
+                            home = executor.prepare('return_to_observation',
+                                                    list(map(math.radians, active['target'])), joint=True)
+                        except (RuntimeError, ValueError, TimeoutError) as exc:
+                            errors.append(f'{pick["yaw_deg"]:.1f} deg (+{retreat_mm} mm): {exc}')
+                            if not retreat_mm:
+                                if not isinstance(exc, TableClearanceError):
+                                    break
+                                raw_descent = executor.raw_descent
+                            continue
+                        selected = candidate, goals
+                        break
+                    if selected is not None:
+                        pick, targets = selected
+                        executor.goals['approach'] = (targets['approach'], {'use_ik': True})
+                        break
                 else:
                     raise RuntimeError('No complete MoveIt plan: ' + '; '.join(errors))
                 if time.monotonic() >= deadline:
                     raise RuntimeError('MoveIt candidate planning deadline: ' + '; '.join(errors))
+                if retreat_mm:
+                    print(f"[fr3 descent trim] action={active['action_id']} retreat_mm={retreat_mm} "
+                          f"minimum_clearance_bound_mm={descent[1]['descent_gap_bound_mm']:.3f}", flush=True)
+                active['grasp_retreat_mm'] = retreat_mm
                 executor.open_hand('pick_open')
                 executor.move_remote(approach)
                 executor.move_remote(descent)
-                executor.grasp(width)
+                try:
+                    executor.grasp(width)
+                except GraspMiss as miss:
+                    active['stage'] = 'miss_recovery_planning'
+                    executor.q = list(executor.idle()['q'])
+                    retreat = executor.prepare('miss_retreat', [targets['approach']], cartesian=True)
+                    home = executor.prepare('return_to_observation',
+                                            list(map(math.radians, active['target'])), joint=True)
+                    if executor.fresh(hand)['is_grasped']:
+                        raise RuntimeError('Hand reports a held object; recovery withheld')
+                    executor.open_hand('miss_open')
+                    active['holding_object_possible'] = False
+                    active['recovery_required'] = True
+                    executor.move_remote(retreat)
+                    executor.move_remote(home)
+                    active.update(return_completed=True, recovery_required=False)
+                    active['stage'] = 'pick_close'
+                    raise RuntimeError('Grasp missed; hand opened and arm returned to observation') from miss
                 executor.move_remote(lift)
                 if not executor.fresh(hand)['is_grasped']:
                     raise RuntimeError('Grasp feedback lost during lift')
@@ -583,6 +695,7 @@ class PickPlacePlugin:
                 rotation = active['transfer']['rotation_deg']
                 result = dict(ok=True, stage='completed', transfer_completed=True, return_completed=True,
                               release_completed=True, holding_object_possible=False, recovery_required=False,
+                              grasp_retreat_mm=retreat_mm,
                               observation_id=pick['observation_id'], rotation_deg=rotation,
                               rotation_completed=bool(rotation), grasp_checked=True,
                               last_completed_stage='return_to_observation', arm_path_commands=executor.arm_commands,
@@ -609,7 +722,8 @@ class PickPlacePlugin:
                           last_completed_stage=active.get('last_completed_stage'),
                           feedback_recoveries=active.get('feedback_recoveries', 0),
                           holding_object_possible=active.get('holding_object_possible',False),
-                          recovery_required=active.get('holding_object_possible',False),
+                          recovery_required=(active.get('holding_object_possible', False)
+                                             or active.get('recovery_required', False)),
                           release_completed=active.get('release_completed',False),
                           rotation_deg=(active.get('transfer') or {}).get('rotation_deg',0),
                           rotation_completed=active.get('rotation_completed',False))

@@ -76,7 +76,7 @@ class PickExecution:
                 return result
             if key == 'command_id' and self.active.get('stage') in ('lift', 'move_to_place') and not self.fresh(self.hand)['is_grasped']:
                 raise RuntimeError('Grasp feedback lost during lift')
-            if key == 'command_id' and self.active.get('stage') in ('approach', 'descend'):
+            if key == 'command_id' and self.active.get('stage') in ('approach', 'descend', 'miss_retreat'):
                 hand = self.fresh(self.hand)
                 if hand['is_grasped'] or abs(hand['width'] - self.opening) > .001:
                     raise RuntimeError('Hand left its open position before grasp')

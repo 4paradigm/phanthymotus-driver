@@ -1,4 +1,5 @@
 """Use MoveIt for arm motion and retain the local Franka Hand commands."""
+from copy import deepcopy
 import math
 import time
 
@@ -8,6 +9,10 @@ from scipy.spatial.transform import Rotation
 from .execution import OBSERVATION_TOLERANCE_DEG, PickExecution
 from .hand_collision import check_descent_curve, check_path_table, frame, table_clearance, vertices
 from .kinematics import Kinematics
+
+
+class GraspMiss(RuntimeError):
+    """A finished grasp command with fresh feedback reporting no object."""
 
 
 class RemoteExecution(PickExecution):
@@ -43,10 +48,10 @@ class RemoteExecution(PickExecution):
         target = np.asarray(ee) @ np.linalg.inv(self.flange_to_ee)
         return [*target[:3, 3], *Rotation.from_matrix(target[:3, :3]).as_quat()]
 
-    def prepare(self, stage, target, *, cartesian=False, joint=False, use_ik=False):
+    def prepare(self, stage, target, *, cartesian=False, joint=False, use_ik=False, descent_plan=None):
         self.check()
         started = time.monotonic()
-        self.goals[stage] = (target, dict(cartesian=cartesian, joint=joint, use_ik=use_ik))
+        self.goals[stage] = (target, dict(cartesian=cartesian, joint=joint, use_ik=use_ik, descent_plan=descent_plan))
         if use_ik:
             target_joints = self.arm.solve_ik(self.flange_pose(target), self.q)
         elif joint:
@@ -78,13 +83,53 @@ class RemoteExecution(PickExecution):
                     failure = error
             raise failure
 
-        if target_joints is not None:
+        if descent_plan is not None:
+            plan = self.trim_descent(descent_plan, target[0])
+        elif target_joints is not None:
             plan = self.arm.plan_joint(target_joints, self.q)
         elif cartesian:
             plan = self.arm.plan_cartesian([self.flange_pose(p) for p in target], .1, self.q)
         else:
             plan = self.arm.plan_pose(self.flange_pose(target), self.q)
+        if stage == 'descend' and descent_plan is None:
+            self.raw_descent = deepcopy(plan)
         return self.prepare_trajectory(stage, target, plan, cartesian, joint, started)
+
+    def trim_descent(self, plan, target):
+        from scipy.interpolate import BPoly
+        from scipy.optimize import brentq
+
+        plan = deepcopy(plan)
+        names = plan['joint_names']
+        order = [names.index(f'fr3_joint{i}') for i in range(1, 8)]
+        samples = plan['points']
+        direction = target[:3, 2]
+        position = target[:3, 3]
+
+        def distance(q):
+            return (self.model.pose(np.asarray(q)[order])[:3, 3] - position) @ direction
+
+        def node(sample, endpoint):
+            return [sample['positions'], *[
+                [0.] * 7 if endpoint else sample[key] or [0.] * 7
+                for key in ('velocities', 'accelerations')]]
+
+        for i, (a, b) in enumerate(zip(samples, samples[1:])):
+            self.check()
+            if not distance(a['positions']) < 0 <= distance(b['positions']):
+                continue
+            start, end = a['time_ns'] / 1e9, b['time_ns'] / 1e9
+            curve = BPoly.from_derivatives([start, end],
+                                           [node(a, i == 0), node(b, i + 2 == len(samples))])
+            stop = brentq(lambda t: distance(curve(t)), start, end)
+            q = curve(stop)
+            if np.linalg.norm(self.model.pose(q[order])[:3, 3] - position) > .0005:
+                raise ValueError('Original descent does not pass near the shallower target')
+            plan['points'] = samples[:i + 1] + [
+                dict(time_ns=round(stop * 1e9), positions=q.tolist(),
+                     velocities=[0.] * 7, accelerations=[0.] * 7)]
+            return plan
+        raise ValueError('Shallower target was not reached along the original descent')
 
     def prepare_trajectory(self, stage, target, plan, cartesian, joint, started):
         if (plan.get('code') != 1 or not plan.get('points')
@@ -115,7 +160,7 @@ class RemoteExecution(PickExecution):
             if (table.shape != (3,) or normal.shape != (3,) or not np.isfinite(table).all()
                     or not np.isclose(np.linalg.norm(normal), 1., atol=.001)):
                 raise ValueError('Invalid table plane')
-        if stage == 'descend':
+        if stage in ('descend', 'miss_retreat'):
             if not plane:
                 raise ValueError('A table plane is required to verify descent clearance')
             allowance = self.profile.get('descent_clearance_allowance_mm', 0)
@@ -123,6 +168,7 @@ class RemoteExecution(PickExecution):
                 raise ValueError('Invalid descent clearance allowance')
             # Apply the measured allowance to collision checking only.
             descent_planes = [(table + normal * (allowance / 1000), normal)]
+            descent_minimum = math.inf
             clearance_mm = self.profile.get('descent_min_clearance_mm', 5)
             if type(clearance_mm) not in (int, float) or not math.isfinite(clearance_mm) or clearance_mm < 1:
                 raise ValueError('Invalid descent minimum clearance')
@@ -163,9 +209,9 @@ class RemoteExecution(PickExecution):
             if len(values[0]) != len(values[1]):
                 raise ValueError('Inconsistent MoveIt interpolation data')
             curve = BPoly.from_derivatives([start, stop], values)
-            if stage == 'descend':
-                check_descent_curve(self.model, curve, self.hand_points, descent_planes, self.check,
-                                    minimum_gap=minimum_gap)
+            if stage in ('descend', 'miss_retreat'):
+                descent_minimum = min(descent_minimum, check_descent_curve(
+                    self.model, curve, self.hand_points, descent_planes, self.check, minimum_gap=minimum_gap))
             segments.append((stop, curve.c[:, 0].tolist()))
             interval = np.linspace(start, stop, max(8, int(np.ceil((stop-start)/.01))+1))
             # Bernstein coefficients bound each derivative over the interval.
@@ -202,9 +248,10 @@ class RemoteExecution(PickExecution):
             sample['time_ns'] = round(sample['time_ns'] * factor)
             sample['velocities'] = [v / factor for v in sample['velocities']]
             sample['accelerations'] = [v / factor**2 for v in sample['accelerations']]
-        if stage == 'descend':
+        if stage in ('descend', 'miss_retreat'):
             plan['descent_planes'] = descent_planes
             plan['descent_min_gap_m'] = minimum_gap
+            plan['descent_gap_bound_mm'] = descent_minimum * 1000
         plan["segments"] = [(end * factor, controls) for end, controls in segments]
         self.q = positions[-1].tolist()
         return stage, plan
@@ -223,6 +270,8 @@ class RemoteExecution(PickExecution):
             if deviation > tolerance:
                 raise RuntimeError(f'Arm moved more than 1 degree before {stage}; trajectory withheld')
             if deviation > .0005:
+                if self.active.get('grasp_retreat_mm') and stage in ('approach', 'descend'):
+                    raise RuntimeError(f'Arm moved from the verified start of {stage}; trimmed pick withheld')
                 goal, options = self.goals[stage]
                 self.q = measured.tolist()
                 _, trajectory = self.prepare(stage, goal, **options)
@@ -237,7 +286,7 @@ class RemoteExecution(PickExecution):
             local = self.arm.local
             duration = trajectory['segments'][-1][0]
             tolerance = math.radians(.1)
-            if stage in ('approach', 'descend'):
+            if stage in ('approach', 'descend', 'miss_retreat'):
                 hand = self.fresh(self.hand)
                 if hand['is_grasped'] or abs(hand['width'] - self.opening) > .001:
                     raise RuntimeError('Hand left its open position before grasp')
@@ -247,14 +296,14 @@ class RemoteExecution(PickExecution):
                           for table, normal in trajectory['descent_planes'])
                 minimum_gap = trajectory['descent_min_gap_m']
                 if not math.isfinite(gap) or gap < minimum_gap:
-                    raise RuntimeError(f'Measured hand clearance {gap*1000:.2f} mm below {minimum_gap*1000:g} mm during descend')
+                    raise RuntimeError(f'Measured hand clearance {gap*1000:.2f} mm below {minimum_gap*1000:g} mm during {stage}')
 
-            if stage == 'descend':
+            if stage in ('descend', 'miss_retreat'):
                 check_live_descent(self.fresh(self.arm))
             command = local.move_timed(self.active['owner'], trajectory['segments'],
                                        math.radians(self.options['speed_deg_s']), tolerance, duration + 8)
             self.wait(self.arm, command, duration + 10, 'command_id',
-                      arm_feedback=check_live_descent if stage == 'descend' else None)
+                      arm_feedback=check_live_descent if stage in ('descend', 'miss_retreat') else None)
             target = np.asarray(trajectory['points'][-1]['positions'])[order]
             deadline = time.monotonic() + 5
             while True:
@@ -274,7 +323,7 @@ class RemoteExecution(PickExecution):
                         f'max speed={math.degrees(speed):.3f} deg/s (limit=0.573 deg/s)'
                     )
                 self.active['cancel'].wait(.05)
-            if stage == 'descend':
+            if stage in ('descend', 'miss_retreat'):
                 check_live_descent(sample)
             self.arm_commands += 1
         self.active['last_completed_stage'] = stage
@@ -311,7 +360,9 @@ class RemoteExecution(PickExecution):
 
     def grasp(self, width):
         self.active.update(stage='pick_close', holding_object_possible=True)
+        failure = None
         for attempt in range(2):
+            requested_at = time.monotonic_ns()
             command = self.hand.command(self.active['owner'], 'grasp', width_m=width,
                                         speed_m_s=self.options['speed_mm_s']/1000, force_n=self.options['force_n'],
                                         epsilon_inner_m=.010, epsilon_outer_m=.010, timeout_s=15)
@@ -319,15 +370,26 @@ class RemoteExecution(PickExecution):
                 self.wait(self.hand, command, 17, 'hand_command_id')
                 break
             except RuntimeError as error:
-                measured = self.fresh(self.hand)
-                if (attempt or self.hand.motion(command).get('status') != 'failed'
-                        or str(error) != 'Gripper command returned false'
-                        or not .005 < measured['width'] < min(measured['max_width'], .08)-.002):
+                if (self.hand.motion(command).get('status') != 'failed'
+                        or str(error) != 'Gripper command returned false'):
                     raise
+                measured = self.fresh(self.hand)
+                if (attempt or not .005 < measured['width'] < min(measured['max_width'], .08)-.002):
+                    failure = error
+                    break
                 width = measured['width']
-                self.active['hand_command_id'] = None
+
         deadline = time.monotonic() + 2
-        while not self.fresh(self.hand)['is_grasped']:
+        while True:
+            measured = self.fresh(self.hand)
+            sdk_ns = measured.get('sdk_received_ns', 0)
+            if requested_at < sdk_ns and time.monotonic_ns() - sdk_ns <= 220_000_000:
+                if measured['is_grasped']:
+                    if failure:
+                        raise failure
+                    return
+                if time.monotonic() >= deadline:
+                    raise GraspMiss('Grasp was not confirmed')
             if time.monotonic() >= deadline:
-                raise RuntimeError('Grasp was not confirmed; lift withheld')
+                raise RuntimeError('Fresh grasp feedback was not confirmed; lift withheld')
             self.active['cancel'].wait(.02)

@@ -59,10 +59,14 @@ def table_clearance(ee, points, table, normal):
     return float(np.min((points @ ee[:3, :3].T+ee[:3, 3]-table) @ normal))
 
 
+class TableClearanceError(ValueError):
+    """Modeled hand clearance is below the required table margin."""
+
+
 def check_table(ee, points, table, normal, stage, *, minimum_gap=.005):
     gap = table_clearance(ee, points, table, normal)
     if gap < minimum_gap:
-        raise ValueError(f'Hand/finger table clearance {gap*1000:.2f} mm below {minimum_gap*1000:g} mm during {stage}; grasp target unchanged')
+        raise TableClearanceError(f'Hand/finger table clearance {gap*1000:.2f} mm below {minimum_gap*1000:g} mm during {stage}; grasp target unchanged')
     return gap
 
 
