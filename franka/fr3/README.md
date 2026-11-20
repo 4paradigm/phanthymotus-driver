@@ -56,7 +56,7 @@ frame timestamps. Pause and resume ramp the playback rate along the same path.
 Playback waits for fresh arm and gripper feedback before issuing movement
 commands. It reports which backend is still starting or has failed. Before
 playing, each selected arm approaches only the first recorded pose. Every
-joint must be within 0.2 rad of that pose before alignment can start.
+joint must be within 50 degrees of that pose before alignment can start.
 The gripper target is held during approach. The arm uses the same joint
 impedance controller for approach and playback. That controller holds the
 start target until settling is confirmed. Tracking aborts if any joint differs from its target
