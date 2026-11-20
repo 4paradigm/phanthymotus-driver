@@ -41,28 +41,33 @@ class PickExecution:
         if self.active['cancel'].is_set():
             raise RuntimeError('Pick cancelled')
 
-    def fresh(self, session):
+    def fresh(self, session, *, wait_for_arm=False):
         self.check()
-        value = session.snapshot()
-        age = value.get('data_age_ms')
         is_gripper = session is self.hand
-        max_age_ms = 200 if is_gripper else 300
-        if (not value.get('connected') or type(age) not in (int, float) or not 0 <= age <= max_age_ms
-                or not value.get('control_ready')):
+        max_age_ms = 220 if is_gripper else 300
+        deadline = time.monotonic() + 2 if wait_for_arm and not is_gripper else None
+        waited = False
+        while True:
+            value = session.snapshot()
+            age = value.get('data_age_ms')
+            ready = value.get('connected') and value.get('control_ready')
+            valid_age = type(age) in (int, float) and age >= 0
+            if ready and valid_age and age <= max_age_ms:
+                if waited:
+                    self.active['feedback_recoveries'] = self.active.get('feedback_recoveries', 0) + 1
+                return value
+            if ready and valid_age and deadline is not None and time.monotonic() < deadline:
+                # Only wait before a new motion. Keep the in-motion watchdog immediate.
+                waited = True
+                self.active['cancel'].wait(.025)
+                self.check()
+                continue
             device = 'Gripper' if is_gripper else 'Arm'
             detail = value.get('control_error') or value.get('error') or 'fresh control feedback required'
-            if device == 'Gripper':
-                sdk_ns = value.get('sdk_received_ns')
-                sdk_age = None if sdk_ns is None else round((time.monotonic_ns() - sdk_ns) / 1e6, 1)
-                print(f"[fr3 feedback] action={self.active.get('action_id')} "
-                      f"stage={self.active.get('stage')} driver_age_ms={age} sdk_age_ms={sdk_age} "
-                      f"sdk_read_ms={value.get('sdk_read_ms')} "
-                      f"sdk_to_driver_ms={value.get('sdk_to_driver_ms')}", flush=True)
             raise RuntimeError(f"{device}: {detail} (connected={value.get('connected')}, "
                                f"ready={value.get('control_ready')}, age_ms={age})")
-        return value
 
-    def wait(self, session, command, timeout, key):
+    def wait(self, session, command, timeout, key, *, arm_feedback=None):
         self.active[key] = command
         deadline = time.monotonic()+timeout
         while True:
@@ -83,6 +88,8 @@ class PickExecution:
             if key == 'command_id':
                 state = self.fresh(self.arm)
                 self.peak_speed = max(self.peak_speed, max(map(abs, state['dq'])))
+                if arm_feedback is not None:
+                    arm_feedback(state)
             if time.monotonic() >= deadline:
                 raise TimeoutError('Command completion timed out')
             self.active['cancel'].wait(.02)
@@ -216,4 +223,5 @@ class PickExecution:
                 session.stop_motion(owner=self.active['owner'], command_id=command)
                 result = session.wait(command, timeout=4)
                 if result['status'] not in ('succeeded', 'cancelled'):
-                    raise RuntimeError('Pending motion stop was not confirmed')
+                    raise RuntimeError(f"Pending motion stop was not confirmed ({key}, "
+                                       f"status={result['status']}, error={result.get('error')})")

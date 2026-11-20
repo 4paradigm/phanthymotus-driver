@@ -16,14 +16,18 @@ class HandCollisionTests(unittest.TestCase):
             def pose(self, q):
                 return rigid(rotation((1, 0, 0), math.pi + q[1]), [0, 0, q[0]])
 
-        def verify(controls, planes):
+        def verify(controls, planes, **kwargs):
             curve = BPoly(np.asarray(controls)[:, None, :], [0., 1.])
-            check_descent_curve(Model(), curve, np.zeros((1, 3)), planes, lambda: None)
+            check_descent_curve(Model(), curve, np.zeros((1, 3)), planes, lambda: None, **kwargs)
 
         plane = (np.zeros(3), np.array([0., 0., 1.]))
         verify([[.05, 0.], [.03, 0.], [.015, 0.]], [plane])
         with self.assertRaisesRegex(ValueError, 'below 5 mm'):
             verify([[.02, 0.], [-.02, 0.], [.02, 0.]], [plane])
+        corrected = (np.array([0., 0., .043]), plane[1])
+        verify([[.045, 0.], [.045, 0.]], [corrected], minimum_gap=.001)
+        with self.assertRaisesRegex(ValueError, 'below 1 mm'):
+            verify([[.0435, 0.], [.0435, 0.]], [corrected], minimum_gap=.001)
         with self.assertRaisesRegex(ValueError, 'tilt'):
             verify([[.05, 0.], [.05, .2], [.05, 0.]], [plane])
         with self.assertRaisesRegex(ValueError, 'below 5 mm'):

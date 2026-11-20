@@ -587,6 +587,7 @@ class PickPlacePlugin:
                               observation_id=pick['observation_id'], rotation_deg=rotation,
                               rotation_completed=bool(rotation), grasp_checked=True,
                               last_completed_stage='return_to_observation', arm_path_commands=executor.arm_commands,
+                              feedback_recoveries=active.get('feedback_recoveries', 0),
                               observe_after_transfer=active['config']['observe_after_transfer'],
                               observation=dict(skipped=True, reason='disabled'),
                               final_pose=pose_vector(self.state(active)['O_T_EE']))
@@ -606,7 +607,8 @@ class PickPlacePlugin:
                           observation=(dict(ok=False,message=str(exc)) if active.get('transfer_completed') and active['config']['observe_after_transfer']
                               else dict(skipped=True,reason='transfer_incomplete' if active['config']['observe_after_transfer'] else 'disabled')),
                           observation_id=(active['observation'] or {}).get('result',{}).get('observation_id'),
-                          last_completed_stage=active.get('last_completed_stage'), feedback_recoveries=0,
+                          last_completed_stage=active.get('last_completed_stage'),
+                          feedback_recoveries=active.get('feedback_recoveries', 0),
                           holding_object_possible=active.get('holding_object_possible',False),
                           recovery_required=active.get('holding_object_possible',False),
                           release_completed=active.get('release_completed',False),

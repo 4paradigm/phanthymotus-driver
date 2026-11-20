@@ -243,7 +243,7 @@ def fit_outline(points, target, table, normal, outline):
     widths=[np.ptp(footprint @ (basis @ [np.cos(a),np.sin(a)]))
             for a in np.radians(np.arange(0,180,5))]
     diameter=float(min(widths))
-    if not .02<diameter<.0794:
+    if not .005 <= diameter < .0794:
         raise ValueError(f'Outline width {diameter*1000:.1f} mm is outside the calibrated opening')
     centre=table+basis @ ((low+high)/2)+normal*height/2
     if np.linalg.norm(centre-target)>.1:

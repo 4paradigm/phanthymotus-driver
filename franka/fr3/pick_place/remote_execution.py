@@ -6,7 +6,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from .execution import OBSERVATION_TOLERANCE_DEG, PickExecution
-from .hand_collision import check_descent_curve, check_path_table, check_table, frame, vertices
+from .hand_collision import check_descent_curve, check_path_table, frame, table_clearance, vertices
 from .kinematics import Kinematics
 
 
@@ -31,8 +31,8 @@ class RemoteExecution(PickExecution):
     def idle(self):
         deadline = time.monotonic() + 3
         while True:
-            state = self.fresh(self.arm)
-            if (state.get('robot_mode') in (1, 2) and len(state['dq']) == 7
+            state = self.fresh(self.arm, wait_for_arm=True)
+            if (state.get('robot_mode') == 1 and len(state['dq']) == 7
                     and max(map(abs, state['dq'])) < .01):
                 return state
             if time.monotonic() >= deadline:
@@ -47,15 +47,46 @@ class RemoteExecution(PickExecution):
         self.check()
         started = time.monotonic()
         self.goals[stage] = (target, dict(cartesian=cartesian, joint=joint, use_ik=use_ik))
-        if joint:
-            plan = self.arm.plan_joint(target, self.q)
-        elif use_ik:
-            goal = self.arm.solve_ik(self.flange_pose(target), self.q)
-            plan = self.arm.plan_joint(goal, self.q)
+        if use_ik:
+            target_joints = self.arm.solve_ik(self.flange_pose(target), self.q)
+        elif joint:
+            target_joints = target
+        else:
+            target_joints = None
+
+        if stage in ('approach', 'move_to_observation', 'return_to_observation') and target_joints is not None:
+            candidates = []
+            failure = None
+            for _ in range(3):
+                self.check()
+                plan = self.arm.plan_joint(target_joints, self.q)
+                if plan.get('code') != 1 or not plan.get('succeeded') or not plan.get('points'):
+                    failure = RuntimeError(f'MoveIt failed to plan {stage} (code={plan.get("code")})')
+                    continue
+                positions = np.asarray([point['positions'] for point in plan['points']], dtype=float)
+                if positions.ndim != 2 or positions.shape[1] != 7 or not np.isfinite(positions).all():
+                    failure = ValueError(f'Invalid MoveIt joint positions during {stage}')
+                    continue
+                candidates.append((float(np.abs(np.diff(positions, axis=0)).sum()), plan))
+            for _, plan in sorted(candidates, key=lambda candidate: candidate[0]):
+                try:
+                    return self.prepare_trajectory(stage, target, plan, cartesian, joint, started)
+                except ValueError as error:
+                    failure = error
+                except RuntimeError as error:
+                    self.check()
+                    failure = error
+            raise failure
+
+        if target_joints is not None:
+            plan = self.arm.plan_joint(target_joints, self.q)
         elif cartesian:
             plan = self.arm.plan_cartesian([self.flange_pose(p) for p in target], .1, self.q)
         else:
             plan = self.arm.plan_pose(self.flange_pose(target), self.q)
+        return self.prepare_trajectory(stage, target, plan, cartesian, joint, started)
+
+    def prepare_trajectory(self, stage, target, plan, cartesian, joint, started):
         if (plan.get('code') != 1 or not plan.get('points')
                 or (cartesian and plan.get('fraction') != 1.)
                 or (not cartesian and not plan.get('succeeded'))):
@@ -87,7 +118,15 @@ class RemoteExecution(PickExecution):
         if stage == 'descend':
             if not plane:
                 raise ValueError('A table plane is required to verify descent clearance')
-            descent_planes = [(table, normal)]
+            allowance = self.profile.get('descent_clearance_allowance_mm', 0)
+            if type(allowance) not in (int, float) or not math.isfinite(allowance) or allowance < 0:
+                raise ValueError('Invalid descent clearance allowance')
+            # Apply the measured allowance to collision checking only.
+            descent_planes = [(table + normal * (allowance / 1000), normal)]
+            clearance_mm = self.profile.get('descent_min_clearance_mm', 5)
+            if type(clearance_mm) not in (int, float) or not math.isfinite(clearance_mm) or clearance_mm < 1:
+                raise ValueError('Invalid descent minimum clearance')
+            minimum_gap = clearance_mm / 1000
             fixed = self.profile.get('table_plane')
             if fixed and fixed is not plane:
                 fixed_table = np.asarray(fixed['point_base_mm']) / 1000
@@ -125,7 +164,8 @@ class RemoteExecution(PickExecution):
                 raise ValueError('Inconsistent MoveIt interpolation data')
             curve = BPoly.from_derivatives([start, stop], values)
             if stage == 'descend':
-                check_descent_curve(self.model, curve, self.hand_points, descent_planes, self.check)
+                check_descent_curve(self.model, curve, self.hand_points, descent_planes, self.check,
+                                    minimum_gap=minimum_gap)
             segments.append((stop, curve.c[:, 0].tolist()))
             interval = np.linspace(start, stop, max(8, int(np.ceil((stop-start)/.01))+1))
             # Bernstein coefficients bound each derivative over the interval.
@@ -162,6 +202,9 @@ class RemoteExecution(PickExecution):
             sample['time_ns'] = round(sample['time_ns'] * factor)
             sample['velocities'] = [v / factor for v in sample['velocities']]
             sample['accelerations'] = [v / factor**2 for v in sample['accelerations']]
+        if stage == 'descend':
+            plan['descent_planes'] = descent_planes
+            plan['descent_min_gap_m'] = minimum_gap
         plan["segments"] = [(end * factor, controls) for end, controls in segments]
         self.q = positions[-1].tolist()
         return stage, plan
@@ -198,9 +241,20 @@ class RemoteExecution(PickExecution):
                 hand = self.fresh(self.hand)
                 if hand['is_grasped'] or abs(hand['width'] - self.opening) > .001:
                     raise RuntimeError('Hand left its open position before grasp')
+            def check_live_descent(state):
+                actual = np.asarray(state['O_T_EE']).reshape(4, 4, order='F')
+                gap = min(table_clearance(actual, self.hand_points, table, normal)
+                          for table, normal in trajectory['descent_planes'])
+                minimum_gap = trajectory['descent_min_gap_m']
+                if not math.isfinite(gap) or gap < minimum_gap:
+                    raise RuntimeError(f'Measured hand clearance {gap*1000:.2f} mm below {minimum_gap*1000:g} mm during descend')
+
+            if stage == 'descend':
+                check_live_descent(self.fresh(self.arm))
             command = local.move_timed(self.active['owner'], trajectory['segments'],
                                        math.radians(self.options['speed_deg_s']), tolerance, duration + 8)
-            self.wait(self.arm, command, duration + 10, 'command_id')
+            self.wait(self.arm, command, duration + 10, 'command_id',
+                      arm_feedback=check_live_descent if stage == 'descend' else None)
             target = np.asarray(trajectory['points'][-1]['positions'])[order]
             deadline = time.monotonic() + 5
             while True:
@@ -221,12 +275,7 @@ class RemoteExecution(PickExecution):
                     )
                 self.active['cancel'].wait(.05)
             if stage == 'descend':
-                actual = np.asarray(sample['O_T_EE']).reshape(4, 4, order='F')
-                for table, keys in ((self.scene, ('table_point_base_mm', 'table_normal_base')),
-                                    (self.profile.get('table_plane'), ('point_base_mm', 'normal_base'))):
-                    if table:
-                        check_table(actual, self.hand_points, np.asarray(table[keys[0]]) / 1000,
-                                    np.asarray(table[keys[1]]), stage)
+                check_live_descent(sample)
             self.arm_commands += 1
         self.active['last_completed_stage'] = stage
 
