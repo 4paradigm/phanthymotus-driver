@@ -8,7 +8,7 @@
 | `hand_gesture` | `actuator` | 预置手势、0–9 数字及已调试的拇指避碰路径 |
 | `hand_grasp` | `actuator` | 自适应接触停止抓取、释放和状态读取 |
 | `hand_tactile` | `sensor` | 按卡片选择采集左右手触觉，发布供 Core 渲染的实时触觉数据 |
-| `joints` | `sensor` | 每张卡片选择左手或右手，CAN 接口自动匹配，持续读取 16 主动关节实测位置，同时输出 JSON 与该手的实时骨架 |
+| `joints` | `sensor` | 每张卡片选择左手或右手，CAN 接口自动匹配，持续读取 16 主动关节实测位置，只输出该手的实时骨架 |
 
 另有 `model`（`resource`）向 Core 提供左右手骨架 URDF，不是画布卡片。
 
