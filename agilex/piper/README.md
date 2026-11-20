@@ -64,6 +64,13 @@ those fixes for the complete canvas experience. A `trigger` activity label is
 presentation; Get status is a synchronous query and its completion does not
 change the previous movement result.
 
+## 可选：夹爪离桌距离
+
+`piper_table_clearance` 是默认关闭的只读 sensor，基于现有末端姿态、夹爪开度
+和经验证的桌面/工具标定，以 5 Hz 输出夹爪模型最低点到桌面的有符号法向间隙。
+缺少标定或反馈过期时输出不可用，不连接 CAN、不使能、不执行运动或避碰。
+配置和现场验收见 [TABLE_CLEARANCE.md](TABLE_CLEARANCE.md)。
+
 ## Build and packaging
 
 ```bash
