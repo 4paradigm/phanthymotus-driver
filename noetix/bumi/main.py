@@ -204,6 +204,13 @@ class BumiDeviceBundle:
                 plugins_cfg["vision_capture"], camera_plugin))
             print("[bundle] VisionCapturePlugin loaded")
 
+        # Public broadcasting requires an explicit go_live action.
+        if plugins_cfg.get("live_stream", {}).get("enabled", False):
+            from live_stream import LiveStreamPlugin
+            self._plugins.append(LiveStreamPlugin(
+                plugins_cfg["live_stream"], namespace, executor, camera_plugin))
+            print("[bundle] LiveStreamPlugin loaded (not broadcasting)")
+
     def start_all(self) -> None:
         failed = 0
         for i, p in enumerate(self._plugins):

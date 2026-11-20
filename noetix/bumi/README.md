@@ -1,5 +1,13 @@
 # Noetix Bumi driver
 
+## 虎牙直播 Card
+
+使用说明、配置教程、故障排查和安全注意事项统一放在 [live_stream/README.md](live_stream/README.md)。
+
+---
+
+
+
 The bundle exposes Bumi sensor, locomotion, audio, camera, motion-state, and independent sound-direction cards. The direction card is implemented in `direction_card.py`; the other cards remain in `device.py`.
 
 ## `mic` and `sound_direction`

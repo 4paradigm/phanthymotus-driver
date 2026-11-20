@@ -134,6 +134,17 @@ RUN cd /work/noetix_sdk_bumi && \
 RUN ls /work/noetix_sdk_bumi/build/highcontrol_py*.so && \
     ls /work/noetix_sdk_bumi/build/mediacontrol_py*.so
 
+# RTMP support is intentionally after ROS2/RTAB-Map and Bumi SDK build.
+# Changing this small optional dependency must not invalidate heavy build caches.
+# Prefer an existing library from the image; otherwise install the runtime only.
+RUN set -eu; \
+    if ! python3 -c 'import ctypes, ctypes.util; p=ctypes.util.find_library("rtmp"); assert p; ctypes.CDLL(p)' >/dev/null 2>&1; then \
+        apt-get update && \
+        apt-get install -y --no-install-recommends librtmp1 && \
+        rm -rf /var/lib/apt/lists/*; \
+    fi; \
+    python3 -c 'import ctypes, ctypes.util; p=ctypes.util.find_library("rtmp"); assert p; lib=ctypes.CDLL(p); assert all(hasattr(lib, x) for x in ("RTMP_Alloc", "RTMP_Init", "RTMP_SetupURL", "RTMP_EnableWrite", "RTMP_Connect", "RTMP_ConnectStream", "RTMP_Write", "RTMP_Close", "RTMP_Free"))'
+
 # ROS2 domain isolation
 ENV ROS_DOMAIN_ID=42
 ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
@@ -154,6 +165,7 @@ COPY visual_odometry_probe.py /work/visual_odometry_probe.py
 COPY odom_spec.py /work/odom_spec.py
 COPY sound_direction.py /work/sound_direction.py
 COPY direction_card.py /work/direction_card.py
+COPY live_stream/*.py /work/live_stream/
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/
 
