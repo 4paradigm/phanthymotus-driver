@@ -32,6 +32,26 @@ def test_rejects_non_huya_and_bad_urls(url):
 XHS_URL = "rtmp://live-push.xhscdn.com/live/123456789?txSecret=example&txTime=ffffffff"
 
 
+def test_xiaohongshu_regional_server_from_official_live_assistant():
+    server = "rtmp://live-push-reg-tx.xhscdn.com/live"
+    stream_key = "987?txSecret=fake_only&txTime=ffffffff&txDelayTime=0&vendor=tencent"
+    platform, url = validate_stream_url(server + "/" + stream_key)
+    assert platform == "xiaohongshu"
+    assert url == server + "/" + stream_key
+
+
+@pytest.mark.parametrize("host", [
+    "fake-live-push-reg-tx.xhscdn.com",
+    "live-push-reg-tx.xhscdn.com.evil.example",
+    "live-push-reg-tx.evil.example",
+])
+def test_regional_server_near_miss_rejected(host):
+    with pytest.raises(ValueError):
+        validate_stream_url(
+            f"rtmp://{host}/live/987?txSecret=fake_only&txTime=ffffffff"
+        )
+
+
 def test_xiaohongshu_server_and_stream_key_form_full_url():
     server = "rtmp://live-push.xhscdn.com/live"
     stream_key = "123456789?txSecret=example&txTime=ffffffff"

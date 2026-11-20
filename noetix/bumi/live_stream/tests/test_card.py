@@ -47,7 +47,7 @@ class Worker:
 def card(store=None, worker=None):
     return LiveStreamPlugin(
         {}, "bumi", None, None, store=store or Store(), worker=worker or Worker(),
-        clock=lambda: 100.0)
+        clock=lambda: 100.0, approval_verifier=lambda *_: True)
 
 
 def test_card_is_huya_only_actuator_and_user_facing():
@@ -117,7 +117,8 @@ def test_canvas_gear_config_reaches_driver_but_never_becomes_llm_tool():
 def test_saved_url_alone_cannot_start_broadcast():
     store, worker = Store(URL), Worker()
     subject = LiveStreamPlugin({}, "bumi", None, None, store=store,
-                               worker=worker, clock=lambda: 100.0)
+                               worker=worker, clock=lambda: 100.0,
+                               approval_verifier=lambda *_: True)
     result = subject.dispatch("go_live", {})
     assert result["error_code"] == "APPROVAL_REQUIRED"
     assert worker.calls == []
@@ -128,7 +129,8 @@ def test_paste_new_url_arms_once_without_extra_code():
     store, worker = Store(), Worker()
     now = [100.0]
     subject = LiveStreamPlugin({}, "bumi", None, None, store=store,
-                               worker=worker, clock=lambda: now[0])
+                               worker=worker, clock=lambda: now[0],
+                               approval_verifier=lambda *_: True)
     assert subject.dispatch("config", {"rtmp_url": URL})["ok"]
     assert subject.dispatch("go_live", {})["state"] == "starting"
     assert subject.dispatch("end_live", {})["state"] == "idle"
@@ -140,6 +142,52 @@ def test_paste_new_url_arms_once_without_extra_code():
     assert subject.dispatch("config", {"rtmp_url": changed_url})["ok"]
     now[0] += 301
     assert subject.dispatch("go_live", {})["error_code"] == "APPROVAL_REQUIRED"
+
+
+def test_explicit_operator_rearm_same_url_does_not_allow_background_replay():
+    store, worker = Store(), Worker()
+    now = [100.0]
+    subject = LiveStreamPlugin({}, "bumi", None, None, store=store, worker=worker,
+                               clock=lambda: now[0], approval_verifier=lambda *_: True)
+    first = subject.dispatch("config", {"rtmp_url": URL})
+    assert first["ready_to_go_live"] is True
+    now[0] += 301
+    assert subject.dispatch("go_live", {})["error_code"] == "APPROVAL_REQUIRED"
+    replay = subject.dispatch("config", {"rtmp_url": URL})
+    assert replay["ready_to_go_live"] is False
+    assert subject.dispatch("go_live", {})["error_code"] == "APPROVAL_REQUIRED"
+    allowed = subject.dispatch("config", {"rtmp_url": URL, "authorize_start": True})
+    assert allowed["ok"] and allowed["ready_to_go_live"]
+    assert subject.dispatch("go_live", {})["state"] == "starting"
+    assert subject.dispatch("end_live", {})["state"] == "idle"
+    assert subject.dispatch("go_live", {})["error_code"] == "APPROVAL_REQUIRED"
+
+
+def test_raw_mcp_cannot_configure_or_publish_without_approval():
+    store, worker = Store(), Worker()
+    def verify(action, url, proof):
+        return proof == "signed:" + action
+
+    subject = LiveStreamPlugin(
+        {}, "bumi", None, None, store=store, worker=worker,
+        clock=lambda: 100.0, approval_verifier=verify,
+    )
+    assert subject.dispatch("config", {"rtmp_url": URL})["error_code"] == "APPROVAL_REQUIRED"
+    assert store.saves == 0
+    assert subject.dispatch("config", {
+        "rtmp_url": URL, "operator_proof": "signed:config",
+        "authorize_start": True,
+    })["ready_to_go_live"] is True
+    # The five-minute approval window alone is insufficient to start.
+    assert subject.dispatch("go_live", {})["error_code"] == "APPROVAL_REQUIRED"
+    assert worker.calls == []
+    assert subject.dispatch("go_live", {"operator_proof": "signed:go_live"})["state"] == "starting"
+    assert subject.dispatch("end_live", {})["state"] == "idle"
+    assert subject.dispatch("go_live", {"operator_proof": "signed:go_live"})["error_code"] == "APPROVAL_REQUIRED"
+    # Replays without signed approval do not permit a second session.
+    assert subject.dispatch("config", {"rtmp_url": URL})["ready_to_go_live"] is False
+    assert subject.dispatch("config", {"rtmp_url": URL, "authorize_start": True})["error_code"] == "APPROVAL_REQUIRED"
+    assert subject.dispatch("config", {"rtmp_url": URL.replace("seq=123", "seq=999")})["error_code"] == "APPROVAL_REQUIRED"
 
 
 def test_xiaohongshu_gear_configuration_without_broadcast():
@@ -262,7 +310,8 @@ def test_auth_status_exposes_expiry_without_url():
     store, worker = Store(), Worker()
     now = [100.0]
     subject = LiveStreamPlugin({}, "bumi", None, None, store=store,
-                               worker=worker, clock=lambda: now[0])
+                               worker=worker, clock=lambda: now[0],
+                               approval_verifier=lambda *_: True)
     assert subject.dispatch("info", {})["ready_to_go_live"] is False
     result = subject.dispatch("config", {"rtmp_url": URL})
     assert result["ready_to_go_live"] is True
@@ -287,7 +336,8 @@ def test_go_live_initializes_audio_subscription_when_canvas_start_was_skipped(mo
     monkeypatch.setattr(module, "attach_audio_subscription", attach)
     executor = object()
     subject = LiveStreamPlugin({}, "bumi", executor, None, store=Store(),
-                               audio=audio, worker=Worker(), clock=lambda: 100.0)
+                               audio=audio, worker=Worker(), clock=lambda: 100.0,
+                               approval_verifier=lambda *_: True)
     assert subject.dispatch("config", {"rtmp_url": URL})["ready_to_go_live"]
     assert subject.dispatch("go_live", {})["state"] == "starting"
     assert calls == [(executor, "bumi")]

@@ -9,7 +9,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 MAX_URL = 4096
-XIAOHONGSHU_PUSH_HOST = "live-push.xhscdn.com"
+XIAOHONGSHU_PUSH_HOSTS = frozenset(("live-push.xhscdn.com", "live-push-reg-tx.xhscdn.com"))
 
 
 def validate_huya_url(value: object) -> str:
@@ -48,7 +48,7 @@ def validate_stream_url(value: object) -> tuple[str, str]:
                 or parts.port not in (None, 1935, 443)
                 or parts.username or parts.password or parts.fragment):
             raise ValueError
-        if host == XIAOHONGSHU_PUSH_HOST:
+        if host in XIAOHONGSHU_PUSH_HOSTS:
             segments = parts.path.split("/")
             params = parse_qs(parts.query, keep_blank_values=True, strict_parsing=True)
             if (len(segments) != 3 or segments[:2] != ["", "live"]

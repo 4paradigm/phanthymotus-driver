@@ -5,6 +5,7 @@ import threading
 import time
 
 from .config import HuyaCredentialStore, validate_stream_url
+from .approval import verify_live_stream_action
 from .worker import AudioBuffer, LiveStreamWorker
 
 
@@ -33,13 +34,15 @@ class LiveStreamPlugin:
     PREFIX = "live_stream"
 
     def __init__(self, cfg: dict, namespace: str, executor, camera,
-                 *, store=None, audio=None, worker=None, clock=None):
+                 *, store=None, audio=None, worker=None, clock=None,
+                 approval_verifier=None):
         self._lock = threading.RLock()
         self._store = store if store is not None else HuyaCredentialStore(
             cfg.get("credential_path", "/opt/phanthy-motus/data/live_stream/huya-rtmp-url"))
         self._url = self._store.read()
         self._platform = validate_stream_url(self._url)[0] if self._url else None
         self._clock = clock if clock is not None else time.monotonic
+        self._verify_approval = approval_verifier or verify_live_stream_action
         # Save from the Canvas gear authorizes one start for five minutes.
         # Merely restoring a persisted URL on startup never arms a broadcast.
         self._armed_until = 0.0
@@ -151,6 +154,10 @@ class LiveStreamPlugin:
                 return {"ok": False, "error_code": "INVALID_STREAM_URL",
                         "message": "仅支持已验证的虎牙或小红书官方 RTMP 地址"}
             with self._lock:
+                signed = self._verify_approval('config', url, args.get('operator_proof'))
+                if not signed and (url != self._url or args.get('authorize_start') is True):
+                    return {'ok': False, 'error_code': 'APPROVAL_REQUIRED',
+                            'message': '只有通过 Agent Core 用户授权才能设置直播地址'}
                 state = self._worker.info()["state"]
                 if state in ("starting", "streaming", "stopping"):
                     if url == self._url:
@@ -167,7 +174,9 @@ class LiveStreamPlugin:
                             "message": "无法安全保存推流地址，请检查机器人数据目录权限"}
                 # Replaying the same saved configuration on reconnect does not
                 # grant fresh authority to capture and publish camera/microphone.
-                if url != self._url:
+                # Only an explicit Canvas user action can re-arm an unchanged key.
+                # Background config replay must never authorize a broadcast.
+                if signed and (url != self._url or args.get("authorize_start") is True):
                     self._armed_until = self._clock() + 300.0
                 self._url = url
                 self._platform = platform
@@ -184,6 +193,9 @@ class LiveStreamPlugin:
                 if self._clock() >= self._armed_until:
                     return {"ok": False, "error_code": "APPROVAL_REQUIRED",
                             "message": "请在卡片齿轮重新填写本场新推流地址并保存"}
+                if not self._verify_approval('go_live', self._url, args.get('operator_proof')):
+                    return {'ok': False, 'error_code': 'APPROVAL_REQUIRED',
+                            'message': '只有经过 Agent Core 人工确认的开播请求才能执行'}
                 # A direct go_live call must not require a separate Canvas start.
                 if self._node is None and self._executor is not None:
                     self.start()
