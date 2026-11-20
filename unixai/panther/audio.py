@@ -1,0 +1,283 @@
+"""Canvas audio cards using the host PulseAudio server on Agent Core domain 42."""
+
+from __future__ import annotations
+
+import multiprocessing as mp
+import os
+import queue
+import subprocess
+import threading
+import time
+
+
+FORMAT = "audio/pcm-16k"
+CHUNK_BYTES = 2048  # 64 ms, S16LE mono at 16 kHz.
+
+
+def _complete_chunks(pending: bytearray, incoming: bytes):
+    pending.extend(incoming)
+    while len(pending) >= CHUNK_BYTES:
+        chunk = bytes(pending[:CHUNK_BYTES])
+        del pending[:CHUNK_BYTES]
+        yield chunk
+
+
+def _pulse_command(mode: str, device: str) -> list[str]:
+    executable = "parec" if mode == "mic" else "paplay"
+    return [executable, "--raw", "--format=s16le", "--rate=16000",
+            "--channels=1", "--latency-msec=80", "--process-time-msec=40",
+            f"--device={device}"]
+
+
+def _pulse_identity(config: dict) -> dict[str, int]:
+    return {"user": int(config["uid"]), "group": int(config["gid"])}
+
+
+def _worker(mode, topic, config, commands, replies):
+    os.environ["ROS_DOMAIN_ID"] = os.environ.get("AGENT_CORE_ROS_DOMAIN_ID", "42")
+    os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
+    os.environ["PULSE_SERVER"] = config["server"]
+    import rclpy
+    from rclpy.node import Node
+    from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+    from audio_msgs.msg import AudioChunk
+
+    rclpy.init(domain_id=int(os.environ["ROS_DOMAIN_ID"]))
+    node = Node(f"panther_{mode}_audio", enable_rosout=False, start_parameter_services=False)
+    qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                     history=HistoryPolicy.KEEP_LAST, depth=10)
+    stop_event = threading.Event()
+    pcm_queue = queue.Queue(maxsize=8)
+    state = {"running": False, "frames": 0, "dropped": 0, "last_frame": 0.0, "error": "",
+             "input_topic": ""}
+    process = None
+    thread = None
+    subscription = None
+    publisher = node.create_publisher(AudioChunk, topic, qos) if mode == "mic" else None
+
+    def capture(proc):
+        try:
+            pending = bytearray()
+            while not stop_event.is_set() and proc.poll() is None:
+                raw = proc.stdout.read(CHUNK_BYTES)
+                if not raw:
+                    break
+                first_sample_ns = time.time_ns() - (len(pending) + len(raw)) * 1_000_000_000 // 32000
+                for chunk in _complete_chunks(pending, raw):
+                    msg = AudioChunk()
+                    msg.format = FORMAT
+                    msg.data = list(chunk)
+                    msg.header.stamp.sec = first_sample_ns // 1_000_000_000
+                    msg.header.stamp.nanosec = first_sample_ns % 1_000_000_000
+                    publisher.publish(msg)
+                    state["frames"] += 1
+                    state["last_frame"] = time.monotonic()
+                    first_sample_ns += CHUNK_BYTES * 1_000_000_000 // 32000
+        except Exception as exc:
+            state["error"] = f"capture failed: {exc}"
+        finally:
+            if not stop_event.is_set():
+                state["running"] = False
+                state["error"] = state["error"] or "capture process stopped"
+
+    def play(proc):
+        try:
+            deadline = time.monotonic()
+            while not stop_event.is_set() and proc.poll() is None:
+                try:
+                    raw = pcm_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                deadline = max(deadline, time.monotonic()) + len(raw) / 32000
+                proc.stdin.write(raw)
+                proc.stdin.flush()
+                stop_event.wait(max(0.0, deadline - time.monotonic() - 0.08))
+        except Exception as exc:
+            state["error"] = f"playback failed: {exc}"
+        finally:
+            if not stop_event.is_set():
+                state["running"] = False
+                state["error"] = state["error"] or "playback process stopped"
+
+    def on_audio(msg):
+        if not state["running"] or msg.format != FORMAT:
+            return
+        raw = bytes(msg.data)
+        if not raw or len(raw) % 2:
+            return
+        state["frames"] += 1
+        state["last_frame"] = time.monotonic()
+        for offset in range(0, len(raw), 4096):
+            block = raw[offset:offset + 4096]
+            try:
+                pcm_queue.put_nowait(block)
+            except queue.Full:
+                try:
+                    pcm_queue.get_nowait()
+                    pcm_queue.put_nowait(block)
+                    state["dropped"] += 1
+                except queue.Empty:
+                    pass
+
+    def stop():
+        nonlocal process, thread, subscription
+        state["running"] = False
+        stop_event.set()
+        if subscription is not None:
+            node.destroy_subscription(subscription)
+            subscription = None
+        if process is not None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+            process = None
+        if thread is not None:
+            thread.join(timeout=2)
+            thread = None
+        while not pcm_queue.empty():
+            try:
+                pcm_queue.get_nowait()
+            except queue.Empty:
+                break
+        state["input_topic"] = ""
+
+    def info():
+        healthy = state["running"] and process is not None and process.poll() is None
+        return {"state": "error" if state["error"] else "running" if healthy else "idle",
+                "pulse_server": config["server"], "pulse_device": config["device"],
+                "frames": state["frames"], "dropped": state["dropped"], "last_frame_age_ms":
+                int((time.monotonic() - state["last_frame"]) * 1000) if state["last_frame"] else None,
+                "input_topic": state["input_topic"], "queued_chunks": pcm_queue.qsize(),
+                "error": state["error"]}
+
+    try:
+        while True:
+            rclpy.spin_once(node, timeout_sec=0.02)
+            try:
+                action, input_topic = commands.get_nowait()
+            except queue.Empty:
+                continue
+            if action == "close":
+                break
+            if action == "stop":
+                stop()
+                replies.put({"state": "idle"})
+            elif action == "info":
+                replies.put(info())
+            elif action == "start":
+                if mode == "speaker" and not input_topic:
+                    replies.put({"state": "waiting_for_input"})
+                    continue
+                stop()
+                state.update(error="", frames=0, dropped=0, last_frame=0.0, input_topic=input_topic)
+                stop_event.clear()
+                try:
+                    probe = subprocess.run(
+                        ["pactl", "info"], timeout=3, stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE, text=True, **_pulse_identity(config))
+                    if probe.returncode != 0:
+                        raise RuntimeError(
+                            f"PulseAudio connection failed: {probe.stderr.strip()[-200:]}")
+                    process = subprocess.Popen(
+                        _pulse_command(mode, config["device"]),
+                        stdin=subprocess.PIPE if mode == "speaker" else subprocess.DEVNULL,
+                        stdout=subprocess.PIPE if mode == "mic" else subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL, bufsize=0,
+                        **_pulse_identity(config))
+                    time.sleep(0.1)
+                    if process.poll() is not None:
+                        raise RuntimeError(f"PulseAudio process exited ({process.returncode})")
+                    if mode == "speaker":
+                        subscription = node.create_subscription(AudioChunk, input_topic, on_audio, qos)
+                    state["running"] = True
+                    thread = threading.Thread(target=capture if mode == "mic" else play,
+                                              args=(process,), daemon=True)
+                    thread.start()
+                    if mode == "mic":
+                        deadline = time.monotonic() + 2.0
+                        while state["frames"] == 0 and time.monotonic() < deadline:
+                            time.sleep(0.02)
+                        if state["frames"] == 0:
+                            raise RuntimeError("no microphone PCM received within 2 seconds")
+                    replies.put({"state": "running",
+                                 "input_topic": input_topic})
+                except Exception as exc:
+                    stop()
+                    state["error"] = str(exc)[:200]
+                    replies.put(info())
+    finally:
+        stop()
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+class AudioPlugin:
+    def __init__(self, name: str, namespace: str, config: dict):
+        self.name = name
+        self.topic = f"/{namespace}/panther/mic/audio" if name == "mic" else ""
+        self.config = {"server": os.environ.get("PULSE_SERVER") or config["server"],
+                       "device": os.environ.get("PANTHER_PULSE_SOURCE" if name == "mic"
+                                                else "PANTHER_PULSE_SINK")
+                       or config["source" if name == "mic" else "sink"],
+                       "uid": os.environ.get("PANTHER_PULSE_UID", config.get("uid", 1001)),
+                       "gid": os.environ.get("PANTHER_PULSE_GID", config.get("gid", 1002))}
+        self._ctx = mp.get_context("spawn")
+        self._commands = None
+        self._replies = None
+        self._process = None
+
+    def get_tool(self):
+        schema = {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["start", "stop", "info"]}},
+            "required": ["action"], "additionalProperties": False}
+        tool = {"name": self.name, "type": "sensor" if self.name == "mic" else "actuator",
+                "multiInstance": False, "description": f"Panther PulseAudio {self.name}",
+                "inputSchema": schema}
+        if self.name == "mic":
+            tool["topic_out"] = [{"topic": self.topic, "format": FORMAT}]
+        else:
+            schema["properties"]["input_topic"] = {"type": "string"}
+            schema["x-action-params"] = {"start": {"params": ["input_topic"]},
+                                         "stop": {"params": []}, "info": {"params": []}}
+            tool["topic_in"] = [{"format": FORMAT}]
+        return tool
+
+    def start(self):
+        return None  # Capture/playback is armed by the canvas, not bundle startup.
+
+    def stop(self):
+        if self._process is not None:
+            self.dispatch("stop", {})
+            self._commands.put(("close", ""))
+            self._process.join(timeout=3)
+            if self._process.is_alive():
+                self._process.terminate()
+                self._process.join(timeout=2)
+            self._process = None
+
+    def dispatch(self, action, args):
+        if action not in {"start", "stop", "info"}:
+            return {"error": "unknown action"}
+        if action != "start" and (self._process is None or not self._process.is_alive()):
+            result = {"state": "idle"}
+            if self.name == "mic":
+                result["topic_out"] = [{"topic": self.topic, "format": FORMAT}]
+            return result
+        if self._process is None or not self._process.is_alive():
+            self._commands = self._ctx.Queue()
+            self._replies = self._ctx.Queue()
+            self._process = self._ctx.Process(
+                target=_worker, args=(self.name, self.topic, self.config,
+                                      self._commands, self._replies), daemon=True)
+            self._process.start()
+        self._commands.put((action, str(args.get("input_topic", "")).strip()))
+        try:
+            result = self._replies.get(timeout=8)
+        except queue.Empty:
+            return {"state": "error", "message": "audio worker did not respond"}
+        if self.name == "mic":
+            result["topic_out"] = [{"topic": self.topic, "format": FORMAT}]
+        return result

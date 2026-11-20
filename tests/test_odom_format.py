@@ -107,14 +107,46 @@ def test_a_stamp_from_the_future_is_not_fresh():
 # ── the declaration ──────────────────────────────────────────────────────────
 
 def test_a_built_interface_round_trips():
-    raw = build_interface(provides=["vx", "vy", "wz"], rate_hz=10,
-                          pose_drift="unbounded")
+    raw = build_interface(
+        provides=["vx", "vy", "wz"], rate_hz=10,
+        pose_drift="unbounded",
+        timing={"stamp_source": "received", "max_measurement_delay_ms": 100})
     parsed = parse_interface(raw)
     assert parsed.frame == BODY_FRAME
     assert parsed.has("vx") and not parsed.has("vz")
     assert parsed.rate_hz == 10.0
     assert parsed.pose_drift == "unbounded"
+    assert parsed.timing == {
+        "stamp_source": "received", "max_measurement_delay_ms": 100}
     assert parsed.usable_for_control is True
+
+
+@pytest.mark.parametrize("timing,problem", [
+    (None, "must be an object"),
+    ({"stamp_source": "some_clock"}, "stamp_source"),
+    ({"stamp_source": "received", "max_measurement_delay_ms": -1},
+     "max_measurement_delay_ms"),
+    ({"stamp_source": "received", "max_measurement_delay_ms": True},
+     "max_measurement_delay_ms"),
+    ({"stamp_source": "received", "max_measurement_delay_ms": float("nan")},
+     "max_measurement_delay_ms"),
+    ({"stamp_source": "received", "max_measurement_delay_ms": float("inf")},
+     "max_measurement_delay_ms"),
+    ({"stamp_source": "received", "max_measurement_delay_ms": 10 ** 400},
+     "max_measurement_delay_ms"),
+    ({"stamp_source": "received", "latency_ms": 1}, "unknown fields"),
+])
+def test_interface_timing_metadata_is_strict(timing, problem):
+    raw = build_interface(provides=["vx"])
+    raw["timing"] = timing
+    with pytest.raises(OdomError, match=problem):
+        parse_interface(raw)
+
+
+def test_interface_without_timing_remains_backward_compatible():
+    raw = build_interface(provides=["vx"])
+    assert "timing" not in raw
+    assert parse_interface(raw).timing == {}
 
 
 def test_a_world_frame_report_is_valid_but_not_usable_for_control():

@@ -111,16 +111,16 @@ def state_data(data, selected_side=None):
 
 
 def tool(metadata, side):
-    label = '左' if side == 'left' else '右'
+    label = ' Left' if side == 'left' else ' Right'
     return {'name': 'gripper_' + side, 'type': 'actuator', 'multiInstance': False,
-            'description': 'TRON2' + label + '夹爪：open按毫米设置开口大小，0mm为最小闭合、85mm为最大目标；驱动自动线性换算为底层0至94。毫米值采用名义换算，实际间距精度待标定。close闭合，recover检查静止反馈后恢复本侧失败任务。速度/力为相对档位，并非牛顿。达到开口不代表夹住物体。恢复前须现场确认静止空载；恢复不是急停。',
+            'description': 'TRON2' + label + ' gripper. Open maps a nominal gap of 0–85 mm to raw values 0–94. Close requests the minimum opening. Recover clears a failed task after fresh feedback confirms the gripper is stationary. Speed and force are relative levels. Reaching the gap does not confirm a grasp. Confirm the gripper is stationary and unloaded before recovery.',
             'inputSchema': {'type': 'object', 'additionalProperties': False,
                 'properties': {
                     'action': {'type': 'string', 'enum': ['open', 'close', 'recover'],
-                               'description': 'open设置目标开口；close闭合；recover恢复本侧失败任务'},
-                    'opening_mm': {'type': 'number', 'title': '夹爪开口大小（mm）', 'minimum': 0, 'maximum': MAX_OPENING_MM, 'description': '夹爪开口大小（mm）：0至85；自动换算到底层0至94，实际间距精度待标定'},
-                    'speed': {'type': 'number', 'exclusiveMinimum': 0, 'maximum': 100, 'description': '开合速度档位：大于0至100'},
-                    'force': {'type': 'number', 'minimum': 0, 'maximum': 100, 'description': '夹持力档位：0至100，并非牛顿'},
+                               'description': 'Open sets a target gap, close requests closure, and recover clears a failed task.'},
+                    'opening_mm': {'type': 'number', 'title': 'Gripper opening (mm)', 'minimum': 0, 'maximum': MAX_OPENING_MM, 'description': 'Nominal gap from 0 to 85 mm, mapped to raw values 0–94. Physical gap accuracy requires calibration.'},
+                    'speed': {'type': 'number', 'exclusiveMinimum': 0, 'maximum': 100, 'description': 'Relative opening speed, greater than 0 and up to 100.'},
+                    'force': {'type': 'number', 'minimum': 0, 'maximum': 100, 'description': 'Relative gripping force, 0–100. Values are not in newtons.'},
                     **metadata},
                 'required': ['action'],
                 'allOf': [{'if': {'properties': {'action': {'enum': list(MOTION_ACTIONS)}}, 'required': ['action']},
@@ -128,9 +128,9 @@ def tool(metadata, side):
                           {'if': {'properties': {'action': {'const': 'open'}}, 'required': ['action']},
                            'then': {'required': ['opening_mm']}}],
                 'x-action-params': {
-                    'open': {'params': ['opening_mm', 'speed', 'force'], 'description': '按填写的毫米数调整本侧夹爪开口大小'},
-                    'close': {'params': ['speed', 'force'], 'description': '闭合本侧夹爪；未到最小开口不会报告到位或抓取成功'},
-                    'recover': {'params': [], 'description': '现场确认本侧静止空载后使用；连续反馈验证后恢复，不重发动作、不把未到位改成成功'}},
+                    'open': {'params': ['opening_mm', 'speed', 'force'], 'description': 'Set the gap of this gripper in millimeters.'},
+                    'close': {'params': ['speed', 'force'], 'description': 'Close this gripper. Completion requires feedback at the minimum opening and does not confirm a grasp.'},
+                    'recover': {'params': [], 'description': 'Use after confirming the gripper is stationary and unloaded. Fresh feedback is required. Recovery does not resend the previous command or mark it successful.'}},
                 'x-resource': ['arm_l' if side == 'left' else 'arm_r'],
                 'x-completion': {'actions': list(MOTION_ACTIONS), 'timeout': ACP_TIMEOUT}}}
 
@@ -138,13 +138,13 @@ def tool(metadata, side):
 def combined_tool():
     """One customer entry; side selection never changes the two motion owners."""
     return {'name':'gripper','type':'actuator','multiInstance':False,
-        'description':'设置所选夹爪开口：0mm闭合，85mm最大目标。毫米为名义线性换算，实际间距待标定；力为相对档位，不是牛顿。到位不代表抓取成功。',
+        'description':'Set the selected gripper gap from 0 mm (closed) to 85 mm (nominal maximum). Force is a relative level. Reaching the gap does not confirm a grasp.',
         'inputSchema':{'type':'object','additionalProperties':False,
             'properties':{
-                'side':{'type':'string','enum':['left','right'],'title':'左右爪','description':'left左爪；right右爪'},
-                'opening_mm':{'type':'number','minimum':0,'maximum':85,'title':'开口大小（mm）','description':'0至85mm；0为闭合'},
-                'speed':{'type':'number','exclusiveMinimum':0,'maximum':100,'description':'速度档位：大于0至100'},
-                'force':{'type':'number','minimum':0,'maximum':100,'description':'力档位：0至100，并非牛顿'}},
+                'side':{'type':'string','enum':['left','right'],'title':'Gripper side','description':'Select the left or right gripper.'},
+                'opening_mm':{'type':'number','minimum':0,'maximum':85,'title':'Opening (mm)','description':'Nominal gap from 0 to 85 mm. Zero is closed.'},
+                'speed':{'type':'number','exclusiveMinimum':0,'maximum':100,'description':'Relative speed, greater than 0 and up to 100.'},
+                'force':{'type':'number','minimum':0,'maximum':100,'description':'Relative force, 0–100. Values are not in newtons.'}},
             'required':['side','opening_mm','speed','force'],
             # Core currently supports static resource declarations only.
             'x-resource':['arm_l','arm_r'], 'x-completion':{'timeout':ACP_TIMEOUT}}}
@@ -153,7 +153,7 @@ def combined_tool():
 def combined_arguments(args):
     """Validate everything before waiting, recovery, ownership or hardware I/O."""
     if not isinstance(args,dict) or set(args)-{'side','opening_mm','speed','force','instance_id','_trace_id'}:
-        raise ValueError('请刷新夹爪卡片；只接受左右爪、开口大小、速度和力档位')
+        raise ValueError('请刷新夹爪卡片；只接受Gripper side、开口大小、速度和力档位')
     side=args.get('side')
     if side not in ('left','right'):
         raise ValueError('请选择left左爪或right右爪')
