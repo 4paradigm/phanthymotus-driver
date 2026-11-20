@@ -70,6 +70,58 @@ class BaseServoTests(unittest.TestCase):
         self.send()
         self.assertTrue(wait_until(lambda:self.servo._applied == 2))
 
+    def test_stop_confirms_idle_without_replaying_a_historical_stream_error(self):
+        self.start()
+        self.servo._error = 'control-enable verification is missing or stale'
+        callback = self.servo._subscription
+        for _ in range(2):
+            self.assertEqual(self.call('base_servo', 'stop'), {'state': 'idle'})
+        import test_main
+        http = test_main.McpTests()
+        with patch.object(test_main.main, '_bundle', self.bundle):
+            status, response = http.request(http.rpc('base_servo', {'action': 'stop'}))
+        self.assertEqual(status, 200)
+        self.assertFalse(response['result'].get('isError', False))
+        self.assertEqual(json.loads(response['result']['content'][0]['text']), {'state': 'idle'})
+        info = self.servo.info()
+        self.assertEqual(info['state'], 'idle')
+        self.assertEqual(info['input'], '')
+        self.assertEqual(info['error'], 'control-enable verification is missing or stale')
+        self.assertIsNone(self.servo._subscription)
+        self.assertTrue(self.servo._paused)
+        self.assertIsNone(self.servo._latest)
+        callback(types.SimpleNamespace(data=json.dumps({'values': [.1]*6})))
+        self.assertIsNone(self.servo._latest)
+        self.assertFalse(self.ros.published)
+
+    def test_stop_preserves_a_current_zero_send_failure(self):
+        self.start(); self.send()
+        self.assertTrue(wait_until(lambda: self.nonzero()))
+        original = self.ros.publish
+        def failure(topic, *args):
+            if topic == '/cmd_vel':
+                raise ConnectionError('failed stop')
+            return original(topic, *args)
+        try:
+            with patch.object(self.ros, 'publish', side_effect=failure):
+                result = self.call('base_servo', 'stop')
+                self.assertEqual(result['state'], 'error')
+                self.assertIn('zero velocity send failed', result['error'])
+                self.assertTrue(self.bundle.state.motion_send_uncertain)
+                self.assertTrue(self.bundle.state.motion_blocked)
+        finally:
+            self.call('base_servo', 'stop')
+
+    def test_stop_does_not_confirm_idle_when_subscription_cleanup_raises(self):
+        self.start()
+        with patch.object(self.node, 'destroy_subscription', side_effect=RuntimeError('cleanup failed')):
+            result = self.call('base_servo', 'stop')
+        self.assertEqual(result['state'], 'error')
+        self.assertIn('cleanup failed', result['error'])
+        self.assertIsNotNone(self.servo._subscription)
+        self.assertTrue(self.servo._paused)
+        self.assertEqual(self.call('base_servo', 'stop'), {'state': 'idle'})
+
     def test_stale_wrong_mode_pinned_axes_and_replayed_frames_are_rejected(self):
         self.start()
         for changes in ({'stamp_ms': 1}, {'obs_stamp_ms': 1}, {'mode': 'joint'},

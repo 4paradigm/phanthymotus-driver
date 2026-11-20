@@ -191,6 +191,10 @@ class BaseServo:
                             self.node.destroy_subscription(self._subscription)
                             self._subscription = None
                         self._topic = ''
+                    # Runtime diagnostics may retain a previous stream error.
+                    # Returning info() here makes MCP mark this successful stop
+                    # as isError; keep those diagnostics on the info action.
+                    return {'state': 'idle'}
                 return self.info()
             if action == 'resume':
                 with self._lock:
