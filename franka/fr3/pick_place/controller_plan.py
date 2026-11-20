@@ -49,9 +49,7 @@ import rclpy
 from rclpy.action import ActionClient
 from action_msgs.msg import GoalStatus
 from moveit_msgs.action import MoveGroup
-from geometry_msgs.msg import Pose
-from moveit_msgs.msg import Constraints, JointConstraint, OrientationConstraint, PositionConstraint
-from shape_msgs.msg import SolidPrimitive
+from moveit_msgs.msg import Constraints, JointConstraint
 
 def wait(node, future, timeout):
     rclpy.spin_until_future_complete(node, future, timeout_sec=timeout)
@@ -82,28 +80,10 @@ try:
     goal.planning_options.plan_only = True
     goal.planning_options.planning_scene_diff.is_diff = True
     goal.planning_options.planning_scene_diff.robot_state.is_diff = True
-    if "pose" in request:
-        x, y, z, qx, qy, qz, qw = request["pose"]
-        position = PositionConstraint(link_name=request["link"], weight=1.0)
-        position.header.frame_id = request["frame"]
-        region_pose = Pose()
-        region_pose.position.x, region_pose.position.y, region_pose.position.z = x, y, z
-        region_pose.orientation.w = 1.0
-        position.constraint_region.primitives = [SolidPrimitive(type=SolidPrimitive.SPHERE, dimensions=[0.001])]
-        position.constraint_region.primitive_poses = [region_pose]
-        rotation = OrientationConstraint(link_name=request["link"], weight=1.0,
-                                         absolute_x_axis_tolerance=0.02,
-                                         absolute_y_axis_tolerance=0.02,
-                                         absolute_z_axis_tolerance=0.02)
-        rotation.header.frame_id = request["frame"]
-        rotation.orientation.x, rotation.orientation.y, rotation.orientation.z, rotation.orientation.w = qx, qy, qz, qw
-        goal.request.goal_constraints = [Constraints(position_constraints=[position],
-                                                     orientation_constraints=[rotation])]
-    else:
-        goal.request.goal_constraints = [Constraints(joint_constraints=[
-            JointConstraint(joint_name=f"fr3_joint{i}", position=position,
-                            tolerance_above=0.001, tolerance_below=0.001, weight=1.0)
-            for i, position in enumerate(request["joints"], 1)])]
+    goal.request.goal_constraints = [Constraints(joint_constraints=[
+        JointConstraint(joint_name=f"fr3_joint{i}", position=position,
+                        tolerance_above=0.001, tolerance_below=0.001, weight=1.0)
+        for i, position in enumerate(request["joints"], 1)])]
     handle = wait(node, client.send_goal_async(goal), 5)
     if not handle.accepted:
         raise RuntimeError("MoveIt rejected the planning goal")

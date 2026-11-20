@@ -97,7 +97,7 @@ class RemoteExecution(PickExecution):
         elif cartesian:
             plan = self.arm.plan_cartesian([self.flange_pose(p) for p in target], .1, self.q)
         else:
-            plan = self.arm.plan_pose(self.flange_pose(target), self.q)
+            raise ValueError(f'Missing planning mode for {stage}')
         return self.prepare_trajectory(stage, target, plan, cartesian, joint, started)
 
     def prepare_trajectory(self, stage, target, plan, cartesian, joint, started):

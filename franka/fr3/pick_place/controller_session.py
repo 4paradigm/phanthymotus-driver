@@ -61,10 +61,9 @@ sys.exit(service.run())
 
 
 class ControllerSession:
-    def __init__(self, endpoint, username, password, cancel, *, fake=False, local=None):
+    def __init__(self, endpoint, username, password, cancel, *, local):
         self.connection = endpoint, username, password
         self.cancel = cancel
-        self.fake = fake or local is not None
         self.local = local
         self.domain = random.randrange(130, 190)
 
@@ -87,7 +86,7 @@ class ControllerSession:
         endpoint, username, password = self.connection
         command = command_for(endpoint, username)
         command[-1] = command[-1].removesuffix('python3 -') + shlex.join([
-            'python3', '-u', '-c', _LAUNCH, address, str(self.domain), str(self.fake).lower(),
+            'python3', '-u', '-c', _LAUNCH, address, str(self.domain), "true",
         ])
         with tempfile.TemporaryFile() as secret:
             secret.write(password.encode() + b'\n')
@@ -127,7 +126,7 @@ class ControllerSession:
         return self.call(rpc._PLAN, payload, 40)
 
     def snapshot(self):
-        return self.local.snapshot() if self.local is not None else self.call(_STATE, {}, 12)
+        return self.local.snapshot()
 
     def motion(self, command):
         return self.local.motion(command)
@@ -151,10 +150,6 @@ class ControllerSession:
             raise ValueError('MoveIt approach IK solution violates joint margin')
         return joints
 
-    def plan_pose(self, pose, start):
-        return self.call(rpc._PLAN, dict(action='/move_action', frame='fr3_link0',
-                                        link='fr3_link8', pose=pose, start=start, joint_bounds=rpc.JOINT_PATH_BOUNDS), 40)
-
     def plan_cartesian(self, poses, speed_scale, start):
         return self.call(rpc._CARTESIAN, dict(service='/compute_cartesian_path', frame='fr3_link0',
                                              link='fr3_link8', poses=poses,
@@ -175,54 +170,6 @@ try:
         if not client.wait_for_server(timeout_sec=9):
             raise RuntimeError("MoveIt controller is not ready: " + name)
     print('FR3_RESULT {"ready": true}', flush=True)
-finally:
-    node.destroy_node()
-    rclpy.shutdown()
-"""
-
-
-_STATE = """
-import math
-import time
-import rclpy
-from rclpy.qos import qos_profile_sensor_data
-from franka_msgs.msg import FrankaRobotState
-
-def matrix(value):
-    p, q = value.pose.position, value.pose.orientation
-    x, y, z, w = q.x, q.y, q.z, q.w
-    if not math.isclose(x*x+y*y+z*z+w*w, 1., abs_tol=0.001):
-        raise RuntimeError("Invalid Franka tool rotation")
-    return [1-2*(y*y+z*z), 2*(x*y+w*z), 2*(x*z-w*y), 0.,
-            2*(x*y-w*z), 1-2*(x*x+z*z), 2*(y*z+w*x), 0.,
-            2*(x*z+w*y), 2*(y*z-w*x), 1-2*(x*x+y*y), 0.,
-            p.x, p.y, p.z, 1.]
-
-rclpy.init()
-node = rclpy.create_node("fr3_pick_robot_state")
-try:
-    values = []
-    def receive(msg):
-        stamp = msg.header.stamp.sec * 1000000000 + msg.header.stamp.nanosec
-        age = (node.get_clock().now().nanoseconds - stamp) / 1000000
-        if 0 <= age <= 200:
-            values[:] = [(msg, age)]
-    sub = node.create_subscription(FrankaRobotState,
-        "/franka_robot_state_broadcaster/robot_state", receive, qos_profile_sensor_data)
-    deadline = time.monotonic() + 4
-    while not values and time.monotonic() < deadline:
-        rclpy.spin_once(node, timeout_sec=0.1)
-    if not values:
-        raise RuntimeError("No fresh Franka robot state")
-    msg, age = values[-1]
-    joints = msg.measured_joint_state
-    if len(joints.position) != 7 or len(joints.velocity) != 7:
-        raise RuntimeError("Incomplete Franka robot state")
-    result = dict(q=list(joints.position), dq=list(joints.velocity),
-        O_T_EE=matrix(msg.o_t_ee), F_T_EE=matrix(msg.f_t_ee),
-        robot_mode=msg.robot_mode, connected=True, data_age_ms=age,
-        control_ready=msg.robot_mode in (1, 2))
-    print("FR3_RESULT " + json.dumps(result, allow_nan=False), flush=True)
 finally:
     node.destroy_node()
     rclpy.shutdown()
