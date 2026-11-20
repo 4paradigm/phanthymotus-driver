@@ -206,15 +206,14 @@ def test_bundle_independent_lifecycle_partial_and_validation():
             assert bundle.dispatch("battery", {"action": "start"})["state"] == "running"
             wait_for(lambda: battery.payload()["state"] == "online")
             payload = bundle.dispatch("battery", {})["data"]
-            # Flat G1-style layout: two pack objects plus a few status fields only.
-            assert set(payload) == {"battery_1", "battery_2", "state", "message", "age_ms", "timestamp_ms"}
-            expected_fields = {"soc", "voltage", "current", "cell_vol_min", "cell_vol_max",
-                               "temperature_min", "temperature_max", "cycle",
-                               "remaining_capacity", "full_charge_capacity", "state"}
-            for key in ("battery_1", "battery_2"):
-                assert set(payload[key]) == expected_fields
-                assert payload[key]["state"] == "online"
-                assert all(not isinstance(v, (dict, list)) for v in payload[key].values())
+            # Flat G1-style layout: every value is a top-level scalar key.
+            fields = ("soc", "voltage", "current", "cell_vol_min", "cell_vol_max",
+                      "temperature_min", "temperature_max", "cycle",
+                      "remaining_capacity", "full_charge_capacity", "state")
+            pack_keys = {f"battery_{n}_{f}" for n in (1, 2) for f in fields}
+            assert set(payload) == pack_keys | {"state", "message", "age_ms", "timestamp_ms"}
+            assert all(not isinstance(v, (dict, list)) for v in payload.values())
+            assert payload["battery_1_state"] == payload["battery_2_state"] == "online"
             assert payload["message"] == "两块电池状态正常" and isinstance(payload["age_ms"], int)
             bundle.dispatch("joints", {"action": "stop"})
             assert battery.payload()["state"] == "online"
@@ -222,9 +221,9 @@ def test_bundle_independent_lifecycle_partial_and_validation():
             stopped = battery.payload()
             assert stopped["state"] == "idle"
             # Stopped/expired data is cleared to null, never zero.
-            assert all(v is None for k in ("battery_1", "battery_2")
-                       for f, v in stopped[k].items() if f != "state")
-            assert stopped["battery_1"]["state"] == "idle"
+            assert all(v is None for k, v in stopped.items()
+                       if k.startswith("battery_") and not k.endswith("_state"))
+            assert stopped["battery_1_state"] == stopped["battery_2_state"] == "idle"
             info = bundle.dispatch("battery", {"action": "info"})
             assert info["configSchema"]["properties"]["battery_state_url"]["x-sensitive"]
             assert info["topic_out"] == [{"topic": "/rokae_helios/state/battery", "format": "data/json"}]
@@ -235,8 +234,8 @@ def test_bundle_independent_lifecycle_partial_and_validation():
                 battery.client._data = parse_battery_frame(frame([pack("2", 0)]))
             partial = battery.payload()
             assert partial["state"] == "partial"
-            assert partial["battery_1"]["state"] == "not_reported" and partial["battery_1"]["soc"] is None
-            assert partial["battery_2"]["state"] == "online" and partial["battery_2"]["soc"] == 0
+            assert partial["battery_1_state"] == "not_reported" and partial["battery_1_soc"] is None
+            assert partial["battery_2_state"] == "online" and partial["battery_2_soc"] == 0
         finally:
             battery.stop()
             joints.stop()

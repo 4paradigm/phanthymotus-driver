@@ -118,7 +118,7 @@ class HeliosBattery:
 
     def get_tools(self):
         sensor = tool("battery", "sensor",
-                      "Helios-2.1 双电池状态（battery_1 / battery_2）：soc(%)、voltage(V)、current(mA，原始符号)、"
+                      "Helios-2.1 双电池状态（battery_1_* / battery_2_*）：soc(%)、voltage(V)、current(mA，原始符号)、"
                       "cell_vol_min/max(V)、temperature_min/max(℃)、cycle(次)、remaining/full_charge_capacity(mAh)。"
                       "只读；1/2 为厂家编号，左右安装位置待核对；不推断充电状态，断线/过期数值为空。",
                       topic_out=self._topics)
@@ -158,9 +158,9 @@ class HeliosBattery:
                 self._node = None
             self._publisher = None
 
-    # Flat, G1-style fields per pack. Core's generic "latest" view expands one
-    # object level, so each value gets its own cell (battery_1.soc, ...).
-    # Units are fixed and documented in the tool description and README.
+    # Flat, G1-style top-level fields (battery_1_soc, ...). Core's generic log
+    # view puts each top-level key on its own line and the "latest" view gives
+    # each one a cell. Units are fixed and documented in the tool description.
     _PACK_FIELDS = (("soc", "soc_pct"), ("voltage", "voltage_v"), ("current", "current_ma"),
                     ("cell_vol_min", "cell_voltage_min_v"), ("cell_vol_max", "cell_voltage_max_v"),
                     ("temperature_min", "temperature_min_c"), ("temperature_max", "temperature_max_c"),
@@ -177,10 +177,11 @@ class HeliosBattery:
         result = {}
         for pack_id in ("1", "2"):
             pack = by_id.get(pack_id)
+            prefix = f"battery_{pack_id}_"
             # Missing or invalid values stay null; never fill with zero.
-            fields = {name: (pack[source] if pack else None) for name, source in self._PACK_FIELDS}
-            fields["state"] = pack["state"] if pack else state
-            result[f"battery_{pack_id}"] = fields
+            for name, source in self._PACK_FIELDS:
+                result[prefix + name] = pack[source] if pack else None
+            result[prefix + "state"] = pack["state"] if pack else state
         return {**result, "state": state,
                 "message": {"online": "两块电池状态正常", "partial": "部分电池电量未报告或无效",
                             "unavailable": "未收到有效电池电量", "idle": "电池订阅已停止",

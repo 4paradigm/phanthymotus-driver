@@ -24,27 +24,28 @@
 
 位置保持厂家原始弧度值，不改零位、符号或限位。独立 `joint/scope` 流提供电机反馈力矩和模型重力矩，单位 Nm；头部未报告重力矩时为 null。两路流分别判断过期，不宣称同步采样。电机反馈不是关节力矩传感器读数，尚未通过实际加载校验，详见 [TORQUE_INTERFACE.md](TORQUE_INTERFACE.md)。
 
-`battery` 发布 `/rokae_helios/state/battery`（`data/json`），从底盘 `UiDatagram.robot_base.data_pool.multi_battery_info` 解码。输出采用与 G1 电池卡相同的扁平写法，官方 Core 监控页"最新"模式会把每个字段显示为独立一格（如 `battery_1.soc`）。示例（数值仅作格式说明）：
+`battery` 发布 `/rokae_helios/state/battery`（`data/json`），从底盘 `UiDatagram.robot_base.data_pool.multi_battery_info` 解码。输出采用与 G1 电池卡相同的扁平写法：所有值都是顶层字段，每块电池以 `battery_1_` / `battery_2_` 为前缀。官方 Core 的日志视图每个字段一行，监控页"最新"模式每个字段一格。示例（数值仅作格式说明）：
 
 ```json
-{"battery_1": {"soc": 98, "voltage": 53.26, "current": 0, "cell_vol_min": 3.515, "cell_vol_max": 3.58,
-               "temperature_min": 25, "temperature_max": 25, "cycle": 10,
-               "remaining_capacity": 29400, "full_charge_capacity": 30000, "state": "online"},
- "battery_2": {"...": "同上"},
- "state": "online", "message": "两块电池状态正常", "age_ms": 71, "timestamp_ms": 1795164659231}
+{"battery_1_soc": 98, "battery_1_voltage": 53.26, "battery_1_current": 0,
+ "battery_1_cell_vol_min": 3.515, "battery_1_cell_vol_max": 3.589,
+ "battery_1_temperature_min": 25, "battery_1_temperature_max": 25, "battery_1_cycle": 10,
+ "battery_1_remaining_capacity": 17346, "battery_1_full_charge_capacity": 17700, "battery_1_state": "online",
+ "battery_2_soc": 98, "...": "battery_2_* 同上",
+ "state": "online", "message": "两块电池状态正常", "age_ms": 250, "timestamp_ms": 1795165967411}
 ```
 
 | 字段 | 单位 / 含义 |
 |---|---|
-| `battery_1` / `battery_2` | 厂家编号 1 / 2，尚未核对物理左右位置 |
-| `soc` | %；0 是有效数值 |
-| `voltage` | 总电压 V，由原始 mV 换算 |
-| `current` | 原始电流 mA，保留符号；不据此推断充放电 |
-| `cell_vol_min` / `cell_vol_max` | 单体电压范围，V |
-| `temperature_min` / `temperature_max` | 当前帧 BMS 最低 / 最高传感器温度，°C |
-| `cycle` | 循环次数 |
-| `remaining_capacity` / `full_charge_capacity` | 剩余 / 当前满充容量，mAh，不是设计容量 |
-| `battery_N.state` | `online`、`not_reported`、`invalid_soc`，或整体停止/过期状态 |
+| `battery_1_*` / `battery_2_*` | 前缀为厂家编号 1 / 2，尚未核对物理左右位置 |
+| `battery_N_soc` | %；0 是有效数值 |
+| `battery_N_voltage` | 总电压 V，由原始 mV 换算 |
+| `battery_N_current` | 原始电流 mA，保留符号；不据此推断充放电 |
+| `battery_N_cell_vol_min` / `_max` | 单体电压范围，V |
+| `battery_N_temperature_min` / `_max` | 当前帧 BMS 最低 / 最高传感器温度，°C |
+| `battery_N_cycle` | 循环次数 |
+| `battery_N_remaining_capacity` / `battery_N_full_charge_capacity` | 剩余 / 当前满充容量，mAh，不是设计容量 |
+| `battery_N_state` | `online`、`not_reported`、`invalid_soc`，或整体停止/过期状态 |
 | `state` / `message` | 整体状态：`online`（两块有效）、`partial`（仅一块）、`idle`、`stale`、`reconnecting` 等 |
 | `age_ms` | 距离最近一次有效电池报文的毫秒数 |
 
@@ -56,7 +57,7 @@
 
 在卡片共享配置中保存状态地址，再将 `joints` 和 `battery` 加入画布并启动。`model` 无需单独运行；首次请求时读取同一 iNex 地址的 `/api/robot_3d_model` 及其同源 `urdf_url`，核对 20 轴名称后在进程内缓存。没有把厂家模型打入镜像。模型服务暂不可用时明确返回错误，不影响关节和电池订阅启动。监控页从 `joints` 自动生成骨架及 `joint_status` 模块。
 
-官方 Core 无需修改即可使用：监控页按真实 Driver ID 读取 URDF 显示骨架，电池用通用"最新"模式逐字段显示。已知差异：
+官方 Core 无需修改即可使用：监控页按真实 Driver ID 读取 URDF 显示骨架，电池在日志视图每字段一行、"最新"模式每字段一格。已知差异：
 
 - 官方骨架把 URDF 中全部连杆画成线段，包括头部 4 个相机、胸部深度相机和 4 个轮子的固定安装坐标，因此头部呈若干短线、胸前有一段前伸线段；关节姿态本身取自实时数据。
 - 配置页"查看数据流"面板在官方 Core 中不读取 Driver 模型，显示的是通用默认人形，应以监控页为准。

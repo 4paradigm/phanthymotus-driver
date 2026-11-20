@@ -17,13 +17,13 @@
 
 | 原厂字段 | Driver 输出 | 处理 |
 |---|---|---|
-| `soc` | `battery_N.soc` | %，范围 0～100；0 有效 |
-| `voltage` | `battery_N.voltage` | 原始 mV / 1000 |
-| `current` | `battery_N.current` | 原厂页面标注 mA，保留符号 |
-| `min_temperature` / `max_temperature` | `battery_N.temperature_min` / `temperature_max` | 当前 BMS 传感器温度范围，°C |
-| `cycle_count` | `battery_N.cycle` | 非负整数 |
-| `min_cell_voltage` / `max_cell_voltage` | `battery_N.cell_vol_min` / `cell_vol_max` | 原始值按 mV / 1000；拒绝倒置范围 |
-| `rc` / `fcc` | `battery_N.remaining_capacity` / `full_charge_capacity` | mAh，非负值 |
+| `soc` | `battery_N_soc` | %，范围 0～100；0 有效 |
+| `voltage` | `battery_N_voltage` | 原始 mV / 1000 |
+| `current` | `battery_N_current` | 原厂页面标注 mA，保留符号 |
+| `min_temperature` / `max_temperature` | `battery_N_temperature_min` / `battery_N_temperature_max` | 当前 BMS 传感器温度范围，°C |
+| `cycle_count` | `battery_N_cycle` | 非负整数 |
+| `min_cell_voltage` / `max_cell_voltage` | `battery_N_cell_vol_min` / `battery_N_cell_vol_max` | 原始值按 mV / 1000；拒绝倒置范围 |
+| `rc` / `fcc` | `battery_N_remaining_capacity` / `battery_N_full_charge_capacity` | mAh，非负值 |
 | `hardware_version` / `software_version` | 不发布 | 解析时校验为可打印字符串，不进入输出 |
 
 单位核查来自原厂页面电池组件：总压除以 1000 显示 V，电流标注 mA，`max_temperature` 显示 °C，`fcc` 标注 mAh。`rc` 与 `fcc` 同尺度，其比例与实际 SOC 一致。单体电压按 mV 的尺度与原始数值和总压一致，尚缺厂家手册的显式定义。
@@ -36,7 +36,7 @@
 
 原始电流曾持续报告为 0，只能说明报文如此，不证明物理电流为零。输出保留原始 `current`，但不依据其符号推断充电。`charge_arrive` 是充电感应光电，不作为正在充电的证据。没有验证过的充电状态、SOH 或设计容量不输出推断值。
 
-输出为 G1 风格的扁平结构：`battery_1`、`battery_2` 两个对象加整体 `state`、`message`、`age_ms`、`timestamp_ms`。官方 Core 监控页"最新"模式会展开一层对象，每个数值独立一格，无需 Core 定制渲染。`temperature_max` 是当前帧最高传感器温度，不是历史最高温度或整机温度。
+输出为 G1 风格的扁平结构：所有值均为顶层标量字段，每块电池以 `battery_1_` / `battery_2_` 为前缀，另有整体 `state`、`message`、`age_ms`、`timestamp_ms`。官方 Core 日志视图在顶层字段多于 6 个时每字段换行，监控页"最新"模式每字段一格，无需 Core 定制渲染。`battery_N_temperature_max` 是当前帧最高传感器温度，不是历史最高温度或整机温度。
 
 ## 验证
 
