@@ -6,8 +6,6 @@ import re
 import os
 from pathlib import Path
 import subprocess
-import socket
-from datetime import datetime, timezone
 import threading
 import time
 import uuid
@@ -15,15 +13,18 @@ import uuid
 from common.vendor_runtime import action_schema, tool
 
 
+TRAJECTORY_NAME = re.compile(r"(?:franka|fr3)-(right|left)-\d{8}T\d{6}(?:\.\d{6})?(?:Z|[+-]\d{4})")
+
+
 class PnpRemoteTeleopPlugin:
-    PREFIX = "teleop"
+    PREFIX = "teach"
     COMPLETION_ACTIONS = ("stop_trajectory", "stop_motion", "delete_trajectory")
 
     def __init__(self, acp_callback=None):
         self._lock = threading.RLock()
         self._recording = None
+        self._playback = None
         self.schema_refresh = threading.Event()
-        self._trajectory_dir = Path(os.environ.get("FRANKA_TEACH_DIR", "/var/lib/fr3-pnp/trajectories"))
         self._loaded = False
         self._stopped = False
         self._init = {"state": "not_initialized"}
@@ -45,16 +46,25 @@ class PnpRemoteTeleopPlugin:
 
     def get_tools(self):
         schema = action_schema({
-            "start_trajectory": ([], "Align the arms and automatically start PNP following."),
+            "start_trajectory": ([], "Align the arms, start PNP following, and record vendor frames."),
             "stop_trajectory": ([], "End the PNP teleoperation session and verify shutdown."),
-            "stop_motion": ([], "Interrupt PNP teleoperation and verify shutdown."),
+            "stop_motion": ([], "Terminate teaching or playback, verify shutdown, and discard playback progress."),
             "list_trajectories": ([], "List saved teaching recordings."),
             "delete_trajectory": (["trajectory"], "Delete a saved teaching recording."),
+            "play": (["left_trajectory", "right_trajectory"],
+                     "Replay the supplied arms. Leave an arm blank to keep it out of this run."),
+            "pause": ([], "Decelerate active playback and hold its position for resume. Use stop_motion during startup or approach."),
+            "resume": ([], "Resume playback from the confirmed pause position."),
             "status": ([], "Read PNP service states and vendor execution stages."),
-        }, {"trajectory": {"type": "string",
-                           "description": "Paste the filename from list_trajectories."}})
+        }, {
+            "trajectory": {"type": "string", "description": "Paste the name from list_trajectories."},
+            "left_trajectory": {"type": "string", "title": "Left Arm Trajectory",
+                                "description": "Optional left-arm recording name from list_trajectories."},
+            "right_trajectory": {"type": "string", "title": "Right Arm Trajectory",
+                                 "description": "Optional right-arm recording name from list_trajectories."},
+        })
         schema.update({
-            "x-completion": {"actions": ["start_trajectory", *self.COMPLETION_ACTIONS], "timeout": 150},
+            "x-completion": {"actions": ["start_trajectory", "play", *self.COMPLETION_ACTIONS], "timeout": 900},
             "x-resource": "arm",
             "x-is-dangerous": True,
             "x-hooks": {
@@ -62,7 +72,7 @@ class PnpRemoteTeleopPlugin:
                 "on_interrupt_all": {"action": "stop_motion"},
             },
         })
-        definition = tool("teleop", "actuator", "PNP master teleoperation", schema)
+        definition = tool(self.PREFIX, "actuator", "FR3 PNP teaching and trajectory recording", schema)
         definition["configSchema"] = {
             "type": "object",
             "properties": {
@@ -186,7 +196,9 @@ class PnpRemoteTeleopPlugin:
         if active == "active":
             stage = execution.get("stage")
             state = "aligning"
-            if stage == "failed":
+            if isinstance(stage, str) and stage.startswith("playback_"):
+                state = stage
+            elif stage == "failed":
                 state = "fault"
             else:
                 arms = list(execution.get("arms", {}).values())
@@ -232,15 +244,15 @@ class PnpRemoteTeleopPlugin:
         state = self._inactive_state()
         if active:
             for candidate in ("unreachable", "fault", "follow_interrupted", "stopping",
-                              "aligning", "starting_follow", "following", "aligned", "unknown"):
+                              "playback_starting", "playback_approaching", "playback_running",
+                              "playback_paused", "playback_completed", "aligning", "starting_follow", "following", "aligned", "unknown"):
                 if candidate in active:
                     state = candidate
                     break
         right = hosts.get("right", {})
         recording = self._recording
         return {"state": state, "acp": self._acp,
-                "recording": ({"trajectory": recording[0].name, **recording[3]}
-                              if recording else None),
+                "recording": ({"state": "recording"} if recording is not None else None),
                 "initialization": dict(self._init),
                 "slave_ips": {side: self._settings[f"{side}_slave_ip"] for side in ("right", "left")},
                 "hosts": hosts,
@@ -261,60 +273,18 @@ class PnpRemoteTeleopPlugin:
         return JointControlPlugin._post_completion(self, action_id, status, result)
 
     def _start_recording(self):
-        self._trajectory_dir.mkdir(parents=True, exist_ok=True)
-        name = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-        path = self._trajectory_dir / (name + ".partial")
-        receiver = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            receiver.bind(("", 18642))
-            receiver.settimeout(.2)
-            output = path.open("x")
-        except Exception:
-            receiver.close()
-            raise
-        cancelled = threading.Event()
-        summary = {"samples": 0, "error": None}
-        host = self._hosts["right"].rsplit("@", 1)[-1]
-
-        def record():
-            try:
-                with receiver, output:
-                    while not cancelled.is_set():
-                        try:
-                            packet, address = receiver.recvfrom(4096)
-                        except socket.timeout:
-                            continue
-                        if address[0] != host:
-                            continue
-                        try:
-                            sample = json.loads(packet)
-                            if not isinstance(sample.get("stamp_ns"), int) or len(sample["submitted_action"]) != 8:
-                                continue
-                            line = json.dumps(sample, allow_nan=False)
-                        except (ValueError, TypeError, KeyError, AttributeError):
-                            continue
-                        output.write(line + "\n")
-                        summary["samples"] += 1
-            except OSError as exc:
-                summary["error"] = str(exc)
-
-        worker = threading.Thread(target=record, daemon=True)
-        self._recording = (path, cancelled, worker, summary)
-        worker.start()
+        self._recording = set(self._saved_trajectories())
 
     def _finish_recording(self, complete=False):
         if self._recording is None:
             return {}
-        path, cancelled, worker, summary = self._recording
-        cancelled.set()
-        worker.join()
-        self._recording = None
-        if complete and summary["samples"] and not summary["error"]:
-            destination = path.with_suffix(".jsonl")
-            path.rename(destination)
-            path = destination
+        previous, self._recording = self._recording, None
         self.schema_refresh.set()
-        return {"trajectory": path.name, **summary, "complete": path.suffix == ".jsonl"}
+        try:
+            trajectories = [name for name in self._saved_trajectories() if name not in previous]
+        except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+            return {"trajectory_error": str(exc)}
+        return {"trajectories": trajectories, "complete": bool(trajectories) and complete}
 
     def _watch_alignment(self, action_id, cancelled, teach=False):
         terminal = "error"
@@ -337,12 +307,12 @@ class PnpRemoteTeleopPlugin:
                     self._acp["message"] = "Alignment complete. Starting Follow."
                     try:
                         self._start_recording()
-                    except OSError as exc:
+                    except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
                         result = {"error": str(exc)}
                         break
                     _, errors = self._batch(
                         (side for side, host in status["hosts"].items() if host["state"] == "aligned"),
-                        lambda side: self._ssh(side, "pnp-enable-follow"),
+                        lambda side: self._ssh(side, "pnp-enable-follow-record"),
                     )
                 if errors:
                     result = {"error": "Unable to start Follow", "details": errors}
@@ -385,13 +355,87 @@ class PnpRemoteTeleopPlugin:
                              "status": terminal, "error": error,
                              **({"message": result["message"]} if "message" in result else {})}
 
+    def _trajectory_hosts(self):
+        if self._init.get("state") != "ready":
+            raise RuntimeError("Wait for PNP initialization before accessing trajectories")
+        result = {}
+        for side in self._hosts:
+            names = json.loads(self._ssh(side, "pnp-list-recordings"))
+            if not isinstance(names, list) or any(not isinstance(name, str) for name in names):
+                raise ValueError("Invalid PNP trajectory listing")
+            for name in names:
+                if name in result:
+                    raise ValueError(f"Duplicate PNP trajectory: {name}")
+                result[name] = side
+        return result
+
     def _saved_trajectories(self):
-        recording = self._recording
-        return sorted((path.name for path in self._trajectory_dir.iterdir()
-                       if path.is_file() and not path.is_symlink()
-                       and path.suffix in (".jsonl", ".partial")
-                       and (recording is None or path != recording[0])), reverse=True
-                      ) if self._trajectory_dir.is_dir() else []
+        return sorted(self._trajectory_hosts(), reverse=True)
+
+    def _playback_selection(self, args):
+        tracks = {}
+        for arm in ("left", "right"):
+            name = args.get(f"{arm}_trajectory")
+            if name in (None, ""):
+                continue
+            match = TRAJECTORY_NAME.fullmatch(name) if isinstance(name, str) else None
+            if not match or match[1] != arm:
+                raise ValueError(f"Choose a {arm}-arm recording for {arm}_trajectory")
+            tracks[arm] = name
+        legacy = args.get("trajectory")
+        if not tracks and isinstance(legacy, str) and (match := TRAJECTORY_NAME.fullmatch(legacy)):
+            tracks[match[1]] = legacy
+        if not tracks:
+            raise ValueError("Choose at least one recording from list_trajectories")
+        owners = self._trajectory_hosts()
+        if any(name not in owners for name in tracks.values()):
+            raise ValueError("A selected PNP recording does not exist")
+        hosts = {owners[name] for name in tracks.values()}
+        if len(hosts) != 1:
+            raise ValueError("Synchronized playback requires both recordings on the same PNP host")
+        return hosts.pop(), tracks
+
+    def _watch_playback(self, action_id, side, cancelled):
+        result = {"error": "Playback timed out"}
+        terminal = "error"
+        deadline = time.monotonic() + 870
+        while not cancelled.wait(.3) and time.monotonic() < deadline:
+            try:
+                status = self._host_status(side)
+                execution = status["execution"]
+                if (execution.get("stage") == "playback_completed"
+                        and status["remote_service"].get("ActiveState") == "inactive"):
+                    terminal, result = "completed", {"state": "playback_completed", "execution": execution}
+                    break
+                if status["state"] == "fault":
+                    result = {"error": execution.get("error", "PNP playback failed"), "execution": execution}
+                    break
+            except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+                result = {"error": str(exc)}
+                break
+        with self._lock:
+            if cancelled.is_set():
+                terminal, result = "cancelled", {"state": "stop"}
+            elif terminal != "completed":
+                try:
+                    self._stop_host(side)
+                except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+                    result["stop_error"] = str(exc)
+            self._playback = None
+            self._acp = {"action_id": action_id, "state": "pending", "status": terminal, "result": result}
+        delivery_error = None
+        for attempt in range(3):
+            try:
+                self._acp_callback(action_id, terminal, result)
+                delivery_error = None
+                break
+            except Exception as exc:
+                delivery_error = str(exc)[:240]
+                if attempt < 2:
+                    time.sleep(.25 * (attempt + 1))
+        with self._lock:
+            if self._acp and self._acp["action_id"] == action_id:
+                self._acp.update(state="failed" if delivery_error else "accepted", error=delivery_error)
 
     def dispatch(self, action, args):
         result = self._dispatch_action(action, args)
@@ -417,22 +461,48 @@ class PnpRemoteTeleopPlugin:
     def _dispatch_action(self, action, args):
         normal_end = action == "stop_trajectory"
         # Core reserves lowercase stop for the card lifecycle.
-        action = {"start_trajectory": "teach", "stop_trajectory": "pause",
-                  "stop_motion": "pause", "Teach": "teach", "Align": "align", "Follow": "follow", "Stop": "pause",
+        action = {"start_trajectory": "teach", "stop_trajectory": "stop_session",
+                  "stop_motion": "stop_session", "Teach": "teach", "Align": "align", "Follow": "follow", "Stop": "stop_session",
                   "Status": "status"}.get(action, action)
         with self._lock:
             try:
+                if action == "play":
+                    if self._playback or not self._loaded:
+                        raise RuntimeError("Load Teach and stop any existing playback first")
+                    side, tracks = self._playback_selection(args)
+                    status = self._status()
+                    if any(entry.get("remote_service", {}).get("ActiveState") not in ("inactive", "failed")
+                           for entry in status["hosts"].values()):
+                        raise RuntimeError("Stop the active PNP session before playback")
+                    self._ssh(side, "pnp-play-recording", *tracks.values())
+                    cancelled = threading.Event()
+                    action_id = "fr3_play_" + uuid.uuid4().hex
+                    self._playback = (side, cancelled)
+                    self._acp = {"action_id": action_id, "state": "waiting_for_motion"}
+                    threading.Thread(target=self._watch_playback, args=(action_id, side, cancelled),
+                                     daemon=True, name="fr3-playback").start()
+                    return {"state": "playback_starting", "action_id": action_id, "selected_arms": list(tracks)}
+                if action in ("pause", "resume"):
+                    if self._playback is None:
+                        raise RuntimeError("No active playback")
+                    side, _ = self._playback
+                    self._ssh(side, "pnp-pause-playback" if action == "pause" else "pnp-resume-playback")
+                    return {"state": "pausing" if action == "pause" else "resuming"}
                 if action == "list_trajectories":
                     self.schema_refresh.set()
-                    return {"trajectories": self._saved_trajectories()}
+                    names = self._saved_trajectories()
+                    return {"trajectories": names, "trajectories_by_arm": {
+                        arm: [name for name in names if name.startswith((f"franka-{arm}-", f"fr3-{arm}-"))]
+                        for arm in ("left", "right")
+                    }}
                 if action == "delete_trajectory":
                     name = args.get("trajectory", "")
-                    if not isinstance(name, str) or not re.fullmatch(r"\d{8}T\d{6}\.\d{6}Z\.(?:jsonl|partial)", name):
-                        raise ValueError("Choose a timestamped recording from list_trajectories")
-                    path = self._trajectory_dir / name
-                    if self._recording and path == self._recording[0]:
-                        raise RuntimeError("Stop the active recording before deleting it")
-                    path.unlink()
+                    if not isinstance(name, str) or not TRAJECTORY_NAME.fullmatch(name):
+                        raise ValueError("Choose a recording from list_trajectories")
+                    side = self._trajectory_hosts().get(name)
+                    if side is None:
+                        raise ValueError("PNP recording does not exist")
+                    self._ssh(side, "pnp-delete-recording", name)
                     self.schema_refresh.set()
                     return {"deleted": name}
                 if action == "config":
@@ -498,7 +568,7 @@ class PnpRemoteTeleopPlugin:
                                                           args=(action_id, self._align_cancel, action == "teach"), daemon=True)
                     self._align_thread.start()
                     return {"state": "aligning", "action_id": action_id, "message": "Aligning. Please wait."}
-                if action in ("pause", "stop"):
+                if action in ("stop_session", "stop"):
                     self._align_cancel.set()
                     if self._init.get("state") == "initializing":
                         if action == "stop":
@@ -508,10 +578,12 @@ class PnpRemoteTeleopPlugin:
                     if errors:
                         return {"state": "error", "message": "部分 PNP 遥操服务停止未确认",
                                 "errors": errors}
+                    if self._playback:
+                        self._playback[1].set()
                     recording = self._finish_recording(normal_end)
                     if action == "stop":
                         self._loaded = False
-                    self._stopped = action == "pause"
+                    self._stopped = action != "stop"
                     return {"state": "stop" if self._stopped else "idle", **recording}
             except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
                 return {"state": "error", "message": str(exc)}

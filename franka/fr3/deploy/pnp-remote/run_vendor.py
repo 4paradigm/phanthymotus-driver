@@ -32,15 +32,11 @@ def stop_vendor(children):
             pass
 
 
-def run_vendor(arm):
-    import grpc
-    import polymetis_pb2 as pb
-    import polymetis_pb2_grpc as rpc
-
+def vendor_environment(arm):
     env = os.environ.copy()
     runtime = Path(__file__).parent
-    vendor = VENDOR_ROOT / f"{arm.side}_franka"
     build = VENDOR_ROOT / "polymetis/polymetis/build"
+    env["FR3_VENDOR_NODE"] = str((VENDOR_ROOT / "teleop/experiments/launch_nodes.py").resolve())
     env["FR3_VENDOR_ARM_PORT"] = str(arm.arm_port)
     env["FR3_VENDOR_SERVER"] = str(build / "run_server")
     env["FR3_VENDOR_CLIENT"] = str(build / "franka_panda_client")
@@ -48,11 +44,26 @@ def run_vendor(arm):
                                   str(Path(os.environ.get("PNP_CONDA_BASE", str(Path.home() / "miniconda3"))) / "bin"), env["PATH"]))
     env["PYTHONUNBUFFERED"] = "1"
     env["PYTHONPATH"] = str(runtime) + os.pathsep + env.get("PYTHONPATH", "")
-    gate = runtime / f"follow-gate-{arm.side}"
-    gate.unlink(missing_ok=True)
-    env["FR3_FOLLOW_GATE"] = str(gate)
     env["FR3_ROBOT_IP"] = arm.robot_ip
     env["BASH_ENV"] = str(runtime / "vendor-follow-env.sh")
+    return env
+
+
+def run_vendor(arm):
+    import grpc
+    import polymetis_pb2 as pb
+    import polymetis_pb2_grpc as rpc
+
+    env = vendor_environment(arm)
+    runtime = Path(__file__).parent
+    vendor = VENDOR_ROOT / f"{arm.side}_franka"
+    gate = runtime / f"follow-gate-{arm.side}"
+    gate.unlink(missing_ok=True)
+    record_marker = runtime / f"record-{arm.side}"
+    record_marker.unlink(missing_ok=True)
+    env["FR3_RECORD_MARKER"] = str(record_marker)
+    env["FR3_ARM_SIDE"] = arm.side
+    env["FR3_FOLLOW_GATE"] = str(gate)
     for name in SCRIPTS:
         if not (vendor / name).is_file():
             raise RuntimeError(f"Missing PNP script: {name}")
@@ -146,4 +157,5 @@ def run_vendor(arm):
                     print(f"[{arm.side}] {line.decode(errors='replace')}", flush=True)
     finally:
         gate.unlink(missing_ok=True)
+        record_marker.unlink(missing_ok=True)
         stop_vendor(children)

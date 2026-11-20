@@ -4,7 +4,7 @@ from pathlib import Path
 import time
 
 
-def release():
+def release(record=False):
     root = Path(__file__).parent
     session = json.loads((root / "execution.json").read_text())
     selected = session.get("selected_arms", [])
@@ -18,8 +18,15 @@ def release():
         if state.get("master_delta_rad", 1) > .05:
             raise RuntimeError(f"{side} master moved after alignment; align again")
     for side in selected:
+        marker = root / f"record-{side}"
+        if record:
+            marker.touch()
+        else:
+            marker.unlink(missing_ok=True)
         (root / f"follow-gate-{side}").touch()
 
 
 if __name__ == "__main__":
-    release()
+    import sys
+
+    release(record=sys.argv[1:] == ["--record"])

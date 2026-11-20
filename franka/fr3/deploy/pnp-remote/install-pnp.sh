@@ -58,7 +58,7 @@ sudo -v
 sudo visudo -cf "$stage/fr3-card"
 sudo systemd-analyze verify "$stage/$unit"
 install -d "$runtime/vendor-bin"
-install -m644 read_vendor_masters.py read_vendor_ips.py arm_config.py vendor_alignment.py release_follow.py run_right.py run_vendor.py execution_status.py prepare_vendor_follow.py \
+install -m644 read_vendor_masters.py read_vendor_ips.py arm_config.py vendor_recordings.py playback.py vendor_alignment.py release_follow.py run_right.py run_vendor.py execution_status.py prepare_vendor_follow.py \
     stop_right.sh vendor-follow-env.sh "$stage/right_run_env.py" "$runtime/"
 install -m755 vendor-bin/sudo "$runtime/vendor-bin/"
 install -m755 pnp-card-ctl "$runtime/"

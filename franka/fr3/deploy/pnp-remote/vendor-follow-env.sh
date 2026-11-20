@@ -1,7 +1,18 @@
 # Sourced only by the right-arm vendor follow script.
 python3() {
-    if [ "$#" -gt 0 ] &&
-       [ "$(realpath -- "$1")" = "$FR3_VENDOR_RUN_ENV" ]; then
+    if [ "$#" -gt 0 ] && [ "$(realpath -- "$1")" = "${FR3_VENDOR_NODE:-}" ]; then
+        command python3 -c '
+import runpy
+import sys
+from teleop.robots import fr3
+from vendor_recordings import GRIPPER_OPEN_WIDTH_M
+
+fr3.MAX_OPEN = GRIPPER_OPEN_WIDTH_M
+del sys.argv[0]
+runpy.run_path(sys.argv[0], run_name="__main__")
+' "$@"
+    elif [ "$#" -gt 0 ] &&
+         [ "$(realpath -- "$1")" = "${FR3_VENDOR_RUN_ENV:-}" ]; then
         shift
         command python3 "$FR3_VENDOR_RUN_ENV_COPY" "$@"
     else

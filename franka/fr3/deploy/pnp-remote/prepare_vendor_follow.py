@@ -31,6 +31,20 @@ def prepare(source):
         "    from vendor_alignment import wait_for_follow\n"
         "    wait_for_follow(env, agent)\n"
         "    obs = env.get_obs()\n" + boundary)
+    loop = "        obs = env.step(action)"
+    start = source.index("    wait_for_follow(env, agent)")
+    before, follow = source[:start], source[start:]
+    if follow.count(loop) != 1:
+        raise ValueError("Vendor recording loop boundary has changed")
+    follow = follow.replace("    save_path = None", """    from os import environ
+    from vendor_recordings import start_recording, record_frame
+    recording = start_recording(environ, args.data_dir)
+    save_path = None""", 1)
+    follow = follow.replace(loop, """        obs = env.step(action)
+        if recording:
+            observed_ns = time.monotonic_ns()
+            record_frame(recording, dt, obs, action.copy(), save_frame, observed_ns=observed_ns)""")
+    source = before + follow
     compile(source, "right_run_env.py", "exec")
     return source
 

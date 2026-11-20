@@ -1,10 +1,12 @@
 import json
 from pathlib import Path
 import runpy
+import sys
 import tempfile
 import threading
+from types import SimpleNamespace
 from unittest import TestCase, main
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from franka.fr3.pnp_remote_teleop import PnpRemoteTeleopPlugin
 from franka.fr3 import pnp_initialize
 
@@ -121,10 +123,10 @@ class AlignmentCompletionTests(TestCase):
         plugin = PnpRemoteTeleopPlugin()
         definition = plugin.get_tools()[0]
         self.assertEqual(definition["inputSchema"]["properties"]["action"]["enum"],
-                         ["start_trajectory", "stop_trajectory", "stop_motion", "list_trajectories", "delete_trajectory", "status"])
+                         ["start_trajectory", "stop_trajectory", "stop_motion", "list_trajectories", "delete_trajectory", "play", "pause", "resume", "status"])
         self.assertNotIn("auto_initialize", definition["configSchema"]["properties"])
         self.assertEqual(definition["inputSchema"]["x-completion"]["actions"],
-                         ["start_trajectory", "stop_trajectory", "stop_motion", "delete_trajectory"])
+                         ["start_trajectory", "play", "stop_trajectory", "stop_motion", "delete_trajectory"])
 
     def test_visible_stop_preserves_pause_behavior(self):
         plugin = PnpRemoteTeleopPlugin()
@@ -188,6 +190,143 @@ class AlignmentCompletionTests(TestCase):
             result = plugin.dispatch("Follow", {})
         self.assertEqual(result["state"], "error")
         ssh.assert_not_called()
+
+class PlaybackStartupTests(TestCase):
+    def test_waits_through_empty_buffer_and_stale_feedback_before_starting_gripper(self):
+        class EmptyBuffer(Exception):
+            def details(self):
+                return str(self)
+
+        now = 1000
+        stale = SimpleNamespace(seconds=now - 2, nanos=0)
+        fresh = SimpleNamespace(seconds=now, nanos=0)
+        events = []
+
+        def robot_state(_, timeout):
+            self.assertEqual(timeout, .3)
+            events.append("arm feedback")
+            if events.count("arm feedback") == 1:
+                raise EmptyBuffer("Cannot retrieve robot state from empty buffer!")
+            stamp = stale if events.count("arm feedback") == 2 else fresh
+            return SimpleNamespace(timestamp=stamp, joint_positions=[0.] * 7,
+                                   joint_velocities=[0.] * 7)
+
+        def gripper_state(_, timeout):
+            self.assertEqual(timeout, .3)
+            events.append("gripper feedback")
+            stamp = stale if events.count("gripper feedback") == 1 else fresh
+            return SimpleNamespace(timestamp=stamp)
+
+        def start(command, **kwargs):
+            events.append(command[-1])
+            return SimpleNamespace(poll=lambda: None)
+
+        vendor = SimpleNamespace(SCRIPTS=("arm.sh", "hand.sh"), VENDOR_ROOT=Path("/vendor"),
+                                 stop_vendor=MagicMock(), vendor_environment=lambda arm: {})
+        rpc = SimpleNamespace(
+            PolymetisControllerServerStub=lambda channel: SimpleNamespace(GetRobotState=robot_state),
+            GripperServerStub=lambda channel: SimpleNamespace(GetState=gripper_state))
+        modules = {
+            "execution_status": SimpleNamespace(report=MagicMock()),
+            "run_vendor": vendor,
+            "vendor_recordings": SimpleNamespace(GRIPPER_OPEN_WIDTH_M=.08, NAME=None,
+                                                 PLAYBACK_TIMESTAMP="fr3_observed_monotonic_ns"),
+            "grpc": SimpleNamespace(RpcError=EmptyBuffer, insecure_channel=MagicMock()),
+            "polymetis_pb2": SimpleNamespace(Empty=object),
+            "polymetis_pb2_grpc": rpc,
+        }
+        path = Path(__file__).resolve().parents[1] / "franka/fr3/deploy/pnp-remote/playback.py"
+        with patch.dict(sys.modules, modules):
+            launch = runpy.run_path(str(path))["_start_backends"]
+            with patch.dict(launch.__globals__, {
+                "time": SimpleNamespace(time=lambda: now, monotonic=lambda: now, sleep=lambda _: None),
+                "subprocess": SimpleNamespace(Popen=start, DEVNULL=-3),
+            }):
+                launch(SimpleNamespace(side="right", arm_port=50051, hand_port=50053), [])
+        self.assertEqual(events, ["arm.sh", "arm feedback", "arm feedback", "arm feedback",
+                                  "hand.sh", "gripper feedback", "gripper feedback"])
+
+
+class DualPlaybackTests(TestCase):
+    left = "franka-left-20261119T192346+0800"
+    right = "fr3-right-20261119T112346.714284Z"
+
+    def test_play_routes_only_selected_arms_and_preserves_legacy_input(self):
+        plugin = PnpRemoteTeleopPlugin()
+        plugin._loaded = True
+        remote = {"hosts": {"right": {"remote_service": {"ActiveState": "inactive"}}}}
+        schema = plugin.get_tools()[0]["inputSchema"]
+        self.assertEqual(schema["x-action-params"]["play"]["params"],
+                         ["left_trajectory", "right_trajectory"])
+        with patch.object(plugin, "_trajectory_hosts", return_value={self.left: "right", self.right: "right"}), \
+                patch.object(plugin, "_status", return_value=remote), \
+                patch.object(plugin, "_ssh") as ssh, patch("threading.Thread"):
+            result = plugin.dispatch("play", {"left_trajectory": self.right})
+            self.assertEqual(result["state"], "error")
+            ssh.assert_not_called()
+
+            result = plugin.dispatch("play", {"left_trajectory": self.left, "right_trajectory": self.right})
+            self.assertEqual(result["selected_arms"], ["left", "right"])
+            ssh.assert_called_once_with("right", "pnp-play-recording", self.left, self.right)
+
+            plugin._playback = None
+            ssh.reset_mock()
+            result = plugin.dispatch("play", {"trajectory": self.right})
+            self.assertEqual(result["selected_arms"], ["right"])
+            ssh.assert_called_once_with("right", "pnp-play-recording", self.right)
+
+    def test_group_releases_when_both_align_and_waits_for_both_completions(self):
+        runtime_path = Path(__file__).resolve().parents[1] / "franka/fr3/deploy/pnp-remote"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            gate = root / "playback.start"
+            approach = root / "playback.approach"
+            state_trace = [
+                {"left": "playback_entry_ready", "right": "playback_starting"},
+                {"left": "playback_entry_ready", "right": "playback_entry_ready"},
+                {"left": "playback_aligned", "right": "playback_approaching"},
+                {"left": "playback_aligned", "right": "playback_aligned"},
+                {"left": "playback_paused", "right": "playback_completed"},
+                {"left": "playback_completed", "right": "playback_completed"},
+            ]
+            step = 0
+            reports = []
+
+            def snapshot(path):
+                side = path.stem.removeprefix("execution-")
+                return {"stage": state_trace[step][side], "duration_s": 2.0}
+
+            def tick(_):
+                nonlocal step
+                self.assertEqual(approach.exists(), step >= 1)
+                self.assertEqual(gate.exists(), step >= 3)
+                step += 1
+
+            def spawn(args):
+                side = "left" if "-left-" in args[-1] else "right"
+                return SimpleNamespace(poll=lambda: 0 if state_trace[step][side] == "playback_completed"
+                                       else None, wait=lambda timeout: None)
+
+            execution = SimpleNamespace(report=lambda stage, **_: reports.append(stage), snapshot=snapshot,
+                                        run_checked=MagicMock())
+            modules = {
+                "execution_status": execution,
+                "arm_config": SimpleNamespace(ARMS={"left": object(), "right": object()}, detect=MagicMock()),
+                "run_vendor": SimpleNamespace(run_vendor=MagicMock()),
+                "playback": SimpleNamespace(START=gate, APPROACH=approach, load_trajectory=MagicMock()),
+            }
+            with patch.dict(sys.modules, modules), patch.object(sys, "path", [str(runtime_path), *sys.path]):
+                launch = runpy.run_path(str(runtime_path / "run_right.py"))["launch_playback"]
+                with patch.dict(launch.__globals__, {
+                    "RUNTIME": root, "check": MagicMock(),
+                    "time": SimpleNamespace(monotonic=lambda: 1., sleep=tick),
+                    "subprocess": SimpleNamespace(Popen=spawn),
+                }):
+                    launch([self.left, self.right])
+        self.assertEqual(reports, ["playback_starting", "playback_starting", "playback_starting",
+                                   "playback_approaching", "playback_running",
+                                   "playback_paused", "playback_completed"])
+
 
 if __name__=='__main__':
     main()
