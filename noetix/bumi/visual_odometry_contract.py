@@ -8,10 +8,7 @@ agree with it" and nothing more.
 
 ``motus.odom/1`` stays unchanged. Everything visual-specific lives in ``vendor``:
 segment, diagnostic counters, input ages and the frame the pose is expressed in.
-The pose is in the camera optical frame unless a mount is configured. The
-shipped Bumi config uses a level-forward optical-to-body axis convention
-(``assumed=true``, ``pose_reference=body_axes``), without claiming a measured
-body origin. Measured installations can explicitly declare their body reference.
+The pose is in the camera optical frame unless a numeric mount is configured.
 """
 from __future__ import annotations
 import math
@@ -89,21 +86,20 @@ def camera_to_body(position, quaternion, mount):
 
 
 class CameraCalibration:
-    """The optional measured camera mount; there is no IMU contract here."""
+    """Optional numeric camera mount; labels do not qualify the geometry."""
 
     def __init__(self, data):
+        if not isinstance(data, dict):
+            raise ValueError('camera mount must be a numeric object')
         self.data = deepcopy(data)
         try:
-            self.id = data['calibration_id']
-            if not isinstance(self.id, str) or not self.id or data['fixed_mount'] is not True:
-                raise ValueError('measured fixed installation required')
-            self.assumed = data.get('assumed', False)
-            if not isinstance(self.assumed, bool):
-                raise ValueError('assumed must be a boolean')
+            self.id = data.get('calibration_id')  # Legacy internal configuration identity.
+            if data.get('fixed_mount') is False:
+                raise ValueError('dynamic camera mount requires capture-time transforms')
             finite(data['camera_to_body']['translation'], 3)
             quat_matrix(data['camera_to_body']['quaternion'])
         except (KeyError, TypeError) as exc:
-            raise ValueError('incomplete measured camera mount: '+str(exc)) from exc
+            raise ValueError('incomplete numeric camera mount: '+str(exc)) from exc
 
 
 class ClockMap:
@@ -198,7 +194,7 @@ class Health:
                                            else ('waiting for camera IMU orientation'
                                                  if self.imu_required and not self.counts.get('imu')
                                                  else 'waiting for paired RGB-D visual odometry')),
-                    segment_id=self.segment, calibration_id=self.calibration_id,
+                    segment_id=self.segment,
                     input_age_ms={k: (now_ns-v)/1e6 for k, v in self.samples.items()},
                     visual_stamp_ns=max(paired) if paired else None)
 
@@ -226,23 +222,15 @@ def make_sample(health, now_ns, estimate, pose_reference='rgb_optical'):
         pose=deepcopy(estimate['pose']) if valid else None,
         vendor={**quality, 'source': 'rtabmap_rgbd_odometry',
                 'pose_reference': pose_reference,
-                'accuracy_validated': False,
                 'motus_slam': {'status': quality['status'],
                                'segment_id': quality['segment_id'],
-                               'stamp_source': 'measurement' if valid else 'unknown',
-                               'clock_id': 'ros'},
+                               'stamp_ns': estimate['stamp_ns'] if valid else None},
                 'twist_source': None,
                 'published_ns': now_ns, **deepcopy(health.details)})
 
 
 def slam_input_declaration(topic, sample, *, fallback_child, pose_reference, extrinsic):
-    """Static producer evidence for this VO output, not a tracking assertion.
-
-    On startup the estimator may not yet have returned a pose. The child frame
-    is still the local estimator's configured base frame; a later tracking
-    sample must agree with it. Neither an arrival-offset clock nor an assumed
-    mount becomes verified by inclusion in info().
-    """
+    """Port format and numeric pose geometry forwarded by canvas wiring."""
     vendor = sample.get('vendor') if isinstance(sample, dict) else None
     vendor = vendor if isinstance(vendor, dict) else {}
     quality = vendor.get('motus_slam')
@@ -254,11 +242,7 @@ def slam_input_declaration(topic, sample, *, fallback_child, pose_reference, ext
         'topic': topic,
         'format': 'state/odom',
         'kind': 'pose',
-        'source_id': quality.get('source_id') or 'unknown',
-        'clock_id': quality.get('clock_id') or 'unknown',
-        'stamp_source': quality.get('stamp_source') or 'unknown',
         'length_unit': 'm',
-        'reference_point': pose_reference,
         'pose_reference': pose_reference,
         # A VO relocalization changes its {segment_id}_odom/base frames. The
         # consumer uses this identity for segment-safe frame templating, never
@@ -266,11 +250,6 @@ def slam_input_declaration(topic, sample, *, fallback_child, pose_reference, ext
         'segment_id': quality.get('segment_id'),
         'frame_id': pose.get('frame_id'),
         'child_frame_id': pose.get('child_frame_id') or fallback_child,
-        'clock': {
-            'mapping': quality.get('clock_mapping') or 'unknown',
-            'verified': quality.get('clock_verified') is True,
-            'uncertainty_ns': None,
-        },
     }
     if extrinsic is not None:
         out['extrinsic'] = deepcopy(extrinsic)

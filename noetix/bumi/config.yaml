@@ -69,24 +69,19 @@ plugins:
     # the extra DDS/CPU load instead of duplicating every 30 Hz camera frame.
     # Invalid values fall back to 10 Hz; the camera-side upper bound is 30 Hz.
     max_rate_hz: 10
-    # Level-forward optical-to-body axis convention, referenced at the camera
-    # origin. Supply a measured installation transform before declaring a body origin.
+    # Numeric camera-to-body installation transform, in metres and xyzw.
     calibration:
-      calibration_id: assumed-level-forward-optical-to-body
-      fixed_mount: true
-      assumed: true
       camera_to_body:
         translation: [0.0, 0.0, 0.0]
         quaternion: [-0.5, 0.5, -0.5, 0.5]
-      # Operator-confirmed zero offset for this fixed installation, in RGB optical metres.
+      # IMU origins in RGB optical metres.
       body_imu_translation:
         gyro: [0.0, 0.0, 0.0]
         accel: [0.0, 0.0, 0.0]
-  # Experimental planar EKF: 40 Hz leg/IMU prediction and timestamped VO
-  # correction. Opt in only after on-robot latency and accuracy validation.
-  # Does not replace rgbd_visual_odometry or send movement commands.
-  fused_odometry:
-    enabled: false
+  # Independent raw leg kinematics, with SDK attitude for coordinate rotation.
+  # 40 Hz reads / 20 Hz state/odom output; visual correction lives in Perception.
+  leg_odometry:
+    enabled: true
   motion_state:
     enabled: true
     # 2 Hz: sufficient for Agent-facing motion telemetry without excessive DDS reads.

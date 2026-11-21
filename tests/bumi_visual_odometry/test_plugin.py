@@ -157,7 +157,7 @@ def test_reset_moves_to_a_new_segment_and_reports_the_old_one_lost(plugin):
 def test_measured_mount_only_changes_the_pose_reference(plugin):
     result = plugin.dispatch('config', {'calibration': calibration()})
     assert result['pose_reference'] == 'body'
-    assert result['calibration_id'] == 'fixture'
+    assert 'calibration_id' not in result
     assert last(plugin)['vendor']['pose_reference'] == 'body'
 
 
@@ -172,8 +172,8 @@ def test_info_is_the_default_action(plugin):
     result = plugin.dispatch('rgbd_visual_odometry', {})
     assert result['state'] == 'idle'
     assert result['namespace'] == 'robot'
-    assert result['odom_interface']['provides'] == []
-    assert result['odom_interface']['slam_pose'] == {'available': True, 'profile': 'motus_slam/1'}
+    assert 'odom_interface' not in result
+    assert result['input_metadata'][0]['format'] == 'state/odom'
     assert plugin.dispatch('info', {})['state'] == 'idle'
 
 
@@ -293,7 +293,7 @@ def test_preflight_info_is_side_effect_free_and_normal_info_remains_compatible(p
     before_origin = node.summary_origin
     snapshot = plugin.dispatch('info', {'read_only': True})
     assert snapshot['sample']['vendor']['status'] == 'tracking'
-    assert snapshot['input_metadata'][0]['clock']['verified'] is False
+    assert 'clock' not in snapshot['input_metadata'][0]
     assert len(node.node.messages) == before_odom
     assert len(node.node.topics[node.status_topic]) == before_status
     assert node.summary_origin == before_origin
@@ -407,32 +407,16 @@ def test_a_single_pose_glitch_is_dropped_not_latched(plugin):
     assert node.jump_count == 0
 
 
-def test_rejected_pose_keeps_capture_stamp_and_is_not_fused_again(plugin):
-    import threading
-    from noetix.bumi.fused_odometry import FusedOdometryPlugin
-    from noetix.bumi.odometry_fusion import PlanarFusion
-
+def test_rejected_pose_keeps_accepted_capture_stamp(plugin):
     plugin._node.node.time += 123_456  # Capture precision must survive publication.
     node = tracking(plugin)
     node.calibration = module.CameraCalibration(calibration())
     accepted_ns = node.estimate['stamp_ns']
-    fused = FusedOdometryPlugin.__new__(FusedOdometryPlugin)
-    fused.node, fused.lock, fused.active = node.node, threading.RLock(), True
-    fused.filter = PlanarFusion()
-    fused.filter.predict(accepted_ns, 0.)
-    fused._on_visual(NS(data=json.dumps(node.publish())))
-    assert fused.filter.last_visual_stamp == accepted_ns
-
-    fused.filter.predict(accepted_ns + 25_000_000, 0., (.01, 0.), True)
-    predicted = fused.filter.steps[-1].state.copy()
+    assert node.publish()['vendor']['visual_stamp_ns'] == accepted_ns
     feed(node, [10., 2., 3.])  # Paired diagnostics, but an impossible pose jump.
     sample = node.publish()
     assert sample['vendor']['status'] == 'tracking'
     assert sample['pose']['position'] == [1., 2., 3.]
-    fused._on_visual(NS(data=json.dumps(sample)))
-
-    assert fused.filter.last_visual_stamp == accepted_ns
-    assert fused.filter.steps[-1].state.tolist() == predicted.tolist()
     assert sample['vendor']['visual_stamp_ns'] == accepted_ns
 
 

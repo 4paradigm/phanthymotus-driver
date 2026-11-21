@@ -20,6 +20,17 @@ def intrinsics(**changes):
     return NS(**data)
 
 
+def test_fixed_camera_mount_uses_supplied_numbers_without_declaration_gates():
+    config = {'camera_to_body': {'translation': [.15, -.03, .4],
+                                'quaternion': [-.5, .5, -.5, .5]}}
+    expected = [[0., 0., 1., .15], [-1., 0., 0., -.03],
+                [0., -1., 0., .4], [0., 0., 0., 1.]]
+    assert rgbd.fixed_body_mount(config) == expected
+    assert rgbd.fixed_body_mount(dict(config, assumed=True, calibrated=False)) == expected
+    assert rgbd.fixed_body_mount(None) is None
+    assert rgbd.fixed_body_mount(dict(config, fixed_mount=False)) is None
+
+
 def frame(ms, pixels, intr=None, domain='hardware_clock'):
     return NS(get_timestamp=lambda: ms, get_frame_number=lambda: int(ms),
               get_frame_timestamp_domain=lambda: 'timestamp_domain.' + domain,
@@ -71,10 +82,8 @@ def test_source_scales_measured_depth_and_keeps_distinct_capture_headers(source)
     assert decoded[240, 320] == 1000
     assert notices[-1]['ready'] is True
     vendor = notices[-1]['camera_info'][0]['vendor']
-    assert vendor['source_clock'] == 'hardware_clock'
-    assert vendor['clock_mapping'] == 'fixed_arrival_offset'
-    assert vendor['mapping_offset_ns'] == 9_000_000_000
-    assert vendor['clock_mapping_verified'] is False
+    assert not {'source_clock', 'clock_mapping', 'mapping_offset_ns', 'clock_mapping_verified'} & vendor.keys()
+    assert publisher.clocks[0].offset == 9_000_000_000
     # Subsequent captures advance by source time, not variable processing delay.
     later = frames(ms=1030.)
     publisher.publish(later)
@@ -117,13 +126,13 @@ def test_source_declarations_are_accepted_by_generic_perception_contract(source,
         assert geometry['child_from_cloud'] == np.eye(4).tolist()
         assert cloud['vendor'].get('body_mount') == depth['vendor'].get('body_mount')
         assert (cloud['vendor'].get('body_mount') is not None) == has_mount
-        assert cloud['vendor']['clock_id'] == accepted['clock_id']
+        assert cloud['vendor'].get('clock_id') == accepted['clock_id']
         assert sample['vendor']['motus_slam']['stamp_ns'] == capture_ns
     finally:
         sys.path[:] = old_path
     assert accepted['frame_id'] == 'robot_rgb_optical'
     assert accepted['K'].tolist() == [[600., 0., 320.], [0., 601., 240.], [0., 0., 1.]]
-    assert all(d['vendor']['clock_mapping_verified'] is False for d in declarations)
+    assert all('clock_mapping_verified' not in d['vendor'] for d in declarations)
 
 
 def test_nonzero_brown_is_not_advertised_as_supported_sdk_registration():
@@ -491,7 +500,7 @@ def test_shared_depth_uses_original_topic_with_no_duplicate_encoder(source):
     rgb, depth = declarations.values()
     assert rgb['K'] == depth['K']
     assert rgb['id'] == depth['id']
-    assert rgb['vendor']['clock_id'] == depth['vendor']['clock_id']
+    assert 'clock_id' not in rgb['vendor'] and 'clock_id' not in depth['vendor']
 
 
 def test_stopped_card_suppresses_only_its_images_and_restart_uses_next_capture(source):
@@ -626,7 +635,9 @@ def test_cold_card_start_waits_for_asynchronous_calibrated_metadata(monkeypatch,
     finally:
         timer.join()
     assert response['sourceReady'] is True
-    assert next(d for d in response['camera_info'] if d['topic'] == topic)['vendor']['clock_id'] == 'fresh-clock'
+    selected = next(d for d in response['camera_info'] if d['topic'] == topic)['vendor']
+    assert selected['frame_id'] == 'robot_rgb_optical'
+    assert 'clock_id' not in selected
 
 
 @pytest.mark.parametrize('name', ['camera', 'depth'])
@@ -725,14 +736,11 @@ def test_clock_reset_cannot_silently_recover_old_epoch_or_feed_imu(source):
     assert all(len(rows) == 1 for rows in messages.values())
 
 
-def test_camera_reference_and_unknown_clock_accuracy_are_explicit(source):
+def test_camera_declarations_omit_source_clock_and_accuracy_claims(source):
     publisher, _, notices = source
     publisher.publish(frames())
     for d in notices[-1]['camera_info']:
         v = d['vendor']
-        assert v['pose_reference'] == 'camera_optical'
-        assert v['source_id'] == publisher.root
-        assert v['source_epoch'] == publisher.clock_id
-        assert v['clock_mapping_uncertainty_ns'] is None
-        assert v['clock_mapping_verified'] is False
-        assert 'clock_reference' not in v  # Arrival-fit offset is not host clock proof.
+        assert v['frame_id'] == 'robot_rgb_optical'
+        assert not {'pose_reference', 'source_id', 'source_epoch', 'clock_mapping_uncertainty_ns',
+                    'clock_mapping_verified', 'clock_reference', 'clock_id'} & v.keys()

@@ -232,6 +232,31 @@ def test_original_depth_is_normalized_capture_mapped_and_owned_once(capture, mon
     assert state.stopped
 
 
+def test_fixed_body_mount_is_available_with_driver_visual_odometry_off(capture, monkeypatch):
+    device, state = capture
+    monkeypatch.delenv('BUMI_VISUAL_ODOMETRY', raising=False)
+    monkeypatch.setitem(sys.modules, 'tf2_ros', None)
+    monkeypatch.setattr(sys.modules['rclpy.qos'], 'qos_profile_sensor_data', object(), raising=False)
+    monkeypatch.setenv('BUMI_BODY_IMU_MOUNT', json.dumps({
+        'calibration_id': 'configured_mount', 'fixed_mount': True, 'assumed': True,
+        'camera_to_body': {'translation': [.15, -.03, .4],
+                           'quaternion': [-.5, .5, -.5, .5]},
+    }))
+    device._camera_subprocess('robot')
+    mounts = state.published['/robot/camera/rgbd/body_mount']
+    packet = json.loads(mounts[0].data)
+    assert packet['matrix'] == [[0., 0., 1., .15], [-1., 0., 0., -.03],
+                                [0., -1., 0., .4], [0., 0., 0., 1.]]
+    assert packet['parent_frame'] == 'base_link'
+    assert packet['child_frame'] == 'robot_rgb_optical'
+    assert packet['mode'] == 'static'
+    assert not {'source', 'version', 'epoch', 'clock_id', 'stamp_source',
+                'accuracy_validated'} & packet.keys()
+    color = state.published['/robot/camera/color'][0]
+    assert packet['stamp_ns'] == color.header.stamp.sec * 10**9 + color.header.stamp.nanosec
+    assert '/robot/odometry_input/rgb' not in state.published
+
+
 def test_invalid_capture_never_falls_back_to_native_public_images(capture, monkeypatch):
     device, state = capture
     state.frame_limit = 2

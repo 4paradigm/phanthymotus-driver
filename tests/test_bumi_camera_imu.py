@@ -31,14 +31,11 @@ def test_capture_uses_body_imu_without_discovering_or_enabling_camera_motion(cap
     state.on_spin=spin
     device._camera_subprocess('robot')
     packet=json.loads(state.published['/robot/state/imu_calibrated'][0].data)
-    assert packet['source_id']=='noetix/robot/body_imu'
-    assert packet['stamp_source']=='read_completion'
+    assert not {'source_id','epoch','stamp_source','clock_id','translation_source'} & packet.keys()
     assert packet['camera_frame_id']=='robot_rgb_optical'
-    assert packet['clock_id'].endswith('/hardware_clock')
     assert packet['angular_velocity']==[1.,2.,3.]
     assert packet['camera_from_gyro_translation']==[0.,0.,0.]
     assert packet['camera_from_accel_translation']==[0.,0.,0.]
-    assert packet['translation_source']=='configured_fixed_mount'
     assert probes==[]
     assert {args[0] for args in state.streams}=={'color','depth'}
     assert '/robot/camera/rgbd/imu' not in state.publisher_topics

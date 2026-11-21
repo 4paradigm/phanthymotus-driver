@@ -29,16 +29,11 @@ def reading(stamp=1_000_000_000, **changes):
 def test_body_packet_keeps_raw_axes_and_read_time_and_inverts_fixed_camera_mount():
     imu = source()
     packet = imu.accept(reading(), 1_010_000_000)
-    assert packet['source_id'] == 'noetix/robot/body_imu'
+    assert not {'source_id', 'epoch', 'clock_id', 'stamp_source', 'clock_mapping',
+                'rotation_source', 'translation_source', 'calibration_id'} & packet.keys()
     assert packet['gyro_frame_id'] == packet['accel_frame_id'] == 'robot_body_imu'
     assert packet['camera_frame_id'] == 'robot_rgb_optical'
-    assert packet['clock_id'] == 'capture/global_time'
     assert packet['stamp_ns'] == packet['accel_stamp_ns'] == 1_000_000_000
-    assert packet['stamp_source'] == 'read_completion'
-    assert packet['clock_mapping'] == dict(method='host_wall_read_completion',
-                                           source_clock='ros_wall', offset_ns=0, verified=False)
-    assert packet['rotation_source'] == 'configured_fixed_mount'
-    assert packet['calibration_id'] == 'level-forward'
     assert packet['angular_velocity'] == [1., 2., 3.]
     assert packet['linear_acceleration'] == [0., 0., 9.81]
     assert packet['camera_from_gyro'] == packet['camera_from_accel'] == [
@@ -49,7 +44,7 @@ def test_body_packet_keeps_raw_axes_and_read_time_and_inverts_fixed_camera_mount
     assert imu.status(1_500_000_001)['state'] == 'unavailable'
 
 
-@pytest.mark.parametrize('change', [dict(timestamp_source='measurement'),
+@pytest.mark.parametrize('change', [
     dict(stamp_ns=True), dict(stamp_ns=400_000_000), dict(stamp_ns=1_100_000_000),
     dict(angular_vel=[float('nan'), 0., 0.]), dict(quaternion=[0., 0., 0., 0.])])
 def test_invalid_body_reading_does_not_become_a_fresh_measurement(change):
@@ -72,7 +67,6 @@ def test_assumed_mount_keeps_numeric_body_rotation_without_measured_translation(
     packet = imu.accept(reading(), 1_010_000_000)
     assert packet['camera_from_gyro'] == packet['camera_from_accel'] == [
         [0., -1., 0.], [0., 0., -1.], [1., 0., 0.]]
-    assert packet['rotation_source'] == 'configured_fixed_mount'
     assert 'camera_from_accel_translation' not in packet
     assert imu.status(1_010_000_000)['state'] == 'ready'
 
@@ -87,7 +81,7 @@ def test_incomplete_body_imu_translation_preserves_rotation_assistance():
     assert status['fusion']['state'] == 'unavailable'
 
 
-def test_cached_sdk_values_do_not_refresh_freshness_and_restart_has_new_epoch():
+def test_cached_sdk_values_do_not_refresh_freshness_after_restart():
     imu = source()
     first = imu.accept(reading(), 1_010_000_000)
     assert imu.accept(reading(1_050_000_000), 1_060_000_000) is None
@@ -98,10 +92,11 @@ def test_cached_sdk_values_do_not_refresh_freshness_and_restart_has_new_epoch():
     assert imu.accept(reading(1_600_000_000), 1_610_000_000) is None
     assert imu.status(1_610_000_000)['state'] == 'unavailable'
     second = imu.accept(reading(1_650_000_000, angular_vel=[1., 2., 3.1]), 1_660_000_000)
-    assert second['epoch'] != first['epoch']
+    assert second['stamp_ns'] > first['stamp_ns']
+    assert 'epoch' not in first and 'epoch' not in second
 
 
-def test_real_generic_consumer_uses_body_axes_once_and_discloses_time_basis():
+def test_real_generic_consumer_uses_numeric_body_axes_without_time_declarations():
     path = ROOT.parent/'pr371-current-review/perception/plugins/rgbd_imu.py'
     if not path.exists():
         pytest.skip('independent Perception checkout is not present')
@@ -120,4 +115,4 @@ def test_real_generic_consumer_uses_body_axes_once_and_discloses_time_basis():
     np.testing.assert_allclose(sample['linear_acceleration'], [0., -9.81, 0.])
     np.testing.assert_allclose(consumer.rotation_from_quaternion(sample['quaternion']) @ [0., -1., 0.],
                                [0., 0., 1.], atol=1e-9)
-    assert attitude.info(1_010_000_000)['stamp_source'] == 'read_completion'
+    assert attitude.info(1_010_000_000)['last_measurement_ns'] == packet['stamp_ns']

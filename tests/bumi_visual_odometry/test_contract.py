@@ -21,7 +21,7 @@ def calibration():
                 camera_to_body=dict(translation=[0.4, 0, 0.2], quaternion=[0, 0, 0, 1]))
 
 
-def test_shipped_mount_does_not_claim_a_measured_body_origin():
+def test_shipped_mount_exposes_numeric_body_transform_without_certificates():
     from pathlib import Path
     import yaml
     from noetix.bumi.visual_odometry import VisualOdometryNode
@@ -30,10 +30,10 @@ def test_shipped_mount_does_not_claim_a_measured_body_origin():
     node = object.__new__(VisualOdometryNode)
     node.calibration = CameraCalibration(config['plugins']['visual_odometry']['calibration'])
     node.namespace, node.segment, node.frame_id = 'robot', 'segment', 'robot_rgb_optical'
-    assert node.pose_reference() == 'body_axes'
+    assert node.pose_reference() == 'body'
     mount = node.slam_extrinsic()
-    assert mount['calibrated'] is False
-    assert mount['source'] == 'bumi_axis_assumption'
+    assert not {'calibrated', 'assumed', 'source', 'version'} & mount.keys()
+    assert np.asarray(mount['matrix']).shape == (4, 4)
 
 
 def test_finite_rejects_nan_and_wrong_size():
@@ -43,16 +43,16 @@ def test_finite_rejects_nan_and_wrong_size():
             finite(bad, 3)
 
 
-def test_calibration_requires_a_measured_fixed_mount_only():
+def test_calibration_requires_numeric_static_geometry_only():
     with pytest.raises(ValueError):
         CameraCalibration({})
     c = CameraCalibration(calibration())
     assert c.id == 'fixture'
-    for key in ('camera_to_body', 'fixed_mount'):
-        data = calibration()
-        data.pop(key)
-        with pytest.raises(ValueError):
-            CameraCalibration(data)
+    data = calibration()
+    data.pop('camera_to_body')
+    with pytest.raises(ValueError):
+        CameraCalibration(data)
+    CameraCalibration({'camera_to_body': calibration()['camera_to_body']})
     bad = calibration()
     bad['fixed_mount'] = False
     with pytest.raises(ValueError):
@@ -139,7 +139,7 @@ def test_sample_never_invents_a_twist_or_a_pose_without_tracking():
     assert sample['pose'] is None
     assert sample['vendor']['source'] == 'rtabmap_rgbd_odometry'
     assert sample['vendor']['pose_reference'] == 'rgb_optical'
-    assert sample['vendor']['accuracy_validated'] is False
+    assert 'accuracy_validated' not in sample['vendor']
     assert sample['vendor']['status'] == 'initializing'
 
 
@@ -256,16 +256,16 @@ def test_slam_metadata_distinguishes_pose_time_from_publication_time():
     sample = make_sample(health, 1_100_000_000, dict(stamp_ns=1_090_000_000, pose=pose))
     assert sample['vendor']['motus_slam'] == {
         'status': 'tracking', 'segment_id': 's',
-        'stamp_source': 'measurement', 'clock_id': 'ros',
+        'stamp_ns': 1_090_000_000,
     }
     assert sample['stamp_ms'] == 1090
     lost = make_sample(health, 900_000_000_000, None)
     assert lost['vendor']['motus_slam']['status'] == 'lost'
-    assert lost['vendor']['motus_slam']['stamp_source'] == 'unknown'
+    assert lost['vendor']['motus_slam']['stamp_ns'] is None
     assert lost['pose'] is None
 
 
-def test_slam_input_declaration_never_upgrades_arrival_clock_or_unknown_pose():
+def test_slam_input_declaration_only_contains_port_and_pose_geometry():
     sample = make_sample(Health('s', None, started_ns=0), 100, None)
     sample['vendor']['motus_slam'].update(
         source_id='noetix/bumi/camera_color',
@@ -276,9 +276,7 @@ def test_slam_input_declaration_never_upgrades_arrival_clock_or_unknown_pose():
     assert declaration['topic'] == '/bumi/vo/odom'
     assert declaration['format'] == 'state/odom'
     assert declaration['schema'] == 'motus.slam_input/1'
-    assert declaration['clock'] == {
-        'mapping': 'shared_camera_mapper', 'verified': False, 'uncertainty_ns': None}
-    assert declaration['stamp_source'] == 'unknown'
+    assert not {'clock', 'clock_id', 'stamp_source', 'source_id'} & declaration.keys()
     assert declaration['child_frame_id'] == 's_base'
     assert declaration['segment_id'] == 's'
     assert 'extrinsic' not in declaration
@@ -302,5 +300,4 @@ def test_slam_input_declaration_retains_measured_pose_child_and_mount_evidence()
     assert declaration['segment_id'] == 's'
     assert declaration['frame_id'] == 's_odom'
     assert declaration['extrinsic'] == mount
-    assert declaration['clock']['verified'] is False
-    assert declaration['stamp_source'] == 'measurement'
+    assert not {'clock', 'clock_id', 'stamp_source', 'source_id'} & declaration.keys()

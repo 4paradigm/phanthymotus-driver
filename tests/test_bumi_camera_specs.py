@@ -182,9 +182,7 @@ def test_depth_declaration_carries_the_capture_time_and_unit_contract():
         {"depth": _color_intrinsics()["color"]})[0])
     for info in (fallback, runtime):
         assert info.vendor["depth_unit"] == "mm"
-        assert info.vendor["depth_source"] == "measured"
-        assert info.vendor["timestamp_semantics"] == "source_capture_mapped"
-        assert info.vendor["clock_mapping"] == "shared_camera_mapper"
+        assert not {"depth_source", "timestamp_semantics", "clock_mapping"} & info.vendor.keys()
     assert fallback.source == "manual"
     assert runtime.source == "derived-from-K"
 
@@ -281,17 +279,13 @@ def test_a_full_angle_in_the_half_angle_field_is_refused():
     assert "half" in str(excinfo.value)
 
 
-def test_depth_capture_metadata_remains_unverified_and_matches_qualified_source():
+def test_depth_capture_metadata_keeps_routing_and_numeric_units_only():
     from noetix.bumi.camera_specs import depth_slam_source_declaration
     d = depth_slam_source_declaration('/robot/camera/depth', 'robot')
     assert d['topic'] == '/robot/camera/depth'
     assert d['format'] == 'image/depth-zlib'
     assert d['frame_id'] == 'robot_rgb_optical'
-    assert d['source_id'] == 'noetix/bumi/camera_color'
     assert d['frame_metadata_topic'] == '/robot/camera/depth/metadata'
-    assert d['clock_id'] == 'ros'
-    assert d['stamp_source'] == 'measurement'
     assert d['length_unit'] == 'mm'
-    assert d['clock']['verified'] is False
-    assert d['clock']['uncertainty_ns'] is None
+    assert not {'source_id', 'clock_id', 'stamp_source', 'clock', 'timestamp_note'} & d.keys()
     assert 'extrinsic' not in d, 'camera must not claim VO calibration'

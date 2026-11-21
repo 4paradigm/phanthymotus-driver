@@ -85,22 +85,11 @@ def depth_frame_metadata(capture, stamp_ns, frame_id, payload, source_generation
     An arrival-offset clock is never certified by a plausible-looking offset.
     Fallback frames have empty frame_id and intentionally get no sidecar.
     """
-    depth = capture['depth']
-    source_ms = float(depth['source_ms'])
-    source_ns = int(source_ms * 1_000_000)
     if type(stamp_ns) is not int or stamp_ns <= 0 or not frame_id:
         raise ValueError('only capture-mapped depth frames may have provenance')
     return {
         'schema': 'motus.slam_frame/1',
-        'stamp_ns': stamp_ns, 'frame_id': frame_id, 'clock_id': 'ros',
-        'clock_epoch': capture['epoch'],
-        'source_generation': source_generation,
-        'source_clock': str(depth['domain']),
-        'source_stamp': source_ms, 'source_unit': 'ms',
-        'mapping': {'method': capture['clock_mapping'],
-                    'version': 'shared_camera_mapper/1',
-                    'offset_ns': stamp_ns-source_ns,
-                    'verified': False, 'uncertainty_ns': None},
+        'stamp_ns': stamp_ns, 'frame_id': frame_id,
         'data_sha256': hashlib.sha256(bytes(payload)).hexdigest(),
     }
 

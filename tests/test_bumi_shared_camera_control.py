@@ -174,7 +174,8 @@ def test_body_imu_stop_ack_waits_for_publish_and_restart_rejects_queued_reads(ca
     device._camera_subprocess('robot')
     packets=[json.loads(m.data) for m in state.published['/robot/state/imu_calibrated']]
     assert blocked==[True]
-    assert len(packets)==2 and packets[0]['epoch']!=packets[1]['epoch']
+    assert len(packets)==2 and packets[0]['stamp_ns']<packets[1]['stamp_ns']
+    assert all('epoch' not in packet for packet in packets)
     assert packets[1]['stamp_ns']==10_045_000_000
     assert len(state.published['/robot/camera/color'])==3
     assert len(state.published['/robot/camera/depth'])==3

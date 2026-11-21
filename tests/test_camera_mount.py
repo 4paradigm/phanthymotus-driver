@@ -179,3 +179,38 @@ def test_missing_tf_reason_names_selected_frames_even_for_generic_lookup_error(s
     mount.buffer.failure = LookupError('not found')
     assert mount.publish(123) is False
     assert 'base_link' in node.messages[-1]['reason'] and 'optical' in node.messages[-1]['reason']
+
+
+def test_configured_fixed_mount_publishes_without_tf_or_visual_estimator(source, monkeypatch):
+    _, node = source
+    monkeypatch.setitem(sys.modules, 'tf2_ros', None)
+    module = importlib.import_module('common.camera_mount')
+    matrix = [[0., 0., 1., .15], [-1., 0., 0., -.03],
+              [0., -1., 0., .4], [0., 0., 0., 1.]]
+    mount = module.BodyMountSource(node, '/camera', body_frame='base_link',
+        camera_frame='optical', clock_id='capture', fixed_matrix=matrix)
+    matrix[0][3] = 99.  # The configured geometry must be copied.
+    assert mount.publish(12_345_678_901)
+    packet = node.messages[-1]
+    assert packet['stamp_ns'] == 12_345_678_901
+    assert packet['mode'] == 'static'
+    assert packet['matrix'] == [[0., 0., 1., .15], [-1., 0., 0., -.03],
+                                [0., -1., 0., .4], [0., 0., 0., 1.]]
+    assert mount.buffer is None and mount.listener is None
+    assert mount.publish(12_355_678_901)
+    assert node.messages[-1]['matrix'] == packet['matrix']
+
+
+@pytest.mark.parametrize('matrix', [
+    [], [[1., 0., 0., 0.]] * 4,
+    [[1., 0., 0., float('nan')], [0., 1., 0., 0.], [0., 0., 1., 0.], [0., 0., 0., 1.]],
+    [[-1., 0., 0., 0.], [0., 1., 0., 0.], [0., 0., 1., 0.], [0., 0., 0., 1.]],
+])
+def test_bad_fixed_geometry_only_disables_optional_mount(source, matrix):
+    _, node = source
+    module = importlib.import_module('common.camera_mount')
+    mount = module.BodyMountSource(node, '/camera', body_frame='base_link',
+        camera_frame='optical', clock_id='capture', fixed_matrix=matrix)
+    assert mount.publish(123) is False
+    assert node.messages[-1]['status'] == 'unavailable'
+    assert 'matrix' not in node.messages[-1]

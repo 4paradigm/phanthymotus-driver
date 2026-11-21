@@ -331,7 +331,7 @@ def test_capture_timed_depth_rejects_non_contract_dimensions(raw_ros):
     assert not messages['/robot/camera/depth']
 
 
-def test_depth_frame_sidecar_hashes_actual_zlib_and_keeps_clock_unverified(raw_ros, monkeypatch):
+def test_depth_frame_sidecar_keeps_actual_stamp_and_zlib_digest(raw_ros, monkeypatch):
     from noetix.bumi.visual_inputs import CaptureTimeMapper, CaptureTimedDepthPublisher
     import hashlib
     messages, node = raw_ros
@@ -350,14 +350,9 @@ def test_depth_frame_sidecar_hashes_actual_zlib_and_keeps_clock_unverified(raw_r
     assert sidecar['schema'] == 'motus.slam_frame/1'
     assert sidecar['stamp_ns'] == _stamp(msg)
     assert sidecar['frame_id'] == msg.header.frame_id == 'robot_rgb_optical'
-    assert sidecar['source_stamp'] == 1010
-    assert sidecar['clock_epoch'] == mapper.epoch
-    assert sidecar['source_generation'] == mapper.source_generation
     assert sidecar['data_sha256'] == hashlib.sha256(bytes(msg.data)).hexdigest()
-    assert sidecar['mapping']['verified'] is False
-    assert sidecar['mapping']['uncertainty_ns'] is None
-    assert (int(sidecar['source_stamp'] * 1_000_000)
-            + sidecar['mapping']['offset_ns'] == sidecar['stamp_ns'])
+    assert set(sidecar) == {'schema', 'stamp_ns', 'frame_id', 'data_sha256'}
+    assert sidecar['stamp_ns'] == 10_010_000_000
 
     # An invalid timestamp domain produces media for display but NEVER proof.
     bad = frames(ms=1033)

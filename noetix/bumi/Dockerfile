@@ -146,8 +146,8 @@ COPY device.py /work/device.py
 COPY loco_servo.py /work/loco_servo.py
 COPY imu_distance_control.py /work/imu_distance_control.py
 COPY leg_odometry.py /work/leg_odometry.py
-COPY odometry_fusion.py /work/odometry_fusion.py
-COPY fused_odometry.py /work/fused_odometry.py
+COPY leg_odometry_source.py /work/leg_odometry_source.py
+COPY leg_odometry_sensor.py /work/leg_odometry_sensor.py
 COPY camera_specs.py /work/camera_specs.py
 COPY rgbd_camera.py /work/rgbd_camera.py
 COPY body_imu.py /work/body_imu.py

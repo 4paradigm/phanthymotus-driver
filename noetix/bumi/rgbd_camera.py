@@ -3,7 +3,8 @@
 rs.align samples depth into the native color lens. Source depth-camera axial Z
 is converted to color-camera Z on the sampled color rays using SDK extrinsics.
 Both images are sampled on common rectified rays. Source capture times are
-mapped once, never replaced by publication time. This is a camera optical frame, with no assumed body mount.
+mapped once, never replaced by publication time. Body geometry is published
+separately using the configured numeric mount or the capture-time TF tree.
 """
 from array import array
 from copy import deepcopy
@@ -20,6 +21,30 @@ try:
     from .visual_odometry_contract import ClockMap
 except ImportError:
     from visual_odometry_contract import ClockMap
+
+
+def fixed_body_mount(config):
+    """Convert the existing installation numbers; no calibration labels needed."""
+    if not isinstance(config, dict) or config.get('fixed_mount') is False:
+        return None
+    mount = config.get('camera_to_body')
+    if mount is None:
+        return None
+    translation = np.asarray(mount['translation'], dtype=float)
+    q = np.asarray(mount['quaternion'], dtype=float)
+    if (translation.shape != (3,) or q.shape != (4,) or
+            not np.isfinite(translation).all() or not np.isfinite(q).all() or
+            not np.any(q)):
+        raise ValueError('camera_to_body requires finite translation and nonzero xyzw quaternion')
+    q = q / np.max(np.abs(q))
+    x, y, z, w = q / np.linalg.norm(q)
+    matrix = np.eye(4)
+    matrix[:3, :3] = [[1-2*(y*y+z*z), 2*(x*y-z*w), 2*(x*z+y*w)],
+                      [2*(x*y+z*w), 1-2*(x*x+z*z), 2*(y*z-x*w)],
+                      [2*(x*z-y*w), 2*(y*z+x*w), 1-2*(x*x+y*y)]]
+    matrix[:3, 3] = translation
+    return matrix.tolist()
+
 
 def make_geometry(intr):
     import cv2
@@ -71,19 +96,10 @@ def color_depth_geometry(intr, extrinsics):
 def camera_declarations(root, geometry, frame_id, clock_id, source_clock, offset_ns, *, source_epoch=None):
     common = dict(schema='motus.camera/1', id=root + '/rectified', width=640, height=480,
                   K=geometry['K'], D=[0.] * 5, distortion_model='pinhole',
-                  source='derived-from-K', vendor=dict(
-                      frame_id=frame_id, clock_id=clock_id, source_id=root, pose_reference='camera_optical',
-                      registration='registered_rectified',
-                      registration_source='realsense_align_depth_to_color_then_rectify_color_z',
-                      timestamp_semantics='source_capture_mapped',
-                      source_clock=source_clock, mapping_offset_ns=offset_ns,
-                      clock_mapping='fixed_arrival_offset' if source_clock == 'hardware_clock' else 'device_wall',
-                      clock_mapping_verified=False, clock_mapping_uncertainty_ns=None))
-    if source_epoch is not None:
-        common['vendor']['source_epoch'] = source_epoch
+                  source='derived-from-K', vendor=dict(frame_id=frame_id))
     color = dict(deepcopy(common), topic=root.removesuffix('/rgbd') + '/color', format='image/jpeg')
     depth = dict(deepcopy(common), topic=root.removesuffix('/rgbd') + '/depth', format='image/depth-zlib')
-    depth['vendor'].update(depth_unit='mm', depth_source='measured')
+    depth['vendor'].update(depth_unit='mm')
     return [color, depth]
 
 
@@ -91,7 +107,7 @@ class RgbdCameraPublisher:
     """Sole normalized RGB-D producer for display, capture and computation."""
 
     def __init__(self, node, namespace, pipeline, qos, *, report=lambda status: None,
-                 min_interval_s=0.):
+                 min_interval_s=0., mount_config=None):
         from sensor_msgs.msg import CompressedImage
         self.Message = CompressedImage
         self.root = f'/{namespace}/camera/rgbd'
@@ -116,10 +132,17 @@ class RgbdCameraPublisher:
         self.last_emit = None
         self.min_interval_s = min_interval_s
         from common.camera_mount import BodyMountSource
+        try:
+            fixed_matrix = fixed_body_mount(mount_config)
+        except (ValueError, TypeError, KeyError):
+            # An invalid optional mount must not stop the RGB-D image source.
+            # The mount producer reports this invalid matrix as unavailable.
+            fixed_matrix = []
         self.body_mount = BodyMountSource(node, self.root,
             body_frame=os.environ.get('CAMERA_BODY_FRAME', 'base_link'),
             camera_frame=lambda: self.frame_id,
-            clock_id=lambda: self.clock_id + '/' + str(self.clocks[0].domain))
+            clock_id=lambda: self.clock_id + '/' + str(self.clocks[0].domain),
+            fixed_matrix=fixed_matrix, numeric_only=True)
         self.mount_error = None
         self._reported_mount = None
         self.report(dict(ready=False, camera_info=[], error='awaiting calibrated capture',

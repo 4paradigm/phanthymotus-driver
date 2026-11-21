@@ -27,14 +27,11 @@ def _node(calibration):
     return node
 
 
-def test_assumed_bumi_mount_is_described_not_declared_calibrated():
+def test_legacy_labels_do_not_change_numeric_bumi_mount():
     mount = _node(ASSUMED).slam_extrinsic()
     assert mount['parent_frame'] == 'segment_base'
     assert mount['child_frame'] == 'ubuntu_rgb_optical'
-    assert mount['calibrated'] is False
-    assert mount['pose_reference'] == 'body_axes'
-    assert mount['source'] == 'bumi_axis_assumption'
-    assert mount['version'] == ASSUMED['calibration_id']
+    assert set(mount) == {'parent_frame', 'child_frame', 'mode', 'matrix'}
     np.testing.assert_allclose(mount['matrix'], [
         [0, 0, 1, 0], [-1, 0, 0, 0],
         [0, -1, 0, 0], [0, 0, 0, 1]])
@@ -44,21 +41,16 @@ def test_shipped_bumi_mount_keeps_numeric_axes_without_claiming_calibration():
     config_path = Path(__file__).resolve().parents[2] / 'noetix/bumi/config.yaml'
     calibration = yaml.safe_load(config_path.read_text())['plugins']['visual_odometry']['calibration']
     mount = _node(calibration).slam_extrinsic()
-    assert mount['calibrated'] is False
-    assert mount['source'] == 'bumi_axis_assumption'
-    assert mount['pose_reference'] == 'body_axes'
-    assert mount['version'] == 'assumed-level-forward-optical-to-body'
+    assert set(mount) == {'parent_frame', 'child_frame', 'mode', 'matrix'}
     np.testing.assert_allclose(mount['matrix'], [
         [0, 0, 1, 0], [-1, 0, 0, 0],
         [0, -1, 0, 0], [0, 0, 0, 1]])
 
 
-def test_measured_mount_is_distinguished_from_assumed_and_unknown():
+def test_measured_and_assumed_labels_produce_identical_numeric_geometry():
     measured = {**ASSUMED, 'assumed': False, 'calibration_id': 'survey-2026'}
     mount = _node(measured).slam_extrinsic()
-    assert mount['calibrated'] is True
-    assert mount['source'] == 'measured_mount'
-    assert mount['pose_reference'] == 'body'
+    assert mount == _node(ASSUMED).slam_extrinsic()
     assert _node(None).slam_extrinsic() is None
     no_frame = _node(measured)
     no_frame.frame_id = None
@@ -70,9 +62,7 @@ def test_depth_camera_info_advertises_frame_without_clock_proof():
     assert len(values) == 1
     hint = values[0]['vendor']['slam_geometry']
     assert hint['frame_id'] == 'ubuntu_rgb_optical'
-    assert hint['clock_id'] == 'ros'
-    assert hint['clock_verified'] is False
-    assert hint['clock_mapping'] == 'shared_camera_mapper'
+    assert not {'clock_id', 'clock_verified', 'clock_mapping'} & hint.keys()
     assert hint['observation_model'] == 'pinhole'
 
 
@@ -87,5 +77,5 @@ def test_depth_geometry_hint_survives_runtime_intrinsics_adoption():
     assert declaration['source'] == 'derived-from-K'
     hint = declaration['vendor']['slam_geometry']
     assert hint['frame_id'] == 'ubuntu_rgb_optical'
-    assert hint['clock_verified'] is False
+    assert 'clock_verified' not in hint
     assert declaration['vendor']['realsense_distortion_model'] == 'none'

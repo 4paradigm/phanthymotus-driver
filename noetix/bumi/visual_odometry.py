@@ -362,19 +362,10 @@ class VisualOdometryNode:
     def pose_reference(self):
         if self.calibration is None:
             return 'rgb_optical'
-        # `body` is reserved for a measured mount; the shipped level-forward
-        # convention is reported as body_axes so consumers never mistake an
-        # assumed axis mapping for a measured reference point.
-        return 'body_axes' if self.calibration.assumed else 'body'
+        return 'body'
 
     def slam_extrinsic(self):
-        """Describe and validate the installed mount, without assuming calibration.
-
-        In the public odometry message this is producer evidence, not a second
-        ROS topic or an extra canvas port. A generic consumer may use a
-        calibrated mount automatically, but must require an operator-supplied
-        matrix when the installed mount is only an axis assumption.
-        """
+        """Publish the numeric body-from-camera transform used by this node."""
         if self.calibration is None or not self.frame_id:
             return None
         mount = self.calibration.data['camera_to_body']
@@ -382,19 +373,12 @@ class VisualOdometryNode:
         translation = [float(v) for v in mount['translation']]
         matrix = [[*rotation[i], translation[i]] for i in range(3)]
         matrix.append([0., 0., 0., 1.])
-        # Validate the same shape expected from every robot's upstream source.
-        # This does not elevate an assumed axis mapping into calibrated evidence.
-        from common.spatial_slam import validate_mount
-        return validate_mount({
+        return {
             'mode': 'static',
             'parent_frame': self.base_frame(),
             'child_frame': self.frame_id,
             'matrix': matrix,
-            'source': 'bumi_axis_assumption' if self.calibration.assumed else 'measured_mount',
-            'version': self.calibration.id,
-            'calibrated': not self.calibration.assumed,
-            'pose_reference': self.pose_reference(),
-        }, parent_frame=self.base_frame(), child_frame=self.frame_id)
+        }
 
     def publish(self, *, emit=True):
         # A preflight info() query must not emit a synthetic sensor sample or
@@ -403,12 +387,6 @@ class VisualOdometryNode:
         sample = make_sample(self.health, self.now(), self.estimate, self.pose_reference())
         quality = sample['vendor']
         slam = quality['motus_slam']
-        # Odom and depth derive from the same RealSense capture-time mapper,
-        # which uses an arrival-offset approximation for hardware timestamps.
-        # Do not label this a verified independent-clock relation.
-        slam['source_id'] = 'noetix/bumi/camera_color'
-        slam['clock_mapping'] = 'shared_camera_mapper'
-        slam['clock_verified'] = False
         mount = self.slam_extrinsic()
         if mount is not None:
             slam['extrinsic'] = mount
@@ -476,7 +454,6 @@ class VisualOdometryNode:
         self.last_summary_ns, self.last_summary_state = now, state
 
     def info(self, *, read_only=False):
-        from common.odom import build_interface
         sample = self.publish(emit=not read_only)
         return dict(state='running' if self.active else 'idle',
                     topic_out=[{'topic': self.status_topic, 'format': 'data/json',
@@ -495,18 +472,11 @@ class VisualOdometryNode:
                                  '\nDisplacement is from the first tracking pose after reset, '
                                  'not accumulated path length.\nDiagnostics:\n'+
                                  json.dumps(sample, indent=2, allow_nan=False)),
-                    odom_interface={**build_interface(provides=[], rate_hz=20,
-                                                      pose_drift='unbounded'),
-                                    'slam_pose': {'available': True,
-                                                  'profile': 'motus_slam/1'}},
                     quality=sample['vendor'],
                     namespace=self.namespace,
                     pose_reference=self.pose_reference(),
-                    slam_geometry={'extrinsic': self.slam_extrinsic(),
-                                   'clock_mapping': 'shared_camera_mapper',
-                                   'clock_verified': False},
-                    segment_id=self.segment,
-                    calibration_id=self.calibration.id if self.calibration else None)
+                    slam_geometry={'extrinsic': self.slam_extrinsic()},
+                    segment_id=self.segment)
 
     def start(self):
         if not self.active:
@@ -641,9 +611,6 @@ class VisualOdometryNode:
                 or t != meta['rgb_stamp_ns']):
             raise ValueError('metadata does not describe paired images')
         self.health.observe('camera', t, self.now(), True)
-        self.health.details['camera_time_provenance'] = dict(
-            epoch=meta.get('epoch'), clock_mapping=meta.get('clock_mapping'),
-            depth_scale=meta.get('depth_scale'))
         if getattr(self, 'imu_assisted', False):
             imu_stamp = self.health.samples.get('imu')
             if imu_stamp is None or self.now()-imu_stamp > MAX_INPUT_AGE_NS:
@@ -808,8 +775,7 @@ class VisualOdometryNode:
             (yaw-self.yaw_origin_rad+math.pi) % (2.0*math.pi) - math.pi)
         self.health.observe('imu', stamp, stamp, True)
         self.health.details['imu_assistance']['input'] = dict(
-            source=self.imu_source, stamp_ns=stamp,
-            timestamp_source=timestamp_source, quaternion=q)
+            source=self.imu_source, stamp_ns=stamp, quaternion=q)
         out = Imu()
         out.header.stamp.sec, out.header.stamp.nanosec = divmod(stamp, 10**9)
         out.header.frame_id = self.base_frame()

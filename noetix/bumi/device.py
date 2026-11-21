@@ -261,10 +261,6 @@ class _BumiStateNode(Node):
                         # visual card uses this to reject delayed/replayed samples.
                         imu_data = {
                             "stamp_ns":     int(self.get_clock().now().nanoseconds),
-                            # The SDK exposes no hardware capture timestamp; this
-                            # is read-completion time, treated conservatively by
-                            # the visual card's 500 ms freshness window.
-                            "timestamp_source": "read_completion",
                             "quaternion":    [imu.ori[i] for i in range(4)],
                             "angular_vel":   [imu.angular_vel[i] for i in range(3)],
                             "linear_acc":    [imu.linear_acc[i] for i in range(3)],
@@ -2428,8 +2424,8 @@ def _camera_subprocess(namespace: str):
         if rgbd_inputs._clock_error:
             raise ValueError(rgbd_inputs._clock_error)
         return rgbd_inputs.frame_id, rgbd_inputs.clock_id + '/' + rgbd_inputs.clocks[0].domain
-    imu = BodyImuSource(namespace, json.loads(os.environ.get('BUMI_BODY_IMU_MOUNT', 'null')),
-                        body_reference)
+    mount_config = json.loads(os.environ.get('BUMI_BODY_IMU_MOUNT', 'null'))
+    imu = BodyImuSource(namespace, mount_config, body_reference)
     def body_reading(message):
         with control_lock:
             if 'imu' not in enabled_cards:
@@ -2537,7 +2533,8 @@ def _camera_subprocess(namespace: str):
     try:
         from rgbd_camera import RgbdCameraPublisher
         rgbd_inputs = RgbdCameraPublisher(node, namespace, pipeline, _QOS,
-                                        report=report_rgbd, min_interval_s=0.)
+                                        report=report_rgbd, min_interval_s=0.,
+                                        mount_config=mount_config)
         rgbd_inputs.set_enabled(enabled_cards)
     except Exception as exc:
         report_rgbd(dict(ready=False, camera_info=[], error=str(exc), retryable=False))
