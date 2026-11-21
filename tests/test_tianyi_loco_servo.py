@@ -725,6 +725,17 @@ def test_timing_separates_input_ttl_age_from_receipt_watchdog_budget(setup):
     assert plugin._backend.deadlines[-1] == pytest.approx(original["stamp_ms"] + 90 + 500, abs=1)
 
 
+@pytest.mark.parametrize("age_ms,accepted", [(668, True), (801, False)])
+def test_tianyi_navigation_admits_briefly_delayed_observation(setup, age_ms, accepted):
+    plugin = start(setup)
+    now = int(setup.clock.time() * 1000)
+    send(plugin, command(setup, obs_stamp_ms=now - age_ms))
+    assert bool(plugin._counts["accepted"]) is accepted
+    rate = plugin._info()["control_interface"]["rate"]
+    assert rate["max_obs_age_ms"] == 800
+    assert rate["max_feedback_gap_ms"] == 350
+
+
 def test_zero_is_prioritized_and_cannot_be_overwritten_by_a_later_motion(setup):
     plugin = start(setup)
     for cmd in (command(setup), command(setup, [0] * 6, seq=2), command(setup, seq=3)):
