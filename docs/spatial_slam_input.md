@@ -74,11 +74,12 @@ these common required fields:
 | `schema` | Literal `motus.slam_input/1` |
 | `topic` | Exact connected ROS topic |
 | `format`, `kind` | `state/odom` + `pose` or `sensor/pointcloud2` + `cloud` |
-| `source_id` | Nonempty sensor/producer source ID, not `unknown` |
-| `clock_id` | Nonempty shared clock label, not `unknown` |
-| `reference_point` | Nonempty description of what position is reported |
-| `stamp_source` | `measurement` |
 | `length_unit` | `m` |
+
+The declaration may include `source_id` (producer identity), `clock_id`
+(clock label), `reference_point` (the point whose position is reported), and
+`stamp_source` (timestamp provenance). These fields are optional port
+metadata. Tracking samples and frame packets have their own timestamp checks.
 
 Pose declarations additionally require `child_frame_id` (same reference
 frame as each tracking sample), with optional `pose_reference`, `frame_id`
@@ -96,11 +97,11 @@ Cloud declarations additionally require:
 | `clock.mapping` | Nonempty mapping method identifier |
 | `extrinsic` | Complete static or dynamic mount declaration, on cloud or pose |
 
-Cloud and pose `clock_id` must match. When `source_id` differs, both
-producers must provide a **verified** relationship with the same nonempty
-`clock.relation_id`. For the strict `motus.slam_input/1` path, both
-`clock.verified` must be `true`, and `extrinsic.calibrated` must be
-`true`; a clock name or arrival-time approximation is not proof.
+To declare a verified pose/cloud clock relationship, supply matching
+`clock_id` values. When the producers are different, both declarations must
+provide the same nonempty verified `clock.relation_id`. A strict setup uses
+measurement timestamps, sets both `clock.verified` values to `true`, and
+requires `extrinsic.calibrated` to be `true`.
 
 Example (identical sensor frame and odometry child frame, static identity mount):
 

@@ -10,6 +10,7 @@ from types import SimpleNamespace as NS
 import numpy as np
 import pytest
 
+from common.spatial_slam import validate_input_port
 from noetix.bumi.visual_odometry_contract import (CameraCalibration, ClockMap, Health,
                                     camera_to_body, finite, make_sample, quat_matrix,
                                     slam_input_declaration)
@@ -276,7 +277,8 @@ def test_slam_input_declaration_only_contains_port_and_pose_geometry():
     assert declaration['topic'] == '/bumi/vo/odom'
     assert declaration['format'] == 'state/odom'
     assert declaration['schema'] == 'motus.slam_input/1'
-    assert not {'clock', 'clock_id', 'stamp_source', 'source_id'} & declaration.keys()
+    assert not {'clock', 'clock_id', 'reference_point', 'stamp_source', 'source_id'} & declaration.keys()
+    assert validate_input_port(declaration) is declaration
     assert declaration['child_frame_id'] == 's_base'
     assert declaration['segment_id'] == 's'
     assert 'extrinsic' not in declaration

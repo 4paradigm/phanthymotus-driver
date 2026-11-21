@@ -104,6 +104,13 @@ def test_input_port_geometry_and_formats():
     for kind in ('pose', 'cloud'):
         item = port(kind)
         assert validate_input_port(item) is item
+        for key in ('source_id', 'clock_id', 'reference_point', 'stamp_source'):
+            del item[key]
+        assert validate_input_port(item) is item
+    invalid = port('pose')
+    invalid['length_unit'] = 'cm'
+    with pytest.raises(SpatialSlamError, match='meters'):
+        validate_input_port(invalid)
     invalid = port('cloud')
     invalid['format'] = 'sensor/pointcloud'
     with pytest.raises(SpatialSlamError, match='format/kind'):

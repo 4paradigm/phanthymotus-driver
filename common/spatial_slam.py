@@ -93,11 +93,10 @@ def validate_input_port(port):
     fmt, kind = port.get('format'), port.get('kind')
     if (fmt, kind) not in ((POSE_FORMAT, 'pose'), (CLOUD_FORMAT, 'cloud')):
         raise SpatialSlamError('input format/kind must be native pose or PointCloud2')
-    for key in ('topic', 'source_id', 'clock_id', 'reference_point'):
-        if not _text(port.get(key)):
-            raise SpatialSlamError('input.' + key + ' is required')
-    if port.get('stamp_source') != 'measurement' or port.get('length_unit') != 'm':
-        raise SpatialSlamError('input requires measurement timestamps and meters')
+    if not _text(port.get('topic')):
+        raise SpatialSlamError('input.topic is required')
+    if port.get('length_unit') != 'm':
+        raise SpatialSlamError('input length unit must be meters')
     if kind == 'pose':
         if not _text(port.get('child_frame_id')):
             raise SpatialSlamError('pose input.child_frame_id is required')
