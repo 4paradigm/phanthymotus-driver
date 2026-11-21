@@ -44,6 +44,8 @@ plugins:
     enabled: true
     # Opt-in estimated installation; requires the read-only companion node.
     estimated_body_tf: false
+    # Optional same-frame transform delivery wait. Cap at 150 ms.
+    capture_tf_wait_ms: 40
     # The sole calibrated depth output serves display, VO and Point Cloud.
     # Limit the shared stream by capture time and keep only the newest pair.
     hz: 8

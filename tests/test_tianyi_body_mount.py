@@ -426,7 +426,7 @@ def test_wait_for_capture_tf_does_not_block_camera_executor(source, monkeypatch)
         return True
     source.body_mount.buffer.can_transform = available
     emit(source)
-    assert waits == [('base_link', 'head_optical', STAMP, .15)]
+    assert waits == [('base_link', 'head_optical', STAMP, .04)]
     packets = [json.loads(msg.data) for topic, msg in source.events if topic.endswith('/body_mount')]
     assert packets[-1]['status'] == 'available'
     assert packets[-1]['stamp_ns'] == STAMP
@@ -455,8 +455,9 @@ def test_tf_wait_timeout_keeps_images_but_never_reuses_transform(source, monkeyp
     assert any(topic.endswith('/depth') for topic, msg in source.events)
 
 
-def test_tf_arriving_after_50ms_retains_exact_capture_stamp(source, monkeypatch):
+def test_longer_opt_in_tf_wait_retains_exact_capture_stamp(source, monkeypatch):
     source.count = 1
+    source.capture_tf_wait_s = .15
     monkeypatch.setitem(sys.modules, 'rclpy.duration', NS(Duration=lambda **kw: NS(**kw)))
     source.body_mount.buffer.fail = True
     def delayed(target, child, stamp, timeout):
@@ -482,7 +483,7 @@ def test_worker_discards_capture_that_expires_during_tf_wait(source, monkeypatch
         return original_get(*args, **kwargs)
     monkeypatch.setattr(source.pending, 'get', get)
     monkeypatch.setattr(source.body_mount, 'wait_for_capture',
-                        lambda stamp: monkeypatch.setattr(m.time, 'time_ns', lambda: STAMP + age))
+                        lambda stamp, **kwargs: monkeypatch.setattr(m.time, 'time_ns', lambda: STAMP + age))
     emit(source)
     assert source.events == []
     assert source.error is None and source.running

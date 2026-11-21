@@ -163,6 +163,7 @@ class RgbdCameraPlugin:
         self.parameter_stage = 'service'
         self.parameter_values = {}
         self.imu_enabled = config.get('imu_enabled', True)
+        self.capture_tf_wait_s = max(0., min(.15, float(config.get('capture_tf_wait_ms', 40)) / 1000))
         self.imu_attached = False
         self.imu_reason = 'waiting for camera motion samples and TF'
         self.imu_samples = {kind: deque(maxlen=512) for kind in ('gyro', 'accel')}
@@ -718,10 +719,10 @@ class RgbdCameraPlugin:
                 out_depth.format = '16UC1; compressedDepth zlib'
                 out_depth.data = array('B', zlib_compress(metric.astype('<u2', copy=False).tobytes(), 1))
                 encoded = time.monotonic()
-                # Publish the first pair immediately. Later pairs may wait for
-                # TF outside the lock if the 150 ms wait plus scheduling margin fits.
-                if self.count and _fresh_images(color, depth, reserve_ns=170_000_000):
-                    self.body_mount.wait_for_capture(max(_stamp(color), _stamp(depth)))
+                # Exact capture TF remains optional for RGB-D publication.
+                wait_s = self.capture_tf_wait_s
+                if self.count and wait_s and _fresh_images(color, depth, reserve_ns=round(wait_s * 1e9) + 20_000_000):
+                    self.body_mount.wait_for_capture(max(_stamp(color), _stamp(depth)), timeout_s=wait_s)
                 tf_ready = time.monotonic()
                 with self.lock:
                     if not self.running or self.stop_event.is_set():

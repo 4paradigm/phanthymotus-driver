@@ -73,11 +73,11 @@ class BodyMountSource:
     def status(self):
         return dict(self.declaration(), stamp_ns=self._stamp_ns)
 
-    def wait_for_capture(self, stamp_ns):
+    def wait_for_capture(self, stamp_ns, *, timeout_s=.15):
         """Let native TF arrive without publishing or substituting another stamp.
 
         Call outside camera locks: the TF listener shares its image executor.
-        The bounded 150 ms delivery wait does not change any synchronization/error budget.
+        The delivery wait does not change the synchronization or error budget.
         """
         if self._closed or self.buffer is None or self.capture_evidence is not None:
             return
@@ -86,7 +86,7 @@ class BodyMountSource:
             from rclpy.clock import ClockType
             from rclpy.duration import Duration
             self.buffer.can_transform(self._value(self.body_frame), self._value(self.camera_frame),
-                Time(nanoseconds=stamp_ns, clock_type=ClockType.ROS_TIME), timeout=Duration(seconds=.15))
+                Time(nanoseconds=stamp_ns, clock_type=ClockType.ROS_TIME), timeout=Duration(seconds=timeout_s))
         except Exception:
             pass  # publish() retains the exact lookup failure and diagnostic.
 

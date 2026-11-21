@@ -18,7 +18,7 @@ from slamtec_velocity import (ChassisBusy, CommandLeaseExpired,
 
 INPUT_TOPIC = "/actucore/navi/cmd"
 WATCHDOG_MS = 500
-MAX_OBS_AGE_MS = 800
+MAX_OBS_AGE_MS = 1200
 MAX_FEEDBACK_GAP_MS = 350
 CANCEL_AFTER_MS = 1000
 FOLLOW_KEYS = ("wz_limit",)
