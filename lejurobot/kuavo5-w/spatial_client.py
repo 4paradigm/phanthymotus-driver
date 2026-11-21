@@ -10,6 +10,7 @@ import os
 import socket
 import secrets
 from pathlib import Path
+import threading
 import time
 import urllib.request
 
@@ -44,6 +45,7 @@ class JatenClient:
         self.base = 'http://' + address + ':8888'
         self.ws_url = 'ws://' + address + ':8888/ws/home'
         self._http = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        self._ws_lock = threading.Lock()
         self._source = (Path(__file__).parent / 'host/navigation_rpc.py').read_text()
 
     def native(self, operation, **args):
@@ -52,7 +54,20 @@ class JatenClient:
         secrets = load_secrets(os.environ.get('KUAVO_SSH_SECRETS', str(manager.state_dir / 'ssh-secrets.json')))
         request = {'operation': operation, 'args': args, 'ros_ip': target['ros_ip'],
                    'master': manager.settings.get('master', 'http://192.168.26.1:11311')}
-        response = manager.transport.run('chassis', target, request, self._source, secrets, timeout=45 if operation in ('prepare', 'soft_stop') else 25 if operation == 'cancel' else 15)
+        source = self._source
+        timeout = 45 if operation in ('prepare', 'soft_stop') else 25 if operation == 'cancel' else 15
+        if operation == 'relocalize':
+            helper = (Path(__file__).parent / 'host/map_relocalize.py').read_text()
+            # Load the same ROS libraries as the factory Cartographer process.
+            source = 'HELPER = ' + repr(helper) + '\n' + """
+import os, subprocess, sys
+environment = dict(os.environ, LD_LIBRARY_PATH='/opt/ros/noetic/lib:/opt/jaten/lib')
+result = subprocess.run([sys.executable, '-c', HELPER], input=sys.stdin.read(), text=True,
+                        capture_output=True, env=environment, timeout=22, check=True)
+print(result.stdout, end='')
+"""
+            timeout = 28
+        response = manager.transport.run('chassis', target, request, source, secrets, timeout=timeout)
         result = response.get('result')
         if not isinstance(result, dict):
             raise RuntimeError('invalid_native_navigation_response')
@@ -113,30 +128,29 @@ class JatenClient:
         return None, None
 
     def pose_observations(self, active):
-        """Read the JaTen broadcast without making a request per pose sample."""
-        import websocket
-        required = {'pose2d', 'agvState', 'state', 'localizationStatus'}
-        seen, received = {}, {}
-        # Bound each subscription to the lifetime of its verified map identity.
+        """Yield fresh snapshots without monopolizing the factory websocket."""
         end = time.monotonic() + 10
-        try:
-            with closing(websocket.create_connection(self.ws_url, timeout=2, http_proxy_host=None)) as ws:
-                ws.settimeout(.5)
-                while active() and time.monotonic() < end:
-                    try:
-                        key, data = self._observation_frame(self._frame(ws.recv()))
-                    except websocket.WebSocketTimeoutException:
-                        continue
-                    if key is None:
-                        continue
-                    now = time.monotonic()
-                    seen[key], received[key] = data, now
-                    if required <= {key for key, at in received.items() if now-at <= 2.}:
-                        yield dict(seen), received['pose2d']
-        except (OSError, websocket.WebSocketException):
-            return
+        while active() and time.monotonic() < end:
+            try:
+                observation, received = self._snapshot(None)
+            except NavigationStateUnavailable:
+                return
+            if active():
+                yield observation, received['pose2d']
 
     def observe(self, required=None):
+        return self._snapshot(required)[0]
+
+    def _snapshot(self, required):
+        fields = tuple(required or ('pose2d', 'agvState', 'state', 'localizationStatus'))
+        if not self._ws_lock.acquire(timeout=5):
+            raise NavigationStateUnavailable(fields, 'factory_socket_busy')
+        try:
+            return self._observe_socket(fields)
+        finally:
+            self._ws_lock.release()
+
+    def _observe_socket(self, required):
         # Base readiness needs fresh faults/driving, not map localization. A
         # navigation request still uses all four fields by default.
         import websocket
@@ -160,12 +174,20 @@ class JatenClient:
                     if key is not None:
                         seen[key], received[key] = data, time.monotonic()
                     if not missing():
-                        return seen
+                        return seen, received
         except (OSError, socket.timeout, websocket.WebSocketException):
             raise NavigationStateUnavailable(missing(), 'connection') from None
         raise NavigationStateUnavailable(missing())
 
     def command(self, method, params, timeout=25):
+        if not self._ws_lock.acquire(timeout=min(7., timeout)):
+            raise TimeoutError('factory_socket_busy_before_command')
+        try:
+            return self._command_socket(method, params, timeout)
+        finally:
+            self._ws_lock.release()
+
+    def _command_socket(self, method, params, timeout):
         import websocket
         if method not in self.COMMANDS:
             raise ValueError('unsupported_map_command')

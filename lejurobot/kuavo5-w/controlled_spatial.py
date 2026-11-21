@@ -76,11 +76,18 @@ class SpatialStore:
             self.db().commit()
             return cursor.rowcount > 0
 
-    def bind_mapping(self, previous, identity):
+    def bind_mapping(self, previous, identity, start_pose=None):
         with self.lock:
-            self.db().execute('UPDATE tags SET map_id=?,fingerprint=? WHERE map_id=? AND fingerprint=?',
-                              (*identity, *previous))
-            self.db().commit()
+            with self.db() as db:
+                db.execute('UPDATE tags SET map_id=?,fingerprint=? WHERE map_id=? AND fingerprint=?',
+                           (*identity, *previous))
+                if start_pose is not None:
+                    db.execute('INSERT OR REPLACE INTO state VALUES (?, ?)',
+                               (self.anchor_key(identity), json.dumps(start_pose)))
+
+    @staticmethod
+    def anchor_key(identity):
+        return 'mapping_anchor:' + json.dumps(identity, ensure_ascii=False)
 
     def close(self):
         with self.lock:
@@ -93,6 +100,7 @@ class ControlledSpatialPlugin:
     PREFIX, CHANNEL = 'controlled_spatial', 'base'
     NAV_TIMEOUT = 150.
     NAV_HANDOFF_GRACE = 5.
+    LOAD_LOCALIZATION_WAIT = 8.
     ACTIONS = {
         'start_mapping': (['map_name'], '开始厂商Cartographer建图；人工控制底盘采集'),
         'stop_mapping': ([], '保存当前建图，重启厂商地图服务并确认地图身份'),
@@ -103,7 +111,7 @@ class ControlledSpatialPlugin:
         'get_pose': ([], '读取当前地图定位，x/y 为米，yaw 为弧度'),
         'delete_map': (['map_name', 'confirm_delete'], '备份并从底盘移除指定的非活动地图'),
         'upload_map': (['map_name'], '从上位机归档恢复完整地图到厂商底盘，可随后载入'),
-        'load_map': (['map_name'], '载入已有地图，确认地图身份；不伪造初始定位'),
+        'load_map': (['map_name'], '在建图起点附近载入地图，以记录的起点辅助定位并核对结果'),
         'navigate_to_pose': (['x', 'y', 'yaw', 'speed'], '导航到map系位姿，按任务ID跟踪ACP'),
         'navigate_to_tag': (['tag_name', 'speed'], '导航到当前地图的语义点'),
         'stop_nav': ([], '原生取消当前导航并确认新鲜里程计停稳'),
@@ -397,7 +405,7 @@ class ControlledSpatialPlugin:
             raise RuntimeError('invalid_map_fingerprint')
         return text(name, 'map_id'), fingerprint
 
-    def _observation(self, navigable=False):
+    def _observation(self, navigable=False, identity=None):
         observation = self.client.observe()
         pose = observation['pose2d']
         result = {'x': number(pose.get('x'), 'x'), 'y': number(pose.get('y'), 'y'),
@@ -416,7 +424,7 @@ class ControlledSpatialPlugin:
                 raise RuntimeError('chassis_stop_or_fault_is_active: ' + ','.join(k for k in flags if agv.get(k) is not False))
             if observation['localizationStatus'].get('cartoStatusId') != 1:
                 raise RuntimeError('cartographer_localization_not_ready')
-        if navigable and state['agvPosition'].get('mapId') != self._identity()[0]:
+        if navigable and state['agvPosition'].get('mapId') != (identity or self._identity())[0]:
             raise RuntimeError('pose_map_identity_mismatch')
         return result, observation
 
@@ -529,6 +537,8 @@ class ControlledSpatialPlugin:
         if self.store.state('mapping'):
             raise RuntimeError('stop_mapping_before_navigation')
         identity = self._identity()
+        if self.store.state('unconfirmed:' + self.store.anchor_key(identity)):
+            raise RuntimeError('map_relocalization_unconfirmed_load_map_again')
         if action == 'navigate_to_tag':
             name = text(args.get('tag_name'), 'tag_name')
             matches = [p for p in self.store.tags(identity) if p['name'] == name]
@@ -546,7 +556,7 @@ class ControlledSpatialPlugin:
         # All potentially blocking IO is outside the publication/tracker lock.
         epoch = self.bundle._stop_epoch
         self.client.native('probe')
-        self._observation(navigable=True)
+        self._observation(navigable=True, identity=identity)
         if self._identity() != identity:
             raise RuntimeError('map_changed_during_navigation_preflight')
         # Explicit discrete commands have priority over the continuous stream.
@@ -555,7 +565,8 @@ class ControlledSpatialPlugin:
         aid, cancelled, generation, issued, preparation = self.bundle.start_motion(
             'base', self.PREFIX, (3,), lambda: None, validate, request_epoch=epoch)
         # The worker owns the external service, including any late response.
-        record = {'action_id': aid, 'task_id': None, 'identity': identity, 'target': target}
+        record = {'action_id': aid, 'task_id': None, 'identity': identity, 'target': target,
+                  'submission_started': False}
         with self.bundle.tracker.lock:
             if cancelled.is_set():
                 return {'state': 'error', 'error': 'navigation_superseded_by_stop'}
@@ -572,14 +583,33 @@ class ControlledSpatialPlugin:
                                    'chassis_selected_nav_mpc_move_base')
 
         def worker():
+            submitted = False
             try:
+                # A fresh socket can time out even while other snapshots are
+                # healthy. Retry read-only preflight once, before any goal RPC.
+                for attempt in range(2):
+                    if cancelled.is_set():
+                        return
+                    try:
+                        self._observation(navigable=True, identity=identity)
+                        break
+                    except NavigationStateUnavailable:
+                        if attempt:
+                            raise
                 if self._identity() != identity:
                     raise RuntimeError('map_changed_before_native_submit')
-                self._observation(navigable=True)
                 with self._native_lock:
                     if cancelled.is_set():
                         return
+                    with self.bundle.tracker.lock:
+                        if not self.bundle.tracker.current('base', aid):
+                            return
+                        self.bundle.require_base_control(self.PREFIX)
+                        if self.bundle.ros1.connection != (True, generation):
+                            raise RuntimeError('navigation_control_connection_changed')
                     self._uncertain = True
+                    submitted = True
+                    record['submission_started'] = True
                     self._persist()
                     response = self.client.native('navigate', **target, speed=speed)
                     if response.get('success') is False:
@@ -612,7 +642,7 @@ class ControlledSpatialPlugin:
                     if self._identity() != identity:
                         raise RuntimeError('map_identity_changed_during_navigation')
                     try:
-                        self._observation(navigable=True)
+                        self._observation(navigable=True, identity=identity)
                     except NavigationStateUnavailable:
                         check_velocity_source(accepted_at)
                         raise
@@ -631,7 +661,7 @@ class ControlledSpatialPlugin:
                     if code == 3:
                         raise RuntimeError('native_navigation_failed')
                     if code == 2 and status.get('arrived') is True:
-                        pose, observation = self._observation(navigable=True)
+                        pose, observation = self._observation(navigable=True, identity=identity)
                         if observation['state'].get('driving') is not False:
                             continue
                         error = math.hypot(pose['x'] - target['x'], pose['y'] - target['y'])
@@ -652,6 +682,8 @@ class ControlledSpatialPlugin:
                         return
             except Exception as exc:
                 detail = str(exc)[:160].encode('unicode_escape').decode('ascii')[:200]
+                if not submitted:
+                    detail = 'preflight_failed_no_goal_sent: ' + detail
                 self.bundle.pause('native_navigation_failed_or_unconfirmed: ' + detail,
                                   status='error', expected=('base', aid))
             finally:
@@ -687,9 +719,12 @@ class ControlledSpatialPlugin:
             if self._task is None and not self._uncertain:
                 return
             uncertain = self._uncertain
-            response = self.client.native('cancel')
+            not_submitted = self._task is not None and self._task.get('submission_started') is False and not uncertain
+            response = self.client.native('soft_stop' if not_submitted else 'cancel')
             if response.get('success') is not True or response.get('stationary') is not True:
                 raise RuntimeError('native_navigation_stop_unconfirmed')
+            if not_submitted and response.get('software_estop') is not True:
+                raise RuntimeError('chassis_soft_stop_unconfirmed')
             if uncertain:
                 raise RuntimeError('older_navigation_submit_unresolved_stop_cannot_be_confirmed')
             self._task = None
@@ -908,6 +943,13 @@ class ControlledSpatialPlugin:
                 state = self.client.observe()['agvState']
                 return state.get('isMapping') is True and state.get('runningMode') == 'AUTO'
             self._wait(mapping_remote_ready, cancelled)
+            try:
+                self._require_stationary()
+                start_pose, sample = self._observation()
+                if sample['agvState'].get('isMapping') is True:
+                    mapping['start_pose'] = start_pose
+            except (RuntimeError, ValueError, TimeoutError):
+                pass
             mapping['phase'] = 'mapping'
             self.store.state('mapping', mapping)
             return {'state': 'mapping', 'map_name': name,
@@ -940,19 +982,78 @@ class ControlledSpatialPlugin:
             self._wait(lambda: self.client.observe()['agvState'].get('isMapping') is False, cancelled, 60)
             self._load(mapping['name'], cancelled)
             new_identity = self._identity()
-            self.store.bind_mapping((mapping['name'], mapping['token']), new_identity)
+            self.store.bind_mapping((mapping['name'], mapping['token']), new_identity,
+                                    mapping.get('start_pose'))
             self.store.state('mapping', None)
-            return {'state': 'completed', 'map_name': new_identity[0], 'map_fingerprint': new_identity[1]}
+            return {'state': 'completed', 'map_name': new_identity[0], 'map_fingerprint': new_identity[1],
+                    'mapping_start_pose': mapping.get('start_pose')}
         if action == 'load_map':
             if mapping:
                 raise RuntimeError('finish_or_reconcile_mapping_before_loading')
             name = text(args.get('map_name'), 'map_name')
             if name not in [Path(m.get('fileName', '')).stem for m in self.client.maps()]:
                 raise ValueError('grid_map_not_found')
-            self._load(name, cancelled)
+            identity = self._load(name, cancelled)
+            anchor = self.store.state(self.store.anchor_key(identity))
+            correction = self._relocalize(identity, anchor, cancelled) if anchor is not None else None
+            # Loading the files and initializing Cartographer are separate.
+            # Give the factory localizer time to initialize without replaying
+            # the map change or treating missing feedback as an unresolved write.
+            localization, feedback = self._loaded_map_localization(name, cancelled)
+            if correction is not None:
+                localization['anchor'] = correction
+                if (correction.get('state') not in ('corrected', 'already_aligned')
+                        or self.store.state('unconfirmed:' + self.store.anchor_key(identity))):
+                    localization.update(state='unconfirmed', reason='anchor_relocalization_not_verified')
             return {'state': 'completed', 'map_name': name,
-                    'localization_required': True, 'feedback': self.client.observe()}
+                    'localization_required': localization['state'] != 'initialized',
+                    'localization': localization, 'feedback': feedback}
         raise ValueError('unsupported_map_action')
+
+    def _relocalize(self, identity, anchor, cancelled):
+        anchor = {key: number(anchor[key], key) for key in ('x', 'y', 'yaw')}
+        try:
+            self._require_stationary()
+        except (RuntimeError, TimeoutError):
+            return {'state': 'stationary_pause_required'}
+        if cancelled.is_set() or self._identity() != identity:
+            raise RuntimeError('map_changed_or_stopped_before_relocalization')
+        key = 'unconfirmed:' + self.store.anchor_key(identity)
+        previous = self.store.state(key)
+        self.store.state(key, True)
+        try:
+            result = self.client.native('relocalize', anchor=anchor)
+        except Exception:
+            return {'state': 'relocalization_delivery_unconfirmed'}
+        state = result.get('state')
+        if state in ('corrected', 'already_aligned') and self._identity() == identity:
+            self.store.state(key, None)
+        elif state in ('stationary_pause_required', 'invalid_map_or_scan', 'insufficient_scan',
+                       'unsupported_localization_receiver', 'relocalization_precondition_lost'):
+            # These states occur before any initial pose is published.
+            self.store.state(key, previous)
+        return result
+
+    def _loaded_map_localization(self, name, cancelled):
+        end = min(self._map_deadline, time.monotonic() + self.LOAD_LOCALIZATION_WAIT)
+        feedback = None
+        while not cancelled.is_set() and time.monotonic() < end:
+            try:
+                feedback = self.client.observe()
+            except NavigationStateUnavailable:
+                feedback = None
+            if feedback is not None:
+                position = feedback['state'].get('agvPosition', {})
+                status = feedback['localizationStatus']
+                if (position.get('mapId') == name and position.get('positionInitialized') is True
+                        and status.get('cartoStatusId') == 1
+                        and feedback['agvState'].get('isMapping') is False
+                        and feedback['agvState'].get('runningMode') == 'AUTO'):
+                    score = status.get('score')
+                    return {'state': 'initialized',
+                            'score': score if type(score) in (float, int) and math.isfinite(score) else None}, feedback
+            cancelled.wait(min(.5, max(0., end - time.monotonic())))
+        return {'state': 'unconfirmed', 'reason': 'factory_localization_not_confirmed'}, feedback
 
     def _command(self, method, params, cancelled):
         if cancelled.is_set():
@@ -994,7 +1095,7 @@ class ControlledSpatialPlugin:
                     and observation['state'].get('agvPosition', {}).get('mapId') == name
                     and observation['state']['agvPosition'].get('positionInitialized') is True):
                 self._command('ChangeMode', {'mode': 'AUTO'}, cancelled)
-                return  # Same content AND confirmed active localization, not just a matching name.
+                return identity
         self._command('ChangeMode', {'mode': 'MANUAL'}, cancelled)
         self._command('ChangeCartoMap', {'mapName': name}, cancelled)
         self._command('ChangeRoadMap', {'mapName': name}, cancelled)
@@ -1004,6 +1105,7 @@ class ControlledSpatialPlugin:
         if identity[0] != name:
             raise RuntimeError('map_changed_during_load_confirmation')
         self.store.state('loaded_map_identity', list(identity))
+        return identity
 
     def _wait(self, predicate, cancelled, timeout=30):
         end = min(time.monotonic() + timeout, self._map_deadline)

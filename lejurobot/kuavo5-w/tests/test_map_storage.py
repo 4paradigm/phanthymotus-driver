@@ -204,6 +204,7 @@ class LoadEfficiencyTests(unittest.TestCase):
         self.assertEqual(self.plugin.store.state('last_map_operation')['state'],'completed')
 
     def test_same_name_with_changed_content_or_missing_localization_forces_real_load(self):
+        self.plugin.LOAD_LOCALIZATION_WAIT = .01
         self.load()
         for changed in ('identity','localization'):
             self.client.commands.clear()

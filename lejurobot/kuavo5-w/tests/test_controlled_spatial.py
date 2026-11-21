@@ -56,6 +56,11 @@ class Bundle:
     def control_ownership(self):
         return {'mode_policy': 'BaseArm'}
 
+    def require_base_control(self, tool):
+        self.state.require_motion((3,))
+        if self.state.read('upper_velocity_enabled')[0] is not False:
+            raise RuntimeError('base velocity ownership changed')
+
     def prepare_mapping_velocity(self, request_epoch):
         if request_epoch != self._stop_epoch:
             raise RuntimeError('superseded')
@@ -594,6 +599,9 @@ class SpatialTests(unittest.TestCase):
         self.assertEqual(self.call('stop_mapping')['state'], 'executing')
         self.assertEqual(self.completed()[0], 'completed')
         self.assertIsNone(self.plugin.store.state('mapping'))
+        identity = self.client.identity
+        self.assertEqual(self.plugin.store.state(self.plugin.store.anchor_key(identity)),
+                         {'x': 1., 'y': 2., 'yaw': .3})
         self.assertEqual(self.call('list_tags')['tags'][0]['name'], 'entry')
         self.assertEqual(self.client.commands[-1], ('ChangeMode', {'mode': 'AUTO'}))
         self.assertFalse(self.plugin.unresolved())
@@ -627,13 +635,50 @@ class SpatialTests(unittest.TestCase):
         self.assertTrue(self.plugin.unresolved())
 
     def test_loading_does_not_clear_stop_or_forge_localization(self):
+        self.plugin.LOAD_LOCALIZATION_WAIT = .01
         self.client.feedback['agvState']['softwareEstop'] = True
         self.client.feedback['state']['agvPosition']['positionInitialized'] = False
         self.assertEqual(self.call('load_map', map_name='other')['state'], 'executing')
-        self.assertEqual(self.completed()[0], 'completed')
+        status, result = self.completed()
+        self.assertEqual(status, 'completed')
+        self.assertTrue(result['localization_required'])
+        self.assertEqual(result['localization']['state'], 'unconfirmed')
         self.assertTrue(self.client.feedback['agvState']['softwareEstop'])
         self.assertFalse(self.client.feedback['state']['agvPosition']['positionInitialized'])
         self.assertEqual(self.navigate()['state'], 'error')
+
+    def test_load_uses_only_the_anchor_for_the_loaded_map_revision(self):
+        anchor = {'x': .2, 'y': -.1, 'yaw': .3}
+        identity = ('other', 'grid-new:road-new')
+        self.plugin.store.state(self.plugin.store.anchor_key(('other', 'old:revision')),
+                                {'x': 8., 'y': 9., 'yaw': 1.})
+        self.plugin.store.state(self.plugin.store.anchor_key(identity), anchor)
+        native = self.client.native
+        observed = []
+
+        def native_with_relocalization(operation, **args):
+            if operation == 'relocalize':
+                observed.append((self.client.identity, args['anchor']))
+                return {'state': 'corrected'}
+            return native(operation, **args)
+
+        self.client.native = native_with_relocalization
+        self.assertEqual(self.call('load_map', map_name='other')['state'], 'executing')
+        status, result = self.completed()
+        self.assertEqual(status, 'completed')
+        self.assertEqual(observed, [(identity, anchor)])
+        self.assertFalse(result['localization_required'])
+
+    def test_unverified_anchor_match_is_reported_and_blocks_navigation(self):
+        identity = ('other', 'grid-new:road-new')
+        self.plugin.store.state(self.plugin.store.anchor_key(identity), {'x': 0., 'y': 0., 'yaw': 0.})
+        native = self.client.native
+        self.client.native = lambda op, **args: (
+            {'state': 'no_distinct_anchor_match'} if op == 'relocalize' else native(op, **args))
+        self.assertEqual(self.call('load_map', map_name='other')['state'], 'executing')
+        _, result = self.completed()
+        self.assertTrue(result['localization_required'])
+        self.assertIn('map_relocalization_unconfirmed', self.navigate()['error'])
 
     def test_loading_waits_for_mode_feedback_after_command_ack(self):
         original_command, original_observe = self.client.command, self.client.observe
@@ -654,7 +699,10 @@ class SpatialTests(unittest.TestCase):
             return original_observe(required)
         self.client.command, self.client.observe = command, observe
         self.call('load_map', map_name='other')
-        self.assertEqual(self.completed()[0], 'completed')
+        status, result = self.completed()
+        self.assertEqual(status, 'completed')
+        self.assertFalse(result['localization_required'])
+        self.assertEqual(result['localization']['state'], 'initialized')
         self.assertEqual(observed, ['MANUAL', 'AUTO'])
 
     def test_explicit_mode_precondition_rejection_does_not_latch_map_busy(self):
@@ -808,6 +856,24 @@ class SpatialTests(unittest.TestCase):
 
 
 class ClientTests(unittest.TestCase):
+    def test_preview_releases_factory_socket_before_dispatch(self):
+        client = object.__new__(JatenClient)
+        client._ws_lock = threading.Lock()
+        snapshot = {'pose2d': {'x': 1.}}
+        client._observe_socket = lambda fields: (snapshot, {'pose2d': 2.})
+
+        def command(method, params, timeout):
+            self.assertTrue(client._ws_lock.locked())
+            return {'method': method}
+
+        client._command_socket = command
+        stream = client.pose_observations(lambda: True)
+        try:
+            self.assertEqual(next(stream), (snapshot, 2.))
+            self.assertEqual(client.command('ChangeMode', {}, timeout=.01), {'method': 'ChangeMode'})
+        finally:
+            stream.close()
+
     def test_base_observation_does_not_require_map_frames_but_navigation_does(self):
         frames = [json.dumps({'type': 'state', 'data': {'driving': False}}),
                   json.dumps({'type': 'agvState', 'data': {'data': {'softwareEstop': True}}})]
@@ -819,7 +885,7 @@ class ClientTests(unittest.TestCase):
                 except StopIteration: raise ConnectionError('closed')
         ws = types.SimpleNamespace(create_connection=lambda *a, **k: Socket(),
             WebSocketTimeoutException=TimeoutError, WebSocketException=ConnectionError)
-        client = object.__new__(JatenClient);client.ws_url='ws://test'
+        client = object.__new__(JatenClient);client.ws_url='ws://test';client._ws_lock=threading.Lock()
         with patch.dict(sys.modules, {'websocket': ws}):
             result=client.observe(required=('agvState','state'))
             self.assertIs(result['state']['driving'],False)
@@ -840,7 +906,7 @@ class ClientTests(unittest.TestCase):
                 except StopIteration: raise ConnectionError('closed')
         ws=types.SimpleNamespace(create_connection=lambda *a, **kw:Socket(),
             WebSocketTimeoutException=TimeoutError,WebSocketException=ConnectionError)
-        client=object.__new__(JatenClient);client.ws_url='ws://test'
+        client=object.__new__(JatenClient);client.ws_url='ws://test';client._ws_lock=threading.Lock()
         with patch.dict(sys.modules,{'websocket':ws}), patch('spatial_client.time.monotonic',side_effect=lambda:clock[0]):
             with self.assertRaises(NavigationStateUnavailable) as caught:
                 client.observe(required=('agvState','state'))
@@ -881,6 +947,7 @@ class ClientTests(unittest.TestCase):
                                    WebSocketTimeoutException=TimeoutError)
         client = object.__new__(JatenClient)
         client.ws_url = 'ws://test'
+        client._ws_lock = threading.Lock()
         with patch.dict(sys.modules, {'websocket': ws}):
             result = client.command('ChangeMode', {'mode': 'MANUAL'})
             self.assertEqual(result['method'], 'ChangeMode')
@@ -905,6 +972,7 @@ class ClientTests(unittest.TestCase):
                                    WebSocketTimeoutException=TimeoutError)
         client = object.__new__(JatenClient)
         client.ws_url = 'ws://test'
+        client._ws_lock = threading.Lock()
         with patch.dict(sys.modules, {'websocket': ws}):
             for edge in (0, 2_147_483_646):
                 with patch('spatial_client.secrets.randbelow', return_value=edge):
