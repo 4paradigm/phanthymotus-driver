@@ -33,9 +33,11 @@ def descriptor(config, drive_config):
             raise ValueError(f"base_servo.{key} must be positive and finite")
         return float(value)
     hz = positive("expected_hz", 10.)
-    vx = positive("max_linear_mps", .3)
-    wz = positive("max_angular_rad_s", .6)
-    if hz > MAX_HZ or vx > drive_config["max_linear_mps"] or wz > math.radians(drive_config["max_angular_deg_s"]):
+    drive_linear = drive_config["max_linear_mps"]
+    drive_angular = math.radians(drive_config["max_angular_deg_s"])
+    vx = positive("max_linear_mps", drive_linear)
+    wz = positive("max_angular_rad_s", drive_angular)
+    if hz > MAX_HZ or vx > drive_linear or wz > drive_angular:
         raise ValueError("base_servo rate/speed exceeds Panther base limits")
     linear_step = positive("linear_acceleration_mps2", .3) / MAX_HZ
     angular_step = positive("angular_acceleration_rad_s2", .6) / MAX_HZ

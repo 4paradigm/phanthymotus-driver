@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from common.camera_info import build as build_camera_info
-from contracts import ARM_JOINT_FIELDS
+from contracts import ARM_JOINT_FIELDS, odom_interface
 
 
 ARM_JOINT_TITLES = (
@@ -105,11 +105,8 @@ class ImuPlugin(SensorPlugin):
 
 class OdomPlugin(SensorPlugin):
     def get_tool(self):
-        from common.odom import build_interface
         tool = super().get_tool()
-        tool["odom_interface"] = {**build_interface(
-            provides=["vx", "vy", "wz"], frame="body", rate_hz=10., pose_drift="unbounded"),
-            "slam_pose": {"available": True, "profile": "motus_slam/1"}}
+        tool["odom_interface"] = odom_interface(self.device.topics["odom"]["topic"])
         return tool
 
     def dispatch(self, action, args):

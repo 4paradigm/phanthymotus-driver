@@ -68,16 +68,16 @@ plugins:
     dry_run: false
     rotate_only: false
     expected_hz: 10.0
-    max_linear_mps: 0.30
-    max_angular_rad_s: 0.60
+    # Defaults to the existing base_drive caps (0.50 m/s, 45 deg/s).
+    # Set max_linear_mps/max_angular_rad_s here only for lower servo limits.
     linear_acceleration_mps2: 0.30
     angular_acceleration_rad_s2: 0.60
     footprint:
       shape: "circle"
-      half_width: 0.37
+      half_width: 0.33
       radius: 0.37
-      source: "estimate"
-      provenance: "vendor Nav2 local_costmap robot_radius=0.37; not a measured arm envelope"
+      source: "configured"
+      provenance: "Operator-selected 0.33 m chassis half-width, checked against vendor CAD; retain vendor Nav2 0.37 m turning radius"
   arm_control:
     enabled: true
     max_duration_s: 20.0

@@ -23,6 +23,8 @@ from contracts import (
     ARM_MIRROR_SIGNS,
     HEAD_JOINTS,
     LEFT_ARM_JOINTS,
+    ODOM_MAX_MEASUREMENT_DELAY_MS,
+    ODOM_RATE_HZ,
     RIGHT_ARM_JOINTS,
     age_ms,
     byte_value,
@@ -32,13 +34,14 @@ from contracts import (
     head_target_from_degrees,
     intersect_joint_limits,
     json_float,
+    odom_interface,
     parse_joint_indices,
     parse_joint_limits,
     populate_switch_request,
     validate_drive,
     validate_joint_target,
 )
-from common.odom import build_interface, build_sample, mean_twist, resolve_stamp_ms
+from common.odom import build_sample, mean_twist, resolve_stamp_ms
 from core_bridge import BridgeWorker, output_topics
 from spatial_inputs import odom_pose, stamp_ns
 
@@ -203,7 +206,7 @@ class PantherDevice:
             sensor_qos,
         )
         self._node.create_subscription(Odometry, "/odom", guarded("odom", self._on_odom), sensor_qos)
-        self._node.create_timer(0.1, guarded("odom", self._publish_odom_window))
+        self._node.create_timer(1.0 / ODOM_RATE_HZ, guarded("odom", self._publish_odom_window))
         self._node.create_subscription(
             DiagnosticArray, "/diagnostics", guarded("robot_state", self._on_diagnostics), sensor_qos
         )
@@ -429,6 +432,7 @@ class PantherDevice:
         self._publish_robot_state()
 
     def _on_odom(self, msg) -> None:
+        received_ms = time.time_ns() // 1_000_000
         self._put("odom", msg)
         twist = msg.twist.twist
         header = msg.header.stamp
@@ -447,6 +451,7 @@ class PantherDevice:
             ])
             self._odom_vendor_ms = vendor_ms
             self._odom_vendor_meta = {
+                "received_ms": received_ms,
                 "frame_id": msg.header.frame_id,
                 "child_frame_id": msg.child_frame_id,
                 "pose": pose, "motus_slam": quality,
@@ -509,8 +514,11 @@ class PantherDevice:
             vendor = dict(self._odom_vendor_meta)
         if not readings:
             return
-        received_ms = int(time.time() * 1000)
+        received_ms = vendor.pop("received_ms")
         stamp, stamp_meta = resolve_stamp_ms(vendor_ms=vendor_ms, received_ms=received_ms)
+        now_ms = time.time_ns() // 1_000_000
+        if now_ms - min(stamp, received_ms) > ODOM_MAX_MEASUREMENT_DELAY_MS:
+            return
         sample = build_sample(
             stamp_ms=stamp,
             twist=mean_twist(readings),
@@ -719,10 +727,7 @@ class PantherDevice:
                 "fresh": fresh(received),
                 "age_ms": age_ms(received),
                 "data": sample,
-                "odom_interface": {**build_interface(
-                    provides=["vx", "vy", "wz"], frame="body", rate_hz=10.0,
-                    pose_drift="unbounded",
-                ), "slam_pose": {"available": True, "profile": "motus_slam/1"}},
+                "odom_interface": odom_interface(self._topics["odom"]["topic"]),
                 "slam_pose": {"available": True, "profile": "motus_slam/1",
                               "clock_mapping_verified": False},
                 **self._callback_health("odom"),

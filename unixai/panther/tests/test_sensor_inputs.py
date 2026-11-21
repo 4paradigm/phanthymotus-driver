@@ -1,8 +1,10 @@
 """Numeric geometry/time regressions for Panther's PR519-compatible inputs."""
 import sys
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace as NS
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -56,6 +58,39 @@ class MotionTest(unittest.TestCase):
         return NS(header=header(frame='odom'), child_frame_id='base_link',
                   pose=NS(pose=NS(position=NS(x=1., y=2., z=0.),
                                   orientation=NS(x=0., y=0., z=0., w=2.)), covariance=[0.]*36))
+
+    def test_odom_clock_fallback_keeps_receipt_time_and_drops_expired_samples(self):
+        from device import PantherDevice
+
+        now_ms = 1795263975000
+        for source_ms, age_ms, expected_ms, source in (
+            (now_ms - 20, 30, now_ms - 20, 'robot'),
+            (1234, 30, now_ms, 'received'),
+            (now_ms - 180, 30, None, None),
+            (1234, 201, None, None),
+        ):
+            with self.subTest(source_ms=source_ms, age_ms=age_ms):
+                runtime = PantherDevice.__new__(PantherDevice)
+                runtime._lock = threading.RLock()
+                runtime._odom_window = []
+                runtime._odom_last_stamp = 0
+                runtime._odom_frames = None
+                runtime._put = Mock()
+                runtime._bridge = Mock()
+                message = self.odom()
+                message.header = header(source_ms * 1_000_000, frame='odom')
+                message.twist = NS(twist=NS(linear=NS(x=.1, y=.2), angular=NS(z=.3)))
+                with patch('device.time.time_ns', side_effect=[now_ms * 1_000_000,
+                                                               (now_ms + age_ms) * 1_000_000]):
+                    runtime._on_odom(message)
+                    runtime._publish_odom_window()
+                if expected_ms is None:
+                    runtime._bridge.publish.assert_not_called()
+                else:
+                    sample = runtime._bridge.publish.call_args.args[1]
+                    self.assertEqual(sample['stamp_ms'], expected_ms)
+                    self.assertEqual(sample['vendor']['stamp_source'], source)
+                    self.assertEqual(sample['pose']['stamp_ms'], source_ms)
 
     def test_imu_keeps_raw_vectors_and_declares_rotation_and_origin(self):
         tf = NS(transform=NS(translation=NS(x=.1, y=.2, z=.3),
@@ -221,10 +256,16 @@ class RuntimeContractTest(unittest.TestCase):
         device = NS(topics=topics, sensor_info=lambda _: {'available': True, 'fresh': True})
         odom = OdomPlugin(device, 'odom', 'test', ['odom'])
         expected = [{'topic': '/test/panther/state/odom', 'format': 'state/odom'}]
-        self.assertEqual(odom.get_tool()['topic_out'], expected)
+        tool = odom.get_tool()
+        self.assertEqual(tool['topic_out'], expected)
+        self.assertEqual(tool['odom_interface']['topic'], expected[0]['topic'])
+        self.assertEqual(tool['odom_interface']['timing'],
+                         {'stamp_source': 'robot', 'max_measurement_delay_ms': 200.0})
         for action in ('start', 'info'):
             with self.subTest(action=action):
-                self.assertEqual(odom.dispatch(action, {})['topic_out'], expected)
+                result = odom.dispatch(action, {})
+                self.assertEqual(result['topic_out'], expected)
+                self.assertEqual(result['odom_interface'], tool['odom_interface'])
 
 
 if __name__ == '__main__':

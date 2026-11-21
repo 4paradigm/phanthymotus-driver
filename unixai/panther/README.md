@@ -124,6 +124,10 @@ child frame and measurement timestamp; `pose.stamp_ms` and
 `vendor.motus_slam.stamp_ns` retain its own time independently of the 100 ms
 window-averaged control twist. Invalid pose/time clears the computation pose;
 source-time regression or frame changes create a new segment identity.
+The control stream declares 10 Hz, robot time and a 200 ms driver-side
+publication budget for the latest measurement. If the source clock cannot be
+compared to wall time, `stamp_ms` uses callback receipt time and the sample's
+`vendor.stamp_source` marks that fallback.
 
 Image, IMU and odometry headers are preserved without receipt-time substitution
 for computation poses or IMU. `clock_id: ros_domain_0` identifies the source
@@ -148,13 +152,15 @@ requires fresh readiness, ownership and newly generated commands. `stop`
 also tears down the receiver. `config(dry_run, rotate_only)` requires a
 confirmed pause/stop; dry-run runs command validation without robot output.
 
-The defaults cap each linear axis at 0.30 m/s and yaw at 0.60 rad/s, within
-`base_drive` caps. Acceleration step bounds use configured acceleration / the
+The default ceilings inherit `base_drive`: 0.50 m/s per linear axis and 45°/s
+(0.785 rad/s) in yaw. The servo config can lower either ceiling. Acceleration
+step bounds use configured acceleration / the
 20 Hz maximum input rate; a 10 Hz source therefore ramps more conservatively.
 The sink is rebased to zero for the first command and after each watchdog hold.
-Explicit zero axes stop immediately. The footprint radius/half-width 0.37 m
-comes from this robot's vendor Nav2 `robot_radius`, is labelled `estimate`, and
-does not certify clearance for extended arms.
+Explicit zero axes stop immediately. Navi uses the configured chassis half-width
+of 0.33 m. The vendor CAD main `base_link` mesh spans about 0.454 m laterally;
+0.33 m includes margin for the chassis. The separate turning radius of 0.37 m
+comes from vendor Nav2. The footprint describes the chassis with its arms stowed.
 
 Commands require finite generation and observation timestamps, source/sequence,
 matching mode/width, and TTL in `(0, 500]` ms. Expired, old-session, regressed,
