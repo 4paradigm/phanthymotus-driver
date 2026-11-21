@@ -56,6 +56,21 @@ plugins:
     fps: 8
     max_duration_s: 30
   state: {enabled: true}
+  battery_power:
+    enabled: true
+    # Confirm installed capacity first; SOH is never applied.
+    capacity_wh: null
+    window_s: 300.0
+    min_observation_s: 180.0
+    min_coverage: 0.9
+    max_gap_s: 0.25
+    stale_s: 1.0
+    min_power_w: 1.0
+    # Software heuristics, NOT safety thresholds. Observed discrepancy <=93 mV.
+    voltage_tolerance_mv: 500.0
+    cell_min_mv: 1500.0
+    cell_max_mv: 4500.0
+    max_segments: 24000
   lidar:
     enabled: true
     process: true

@@ -25,6 +25,7 @@ cards:
   - { name: joints, type: sensor }
   - { name: joint_state, type: sensor }
   - { name: battery, type: sensor }
+  - { name: battery_power, type: sensor }
   - { name: loco_state, type: sensor }
   - { name: remote_controller, type: sensor }
   - { name: lidar_cloud, type: sensor }
