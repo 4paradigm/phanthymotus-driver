@@ -33,6 +33,11 @@ def output_topics(namespace: str) -> dict[str, dict[str, str]]:
     }
 
 
+def navi_odom_output(odom_topic: str) -> dict[str, str]:
+    prefix = odom_topic.rsplit("/", 1)[0]
+    return {"topic": f"{prefix}/state/odom", "format": "state/odom", "name": "navi_odom"}
+
+
 def encode_bridge_payload(card: str, payload) -> dict:
     """Encode one card payload using the same contract as its ROS publisher."""
     if card not in TOPIC_SUFFIXES:
@@ -191,9 +196,12 @@ def _run_lane(messages, profile: str, domain: int, namespace: str, card: str) ->
                      history=HistoryPolicy.KEEP_LAST, depth=1)
     spec = output_topics(namespace)[card]
     message_type = CompressedImage if spec["format"].startswith("image/") else String
-    publisher = node.create_publisher(message_type, spec["topic"], qos)
-    print(f"[bridge] ready lane={card} domain={domain} topic={spec['topic']}", flush=True)
+    topics = [spec["topic"]]
+    if card == "odom":
+        topics.append(navi_odom_output(spec["topic"])["topic"])
     try:
+        publishers = [node.create_publisher(message_type, topic, qos) for topic in topics]
+        print(f"[bridge] ready lane={card} domain={domain} topics={', '.join(topics)}", flush=True)
         while True:
             payload = messages.get()
             if payload is None:
@@ -210,7 +218,8 @@ def _run_lane(messages, profile: str, domain: int, namespace: str, card: str) ->
             else:
                 message = String()
                 message.data = wire["data"]
-            publisher.publish(message)
+            for publisher in publishers:
+                publisher.publish(message)
     finally:
         node.destroy_node()
         if rclpy.ok():

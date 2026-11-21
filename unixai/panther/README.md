@@ -74,6 +74,7 @@ Agent Core is unchanged. Topic paths below use `/<namespace>/panther` as `P`.
 | `imu`, original `P/imu` | `data/json`, `std_msgs/String` | Existing body IMU display remains available |
 | `imu.camera_imu`, `P/camera/rgbd/imu` | `sensor/imu`, `std_msgs/String`, `motus.imu/1` JSON | Raw camera gyro xyz in rad/s and acceleration xyz in m/s², source nanosecond times, optical-frame rotations and sensor origins from TF |
 | `odom`, `P/odom` | `state/odom`, `std_msgs/String`, `motus.odom/1` JSON | Body `[vx,vy,null,null,null,wz]`, m/s and rad/s; source pose, quaternion, covariance and its own measurement time |
+| `odom.navi_odom`, `P/state/odom` | `state/odom`, `std_msgs/String`, `motus.odom/1` JSON | Same sample as `P/odom`; connect this port to ActuCore `navi` for motion feedback |
 
 Each camera retains exactly one image output. Both use live
 `/camera/{color,depth}/camera_info` to derive a common rectified pinhole ray

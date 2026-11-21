@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from common.camera_info import build as build_camera_info
 from contracts import ARM_JOINT_FIELDS
+from core_bridge import navi_odom_output
 
 
 ARM_JOINT_TITLES = (
@@ -107,6 +108,7 @@ class OdomPlugin(SensorPlugin):
     def get_tool(self):
         from common.odom import build_interface
         tool = super().get_tool()
+        tool["topic_out"].append(navi_odom_output(self.device.topics["odom"]["topic"]))
         tool["odom_interface"] = {**build_interface(
             provides=["vx", "vy", "wz"], frame="body", rate_hz=10., pose_drift="unbounded"),
             "slam_pose": {"available": True, "profile": "motus_slam/1"}}
@@ -114,7 +116,10 @@ class OdomPlugin(SensorPlugin):
 
     def dispatch(self, action, args):
         result = super().dispatch(action, args)
-        result["odom_interface"] = self.get_tool()["odom_interface"]
+        tool = self.get_tool()
+        result["odom_interface"] = tool["odom_interface"]
+        if "topic_out" in result:
+            result["topic_out"] = tool["topic_out"]
         return result
 
 
