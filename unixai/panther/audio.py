@@ -94,6 +94,8 @@ def _resolve_pulse(config: dict) -> dict:
 
 
 def _worker(mode, topic, config, commands, replies):
+    from common import logsafe
+    logsafe.install(check_fd=False)
     os.environ["ROS_DOMAIN_ID"] = os.environ.get("AGENT_CORE_ROS_DOMAIN_ID", "42")
     os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
     import rclpy

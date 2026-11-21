@@ -340,7 +340,9 @@ class ControlledSpatialPlugin:
         try:
             if action in ('stop', 'stop_nav'):
                 return self.stop_nav()
-            if action in ('start', 'info'):
+            if action == 'start':
+                return {'state': 'ready', 'data': self.info()}
+            if action == 'info':
                 return self.info()
             if action == 'get_pose':
                 return {'pose': self.current_pose()}

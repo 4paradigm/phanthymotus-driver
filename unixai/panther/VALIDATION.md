@@ -154,6 +154,16 @@ physical movement remain to be verified on a complete map with an operator.
 
 ## Local checks
 
+Review follow-up (2026-11-21): 54 focused tests and 48 existing Panther tests
+passed (102 total), and `scripts/check_service_yml.py unixai/panther` passed.
+Regression coverage checks that `controlled_spatial.start` returns `ready`
+while preserving detailed mapping status under `data`, and that audio, map
+publisher and base-servo spawned entry points install `common.logsafe` before
+child setup. These checks require no ROS installation or physical movement.
+The log wrapper protects Python stdout/stderr; this is not a guarantee for
+arbitrary native-library writes or a repair for existing Docker logs.
+This follow-up adds no Docker packages, mounts or card declarations.
+
 - Existing Panther regression suite: 48 passed.
 - New focused tests: 19 passed (store/schema compatibility, exact tag lookup,
   stale pose/input rejection, map isolation, cancellation/timeout ownership,

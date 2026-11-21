@@ -60,6 +60,8 @@ def descriptor(config, drive_config):
 
 
 def _receive(topic, domain, profile, inbox, ready, closing):
+    from common import logsafe
+    logsafe.install(check_fd=False)
     os.environ["ROS_DOMAIN_ID"] = str(domain)
     os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
     os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = profile

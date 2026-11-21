@@ -41,6 +41,8 @@ def grid_points(data, width, height, resolution, origin):
 
 
 def _publisher(messages, topic):
+    from common import logsafe
+    logsafe.install(check_fd=False)
     os.environ['ROS_DOMAIN_ID'] = os.environ.get('AGENT_CORE_ROS_DOMAIN_ID', '42')
     os.environ['RMW_IMPLEMENTATION'] = 'rmw_fastrtps_cpp'
     os.environ['FASTRTPS_DEFAULT_PROFILES_FILE'] = '/opt/phanthy-motus/dds-local.xml'

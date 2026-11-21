@@ -14,6 +14,28 @@ from controlled_spatial import ControlledSpatialPlugin, SpatialStore, safe_name
 import audio
 
 
+class SpawnLoggingTest(unittest.TestCase):
+    def test_logging_is_installed_before_child_setup(self):
+        from common import logsafe
+        import base_servo
+        import spatial_map
+
+        class InitializationReached(Exception):
+            pass
+
+        entries = [
+            (audio._worker, (None,) * 5),
+            (spatial_map._publisher, (None,) * 2),
+            (base_servo._receive, (None,) * 6),
+        ]
+        for entry, args in entries:
+            with self.subTest(entry=entry.__module__):
+                with patch.object(logsafe, 'install', side_effect=InitializationReached) as install:
+                    with self.assertRaises(InitializationReached):
+                        entry(*args)
+                    install.assert_called_once_with(check_fd=False)
+
+
 class SpatialTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -27,6 +49,28 @@ class SpatialTest(unittest.TestCase):
     def tearDown(self):
         self.plugin.stop()
         self.tmp.cleanup()
+
+    def test_start_is_ready_without_claiming_mapping_or_localization(self):
+        p = self.plugin
+        p._call.reset_mock()
+        before = p.info()
+        result = p.dispatch('start', {})
+        self.assertEqual(result['state'], 'ready')
+        self.assertEqual(result['data']['state'], 'idle')
+        self.assertEqual(p.dispatch('info', {})['state'], 'idle')
+        self.assertEqual(before['active_map'], result['data']['active_map'])
+        self.assertFalse(p.mapping)
+        self.assertIsNone(p.nav)
+        p._call.assert_not_called()
+
+    def test_start_preserves_detailed_mapping_status(self):
+        self.plugin.mapping = True
+        self.plugin.active_map = 'room'
+        result = self.plugin.dispatch('start', {})
+        self.assertEqual(result['state'], 'ready')
+        self.assertEqual(result['data']['state'], 'mapping')
+        self.assertEqual(result['data']['active_map'], 'room')
+        self.assertEqual(self.plugin.dispatch('info', {})['state'], 'mapping')
 
     def test_rejects_paths_and_empty_names(self):
         for value in ['', '../other', '/tmp/map', 'a/b', 'a.b', 'x'*65]:

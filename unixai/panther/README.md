@@ -274,7 +274,11 @@ for these concrete runtime paths:
 
 | Package | Runtime reason | Image impact policy |
 |---|---|---|
-| `ros-humble-nav-msgs` | `nav_msgs/msg/Odometry` on `/odom` | Required even though the navigation card was removed |
+| `ros-humble-nav-msgs` | `nav_msgs/msg/Odometry` on `/odom` | Required for measured body velocity and pose |
+| `ros-humble-nav2-msgs` | `NavigateToPose` action for `controlled_spatial` | Panther navigation runtime dependency |
+| `ros-humble-std-srvs` | Vendor SLAM `Trigger` / `SetBool` services | Panther mapping/localization runtime dependency |
+| `ros-humble-tf2-ros` | Capture-time camera/IMU transforms and map-frame localization | Panther TF runtime dependency |
+| `ros-humble-rcl-interfaces` | Read `cmd_vel_timeout` before arming `base_servo` | Panther controller-timeout verification dependency |
 | `ros-humble-rmw-cyclonedds-cpp` | Robot-facing domain 0 process | Required |
 | `ros-humble-rmw-fastrtps-cpp` | Agent Core domain 42 bridge process | Required |
 | `python3-numpy`, `python3-opencv` | RGB/depth conversion and laser rendering | Apt-only; no duplicate pip wheels |
@@ -283,6 +287,8 @@ for these concrete runtime paths:
 
 For a base-image update, measure package-layer changes with `docker history`
 instead of recording a size that becomes stale with the moving base image.
+These ROS packages can increase image size when absent from the base; no
+zero-growth claim is made. The follow-up review fix adds no packages or mounts.
 
 Physical capabilities are registered only when their plugin has
 `enabled: true`. Motion cards are declared as `type: actuator`, so Agent Core
