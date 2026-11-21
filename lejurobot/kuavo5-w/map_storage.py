@@ -129,6 +129,18 @@ class MapArchive:
             raise ValueError('invalid_map_archive_manifest')
         return snapshot, manifest
 
+    def names(self):
+        if not self.root.is_dir():
+            return []
+        names = []
+        for item in self.root.iterdir():
+            try:
+                self.archived(item.name)
+            except (OSError, ValueError, RuntimeError, TypeError, KeyError):
+                continue
+            names.append(item.name)
+        return sorted(names)
+
     def stage_upload(self, name, token, cancelled, deadline):
         directory, manifest = self.archived(name)
         identity = {'map_name': name, 'token': token}

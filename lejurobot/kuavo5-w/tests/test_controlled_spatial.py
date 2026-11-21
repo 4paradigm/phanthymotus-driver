@@ -647,6 +647,52 @@ class SpatialTests(unittest.TestCase):
         self.assertFalse(self.client.feedback['state']['agvPosition']['positionInitialized'])
         self.assertEqual(self.navigate()['state'], 'error')
 
+    def test_unload_keeps_native_map_and_blocks_navigation_until_load(self):
+        schema = self.plugin.get_tool()['inputSchema']
+        self.assertNotIn('upload_map', schema['properties']['action']['enum'])
+        self.assertEqual(schema['x-action-params']['unload_map']['params'], [])
+        self.assertEqual(self.call('unload_map')['state'], 'unloaded')
+        listing = self.call('list_maps')
+        self.assertIsNone(listing['current_map'])
+        self.assertEqual(listing['chassis_map']['mapId'], 'factory')
+        self.assertEqual(self.navigate()['error'], 'load_map_before_using_navigation_map')
+        self.assertEqual(self.call('get_pose')['error'], 'load_map_before_using_navigation_map')
+        self.assertEqual(self.client.commands, [])
+        self.assertEqual(self.call('load_map', map_name='factory')['state'], 'executing')
+        self.assertEqual(self.completed()[0], 'completed')
+        self.assertEqual(self.call('list_maps')['current_map']['mapId'], 'factory')
+
+    def test_archive_only_map_can_be_loaded_without_separate_upload(self):
+        archive = self.plugin.archive = unittest.mock.Mock()
+        archive.names.return_value = ['archive', 'other']
+        original = self.client.native
+
+        def native(operation, **args):
+            if operation == 'map_upload_commit':
+                self.client.grid_maps.append({'fileName': 'archive.pgm'})
+                return {'success': True}
+            return original(operation, **args)
+
+        self.client.native = native
+        self.assertIn({'fileName': 'archive.pgm', 'status': 'archive_only'},
+                      self.call('list_maps')['maps'])
+        self.assertEqual(self.call('load_map', map_name='archive')['state'], 'executing')
+        self.assertEqual(self.completed()[0], 'completed')
+        archive.stage_upload.assert_called_once()
+        self.assertEqual(self.client.identity[0], 'archive')
+
+    def test_unload_requires_confirmed_native_stop(self):
+        self.client.check = {'success': True, 'status': 1, 'arrived': False}
+        self.assertEqual(self.navigate()['state'], 'executing')
+        wait(lambda: self.plugin._task and self.plugin._task['task_id'])
+        original = self.client.native
+        self.client.native = lambda op, **args: (
+            {'success': False} if op == 'cancel' else original(op, **args))
+        self.assertEqual(self.call('unload_map')['error'], 'native_navigation_stop_unconfirmed')
+        self.assertEqual(self.call('list_maps')['current_map']['mapId'], 'factory')
+        self.client.native = original
+        self.assertEqual(self.call('unload_map')['state'], 'unloaded')
+
     def test_load_uses_only_the_anchor_for_the_loaded_map_revision(self):
         anchor = {'x': .2, 'y': -.1, 'yaw': .3}
         identity = ('other', 'grid-new:road-new')

@@ -336,9 +336,9 @@ sensor/actuator 卡片实现系统生命周期动作；`model` 为读取型 reso
 | `stop_mapping` | 无 | 保存地图/路网、重启厂商地图服务，载入并确认地图文件身份 |
 | `tag_place` | `name`，可选 `description` | 保存当前 map 系 x/y/yaw；建图期间先绑定当前建图会话 |
 | `untag_place` / `list_tags` | `name` / 无 | 删除/列出当前地图语义点，列表含相对距离和方向 |
-| `list_maps` / `load_map` | 无 / `map_name` | 列出真实 PGM 地图 / 载入并切回自动模式 |
+| `list_maps` / `load_map` | 无 / `map_name` | 列出底盘和上位机归档地图 / 如有需要从归档恢复到底盘，再载入并切回自动模式 |
 | `delete_map` | `map_name`、`confirm_delete: true` | 校验并备份完整地图，随后从底盘列表移除非活动地图，保留归档和点位 |
-| `upload_map` | `map_name` | 将上位机同名归档的四个 JaTen 文件恢复到底盘，拒绝覆盖；可另行载入 |
+| `unload_map` | 无 | 停止正在执行的卡片导航并退出驱动的当前地图。JaTen 继续保留地图，归档和点位仍可预览 |
 | `navigate_to_pose` | `x`、`y`（米）、`yaw`（弧度），可选 `speed` | 按 map 系目标导航 |
 | `navigate_to_tag` | `tag_name`，可选 `speed` | 只精确匹配当前地图中的语义点 |
 | `stop_nav` | 无 | 全身暂停，同时取消原生导航并核实新鲜里程计停稳 |
@@ -357,6 +357,8 @@ sensor/actuator 卡片实现系统生命周期动作；`model` 为读取型 reso
 `plugins` 下增加 `controlled_spatial: {enabled: true}`；新部署的镜像默认已开启。
 `spatial_map` 是独立的地图预览卡，读取上位机的 `<data>/maps/kuavo5w` 快照，
 默认展示最近归档的地图版本。`list_maps` 列出可预览地图，`select_map` 切换预览。
+导航卡的列表还显示尚未归档的底盘地图。仅在上位机存有归档的地图标记为 `archive_only`，可直接用 `load_map` 载入。
+Kuavo 的 `unload_map` 作用于驱动。再次使用地图导航前须调用 `load_map`，`info.chassis_map` 仍显示厂商保留的活动地图。
 画面显示占据栅格、点位标记及其方向，`info` 返回点位名称和坐标。
 点位按栅格和路网指纹匹配，活动导航地图仍由 `controlled_spatial.load_map` 切换。
 
