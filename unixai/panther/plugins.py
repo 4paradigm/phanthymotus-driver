@@ -242,8 +242,8 @@ def build_plugins(config, namespace, device):
             plugins.append(cls(device, name, description, [name]))
     if on("laser_scan"):
         plugins.append(SensorPlugin(
-            device, "laser_scan", "Panther merged dual-lidar scan from /scan",
-            ["laser_scan", "laser_view"],
+            device, "laser_scan", "Panther planar XYZ point cloud projected from /scan",
+            ["laser_scan"],
         ))
     if on("camera_color"):
         plugins.append(CameraPlugin(

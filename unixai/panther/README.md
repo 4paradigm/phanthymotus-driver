@@ -272,9 +272,10 @@ instead of failing the card lifecycle.
 `robot_state` contains compact readiness, controller, diagnostic, and hardware
 summaries. Battery measurements use the separate `battery` card; gripper and
 lifting feedback are available from their actuator cards. `laser_scan`
-consumes only `/scan`, whose publisher on Panther is the existing
-`dual_lidar_merger`; this driver performs no second lidar fusion, but pools each
-angular bin to its nearest valid return and reports scan quality.
+projects valid returns from `/scan` to XYZ in the scan frame, with Z set to
+zero. The card publishes `sensor/pointcloud` at up to 5 Hz. ROS consumers on
+the body domain can subscribe to `/<namespace>/panther/laser_scan/points`
+as `sensor_msgs/msg/PointCloud2`, with the source frame and scan timestamp.
 
 The first camera card started on the canvas reuses an already-active host
 `panther_orbbec.service` without taking ownership. Otherwise it creates a

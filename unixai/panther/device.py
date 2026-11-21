@@ -12,9 +12,11 @@ import json
 import math
 import os
 import ssl
+import struct
 import threading
 import time
 import urllib.request
+from array import array
 from pathlib import Path
 from uuid import uuid4
 
@@ -42,7 +44,7 @@ from contracts import (
     validate_joint_target,
 )
 from common.odom import build_sample, mean_twist, resolve_stamp_ms
-from core_bridge import BridgeWorker, output_topics
+from core_bridge import BridgeWorker, XYZ_POINT_STEP, output_topics
 from spatial_inputs import odom_pose, stamp_ns
 
 
@@ -104,6 +106,19 @@ def _message_dict(value):
     return str(value)
 
 
+def project_laser_scan(msg) -> bytes:
+    """Pack valid lidar returns as XYZ float32 in the scan frame."""
+    if not all(math.isfinite(v) for v in (msg.angle_min, msg.angle_increment)):
+        raise ValueError("LaserScan angles must be finite")
+    points = bytearray()
+    for i, distance in enumerate(msg.ranges):
+        if not math.isfinite(distance) or not msg.range_min <= distance <= msg.range_max:
+            continue
+        angle = msg.angle_min + i * msg.angle_increment
+        points.extend(struct.pack("<fff", distance * math.cos(angle), distance * math.sin(angle), 0.0))
+    return bytes(points)
+
+
 class PantherDevice:
     def __init__(self, config: dict, namespace: str, executor):
         import rclpy
@@ -113,7 +128,7 @@ class PantherDevice:
         from rclpy.action import ActionClient
         from rclpy.node import Node
         from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
-        from sensor_msgs.msg import BatteryState, Imu, JointState, LaserScan
+        from sensor_msgs.msg import BatteryState, Imu, JointState, LaserScan, PointCloud2, PointField
         from std_msgs.msg import Float64MultiArray, String
         from control_msgs.action import FollowJointTrajectory
         from controller_manager_msgs.srv import ListControllers, SwitchController
@@ -130,7 +145,6 @@ class PantherDevice:
         self._cache: dict[str, tuple[object, float]] = {}
         self._last_card_publish: dict[str, float] = {}
         self._callback_errors: dict[str, dict] = {}
-        self._laser_render_failures = 0
         self._model_urdf = MODEL_PATH.read_text(encoding="utf-8")
         self._model_joint_indices = parse_joint_indices(self._model_urdf)
         self._model_joint_limits = parse_joint_limits(self._model_urdf)
@@ -232,6 +246,14 @@ class PantherDevice:
         )
         self._node.create_subscription(
             String, "/robot_description", guarded("model", self._on_robot_description), latched_qos
+        )
+        self._laser_cloud_type = PointCloud2
+        self._laser_cloud_fields = [
+            PointField(name=axis, offset=index * 4, datatype=PointField.FLOAT32, count=1)
+            for index, axis in enumerate(("x", "y", "z"))
+        ]
+        self._laser_cloud_pub = self._node.create_publisher(
+            PointCloud2, self._topics["laser_scan"]["topic"] + "/points", sensor_qos
         )
         self._node.create_subscription(
             LaserScan, "/scan", guarded("laser_scan", self._on_laser), sensor_qos,
@@ -364,8 +386,7 @@ class PantherDevice:
 
     def _store_and_publish(self, card: str, msg, builder) -> None:
         received = self._put(card, msg)
-        rates = {"imu": 10.0, "laser_scan": 5.0}
-        self._publish_limited(card, builder(msg, received), rates.get(card, 10.0))
+        self._publish_limited(card, builder(msg, received), 10.0)
 
     def _publish_limited(self, card: str, payload: dict, rate_hz: float, force: bool = False) -> bool:
         now = time.monotonic()
@@ -458,53 +479,26 @@ class PantherDevice:
             }
 
     def _on_laser(self, msg) -> None:
-        received = self._put("laser_scan", msg)
-        payload = self._laser_payload(msg, received)
-        self._publish_limited("laser_scan", payload, 5.0)
+        self._put("laser_scan", msg)
         now = time.monotonic()
         with self._lock:
-            # Track attempts separately from successful publishes. Otherwise a
-            # persistent encoder failure retries at the full lidar rate.
-            previous = self._last_card_publish.get("laser_view_attempt", 0.0)
-            due = now - previous >= 1.0
-            if due:
-                self._last_card_publish["laser_view_attempt"] = now
-        if not due:
-            return
-        try:
-            import cv2
-            import numpy as np
-            size = 400
-            image = np.zeros((size, size, 3), dtype=np.uint8)
-            center = size // 2
-            maximum = min(6.0, float(payload.get("range_max") or 6.0))
-            for index, distance in enumerate(payload["ranges"]):
-                if distance is None or distance > maximum:
-                    continue
-                angle = payload["angle_min"] + index * payload["angle_increment"]
-                radius = distance / maximum * (center - 8)
-                x = int(round(center + radius * math.cos(angle)))
-                y = int(round(center - radius * math.sin(angle)))
-                if 0 <= x < size and 0 <= y < size:
-                    image[y, x] = (0, 220, 0)
-            cv2.circle(image, (center, center), 4, (0, 80, 255), -1)
-            ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 75])
-            if ok:
-                self._publish_limited("laser_view", {
-                    "message_format": "jpeg", "data": encoded.tobytes(),
-                    "frame_id": payload.get("frame_id", ""),
-                }, 1.0)
-        except Exception as exc:
-            self._log_laser_render_failure(exc)
+            if now - self._last_card_publish.get("laser_scan", -math.inf) < 0.2:
+                return
+            self._last_card_publish["laser_scan"] = now
 
-    def _log_laser_render_failure(self, exc: Exception) -> None:
-        with self._lock:
-            self._laser_render_failures += 1
-            count = self._laser_render_failures
-        if count != 1 and count % 100:
-            return
-        detail = " ".join(f"{type(exc).__name__}: {exc}".split())[:240]
-        print(f"[laser_scan] top-down view failure #{count}: {detail}", flush=True)
+        points = project_laser_scan(msg)
+        cloud = self._laser_cloud_type()
+        cloud.header = msg.header
+        cloud.height = 1
+        cloud.width = len(points) // XYZ_POINT_STEP
+        cloud.fields = self._laser_cloud_fields
+        cloud.is_bigendian = False
+        cloud.point_step = XYZ_POINT_STEP
+        cloud.row_step = len(points)
+        cloud.data = array("B", points)
+        cloud.is_dense = True
+        self._laser_cloud_pub.publish(cloud)
+        self._bridge.publish("laser_scan", points)
 
     def _publish_odom_window(self) -> None:
         with self._lock:
@@ -654,8 +648,6 @@ class PantherDevice:
             "fresh": fresh(received),
             "age_ms": age_ms(received),
             "source_topic": "/scan",
-            "source_node": "dual_lidar_merger",
-            "merged": True,
             "frame_id": msg.header.frame_id,
             "angle_min": json_float(msg.angle_min),
             "angle_max": json_float(msg.angle_max),
