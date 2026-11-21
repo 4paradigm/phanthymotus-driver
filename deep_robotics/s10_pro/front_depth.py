@@ -115,7 +115,7 @@ def _project_worker(jobs, results):
             return
         # Do not send the source point buffer back through the result queue.
         context = {key: job[key] for key in
-                   ("generation", "camera_generation", "stamp", "received_monotonic")}
+                   ("generation", "camera_generation", "stamp", "source_stamp", "received_monotonic")}
         try:
             started = time.monotonic()
             packet, stats = project_depth(
@@ -374,8 +374,8 @@ class FrontDepthPlugin:
                 "rgb_resolution": [640, 360],
                 "rgb_pixel_mapping": {"scale": [1., 4 / 3], "offset": [0., 1 / 6],
                                       "convention": "pixel_centres"},
-                "timestamp_source": "lidar_header_unverified",
-                "source_stamp_preserved": True, "hardware_capture_timestamp_available": False,
+                "timestamp_source": "driver_receive",
+                "source_stamp_preserved": False, "hardware_capture_timestamp_available": False,
                 "temporal_synchronization": False, "rgb_depth_capture_skew_ms": None,
                 "rgb_timestamp_source": "publication_clock", "scan_deskewed": None,
             })
@@ -558,6 +558,7 @@ class FrontDepthPlugin:
         self._error_code = code
 
     def _receive_cloud(self, generation, message, transport="ros"):
+        receipt_stamp = divmod(time.time_ns(), 10**9)
         with self._lock:
             if not self._running or generation != self._generation or transport != self._input_transport:
                 return
@@ -603,7 +604,7 @@ class FrontDepthPlugin:
                 source["data"] = bytes(view)
                 job = {
                     "generation": generation, "camera_generation": camera_generation,
-                    "stamp": (sec, nsec), "received_monotonic": now,
+                    "stamp": receipt_stamp, "source_stamp": (sec, nsec), "received_monotonic": now,
                     "jpeg": frame[2], "rgb_received_monotonic": frame[1],
                     "cloud": source,
                     "K": depth_intrinsics(calibration), "transform": config["camera_optical_from_cloud"],
@@ -645,7 +646,7 @@ class FrontDepthPlugin:
                 self._publisher.publish(output)
                 self._stats.update(stats)
                 self._stats["published"] += 1
-                self._stats["last_source_stamp"] = list(context["stamp"])
+                self._stats["last_source_stamp"] = list(context["source_stamp"])
                 self._last_error = None
                 self._error_code = None
                 published = True

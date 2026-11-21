@@ -397,12 +397,12 @@ The depth declaration supplies its own K using pixel-centre scaling:
 `camera_info.vendor` declares this mapping, optical-Z units, sparsity, invalid
 values, the configured extrinsics, and `depth_aligned_to_rgb: false`.
 
-The depth header copies the selected LiDAR message's stamp exactly and uses
-the calibration's `camera_optical_frame_id` (the historical driver label
-`s10_pro_camera_front_optical` for maintenance-only configurations). This preserves source time without
-asserting that the source clock is a verified acquisition clock. The existing
-RTSP JPEG timestamps are publication times; no exposure pairing is available.
-Metadata therefore declares `timestamp_source="lidar_header_unverified"`,
+The depth header uses the driver host time when the LiDAR message arrives, before
+projection and depth completion. The original LiDAR stamp is used for ordering
+and reported in `stats.last_source_stamp`. The frame ID comes from the calibration's
+`camera_optical_frame_id` (the historical driver label `s10_pro_camera_front_optical`
+for maintenance-only configurations). RTSP JPEG timestamps are publication times.
+Metadata declares `timestamp_source="driver_receive"`,
 `temporal_synchronization: false`, unknown RGB/depth capture skew and unknown
 source scan deskew. This output alone is not synchronized RGB-D input for VO.
 

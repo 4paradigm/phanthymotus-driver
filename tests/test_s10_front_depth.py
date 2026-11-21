@@ -19,6 +19,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 DRIVER = ROOT / "deep_robotics" / "s10_pro"
 IDENTITY = [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]]
+RECEIPT_STAMP = (1795180675, 778_123_456)
 
 
 def module():
@@ -58,6 +59,7 @@ class FakeWorker:
 @pytest.fixture
 def rig(tmp_path, monkeypatch):
     depth = module()
+    monkeypatch.setattr(depth.time, "time_ns", lambda: RECEIPT_STAMP[0] * 10**9 + RECEIPT_STAMP[1])
     from deep_robotics.s10_pro.undistortion import CameraUndistortion
     controller = CameraUndistortion(("camera_front",), config_path=tmp_path / "rgb.json",
                                    map_dir=tmp_path / "maps")
@@ -200,7 +202,7 @@ def test_default_canvas_start_loads_directed_calibration_readonly(rig):
     rig.plugin._worker.complete()
     output = rig.publications[-1]
     assert output.header.frame_id == "measured_front_optical"
-    assert (output.header.stamp.sec, output.header.stamp.nanosec) == (10, 123)
+    assert (output.header.stamp.sec, output.header.stamp.nanosec) == RECEIPT_STAMP
     raw = zlib.decompress(output.data)
     assert struct.unpack_from("<H", raw, (453 * 640 + 337) * 2)[0] == 2000
     assert result["config"]["cloud_frame_id"] == "lidar_link"
@@ -590,7 +592,7 @@ def test_missing_ros_cloud_automatically_uses_ssh_without_canvas_settings(rig, m
     rig.relays[0].on_message(cloud(frame='lidar_link'))
     rig.plugin._worker.complete()
     output = rig.publications[-1]
-    assert (output.header.stamp.sec, output.header.stamp.nanosec) == (10, 123)
+    assert (output.header.stamp.sec, output.header.stamp.nanosec) == RECEIPT_STAMP
     assert rig.plugin.dispatch('info', {})['input']['state'] == 'live'
     assert set(rig.plugin.get_tool()['configSchema']['properties']) == {'rate_hz', 'min_depth_m', 'max_depth_m'}
 
@@ -729,7 +731,8 @@ def test_card_wire_contract_geometry_and_time_provenance(rig):
     assert vendor["interpolated_pixels_are_measured"] is False
     assert not vendor.get("raw_depth_topic")
     assert vendor["depth_aligned_to_rgb"] is False
-    assert vendor["timestamp_source"] == "lidar_header_unverified"
+    assert vendor["timestamp_source"] == "driver_receive"
+    assert vendor["source_stamp_preserved"] is False
     assert vendor["temporal_synchronization"] is False
     assert vendor["rgb_depth_capture_skew_ms"] is None
 
@@ -784,7 +787,7 @@ def test_canvas_instance_transport_does_not_become_a_depth_setting(rig):
         "action": "start", "instance_id": "canvas-depth-1"})["state"] == "running"
 
 
-def test_start_is_lazy_and_idempotent_preserves_source_stamp_and_metric_payload(rig):
+def test_start_is_lazy_and_idempotent_keeps_receipt_stamp_and_metric_payload(rig, monkeypatch):
     configure(rig)
     rig.plugin.start()  # Bundle startup only advertises the card.
     assert not rig.subscriptions
@@ -796,16 +799,18 @@ def test_start_is_lazy_and_idempotent_preserves_source_stamp_and_metric_payload(
     handle.callback(cloud())
     worker = rig.plugin._worker
     assert len(worker.jobs) == 1
+    monkeypatch.setattr(module().time, "time_ns", lambda: (RECEIPT_STAMP[0] + 1) * 10**9)
     worker.complete()
     output = rig.publications[-1]
     assert output.format == "16UC1; compressedDepth zlib"
     assert output.header.frame_id == "s10_pro_camera_front_optical"
-    assert (output.header.stamp.sec, output.header.stamp.nanosec) == (10, 123)
+    assert (output.header.stamp.sec, output.header.stamp.nanosec) == RECEIPT_STAMP
     raw = zlib.decompress(output.data)
     assert len(raw) == 640 * 480 * 2
     values = struct.unpack("<307200H", raw)
     assert values.count(2000) == 1 and values.count(0) == 307199
     assert rig.plugin.dispatch("info", {})["stats"]["published"] == 1
+    assert rig.plugin.dispatch("info", {})["stats"]["last_source_stamp"] == [10, 123]
 
 
 @pytest.mark.parametrize("bad", [cloud(frame="map"), cloud(sec=0, nanosec=0),
@@ -978,7 +983,7 @@ def test_real_worker_reports_bad_layout_then_completes_depth_and_closes(monkeypa
     source = {key: getattr(message, key) for key in
               ("width", "height", "point_step", "row_step", "is_bigendian", "data")}
     source["fields"] = [(f.name, f.offset, f.datatype, f.count) for f in message.fields]
-    job = {"generation": 1, "camera_generation": 0, "stamp": (10, 123),
+    job = {"generation": 1, "camera_generation": 0, "stamp": RECEIPT_STAMP, "source_stamp": (10, 123),
            "received_monotonic": time.monotonic(), "cloud": source,
            "jpeg": b'front-jpeg', "rgb_received_monotonic": time.monotonic(),
            "K": [100, 0, 320, 0, 100, 240, 0, 0, 1], "transform": IDENTITY,
@@ -992,7 +997,8 @@ def test_real_worker_reports_bad_layout_then_completes_depth_and_closes(monkeypa
         assert worker.submit(job)
         assert ready.wait(5), "worker did not return depth"
         context, packet, stats = received[0]
-        assert context["stamp"] == (10, 123) and "cloud" not in context
+        assert context["stamp"] == RECEIPT_STAMP and context["source_stamp"] == (10, 123)
+        assert "cloud" not in context
         assert isinstance(packet, bytes)
         raw = zlib.decompress(packet)
         assert len(raw) == 640 * 480 * 2
@@ -1109,7 +1115,7 @@ def test_output_config_keeps_projection_worker_and_encoder_latency_fix():
     cmd = _rtsp_command("rtsp://camera")
     assert cmd[cmd.index("-threads") + 1] == "1"
 
-def test_only_filled_stream_uses_original_topic_stamp_and_estimated_provenance(rig):
+def test_only_filled_stream_uses_original_topic_receipt_stamp_and_estimated_provenance(rig):
     from deep_robotics.s10_pro.depth_projection import project_depth, fill_depth_holes
     configure(rig)
     assert rig.plugin.dispatch("start", {})["state"] == "running"
@@ -1125,8 +1131,7 @@ def test_only_filled_stream_uses_original_topic_stamp_and_estimated_provenance(r
     estimate = rig.publications[0]
     assert estimate.data == filled
     assert zlib.decompress(estimate.data) != zlib.decompress(raw)
-    assert estimate.header.stamp.sec == 10
-    assert estimate.header.stamp.nanosec == 123
+    assert (estimate.header.stamp.sec, estimate.header.stamp.nanosec) == RECEIPT_STAMP
     info = rig.plugin.dispatch("info", {})
     assert info["stats"]["filled_pixels"] > 0
     assert [entry["topic"] for entry in info["topic_out"]] == ["/robot/camera_front/depth"]
