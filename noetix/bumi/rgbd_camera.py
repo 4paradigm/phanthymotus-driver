@@ -259,24 +259,26 @@ class RgbdCameraPublisher:
             raise ValueError('RGB-D JPEG encoding failed')
         encoded = (jpeg.tobytes(), zlib.compress(metric.astype('<u2').tobytes(), 1))
         messages = []
+        mount_stamps = set()
         for kind, stamp, payload, fmt in zip(('color', 'depth'), stamps, encoded,
                                             ('jpeg', '16UC1; compressedDepth zlib')):
+            if ('camera' if kind == 'color' else 'depth') not in self.enabled:
+                continue
             msg = self.Message()
             msg.header.stamp.sec, msg.header.stamp.nanosec = divmod(stamp, 10**9)
             msg.header.frame_id = self.frame_id
             msg.format, msg.data = fmt, array('B', payload)
             messages.append((kind, msg))
-        try:
-            # Match pinned RTAB-Map/PR371: later double-seconds value wins;
-            # ties select depth, retaining that original integer capture stamp.
-            mount_stamp = stamps[0] if float(stamps[0])/1e9 > float(stamps[1])/1e9 else stamps[1]
-            self.body_mount.publish(mount_stamp)
-            self.mount_error = None
-        except Exception as error:
-            self.mount_error = str(error)
+            mount_stamps.add(stamp)
+        # Vision can use either RGB-D header, and point clouds keep the depth header.
+        self.mount_error = None
+        for stamp in sorted(mount_stamps):
+            try:
+                self.body_mount.publish(stamp)
+            except Exception as error:
+                self.mount_error = str(error)
         for kind, msg in messages:
-            if ('camera' if kind == 'color' else 'depth') in self.enabled:
-                self.pubs[kind].publish(msg)
+            self.pubs[kind].publish(msg)
         self.last_emit = now
         self.last_error = None
         mount_status = self.body_mount.status()

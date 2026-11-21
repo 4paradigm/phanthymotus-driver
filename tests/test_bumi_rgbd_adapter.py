@@ -297,7 +297,7 @@ class Mount:
     def close(self): self.calls.append(('close',))
 
 
-def test_bumi_mount_precedes_images_at_depth_capture_time_and_updates_status(source):
+def test_bumi_mount_precedes_both_capture_headers_and_updates_status(source):
     publisher, messages, notices = source
     mount = Mount()
     publisher.body_mount = mount
@@ -307,7 +307,7 @@ def test_bumi_mount_precedes_images_at_depth_capture_time_and_updates_status(sou
         return original(stamp)
     mount.publish = publish
     publisher.publish(frames())
-    assert mount.calls == [('publish', 10_010_000_000)]
+    assert mount.calls == [('publish', 10_000_000_000), ('publish', 10_010_000_000)]
     a, b = notices[-1]['camera_info']
     assert a['vendor']['body_mount'] == b['vendor']['body_mount'] == mount.declaration()
     assert notices[-1]['body_mount_status'] == mount.status()
@@ -349,7 +349,7 @@ def test_bumi_mount_constructor_uses_existing_node_optical_frame_and_mapped_cloc
     assert args['clock_id']() == publisher.clock_id + '/hardware_clock'
 
 
-def actual_mount(monkeypatch, path, parent, child, clock, events):
+def actual_mount(monkeypatch, path, parent, child, clock, events, **kwargs):
     """Load the shipped provider, substituting only unavailable ROS transport."""
     import json
     import sys
@@ -377,7 +377,7 @@ def actual_mount(monkeypatch, path, parent, child, clock, events):
                   publish=lambda message: events.append(('packet', json.loads(message.data)))),
               destroy_publisher=lambda _: events.append(('destroy_publisher',)))
     return module.BodyMountSource(node, '/robot/camera/rgbd', body_frame=parent,
-                                  camera_frame=child, clock_id=clock)
+                                  camera_frame=child, clock_id=clock, **kwargs)
 
 
 @pytest.mark.parametrize('color_ms,depth_ms,now_ns,color_ns,depth_ns,mount_ns', [
@@ -388,13 +388,16 @@ def actual_mount(monkeypatch, path, parent, child, clock, events):
     (1000.000002, 1000.000001, 1_794_654_700_000_000_002,
      1_794_654_700_000_000_002, 1_794_654_700_000_000_001, 1_794_654_700_000_000_001),
 ], ids=['color-later', 'depth-later', 'equal', 'double-seconds-tie'])
-def test_bumi_mount_matches_native_pair_time_without_rewriting_headers(
+def test_bumi_fixed_mount_covers_both_capture_times_without_rewriting_headers(
         source, monkeypatch, color_ms, depth_ms, now_ns, color_ns, depth_ns, mount_ns):
     publisher, messages, _ = source
     events = []
+    fixed = [[1., 0., 0., .2], [0., 1., 0., -.1],
+             [0., 0., 1., .3], [0., 0., 0., 1.]]
     publisher.body_mount = actual_mount(monkeypatch, ROOT / 'common/camera_mount.py',
         'base_link', publisher.frame_id,
-        lambda: publisher.clock_id + '/' + publisher.clocks[0].domain, events)
+        lambda: publisher.clock_id + '/' + publisher.clocks[0].domain, events,
+        fixed_matrix=fixed, numeric_only=True)
     monkeypatch.setattr(rgbd.time, 'time_ns', lambda: now_ns)
     pair = frames()
     pair.get_color_frame().get_timestamp = lambda: color_ms
@@ -403,10 +406,12 @@ def test_bumi_mount_matches_native_pair_time_without_rewriting_headers(
         publisher.publish(pair)
         assert stamp(messages['/robot/camera/color'][0]) == color_ns
         assert stamp(messages['/robot/camera/depth'][0]) == depth_ns
-        packet = next(event[1] for event in events if event[0] == 'packet')
-        assert packet['status'] == 'available'
-        assert packet['stamp_ns'] == mount_ns
-        assert packet['matrix'][0][3] == .2
+        packets = [event[1] for event in events if event[0] == 'packet']
+        assert [packet['stamp_ns'] for packet in packets] == sorted({color_ns, depth_ns})
+        assert mount_ns in {packet['stamp_ns'] for packet in packets}
+        assert all(packet['status'] == 'available' and packet['matrix'] == fixed
+                   and packet['mode'] == 'static' and 'clock_id' not in packet for packet in packets)
+        assert not any(event[0] == 'lookup' for event in events)
     finally:
         publisher.close()
 
@@ -446,9 +451,12 @@ def test_bumi_capture_mount_produces_body_pose_with_real_pr371_consumer(
         pose = dict(frame_id='run1_odom', child_frame_id=accepted['frame_id'],
                     position=[0., 0., 0.], quaternion=[0., 0., 0., 1.], covariance=None)
         sample = make_sample('tracking', selected, 'run1', accepted['clock_id'], pose)
-        packet = next(event[1] for event in events if event[0] == 'packet')
         mounts = CaptureMounts(accepted['body_mount'], accepted['frame_id'], accepted['clock_id'])
-        mounts.observe(packet, selected)
+        for kind, *data in events:
+            if kind == 'packet':
+                mounts.observe(data[0], selected)
+        assert mounts.matrix_at(stamp(messages['/robot/camera/color'][0])) is not None
+        assert mounts.matrix_at(stamp(messages['/robot/camera/depth'][0])) is not None
         mounts.attach(sample, selected)
         body = sample['vendor']['body_pose']
         assert body is not None
@@ -460,17 +468,17 @@ def test_bumi_capture_mount_produces_body_pose_with_real_pr371_consumer(
         publisher.close()
 
 
-def test_bumi_real_provider_uses_mapped_depth_time_and_missing_tf_keeps_pairs(source, monkeypatch):
+def test_bumi_real_provider_uses_mapped_capture_times_and_missing_tf_keeps_pairs(source, monkeypatch):
     publisher, messages, notices = source
     events = []
     mount = actual_mount(monkeypatch, ROOT / 'common/camera_mount.py', 'base_link',
                          publisher.frame_id, lambda: publisher.clock_id + '/' + publisher.clocks[0].domain, events)
     publisher.body_mount = mount
     publisher.publish(frames())
-    assert events[0] == ('lookup', 'base_link', 'robot_rgb_optical', 10_010_000_000)
-    assert events[1][1]['status'] == 'available'
-    assert events[1][1]['matrix'][0][3] == .2
-    assert events[1][1]['clock_id'] == publisher.clock_id + '/hardware_clock'
+    assert [event[3] for event in events if event[0] == 'lookup'] == [10_000_000_000, 10_010_000_000]
+    packets = [event[1] for event in events if event[0] == 'packet']
+    assert all(packet['status'] == 'available' and packet['matrix'][0][3] == .2
+               and packet['clock_id'] == publisher.clock_id + '/hardware_clock' for packet in packets)
     assert notices[-1]['camera_info'][0]['vendor']['body_mount'] == mount.declaration()
     mount.buffer.missing = True
     publisher.publish(frames(ms=1030.))
@@ -518,6 +526,9 @@ def test_stopped_card_suppresses_only_its_images_and_restart_uses_next_capture(s
     publisher.set_enabled({'camera', 'depth'})
     publisher.publish(frames(ms=1030.))
     assert stamp(messages['/robot/camera/depth'][-1]) == 10_040_000_000
+    assert publisher.body_mount.calls == [('publish', value) for value in (
+        10_000_000_000, 10_010_000_000, 10_020_000_000, 10_020_000_000,
+        10_030_000_000, 10_040_000_000)]
 
 
 
