@@ -2,17 +2,43 @@
 
 from __future__ import annotations
 
+from array import array
 import multiprocessing as mp
 import glob
 import os
 import queue
 import subprocess
+import sys
 import threading
 import time
 
 
 FORMAT = "audio/pcm-16k"
 CHUNK_BYTES = 2048  # 64 ms, S16LE mono at 16 kHz.
+
+
+def _validate_volume(value) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 100:
+        raise ValueError("volume must be an integer from 0 to 100")
+    return value
+
+
+def _speaker_pcm(raw: bytes, volume: int) -> bytes:
+    """Attenuate only this card's playback; leave the source topic and sink alone."""
+    if volume == 100:
+        return raw
+    if volume == 0:
+        return bytes(len(raw))
+    samples = array("h")
+    samples.frombytes(raw)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    # Truncate toward zero symmetrically, avoiding a negative DC bias.
+    samples = array("h", ((1 if sample >= 0 else -1) * (abs(sample) * volume // 100)
+                          for sample in samples))
+    if sys.byteorder != "little":
+        samples.byteswap()
+    return samples.tobytes()
 
 
 def _complete_chunks(pending: bytearray, incoming: bytes):
@@ -82,7 +108,7 @@ def _worker(mode, topic, config, commands, replies):
     stop_event = threading.Event()
     pcm_queue = queue.Queue(maxsize=256)  # At most 32 seconds of 4096-byte blocks.
     state = {"running": False, "frames": 0, "dropped": 0, "last_frame": 0.0, "error": "",
-             "input_topic": ""}
+             "input_topic": "", "volume": config.get("volume", 100)}
     process = None
     thread = None
     subscription = None
@@ -121,6 +147,7 @@ def _worker(mode, topic, config, commands, replies):
                     raw = pcm_queue.get(timeout=0.1)
                 except queue.Empty:
                     continue
+                raw = _speaker_pcm(raw, state["volume"])
                 deadline = max(deadline, time.monotonic()) + len(raw) / 32000
                 # Unbuffered pipe writes may be partial, especially for large frames.
                 remaining = memoryview(raw)
@@ -189,13 +216,14 @@ def _worker(mode, topic, config, commands, replies):
                 "frames": state["frames"], "dropped": state["dropped"], "last_frame_age_ms":
                 int((time.monotonic() - state["last_frame"]) * 1000) if state["last_frame"] else None,
                 "input_topic": state["input_topic"], "queued_chunks": pcm_queue.qsize(),
-                "error": state["error"]}
+                "error": state["error"],
+                **({"volume": state["volume"], "volume_scope": "stream"} if mode == "speaker" else {})}
 
     try:
         while True:
             rclpy.spin_once(node, timeout_sec=0.02)
             try:
-                action, input_topic = commands.get_nowait()
+                action, arguments = commands.get_nowait()
             except queue.Empty:
                 continue
             if action == "close":
@@ -205,7 +233,12 @@ def _worker(mode, topic, config, commands, replies):
                 replies.put({"state": "idle"})
             elif action == "info":
                 replies.put(info())
+            elif action in {"get_volume", "set_volume"} and mode == "speaker":
+                if action == "set_volume":
+                    state["volume"] = _validate_volume(arguments.get("volume"))
+                replies.put(info())
             elif action == "start":
+                input_topic = str(arguments.get("input_topic", "")).strip()
                 if mode == "speaker" and not input_topic:
                     replies.put({"state": "waiting_for_input"})
                     continue
@@ -263,6 +296,10 @@ class AudioPlugin:
         self._replies = None
         self._process = None
         self._rpc_lock = threading.RLock()
+        self._volume = 100
+        if name == "speaker":
+            self._volume = _validate_volume(config.get("speaker_volume", 100))
+            self.config["volume"] = self._volume
 
     def get_tool(self):
         schema = {"type": "object", "properties": {
@@ -274,9 +311,15 @@ class AudioPlugin:
         if self.name == "mic":
             tool["topic_out"] = [{"topic": self.topic, "format": FORMAT}]
         else:
+            schema["properties"]["action"]["enum"].extend(["get_volume", "set_volume"])
             schema["properties"]["input_topic"] = {"type": "string"}
+            schema["properties"]["volume"] = {
+                "type": "integer", "minimum": 0, "maximum": 100,
+                "description": "Playback stream volume (%); 0=mute, 100=original PCM level. Host master volume is independent."}
             schema["x-action-params"] = {"start": {"params": ["input_topic"]},
-                                         "stop": {"params": []}, "info": {"params": []}}
+                                         "stop": {"params": []}, "info": {"params": []},
+                                         "get_volume": {"params": []},
+                                         "set_volume": {"params": ["volume"]}}
             tool["topic_in"] = [{"format": FORMAT}]
         return tool
 
@@ -286,7 +329,7 @@ class AudioPlugin:
     def stop(self):
         if self._process is not None:
             self.dispatch("stop", {})
-            self._commands.put(("close", ""))
+            self._commands.put(("close", {}))
             self._process.join(timeout=3)
             if self._process.is_alive():
                 self._process.terminate()
@@ -299,12 +342,26 @@ class AudioPlugin:
             return self._dispatch(action, args)
 
     def _dispatch(self, action, args):
-        if action not in {"start", "stop", "info"}:
+        allowed = {"start", "stop", "info"}
+        if self.name == "speaker":
+            allowed.update({"get_volume", "set_volume"})
+        if action not in allowed:
             return {"error": "unknown action"}
+        requested_volume = None
+        if action == "set_volume":
+            try:
+                requested_volume = _validate_volume(args.get("volume"))
+            except ValueError as exc:
+                return {"state": "error", "error": str(exc)}
         if action != "start" and (self._process is None or not self._process.is_alive()):
+            if requested_volume is not None:
+                self._volume = requested_volume
+                self.config["volume"] = self._volume
             result = {"state": "idle"}
             if self.name == "mic":
                 result["topic_out"] = [{"topic": self.topic, "format": FORMAT}]
+            else:
+                result.update(volume=self._volume, volume_scope="stream")
             return result
         if self._process is None or not self._process.is_alive():
             self._commands = self._ctx.Queue()
@@ -313,11 +370,15 @@ class AudioPlugin:
                 target=_worker, args=(self.name, self.topic, self.config,
                                       self._commands, self._replies), daemon=True)
             self._process.start()
-        self._commands.put((action, str(args.get("input_topic", "")).strip()))
+        self._commands.put((action, {"volume": requested_volume} if action == "set_volume"
+                            else {"input_topic": str(args.get("input_topic", "")).strip()}))
         try:
             result = self._replies.get(timeout=8)
         except queue.Empty:
             return {"state": "error", "message": "audio worker did not respond"}
         if self.name == "mic":
             result["topic_out"] = [{"topic": self.topic, "format": FORMAT}]
+        elif "volume" in result:
+            self._volume = result["volume"]
+            self.config["volume"] = self._volume
         return result

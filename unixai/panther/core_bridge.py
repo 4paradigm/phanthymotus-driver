@@ -15,6 +15,8 @@ TOPIC_SUFFIXES = {
     "robot_state": ("robot_state", "data/json"),
     "battery": ("battery", "data/json"),
     "imu": ("imu", "data/json"),
+    "camera_imu": ("camera/rgbd/imu", "sensor/imu"),
+    "body_mount": ("camera/body_mount", "state/extrinsic"),
     "odom": ("odom", "state/odom"),
     "laser_scan": ("laser_scan", "data/json"),
     "laser_view": ("laser_scan/view", "image/jpeg"),

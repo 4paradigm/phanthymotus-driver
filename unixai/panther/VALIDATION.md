@@ -3,6 +3,99 @@
 Branch: `feat/add_phanther_spatial`, based on main `25c56b0f`.
 Repository edits are confined to `unixai/panther`.
 
+## Camera mount estimate and base_servo follow-up
+
+Read-only live URDF/static-TF inspection located the body/head chain ending
+in `link_rgbd`, and the separate Orbbec root `camera_link`. No measured transform
+between those origins was found. The configurable `estimated_body_mount`
+assumes coincident CAD/source origins by default and composes both capture-time
+chains inside this driver. It does not broadcast a new host TF or edit the
+vendor URDF. Native connected TF takes precedence. Packets explicitly retain
+`source=configured_cad_estimate` and `accuracy_validated=false`.
+
+The 20-second read-only estimate probe produced 79 body-mount packets,
+39 color frames, 40 depth frames, 1972 camera IMU packets and 197 odometry
+packets. The last estimated optical origin in `base_link` was approximately
+[0.289892, -0.013848, 1.645219] metres. This numerical chain validation does not
+verify head-axis modelling, mounting accuracy or moving-map quality.
+
+Read-only parameter queries confirmed vendor
+`/movebase3_drive_controller.cmd_vel_timeout=0.5` seconds,
+Nav2 `local_costmap.robot_radius=0.37` metres, and Orbbec
+`depth_registration=true`, `enable_depth_scale=true`, `time_domain=global`.
+No parameter was changed. Real stream start verifies the controller timeout.
+
+`tests/probe_base_servo.py` exercised the real spawned domain-42 receiver,
+JSON/ControlSink/lease handling and robot-domain Twist encoding against only
+`/panther_validation/base_servo/input` and `/panther_validation/base_servo/output`.
+Its output boundary was a private recorder, not the actual base command topic.
+It received 70 output frames (21 nonzero), observed zero output 51.7 ms after
+the final nonzero frame, and confirmed pause/stop plus receiver/thread cleanup.
+That interval is not a physical braking or generation-to-stop measurement.
+Twelve base-servo regressions also passed inside the robot image. ActuCore's
+actual `control_stream.negotiate` accepted the descriptor; its 10 Hz TTL is
+200 ms, within this sink's bounds.
+
+Focused regressions cover stale/future/old-session commands, TTL/observation
+expiry, unsupported axes, sequence/priority checks, immediate zero, acceleration
+bounds, receiver exit, independent watchdog, unconfirmed stop ownership and
+manual/Nav2 arbitration. Estimated-mount composition/native precedence is
+also covered. No real base movement, visual arrival, braking-distance test,
+installation calibration or new production deployment was performed.
+
+Final local validation: 51 focused tests plus 48 existing Panther regressions
+passed (99 total); Compose validation and `git diff --check` passed. The final
+extra regression confirms that zero input without a matched reader cannot
+claim a confirmed stop. All submitted files are under `unixai/panther`.
+
+## PR519 sensor contracts follow-up
+
+The new `tests/probe_sensor_inputs.py` ran as a temporary read-only process
+inside the existing driver image, with changed Python modules loaded from
+`/tmp/panther-sensor-validation` via the existing read-only host-tmp mount.
+It did not replace production files, start/restart camera services, publish
+commands, drive the robot or publish to the production Agent Core topics.
+
+The first 20-second run received/encoded 39 color frames, 39 depth frames,
+1969 camera IMU packets and 197 odometry packets. JPEG decoded to 480x640x3;
+zlib depth decoded to 480x640 LE uint16 with 261751 valid pixels, valid depth
+1366–11576 mm in the sampled last frame. Color and depth shared identical
+rectified K: fx 522.753742, fy 522.827600, cx 323.204007, cy 242.011975.
+Source K and distortion were read live; these numbers are evidence for this
+device only, not calibration defaults. Original source capture headers were
+retained. Numeric reports contain no image or audio recordings.
+
+Camera IMU TF supplied rotation and translation from
+`camera_accel_gyro_optical_frame` to `camera_color_optical_frame`.
+In these initial runs the independent TF trees were disconnected: body-mount
+sidecars correctly reported unavailable and omitted their matrix. No installation
+estimate was enabled in these runs. Clock mapping remains explicitly unverified;
+these stationary format checks do not validate motion accuracy or fusion.
+
+The repeat run after depth-unit normalization received 40 color frames,
+39 depth frames, 1965 camera IMU packets and 197 odometry packets. JPEG/depth
+decoding and shared K passed again; all 12 numerical/port tests also passed
+inside the robot image. Optional-IMU watchdog isolation was subsequently
+covered by an additional local lifecycle test.
+
+Thirteen focused local tests cover common-ray geometry, calibration rejection,
+crop/resize K, depth stride/endianness/units/invalid values, IMU vectors/TF/time,
+odometry pose/time/null semantics, unavailable mount clearing and public ports.
+The complete local Panther-focused run passed 37 tests, plus the existing
+48-test Panther suite (85 total); Compose checks and `git diff --check` passed.
+No new image
+has been built or deployed for this follow-up.
+
+## Speaker volume follow-up, local validation
+
+Added per-stream `get_volume` / `set_volume` with integer range 0–100,
+default 100 (unchanged PCM). Five focused tests cover signed PCM attenuation,
+silence/unity, invalid input, idle configuration without starting hardware,
+worker command/acknowledgement and retained settings, and mic schema isolation.
+The focused suite now passes 24 tests; the existing Panther suite passes 48.
+These volume changes have not been deployed or tested on physical hardware.
+Microphone capture and Agent Core rendering remain unchanged.
+
 ## Audio, real hardware
 
 An independent temporary container used the existing driver image with the new

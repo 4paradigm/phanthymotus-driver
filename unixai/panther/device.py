@@ -40,6 +40,7 @@ from contracts import (
 )
 from common.odom import build_interface, build_sample, mean_twist, resolve_stamp_ms
 from core_bridge import BridgeWorker, output_topics
+from spatial_inputs import odom_pose, stamp_ns
 
 
 MODEL_PATH = Path(__file__).with_name("resource") / "panther.urdf"
@@ -120,6 +121,9 @@ class PantherDevice:
         self._cfg = config
         self.namespace = namespace
         self._lock = threading.RLock()
+        self._base_gate = threading.RLock()
+        self._base_servo = None
+        self._controlled_spatial = None
         self._cache: dict[str, tuple[object, float]] = {}
         self._last_card_publish: dict[str, float] = {}
         self._callback_errors: dict[str, dict] = {}
@@ -141,6 +145,9 @@ class PantherDevice:
         self._odom_window: list[list] = []
         self._odom_vendor_ms = None
         self._odom_vendor_meta: dict = {}
+        self._odom_segment = uuid4().hex
+        self._odom_last_stamp = 0
+        self._odom_frames = None
         self._drive_lock = threading.Lock()
         self._drive_generation = 0
         self._drive_action_id = None
@@ -283,6 +290,8 @@ class PantherDevice:
     def close(self) -> None:
         if self._closed:
             return
+        if self._base_servo is not None:
+            self._base_servo.stop()
         base_cfg = self._cfg.get("plugins", {}).get("base_drive", {})
         stop_wait = (float(base_cfg.get("stop_match_timeout_s", 3.0))
                      + float(base_cfg.get("stop_publish_duration_s", 1.0)))
@@ -425,6 +434,13 @@ class PantherDevice:
         header = msg.header.stamp
         vendor_ms = int(header.sec) * 1000 + int(header.nanosec) // 1_000_000
         with self._lock:
+            source_stamp = stamp_ns(msg)
+            frames = (msg.header.frame_id, msg.child_frame_id)
+            if source_stamp < self._odom_last_stamp or frames != self._odom_frames:
+                self._odom_segment = uuid4().hex
+            self._odom_last_stamp = source_stamp
+            self._odom_frames = frames
+            pose, quality = odom_pose(msg, self._odom_segment)
             self._odom_window.append([
                 json_float(twist.linear.x), json_float(twist.linear.y), None,
                 None, None, json_float(twist.angular.z),
@@ -433,6 +449,7 @@ class PantherDevice:
             self._odom_vendor_meta = {
                 "frame_id": msg.header.frame_id,
                 "child_frame_id": msg.child_frame_id,
+                "pose": pose, "motus_slam": quality,
             }
 
     def _on_laser(self, msg) -> None:
@@ -498,6 +515,7 @@ class PantherDevice:
             stamp_ms=stamp,
             twist=mean_twist(readings),
             frame="body",
+            pose=vendor.pop("pose", None),
             vendor={**vendor, **stamp_meta, "source_topic": "/odom"},
         )
         self._put("odom_sample", sample)
@@ -701,10 +719,12 @@ class PantherDevice:
                 "fresh": fresh(received),
                 "age_ms": age_ms(received),
                 "data": sample,
-                "odom_interface": build_interface(
+                "odom_interface": {**build_interface(
                     provides=["vx", "vy", "wz"], frame="body", rate_hz=10.0,
-                    pose_drift="none",
-                ),
+                    pose_drift="unbounded",
+                ), "slam_pose": {"available": True, "profile": "motus_slam/1"}},
+                "slam_pose": {"available": True, "profile": "motus_slam/1",
+                              "clock_mapping_verified": False},
                 **self._callback_health("odom"),
             }
         msg, received = self._get(card)
@@ -993,7 +1013,70 @@ class PantherDevice:
                 _notify_completion(action_id, status, completion, "base_drive")
             return
 
+    def base_check_available(self, owner):
+        """Called under _base_gate: a resource label alone is not a motor lock."""
+        if self._closed:
+            raise RuntimeError("Panther device is closing")
+        if owner != "base_servo" and self._base_servo is not None and self._base_servo._reserved:
+            raise RuntimeError("base_servo owns the chassis; confirm its stop first")
+        if owner != "controlled_spatial" and self._controlled_spatial is not None and self._controlled_spatial.nav:
+            raise RuntimeError("Nav2 owns the chassis; stop navigation and await its terminal result")
+        if self._drive_stop_request is not None or (owner != "base_drive" and self._drive_action_id is not None):
+            raise RuntimeError("base_drive motion or its zero-output stop is still active")
+
+    def servo_prepare(self, dry_run=False):
+        if not dry_run:
+            self._ensure_motion_ready()
+            self._require_controller("movebase3_drive_controller")
+            from rcl_interfaces.srv import GetParameters
+            client = self._node.create_client(GetParameters, "/movebase3_drive_controller/get_parameters")
+            try:
+                if not client.wait_for_service(timeout_sec=2):
+                    raise RuntimeError("cannot verify the base controller command timeout")
+                request = GetParameters.Request()
+                request.names = ["cmd_vel_timeout"]
+                result = self._wait_future(client.call_async(request), 3.)
+                value = result.values[0]
+                timeout = value.double_value if value.type == 3 else value.integer_value if value.type == 2 else None
+                if timeout is None or not math.isfinite(timeout) or not 0 < timeout <= .5:
+                    raise RuntimeError("base_servo requires controller cmd_vel_timeout in (0, 0.5] seconds")
+            finally:
+                self._node.destroy_client(client)
+            self._select_drive_topic()
+
+    def servo_publish(self, values):
+        """All stream output stays on the robot domain and uses the existing route."""
+        moving = any(values)
+        if moving:
+            self._ensure_motion_ready()
+            states, received = self._get("controllers")
+            if not fresh(received, 3.) or not states or states.get("movebase3_drive_controller") != "active":
+                raise RuntimeError("base controller state is stale or inactive")
+        with self._drive_lock:
+            matched = self._drive_publisher_matched(self._drive_pub)
+            if moving and (not matched or self._closed):
+                raise RuntimeError("base command subscriber disappeared or device is closing")
+            if self._drive_pub is not None:
+                msg = self._twist_type()
+                msg.linear.x, msg.linear.y, msg.angular.z = values[0], values[1], values[5]
+                self._drive_pub.publish(msg)
+            return matched
+
     def drive(self, args: dict) -> dict:
+        if args.get("action", "move") == "move":
+            self._ensure_motion_ready()
+        with self._base_gate:
+            action = args.get("action", "move")
+            if action in ("move", "stop", "cancel"):
+                if self._base_servo is not None:
+                    self._base_servo.pause_for_explicit_command()
+                if action in ("stop", "cancel") and self._controlled_spatial is not None and self._controlled_spatial.nav:
+                    return self._controlled_spatial.stop_nav()
+                if action == "move":
+                    self.base_check_available("base_drive")
+            return self._drive_impl(args)
+
+    def _drive_impl(self, args: dict) -> dict:
         action = args.get("action", "move")
         if action in ("cancel", "stop"):
             return self.cancel_drive("cancelled_by_request", force=True)
@@ -1578,6 +1661,20 @@ class PantherDevice:
             thread.join(timeout=wait_s)
         return {"state": "idle" if not thread or not thread.is_alive() else "stopping",
                 "stopped": True, "reason": reason, "action_id": action_id}
+
+    def camera_info(self, kind):
+        card = "camera_color" if kind == "rgb" else "camera_depth"
+        return self._camera.declaration(kind, self.topics[card])
+
+    def camera_imu(self, action):
+        if action == "start":
+            try:
+                return self._camera.arm_imu()
+            except Exception as exc:
+                return {"state": "unavailable", "reason": str(exc)[:200]}
+        if action == "stop":
+            return self._camera.stop("imu")
+        return self._camera.info("imu")
 
     def camera(self, kind: str, args: dict) -> dict:
         action = args.get("action", "info")

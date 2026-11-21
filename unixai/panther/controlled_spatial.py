@@ -15,6 +15,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
 
 
@@ -114,6 +115,7 @@ class ControlledSpatialPlugin:
         self.last_navigation = None
         self.last_error = ''
         self.stop_generation = 0
+        self.base_device = None
 
     def get_tool(self):
         props = {'action': {'type': 'string', 'enum': list(self.ACTION_PARAMS)},
@@ -449,6 +451,15 @@ class ControlledSpatialPlugin:
         raise ValueError('Unknown action: ' + action)
 
     def _navigate(self, target):
+        device = self.base_device
+        with device._base_gate if device is not None else nullcontext():
+            if device is not None:
+                if device._base_servo is not None:
+                    device._base_servo.pause_for_explicit_command()
+                device.base_check_available("controlled_spatial")
+            return self._navigate_owned(target)
+
+    def _navigate_owned(self, target):
         from nav2_msgs.action import NavigateToPose
         with self.lock:
             if self.nav:

@@ -28,6 +28,7 @@ RUN . /etc/os-release && \
       ros-humble-controller-manager-msgs \
       ros-humble-diagnostic-msgs \
       ros-humble-geometry-msgs \
+      ros-humble-rcl-interfaces \
       ros-humble-nav-msgs \
       ros-humble-nav2-msgs \
       ros-humble-std-srvs \
@@ -54,7 +55,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=interface-builder /panther_ws/install /panther_ws/install
 WORKDIR /work
 COPY common/ /work/common/
-COPY main.py device.py plugins.py contracts.py core_bridge.py camera.py audio.py controlled_spatial.py spatial_map.py config.yaml driver.yaml /work/
+COPY main.py device.py plugins.py contracts.py core_bridge.py camera.py audio.py controlled_spatial.py spatial_map.py spatial_inputs.py base_servo.py config.yaml driver.yaml /work/
 COPY resource/panther.urdf /work/resource/panther.urdf
 COPY resource/cyclonedds-muzzle.xml /work/resource/cyclonedds-muzzle.xml
 COPY entrypoint.sh /work/entrypoint.sh

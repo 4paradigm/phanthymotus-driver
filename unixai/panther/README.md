@@ -42,6 +42,140 @@ partial pipe writes, and reports buffer overflow rather than silently dropping
 speech. Use `mic -> ASR` and `TTS -> speaker` on the canvas. For simultaneous
 listening and speaking, insert the perception echo-cancellation card before ASR.
 
+`speaker` also accepts `get_volume` and `set_volume(volume)`:
+
+```json
+{"action": "get_volume"}
+{"action": "set_volume", "volume": 50}
+```
+
+Volume is an integer from 0 to 100 and controls only this card's playback
+stream: 0 is silent, 50 halves PCM amplitude (about -6 dB), and the default
+100 preserves the original PCM level. Responses include `volume` and
+`volume_scope: "stream"`; this is not a reading of the host master volume.
+The independent host/speaker volume still affects physical loudness.
+Settings can be queried or changed while idle without opening an audio device,
+and changes during playback apply to subsequent dequeued blocks. Audio already
+buffered in PulseAudio may still play at the previous level. Volume survives
+card stop/start and worker restarts, but resets when the driver restarts
+(optional `audio.speaker_volume` config sets its initial value). It does not
+change microphone samples, the input topic, or the host's shared sink volume.
+
+## Computation inputs compatible with PR519
+
+The existing camera, IMU and odometry cards also supply the numeric contracts
+used by [Tianyi PR519](https://github.com/4paradigm/phanthymotus-driver/pull/519).
+Agent Core is unchanged. Topic paths below use `/<namespace>/panther` as `P`.
+
+| Card / output | Format and message | Geometry / units / timing |
+|---|---|---|
+| `camera_color`, `P/camera/rgb` | `image/jpeg`, `sensor_msgs/CompressedImage` | Rectified 640x480 JPEG; original source frame and capture header |
+| `camera_depth`, `P/camera/depth` | `image/depth-zlib`, `sensor_msgs/CompressedImage` | 640x480 LE uint16 axial millimetres, zero invalid, zlib without a header prefix |
+| `imu`, original `P/imu` | `data/json`, `std_msgs/String` | Existing body IMU display remains available |
+| `imu.camera_imu`, `P/camera/rgbd/imu` | `sensor/imu`, `std_msgs/String`, `motus.imu/1` JSON | Raw camera gyro xyz in rad/s and acceleration xyz in m/s², source nanosecond times, optical-frame rotations and sensor origins from TF |
+| `odom`, `P/odom` | `state/odom`, `std_msgs/String`, `motus.odom/1` JSON | Body `[vx,vy,null,null,null,wz]`, m/s and rad/s; source pose, quaternion, covariance and its own measurement time |
+
+Each camera retains exactly one image output. Both use live
+`/camera/{color,depth}/camera_info` to derive a common rectified pinhole ray
+window. Color distortion is removed; depth is sampled by nearest neighbour.
+The `camera_info` in tool declarations and action responses contains
+`motus.camera/1`, actual output K/D, size, optical frame, camera identity,
+registration and clock provenance. No generic Gemini calibration is hardcoded.
+Missing or contradictory calibration pauses image forwarding and is reported.
+The effective field can be slightly cropped to keep all rays within both images.
+
+`plugins.camera.registered_depth` must describe a vendor-registered common
+optical frame (true on the development robot). For uint16 input,
+`source_depth_unit_mm` defaults to 1.0, matching this robot's vendor output;
+adjust it only for a source that uses a different verified scale. Float32 ROS
+depth is metres. Invalid, negative, nonfinite or unrepresentable depths become
+zero. Output stays millimetres regardless of source encoding or scale.
+
+Starting the existing `imu` card additionally arms the optional camera IMU
+from `/camera/gyro_accel/sample`, sharing the existing Orbbec owner. It does
+not substitute body IMU readings for camera motion. Source-frame raw vectors
+are not pre-rotated: the consumer applies `camera_from_gyro` / `camera_from_accel`
+once. Translations express the source's declared combined IMU origin in camera
+coordinates. Absent source motion or TF is reported in `imu_status`; body IMU
+display and valid RGB-D remain usable. The camera watchdog does not restart
+RGB-D because this optional IMU is missing.
+
+Camera declarations advertise the optional `state/extrinsic` sidecar
+`P/camera/body_mount` under `vendor.body_mount`. It carries
+`motus.camera_mount/1`, a capture-time `body_from_camera` 4x4 transform in metres,
+or an explicit unavailable status without a retained matrix. Lookups use the
+actual image timestamp, never latest TF. The development robot's camera and
+`base_link` TF trees are disconnected. `estimated_body_mount` now explicitly
+connects them numerically inside this driver: capture-time `base_link <-
+link_rgbd`, a configured installation offset, then vendor `camera_link <-
+optical`. The default offset assumes CAD `link_rgbd` and vendor `camera_link`
+origins coincide. This is an **installation estimate**, not measured calibration:
+packets report `source: configured_cad_estimate` and `accuracy_validated: false`.
+Head joints still participate through the live capture-time TF chain. No
+competing static transform is broadcast into the host graph. A real native
+body-camera TF always takes precedence; disable `estimated_body_mount.enabled`
+to require it. Set `translation_m` / `rpy_rad` only from known mounting data.
+Missing either capture-time chain reports unavailable rather than reusing an
+old transform. The original vendor URDF is unchanged.
+
+`odom_interface.slam_pose` advertises `motus_slam/1` on the existing port and
+`pose_drift: unbounded`. `/odom` supplies the original pose frame, `base_link`
+child frame and measurement timestamp; `pose.stamp_ms` and
+`vendor.motus_slam.stamp_ns` retain its own time independently of the 100 ms
+window-averaged control twist. Invalid pose/time clears the computation pose;
+source-time regression or frame changes create a new segment identity.
+
+Image, IMU and odometry headers are preserved without receipt-time substitution
+for computation poses or IMU. `clock_id: ros_domain_0` identifies the source
+ROS timeline; mapping is explicitly unverified. This adapter does not claim
+hardware synchronization, measured body installation calibration, or moving
+SLAM accuracy. The source's numeric data remains available with that provenance.
+
+## Continuous visual navigation: base_servo
+
+Wire ActuCore `navi`'s `control/velocity` output to `base_servo`. Its
+`control_interface` declares `motus.control/1`, six body-frame SI values in
+`[vx, vy, vz, wx, wy, wz]` order. Default input is `/actucore/navi/cmd`;
+`start(input_topic)` selects another canvas connection. Only vx/vy/wz are
+actuated; nonzero vz/wx/wy are rejected. Output uses the existing matched
+Panther `/cmd_vel` route (or its configured fallback) on robot domain 0.
+Angular values here are **rad/s**, unlike the call-shaped `base_drive` form.
+
+The card's bundle `start()` is inert. Explicit canvas/MCP `start` reserves the
+chassis and attaches an isolated FastDDS domain-42 receiver. `pause` zeros the
+output and releases ownership after three matched zero writes; `resume`
+requires fresh readiness, ownership and newly generated commands. `stop`
+also tears down the receiver. `config(dry_run, rotate_only)` requires a
+confirmed pause/stop; dry-run runs command validation without robot output.
+
+The defaults cap each linear axis at 0.30 m/s and yaw at 0.60 rad/s, within
+`base_drive` caps. Acceleration step bounds use configured acceleration / the
+20 Hz maximum input rate; a 10 Hz source therefore ramps more conservatively.
+The sink is rebased to zero for the first command and after each watchdog hold.
+Explicit zero axes stop immediately. The footprint radius/half-width 0.37 m
+comes from this robot's vendor Nav2 `robot_radius`, is labelled `estimate`, and
+does not certify clearance for extended arms.
+
+Commands require finite generation and observation timestamps, source/sequence,
+matching mode/width, and TTL in `(0, 500]` ms. Expired, old-session, regressed,
+unsupported-axis and future-dated commands are rejected. A single latest-value
+inbox bounds backlog and input application is capped at 20 Hz. The output
+lease expires at the earliest command TTL, observation expiry or 300 ms of
+silence. An independent thread emits zeros, including after receiver exit;
+stop status remains unconfirmed if its output has no matched subscriber.
+Confirmed here means zero commands reached a matched ROS reader, not measured
+physical standstill. The vendor's own `cmd_vel_timeout` must be in `(0, 0.5]` s
+before real stream start; it provides the controller-side process-death backstop.
+No timeout parameter is changed by the card.
+
+`base_drive`, `controlled_spatial` Nav2 goals and `base_servo` share an explicit
+chassis gate. Stream start/resume refuses an existing call motion, pending
+stop or Nav2 goal. A new explicit `base_drive` motion or Nav2 goal pauses the
+stream first and refuses handover if zero output is unconfirmed. Once paused,
+old queued commands cannot resume the stream. A Nav2 cancellation retains
+ownership until its terminal result. This arbitration covers this driver's
+cards; external vendor/remote-control publishers remain separate authorities.
+
 ## Controlled mapping and navigation
 
 `controlled_spatial` is a new independent card; existing body, camera and lidar
