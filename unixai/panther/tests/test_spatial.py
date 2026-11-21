@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from controlled_spatial import ControlledSpatialPlugin, SpatialStore, safe_name
+from controlled_spatial import ControlledSpatialPlugin, SpatialStore, filter_body_returns, safe_name
 import audio
 
 
@@ -147,6 +147,74 @@ class SpatialTest(unittest.TestCase):
         try:
             p._single_scan(msg)
             p.scan_relay.publish.assert_not_called()
+        finally:
+            p.node = None
+
+    def test_body_filter_keeps_external_hits_at_the_same_range(self):
+        import math
+        import numpy as np
+
+        scan = SimpleNamespace(header=object(), angle_min=0.0, angle_increment=math.pi,
+                               range_min=.1, range_max=50., ranges=[.15, .15, float('inf')])
+        transform = np.eye(4)
+        transform[0, 3] = .22584
+        result, count = filter_body_returns(scan, transform, [-.15, .15, -.14, .14])
+        self.assertEqual(count, 1)
+        self.assertEqual(scan.ranges[1], .15)
+        self.assertEqual(result.ranges[0], .15)
+        self.assertTrue(math.isnan(result.ranges[1]))
+        self.assertTrue(math.isinf(result.ranges[2]))
+        self.assertIs(result.header, scan.header)
+
+    def test_unverified_loaded_pose_cannot_start_navigation(self):
+        p = self.plugin
+        p.config['require_tag_localization'] = True
+        p.active_map = 'room'
+        p.localized_after = 0
+        p.pose_received = p.scan_received = time.monotonic()
+        p.pose = {'x': .35, 'y': -2., 'yaw': 1.1}
+        p._navigate = Mock()
+        self.assertEqual(p.info()['state'], 'localizing')
+        self.assertFalse(p.dispatch('get_pose', {})['localization_verified'])
+        self.assertIn('relocalize_at_tag', p.dispatch('tag_place', {'name': 'P0'})['error'])
+        self.assertEqual(p.store.tags('room'), [])
+        result = p.dispatch('navigate_to_pose', {'x': 0., 'y': 0., 'yaw': 0.})
+        self.assertIn('relocalize_at_tag', result['error'])
+        p._navigate.assert_not_called()
+
+    def test_tag_seed_checks_new_tf_for_agreement_before_enabling_navigation(self):
+        p = self.plugin
+        tag = {'name': 'P0', 'x': -.326, 'y': -.002, 'yaw': -.15}
+        p.active_map = 'room'
+        p.grid = object()
+        p.scan_received = 10.
+        p.node = SimpleNamespace(get_clock=lambda: SimpleNamespace(now=lambda: SimpleNamespace(
+            nanoseconds=100_000_000_000, to_msg=lambda: object())))
+        p.initial_pose_type = lambda: SimpleNamespace(header=SimpleNamespace(), pose=SimpleNamespace(
+            pose=SimpleNamespace(position=SimpleNamespace(), orientation=SimpleNamespace()), covariance=[0.] * 36))
+        p.initial_pose_pub = Mock()
+        p.initial_pose_pub.get_subscription_count.return_value = 1
+        try:
+            for matches in (False, True):
+                fake_now = 10.
+                def spin(_):
+                    nonlocal fake_now
+                    fake_now += .2
+                    p.pose = {'x': tag['x'], 'y': tag['y'] if matches else -2., 'yaw': tag['yaw']}
+                    p.pose_source = 'tf:map->base_link'
+                    p.pose_received = fake_now
+                    p.pose_stamp = 100. + fake_now - 10.
+                with patch('controlled_spatial.time.monotonic', lambda: fake_now), \
+                     patch('controlled_spatial.time.sleep', spin):
+                    if matches:
+                        self.assertEqual(p._relocalize_at_tag(tag)['state'], 'localized')
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, 'did not settle'):
+                            p._relocalize_at_tag(tag)
+                    self.assertEqual(p.localization_verified, matches)
+                sent = p.initial_pose_pub.publish.call_args.args[0]
+                self.assertEqual(sent.header.frame_id, 'map')
+                self.assertEqual(sent.pose.pose.position.x, tag['x'])
         finally:
             p.node = None
 

@@ -28,6 +28,7 @@ RUN . /etc/os-release && \
       ros-humble-controller-manager-msgs \
       ros-humble-diagnostic-msgs \
       ros-humble-geometry-msgs \
+      ros-humble-lifecycle-msgs \
       ros-humble-rcl-interfaces \
       ros-humble-nav-msgs \
       ros-humble-nav2-msgs \

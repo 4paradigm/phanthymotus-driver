@@ -229,13 +229,23 @@ The development robot has one observed live lidar topic, `/lidar_front/scan`.
 The vendor defaults start a dual-lidar merger that waits for an absent rear
 input (`rear_missing`), so `/scan` and consequently SLAM have no data.
 `controlled_spatial.single_lidar_topic` explicitly selects the live sensor and
-relays its unmodified `LaserScan` to the vendor `/scan` input. Sensor frame,
-timestamps, beam angles, ranges and timing remain intact; the vendor TF handles
-its physical extrinsic. No existing lidar card implementation is changed.
+relays its `LaserScan` to the vendor `/scan` input. `self_filter_box_m` uses the
+TF at scan time to identify chassis returns in `base_link`. Those rays become
+invalid (`NaN`). The sensor frame, timestamps and beam geometry are preserved
+for the vendor SLAM node. `info` shows the number of filtered returns.
 If the vendor merger starts publishing real merged scans, the relay yields.
 Set this setting to `""` on a verified dual-lidar model with working native
 fusion. A second USB serial interface is not evidence of a second physical
 lidar; no rear-device alias or udev rule is installed by this driver.
+
+Build a new map after enabling the filter because old saved maps can contain
+chassis returns. After saving or loading a map, stand at a recorded tag with
+its recorded heading and call `relocalize_at_tag(tag_name)`. This seeds vendor
+SLAM in the map frame using the tag's `base_link` pose. The driver checks for
+fresh TF within 0.25 m and 20 degrees of the tag for one second. With
+`require_tag_localization` enabled, navigation and tagging on a loaded map
+wait for this check. `get_pose` reports `localization_verified` alongside
+the pose. The driver also checks `/bt_navigator/get_state` before sending a goal.
 
 `model` falls back to the bundled, verbatim vendor `pmm_urdf` model before the robot
 publishes anything. Once a live `/robot_description` is available, reading the
@@ -282,6 +292,7 @@ for these concrete runtime paths:
 |---|---|---|
 | `ros-humble-nav-msgs` | `nav_msgs/msg/Odometry` on `/odom` | Required for measured body velocity and pose |
 | `ros-humble-nav2-msgs` | `NavigateToPose` action for `controlled_spatial` | Panther navigation runtime dependency |
+| `ros-humble-lifecycle-msgs` | Check that the host Nav2 navigator is active | Explicit dependency already present in the tested driver image |
 | `ros-humble-std-srvs` | Vendor SLAM `Trigger` / `SetBool` services | Panther mapping/localization runtime dependency |
 | `ros-humble-tf2-ros` | Capture-time camera/IMU transforms and map-frame localization | Panther TF runtime dependency |
 | `ros-humble-rcl-interfaces` | Read `cmd_vel_timeout` before arming `base_servo` | Panther controller-timeout verification dependency |

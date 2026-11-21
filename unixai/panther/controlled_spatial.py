@@ -6,6 +6,7 @@ or controller configuration changed by the card.
 """
 from __future__ import annotations
 
+from copy import copy
 import json
 import math
 import os
@@ -28,6 +29,28 @@ def safe_name(value):
 
 def yaw_of(q):
     return math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
+
+
+def filter_body_returns(scan, base_from_laser, box):
+    """Invalidate endpoints inside the chassis without changing sensor geometry."""
+    import numpy as np
+
+    ranges = np.asarray(scan.ranges)
+    valid = np.isfinite(ranges) & (ranges >= scan.range_min) & (ranges <= scan.range_max)
+    indices = np.flatnonzero(valid)
+    angles = scan.angle_min + indices * scan.angle_increment
+    points = ranges[indices] * np.stack((np.cos(angles), np.sin(angles)))
+    endpoints = base_from_laser[:2, :2] @ points + base_from_laser[:2, 3, None]
+    xmin, xmax, ymin, ymax = box
+    x, y = endpoints
+    inside = (xmin <= x) & (x <= xmax) & (ymin <= y) & (y <= ymax)
+    if not inside.any():
+        return scan, 0
+    filtered = copy(scan)
+    values = ranges.copy()
+    values[indices[inside]] = np.nan  # invalid ray, not a clear ray through the body
+    filtered.ranges = values.tolist()
+    return filtered, int(inside.sum())
 
 
 class SpatialStore:
@@ -81,6 +104,7 @@ class ControlledSpatialPlugin:
         'start_mapping': ['map_name'], 'stop_mapping': [],
         'list_maps': [], 'load_map': ['map_name'], 'delete_map': ['map_name'],
         'tag_place': ['name', 'description'], 'untag_place': ['name'], 'list_tags': [],
+        'relocalize_at_tag': ['tag_name'],
         'navigate_to_tag': ['tag_name'], 'navigate_to_pose': ['x', 'y', 'yaw'],
         'stop_nav': [], 'get_pose': [],
     }
@@ -103,12 +127,21 @@ class ControlledSpatialPlugin:
         self.pose_received = 0.0
         self.pose_source = None
         self.pose_stamp_after = 0.0
+        self.pose_stamp = 0.0
+        self.localization_verified = False
         self.scan_received = 0.0
         self.scan_frames = 0
         self.scan_frame = None
         self.external_scan_received = 0.0
         self.input_scan_frame = None
         self.relayed_scans = 0
+        self.filtered_returns = 0
+        self.scan_filter_error = ''
+        self.self_filter = config.get('self_filter_box_m')
+        if self.self_filter is not None:
+            if (len(self.self_filter) != 4 or not all(math.isfinite(v) for v in self.self_filter)
+                    or self.self_filter[0] >= self.self_filter[1] or self.self_filter[2] >= self.self_filter[3]):
+                raise ValueError('self_filter_box_m must be [xmin, xmax, ymin, ymax] in base_frame')
         self.grid = None
         self.grid_received = 0.0
         self.nav = None
@@ -122,7 +155,7 @@ class ControlledSpatialPlugin:
                  **{key: {'type': 'string'} for key in ('map_name', 'name', 'tag_name', 'description')},
                  **{key: {'type': 'number'} for key in ('x', 'y', 'yaw')}}
         return {'name': 'controlled_spatial', 'type': 'actuator', 'multiInstance': False,
-                'description': 'Panther controlled SLAM: map manually, tag places, load maps and navigate. yaw is radians.',
+                'description': 'Panther controlled SLAM: map manually, tag places, load maps and navigate. Use relocalize_at_tag when physically at a known tag, with the recorded heading. yaw is radians.',
                 'inputSchema': {'type': 'object', 'properties': props, 'required': ['action'],
                     'additionalProperties': False, 'x-resource': 'base',
                     'x-completion': {'actions': ['navigate_to_tag', 'navigate_to_pose'],
@@ -156,6 +189,8 @@ class ControlledSpatialPlugin:
             self.services[name] = self.node.create_client(service_type, '/unix_slam/' + name,
                                                           callback_group=group)
         self.node.create_subscription(PoseWithCovarianceStamped, '/pose', self._pose, 10, callback_group=group)
+        self.initial_pose_type = PoseWithCovarianceStamped
+        self.initial_pose_pub = self.node.create_publisher(PoseWithCovarianceStamped, '/initialpose', 10)
         from rclpy.qos import qos_profile_sensor_data
         self.node.create_subscription(LaserScan, '/scan', self._scan, qos_profile_sensor_data, callback_group=group)
         self.scan_relay = None
@@ -174,6 +209,13 @@ class ControlledSpatialPlugin:
                          reliability=ReliabilityPolicy.RELIABLE)
         self.node.create_subscription(OccupancyGrid, '/map', self._grid, qos, callback_group=group)
         self.client = ActionClient(self.node, NavigateToPose, self.config.get('navigation_action', '/navigate_to_pose'), callback_group=group)
+        navigator_state_service = self.config.get('navigator_state_service')
+        if navigator_state_service:
+            from lifecycle_msgs.srv import GetState
+
+            self.types['navigator_state'] = GetState
+            self.services['navigator_state'] = self.node.create_client(
+                GetState, navigator_state_service, callback_group=group)
         self.node.create_timer(0.5, self._watchdog, callback_group=group)
         self.node.create_timer(0.1, self._tf_pose, callback_group=group)
         self.executor.add_node(self.node)
@@ -199,9 +241,12 @@ class ControlledSpatialPlugin:
         with self.lock:
             if stamp <= self.pose_stamp_after:
                 return
+            if self.config.get('require_tag_localization') and not self.mapping:
+                return  # use one consistent source during localization
             self.pose = values
             self.pose_source = "/pose"
             self.pose_received = time.monotonic()
+            self.pose_stamp = stamp
 
     def _tf_pose(self):
         from rclpy.time import Time
@@ -214,11 +259,13 @@ class ControlledSpatialPlugin:
             if age < -1 or age > 3 or not all(math.isfinite(v) for v in pose.values()):
                 return
             with self.lock:
-                if stamp <= self.pose_stamp_after:
+                source = 'tf:map->' + self.config.get('base_frame', 'base_link')
+                if stamp <= self.pose_stamp_after or (self.pose_source == source and stamp <= self.pose_stamp):
                     return
                 self.pose = pose
-                self.pose_source = 'tf:map->' + self.config.get('base_frame', 'base_link')
+                self.pose_source = source
                 self.pose_received = time.monotonic()
+                self.pose_stamp = stamp
         except Exception:
             # TF is normally absent before SLAM starts or localization converges.
             return
@@ -228,12 +275,27 @@ class ControlledSpatialPlugin:
         age = self.node.get_clock().now().nanoseconds / 1e9 - stamp
         if age < -1 or age > 3 or not msg.ranges:
             return
+        removed = 0
+        if self.self_filter is not None:
+            try:
+                from rclpy.time import Time
+                from spatial_inputs import transform_matrix
+
+                transform = self.tf_buffer.lookup_transform(self.config.get('base_frame', 'base_link'),
+                                                            msg.header.frame_id, Time.from_msg(msg.header.stamp))
+                msg, removed = filter_body_returns(msg, transform_matrix(transform), self.self_filter)
+            except Exception as exc:
+                with self.lock:
+                    self.scan_filter_error = str(exc)[:240]
+                return
         with self.lock:
             self.input_scan_frame = msg.header.frame_id
             # Yield if the vendor merger starts producing real merged scans.
             if self.external_scan_received and time.monotonic() - self.external_scan_received < 3:
                 return
             self.relayed_scans += 1
+            self.filtered_returns += removed
+            self.scan_filter_error = ''
         self.scan_relay.publish(msg)
 
     def _scan(self, msg):
@@ -274,7 +336,7 @@ class ControlledSpatialPlugin:
     def _call(self, name, **kwargs):
         client = self.services[name]
         if not client.wait_for_service(timeout_sec=2):
-            raise RuntimeError('/unix_slam/' + name + ' is unavailable')
+            raise RuntimeError(client.srv_name + ' is unavailable')
         request = self.types[name].Request(**kwargs)
         response = self._wait(client.call_async(request), self.config.get('service_timeout_s', 20))
         if hasattr(response, 'success') and not response.success:
@@ -294,13 +356,20 @@ class ControlledSpatialPlugin:
         except RuntimeError:
             pose = None
         with self.lock:
-            return {'state': 'mapping' if self.mapping else 'localized' if pose and self.active_map else 'idle',
+            state = 'mapping' if self.mapping else 'idle'
+            if self.active_map and not self.mapping:
+                ready = pose and (self.localization_verified or not self.config.get('require_tag_localization'))
+                state = 'localized' if ready else 'localizing'
+            return {'state': state,
                     'active_map': self.active_map, 'pose': pose, 'pose_source': self.pose_source,
+                    'localization_verified': self.localization_verified,
                     'navigation': {k: v for k, v in self.nav.items() if k not in ('handle', 'future')} if self.nav else None,
                     'last_navigation': self.last_navigation, 'error': self.last_error,
                     'scan': {'frames': self.scan_frames, 'frame_id': self.scan_frame,
                              'single_lidar_topic': self.config.get('single_lidar_topic'),
                              'relayed_frames': self.relayed_scans,
+                             'filtered_body_returns': self.filtered_returns,
+                             'filter_error': self.scan_filter_error,
                              'age_s': time.monotonic()-self.scan_received if self.scan_received else None},
                     'map_available': self.grid is not None,
                     'map_dir': str(self.root), 'vendor_map_dir': str(self.vendor_dir)}
@@ -312,8 +381,62 @@ class ControlledSpatialPlugin:
             self.localized_after = time.monotonic()
             self.pose_stamp_after = self.node.get_clock().now().nanoseconds / 1e9 if self.node else 0.0
             self.pose = None
+            self.localization_verified = False
             self.grid = None
             self.active_map = None
+
+    def _relocalize_at_tag(self, tag):
+        if self.mapping or not self.active_map or self.grid is None:
+            raise RuntimeError('Wait for the loaded map before setting its pose')
+        self._require_scan()
+        if not all(math.isfinite(tag[key]) for key in ('x', 'y', 'yaw')):
+            raise ValueError('Tag has an invalid pose')
+        with self.lock:
+            if self.nav:
+                raise RuntimeError('Stop navigation before setting the pose')
+        if not self.initial_pose_pub.get_subscription_count():
+            raise RuntimeError('No SLAM subscriber on /initialpose')
+        message = self.initial_pose_type()
+        stamp = self.node.get_clock().now()
+        message.header.frame_id = 'map'
+        message.header.stamp = stamp.to_msg()
+        message.pose.pose.position.x = tag['x']
+        message.pose.pose.position.y = tag['y']
+        message.pose.pose.orientation.z = math.sin(tag['yaw'] / 2)
+        message.pose.pose.orientation.w = math.cos(tag['yaw'] / 2)
+        message.pose.covariance[0] = message.pose.covariance[7] = 0.15 ** 2
+        message.pose.covariance[35] = math.radians(15) ** 2
+        stamp_s = stamp.nanoseconds / 1e9
+        with self.lock:
+            self.localization_verified = False
+            self.pose = None
+            self.pose_stamp_after = stamp_s
+            self.localized_after = time.monotonic()
+        self.initial_pose_pub.publish(message)
+
+        # Check the live base-frame TF after the seed, allowing for SLAM's
+        # scan-matching period. A cached /pose message cannot confirm the seed.
+        deadline = time.monotonic() + 5
+        stable_since = None
+        last_stamp = stamp_s
+        while time.monotonic() < deadline:
+            with self.lock:
+                pose = self.pose
+                if (pose and self.pose_source == 'tf:map->' + self.config.get('base_frame', 'base_link')
+                        and self.pose_stamp > stamp_s and time.monotonic() - self.pose_received < 0.5
+                        and math.hypot(pose['x'] - tag['x'], pose['y'] - tag['y']) <= 0.25
+                        and abs(math.remainder(pose['yaw'] - tag['yaw'], 2 * math.pi)) <= math.radians(20)):
+                    now = time.monotonic()
+                    stable_since = now if stable_since is None else stable_since
+                    if self.pose_stamp > last_stamp and now - stable_since >= 1.0:
+                        self.localization_verified = True
+                        self.last_error = ''
+                        return {'state': 'localized', 'tag_name': tag['name'], 'pose': dict(pose)}
+                    last_stamp = self.pose_stamp
+                else:
+                    stable_since = None
+            time.sleep(0.05)
+        raise RuntimeError('SLAM pose did not settle within 0.25 m and 20 degrees of the tag')
 
     def _archive(self, name):
         """Mirror native artifacts into the same persistent map root as G1/Tianyi."""
@@ -345,7 +468,8 @@ class ControlledSpatialPlugin:
             if action == 'info':
                 return self.info()
             if action == 'get_pose':
-                return {'pose': self.current_pose()}
+                with self.lock:
+                    return {'pose': self.current_pose(), 'localization_verified': self.localization_verified}
             if not self.operations.acquire(blocking=False):
                 return {'state': 'busy', 'error': 'Another mapping operation is in progress'}
             try:
@@ -388,6 +512,7 @@ class ControlledSpatialPlugin:
             self._call('set_localization_mode', data=True)
             with self.lock:
                 self.mapping = False
+                self.localization_verified = False
             return {'state': 'saved', 'map_name': name, 'path': str(target)}
         if action == 'load_map':
             if self.mapping:
@@ -414,6 +539,11 @@ class ControlledSpatialPlugin:
                 self.active_map = name
                 self.localized_after = time.monotonic()
             return {'state': 'localizing', 'map_name': name}
+        if action == 'relocalize_at_tag':
+            tag = next((p for p in self.store.tags(self.active_map) if p['name'] == args.get('tag_name')), None)
+            if tag is None:
+                raise ValueError('Unknown tag on the loaded map')
+            return self._relocalize_at_tag(tag)
         if action == 'delete_map':
             name = safe_name(args.get('map_name', ''))
             if name == self.active_map:
@@ -430,6 +560,9 @@ class ControlledSpatialPlugin:
             if not self.active_map:
                 raise ValueError('Load a map or start mapping first')
             if action == 'tag_place':
+                if (not self.mapping and self.config.get('require_tag_localization')
+                        and not self.localization_verified):
+                    raise RuntimeError('Confirm localization with relocalize_at_tag before saving tags')
                 self.store.tag(safe_name(args.get('name', '')), self.active_map,
                                self.current_pose(), str(args.get('description', ''))[:1024])
             elif action == 'untag_place':
@@ -441,6 +574,8 @@ class ControlledSpatialPlugin:
                 raise ValueError('Load a saved map before navigation')
             self.current_pose()
             self._require_scan()
+            if self.config.get('require_tag_localization') and not self.localization_verified:
+                raise RuntimeError('Confirm localization with relocalize_at_tag before navigation')
             if action == 'navigate_to_tag':
                 target = next((p for p in self.store.tags(self.active_map) if p['name'] == args.get('tag_name')), None)
                 if target is None:
@@ -467,6 +602,12 @@ class ControlledSpatialPlugin:
             if self.nav:
                 raise RuntimeError('Navigation is already active')
             generation = self.stop_generation
+        if self.config.get('navigator_state_service'):
+            from lifecycle_msgs.msg import State
+
+            state = self._call('navigator_state').current_state
+            if state.id != State.PRIMARY_STATE_ACTIVE:
+                raise RuntimeError(f'Nav2 bt_navigator is {state.label}; check its lifecycle and behavior tree configuration')
         if not self.client.wait_for_server(timeout_sec=2):
             raise RuntimeError('Nav2 navigate_to_pose action server is unavailable')
         goal = NavigateToPose.Goal()
