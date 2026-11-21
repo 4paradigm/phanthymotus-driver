@@ -17,6 +17,7 @@ import threading
 import time
 import uuid
 from contextlib import nullcontext
+from functools import wraps
 from pathlib import Path
 
 
@@ -178,6 +179,14 @@ class ControlledSpatialPlugin:
                     'x-action-params': {a: {'params': p} for a, p in self.ACTION_PARAMS.items()}}}
 
     def start(self):
+        if self.node is None:
+            try:
+                self._start_ros()
+            except Exception:
+                self._stop_ros()
+                raise
+
+    def _start_ros(self):
         from rclpy.node import Node
         from rclpy.callback_groups import ReentrantCallbackGroup
         from rclpy.action import ActionClient
@@ -189,9 +198,21 @@ class ControlledSpatialPlugin:
         from tf2_ros import Buffer, TransformListener
         from std_srvs.srv import Trigger, SetBool
         from unix_msgs.srv import SaveMap, LoadMap, DeleteMap, GetMapList
-        if self.node is not None:
-            return
-        self.node = Node('panther_controlled_spatial')
+        source = self.config.get('single_lidar_topic', '')
+        if source == '/scan':
+            raise ValueError('single_lidar_topic must differ from /scan')
+        node = self.node = Node('panther_controlled_spatial')
+
+        def while_active(callback):
+            @wraps(callback)
+            def guarded(*args):
+                # A callback queued by the previous node must not touch new
+                # publishers or caches after a stop/start.
+                with self.lock:
+                    if self.node is node:
+                        callback(*args)
+            return guarded
+
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self.node, spin_thread=False)
         group = ReentrantCallbackGroup()
@@ -201,26 +222,23 @@ class ControlledSpatialPlugin:
         for name, service_type in self.types.items():
             self.services[name] = self.node.create_client(service_type, '/unix_slam/' + name,
                                                           callback_group=group)
-        self.node.create_subscription(PoseWithCovarianceStamped, '/pose', self._pose, 10, callback_group=group)
+        self.node.create_subscription(PoseWithCovarianceStamped, '/pose', while_active(self._pose), 10, callback_group=group)
         self.initial_pose_type = PoseWithCovarianceStamped
         self.initial_pose_pub = self.node.create_publisher(PoseWithCovarianceStamped, '/initialpose', 10)
         from rclpy.qos import qos_profile_sensor_data
-        self.node.create_subscription(LaserScan, '/scan', self._scan, qos_profile_sensor_data, callback_group=group)
+        self.node.create_subscription(LaserScan, '/scan', while_active(self._scan), qos_profile_sensor_data, callback_group=group)
         self.scan_relay = None
-        source = self.config.get('single_lidar_topic', '')
         if source:
-            if source == '/scan':
-                raise ValueError('single_lidar_topic must differ from /scan')
             # The shipped vendor merger waits forever for a second lidar on
             # single-lidar Panthers. Preserve the real sensor frame/timestamps;
             # SLAM and Nav2 already consume /scan and use TF for the extrinsic.
             self.scan_relay = self.node.create_publisher(LaserScan, '/scan', 10)
-            self.node.create_subscription(LaserScan, source, self._single_scan,
+            self.node.create_subscription(LaserScan, source, while_active(self._single_scan),
                                           qos_profile_sensor_data, callback_group=group)
 
         qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
                          reliability=ReliabilityPolicy.RELIABLE)
-        self.node.create_subscription(OccupancyGrid, '/map', self._grid, qos, callback_group=group)
+        self.node.create_subscription(OccupancyGrid, '/map', while_active(self._grid), qos, callback_group=group)
         self.client = ActionClient(self.node, NavigateToPose, self.config.get('navigation_action', '/navigate_to_pose'), callback_group=group)
         navigator_state_service = self.config.get('navigator_state_service')
         if navigator_state_service:
@@ -229,17 +247,54 @@ class ControlledSpatialPlugin:
             self.types['navigator_state'] = GetState
             self.services['navigator_state'] = self.node.create_client(
                 GetState, navigator_state_service, callback_group=group)
-        self.node.create_timer(0.5, self._watchdog, callback_group=group)
-        self.node.create_timer(0.1, self._tf_pose, callback_group=group)
+        self.node.create_timer(0.5, while_active(self._watchdog), callback_group=group)
+        self.node.create_timer(0.1, while_active(self._tf_pose), callback_group=group)
         self.executor.add_node(self.node)
 
     def stop(self):
-        if self.node is not None:
-            self.stop_nav()
-            self.executor.remove_node(self.node)
-            self.node.destroy_node()
-            self.node = None
-        # The registered map display and a later start still share this store.
+        if not self.operations.acquire(blocking=False):
+            result = self.stop_nav()
+            return {**result, 'state': 'busy', 'error': 'Another spatial operation is in progress. Retry stop.'}
+        try:
+            return self._stop_owned()
+        finally:
+            self.operations.release()
+
+    def _stop_owned(self):
+        if self.mapping:
+            return {'state': 'mapping', 'map_name': self.active_map,
+                    'error': 'Save the active map with stop_mapping before stopping the card'}
+        result = self.stop_nav()
+        if result['state'] != 'idle':
+            if not self._wait_until(lambda: self.nav is None, timeout=3):
+                return {**result, 'error': result.get('error') or
+                        'Waiting for Nav2 to finish canceling. Retry stop when navigation ends.'}
+        self._stop_ros()
+        return {'state': 'idle'}
+
+    def _stop_ros(self):
+        with self.lock:
+            node, self.node = self.node, None
+            if node is None:
+                return
+            self.pose = self.pose_source = self.grid = None
+            self.pose_received = self.pose_stamp = self.grid_received = 0.0
+            self.scan_received = self.external_scan_received = 0.0
+            self.scan_frame = self.input_scan_frame = None
+            self.scan_filter_error = ''
+            self.localization_verified = False
+            # Keep active_map to protect the map still loaded by vendor SLAM
+            # from deletion. The operator can load it again or unload it.
+        self.executor.remove_node(node)
+        try:
+            if getattr(self, 'client', None) is not None:
+                self.client.destroy()
+        finally:
+            node.destroy_node()
+            self.client = self.scan_relay = self.initial_pose_pub = None
+            self.tf_listener = self.tf_buffer = None
+            self.services = {}
+        # The map display and later starts still share the persistent store.
 
     def _pose(self, msg):
         if msg.header.frame_id.lstrip('/') != 'map':
@@ -371,7 +426,7 @@ class ControlledSpatialPlugin:
             pose = None
         with self.lock:
             state = 'mapping' if self.mapping else 'idle'
-            if self.active_map and not self.mapping:
+            if self.node is not None and self.active_map and not self.mapping:
                 ready = pose and (self.localization_verified or not self._requires_localization())
                 state = 'localized' if ready else 'localizing'
             return {'state': state,
@@ -489,10 +544,10 @@ class ControlledSpatialPlugin:
 
     def dispatch(self, action, args):
         try:
-            if action in ('stop', 'stop_nav'):
+            if action == 'stop_nav':
                 return self.stop_nav()
-            if action == 'start':
-                return {'state': 'ready', 'data': self.info()}
+            if action == 'stop':
+                return self.stop()
             if action == 'info':
                 return self.info()
             if action == 'get_pose':
@@ -501,6 +556,11 @@ class ControlledSpatialPlugin:
             if not self.operations.acquire(blocking=False):
                 return {'state': 'busy', 'error': 'Another mapping operation is in progress'}
             try:
+                if action == 'start':
+                    self.start()
+                    return {'state': 'ready', 'data': self.info()}
+                if self.node is None:
+                    return {'state': 'error', 'error': 'Start controlled_spatial before using this action'}
                 return self._dispatch(action, args)
             finally:
                 self.operations.release()

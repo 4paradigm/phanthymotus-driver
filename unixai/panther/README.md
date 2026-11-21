@@ -224,8 +224,13 @@ another navigation stack or change controller parameters.
   map, fresh localization and live scans. Tag names match exactly. Nav2 terminal
   results determine completion; timeout requests cancellation and retains
   ownership until Nav2 confirms termination.
-- `stop_nav` / `stop`: cancel the owned navigation goal, including a goal still
-  being accepted. Interrupt hooks share the existing `base` resource.
+- `stop_nav`: cancel the owned navigation goal, including a goal still being
+  accepted. Interrupt hooks share the existing `base` resource.
+- `stop`: release the card's ROS node and scan relay once Nav2 has confirmed
+  that any owned goal has ended. If cancellation is still pending, retry after
+  it finishes. During mapping, use `stop_mapping` to save the active session
+  before stopping the card. `start` recreates the node. Reload the map to
+  verify localization before navigating again.
 - `info` / `get_pose`: expose mapping, localization, scan freshness and
   navigation status. No stale pose is used for tagging or navigation.
 

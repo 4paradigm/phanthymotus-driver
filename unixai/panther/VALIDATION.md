@@ -181,6 +181,17 @@ The PulseAudio discovery and vendor map mounts and the driver metadata do not
 add image layers. The incremental byte count has not been measured in a
 before-and-after build using the same base digest and architecture.
 
+## Shared command freshness
+
+Panther republishes accepted velocities until the earliest deadline set by the
+command TTL, observation age, or watchdog. The driver needs that deadline in
+monotonic time. `ControlSink` already owns freshness, so the shared change
+returns the deadline on accepted outcomes and lets Panther opt into its
+existing stricter timestamp bounds. Consumers that use the default options
+keep their existing timestamp policy and apply callback signature. The
+shared source is copied into existing images and adds no runtime dependency.
+The shared tests exercise the deadline and the stricter checks without ROS.
+
 ## Local checks
 
 Review follow-up (2026-11-21): 54 focused tests and 48 existing Panther tests

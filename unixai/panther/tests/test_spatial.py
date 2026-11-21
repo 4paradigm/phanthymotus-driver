@@ -45,6 +45,9 @@ class SpatialTest(unittest.TestCase):
                             'native_slam_db_path': str(root / 'controlled_spatial.db'),
                             'vendor_map_dir': str(root / 'native')}, 'test', None)
         self.plugin.vendor_dir.mkdir()
+        self.plugin.executor = Mock()
+        self.plugin.node = Mock()
+        self.plugin.node.get_clock().now().nanoseconds = 0
         self.plugin._call = Mock(return_value=SimpleNamespace(map_names=[], success=True))
 
     def tearDown(self):
@@ -59,7 +62,8 @@ class SpatialTest(unittest.TestCase):
         p.store.save_map('room', p.root / 'room')
         p.store.tag('P1', 'room', {'x': 1, 'y': 2, 'yaw': 0}, 'desk')
         display = SpatialMapPlugin(p, 'test')
-        p.executor = Mock()
+        p.node = None
+        p.config['single_lidar_topic'] = '/lidar_front/scan'
         first, second = Mock(), Mock()
         modules = {name: Mock() for name in (
             'rclpy.node', 'rclpy.callback_groups', 'rclpy.action', 'rclpy.qos',
@@ -68,10 +72,22 @@ class SpatialTest(unittest.TestCase):
         )}
         modules['rclpy.node'].Node.side_effect = [first, second]
         with patch.dict(sys.modules, modules):
-            p.start()
-            p.stop()
+            self.assertEqual(p.dispatch('start', {})['state'], 'ready')
+            relay = p.scan_relay
+            queued_scan = next(call.args[2] for call in first.create_subscription.call_args_list
+                               if call.args[1] == '/lidar_front/scan')
+            self.assertEqual(p.dispatch('stop', {}), {'state': 'idle'})
+            self.assertIsNone(p.node)
+            self.assertIsNone(p.scan_relay)
+            self.assertEqual(p.dispatch('stop', {}), {'state': 'idle'})
             self.assertEqual(display.dispatch('list_maps', {})['maps'][0]['name'], 'room')
-            p.start()
+            self.assertIn('Start controlled_spatial', p.dispatch('start_mapping', {})['error'])
+            p._call.assert_not_called()
+            self.assertEqual(p.dispatch('start', {})['state'], 'ready')
+            # Old executor work cannot accidentally relay via the replacement node.
+            queued_scan(object())
+            relay.publish.assert_not_called()
+            p.scan_relay.publish.assert_not_called()
         p.executor.remove_node.assert_called_once_with(first)
         first.destroy_node.assert_called_once()
         p.executor.add_node.assert_called_with(second)
@@ -99,6 +115,38 @@ class SpatialTest(unittest.TestCase):
         self.assertEqual(result['data']['state'], 'mapping')
         self.assertEqual(result['data']['active_map'], 'room')
         self.assertEqual(self.plugin.dispatch('info', {})['state'], 'mapping')
+
+    def test_canvas_stop_preserves_an_unsaved_mapping_session(self):
+        p = self.plugin
+        node = p.node
+        p.mapping, p.active_map = True, 'room'
+        result = p.dispatch('stop', {})
+        self.assertEqual(result['state'], 'mapping')
+        self.assertIn('stop_mapping', result['error'])
+        self.assertIs(p.node, node)
+        self.assertTrue(p.mapping)
+        p.executor.remove_node.assert_not_called()
+        p._call.assert_not_called()
+
+    def test_canvas_stop_retains_ros_until_nav2_reports_terminal_result(self):
+        p = self.plugin
+        node = p.node
+        handle = Mock()
+        p.nav = {'action_id': 'one', 'handle': handle, 'state': 'navigating', 'target': {}}
+        p._wait = Mock(return_value=SimpleNamespace(goals_canceling=[object()]))
+        p._wait_until = Mock(return_value=False)
+        result = p.dispatch('stop', {})
+        self.assertEqual(result['state'], 'canceling')
+        self.assertEqual(result['action_id'], 'one')
+        handle.cancel_goal_async.assert_called_once()
+        p.executor.remove_node.assert_not_called()
+        self.assertIs(p.node, node)
+
+        p._notify = Mock()
+        p._finish(p.nav, 'cancelled', 'Nav2 terminal status 5')
+        self.assertEqual(p.dispatch('stop', {}), {'state': 'idle'})
+        p.executor.remove_node.assert_called_once_with(node)
+        node.destroy_node.assert_called_once()
 
     def test_rejects_paths_and_empty_names(self):
         for value in ['', '../other', '/tmp/map', 'a/b', 'a.b', 'x'*65]:
