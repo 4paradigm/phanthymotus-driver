@@ -368,6 +368,15 @@ class DriverContractTests(unittest.TestCase):
         self.assertFalse(published)
         self.assertTrue(self.bundle.state.motion_blocked)
 
+    def test_native_navigation_disables_upper_velocity_before_resuming(self):
+        self.ros.emit('/enable_control_state', False)
+        self.bundle.state.verify_enable()
+        self.bundle.start_motion('base', 'controlled_spatial', (3,), lambda: None)
+        self.assertEqual(self.ros.sent_services[:2], [
+            ('/enable_vel_control', 'std_srvs/SetBool', {'data': False}),
+            ('/enable_control', 'std_srvs/SetBool', {'data': True}),
+        ])
+
     def test_stop_during_velocity_handoff_retains_the_older_remote_request(self):
         entered, release, errors = threading.Event(), threading.Event(), []
         original = self.ros.wait_service

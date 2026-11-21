@@ -366,7 +366,7 @@ SSH RPC 辅助源码随镜像构建，每次在底盘执行固定操作，使用
 
 导航的提交、查询和取消均核验为同一服务提供者。ACP 使用厂商返回的 task_id 跟踪，
 到达还需核对地图、位姿和零速反馈；不是“服务返回 success 就完成”。
-速度默认0.15m/s、范围0.05–0.3m/s；启用避障，避障距离0.5m，不暴露禁用避障开关。
+速度上限默认0.15m/s、可设范围0.05–0.5m/s，实际速度由厂商规划器和避障决定。避障距离为0.5m。
 `base_drive` 和新卡共用内部 base 动作锁及 Agent Core 的 base 资源声明，中断走 `stop_nav`。地图流程每次ChangeMode均等待实际模式反馈再发下一条命令，不把接口应答当作模式已切换；载图若收到厂商8211模式前置条件拒绝，保留错误ACP但不遗留“远端仍在执行”的锁，允许重试。超时/断连仍保留未确认状态。
 停止会先请求全身禁用，不因旧导航提交阻塞这一步，再按顺序原生取消并核实停稳。
 
@@ -797,6 +797,14 @@ requires fresh `/enable_vel_control_state` feedback after changing it. This
 state is latched, not a periodic heartbeat: a confirmed value is retained within
 the same bridge connection and invalidated on reconnect. Otherwise upper MPC output
 can select `nav_mpc_move_base` and override the native navigation velocity.
+After confirming the upper velocity switch, the goal RPC calls the chassis
+`SetDispatchMode.STATUS_IDLE` to return control to the factory dispatcher. It
+submits `MoveToTarget` only after that call succeeds. If the chassis still reports
+`nav_mpc_move_base` five seconds after accepting the goal, the driver stops and
+cancels the task.
+`navigate_to_pose` and `navigate_to_tag` accept a 0.05–0.5 m/s linear speed
+limit (default 0.15 m/s). The factory planner and obstacle handling determine
+the actual speed.
 `base_drive` and `base_servo` restore this switch before publishing; starting
 mapping restores the upper MPC remote-control route without resuming motors.
 Stops retain the software stop and require native cancellation plus fresh

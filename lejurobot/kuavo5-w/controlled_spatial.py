@@ -12,6 +12,9 @@ from spatial_client import JatenClient, MapCommandRejected, NavigationStateUnava
 from map_storage import MapArchive, migrate_database, safe_name
 
 
+NAV_SPEED_MIN, NAV_SPEED_MAX, NAV_SPEED_DEFAULT = .05, .5, .15
+
+
 def text(value, field):
     if (not isinstance(value, str) or not value.strip() or len(value) > 80
             or any(ord(c) < 32 for c in value) or any(c in value for c in '/\\')):
@@ -89,6 +92,7 @@ class SpatialStore:
 class ControlledSpatialPlugin:
     PREFIX, CHANNEL = 'controlled_spatial', 'base'
     NAV_TIMEOUT = 150.
+    NAV_HANDOFF_GRACE = 5.
     ACTIONS = {
         'start_mapping': (['map_name'], '开始厂商Cartographer建图；人工控制底盘采集'),
         'stop_mapping': ([], '保存当前建图，重启厂商地图服务并确认地图身份'),
@@ -151,13 +155,15 @@ class ControlledSpatialPlugin:
                  **{k: {'type': 'number', 'description': 'map坐标系位置，米'} for k in ('x', 'y')},
                  'confirm_delete': {'type': 'boolean', 'description': '确认移除指定的底盘地图'},
                  'yaw': {'type': 'number', 'description': 'map坐标系绝对朝向，弧度'},
-                 'speed': {'type': 'number', 'description': '0.05–0.3 m/s；导航线速度，默认0.15 m/s', 'minimum': .05, 'maximum': .3, 'default': .15}}
+                 'speed': {'type': 'number',
+                           'description': f'{NAV_SPEED_MIN:g}–{NAV_SPEED_MAX:g} m/s；导航线速度上限，默认{NAV_SPEED_DEFAULT:g} m/s，实际速度由厂商规划及安全限速决定',
+                           'minimum': NAV_SPEED_MIN, 'maximum': NAV_SPEED_MAX, 'default': NAV_SPEED_DEFAULT}}
         required = {'start_mapping': ['map_name'], 'tag_place': ['name'], 'untag_place': ['name'],
                     'load_map': ['map_name'], 'delete_map': ['map_name', 'confirm_delete'],
                     'upload_map': ['map_name'], 'navigate_to_pose': ['x', 'y', 'yaw'],
                     'navigate_to_tag': ['tag_name']}
         return {'name': self.PREFIX, 'type': 'actuator', 'multiInstance': False,
-                'description': '0.05–0.3 m/s；Kuavo 5-W人工建图、打点与厂商底盘原生导航；导航独占底盘速度，保持全身BaseArm，可并行控制手臂/头部/下肢。',
+                'description': f'{NAV_SPEED_MIN:g}–{NAV_SPEED_MAX:g} m/s；Kuavo 5-W人工建图、打点与厂商底盘原生导航；导航独占底盘速度，保持全身BaseArm，可并行控制手臂/头部/下肢。',
                 'inputSchema': {'type': 'object', 'properties': props, 'required': ['action'],
                     'x-resource': 'base', 'x-hooks': {'on_interrupt_motion': {'action': 'stop_nav'}},
                     'x-completion': {'actions': ['navigate_to_pose', 'navigate_to_tag', 'start_mapping', 'stop_mapping', 'load_map', 'delete_map', 'upload_map'], 'timeout': 1830},
@@ -531,7 +537,7 @@ class ControlledSpatialPlugin:
             target = {k: matches[0][k] for k in ('x', 'y', 'yaw')}
         else:
             target = {k: number(args.get(k), k) for k in ('x', 'y', 'yaw')}
-        speed = number(args.get('speed', .15), 'speed', .05, .3)
+        speed = number(args.get('speed', NAV_SPEED_DEFAULT), 'speed', NAV_SPEED_MIN, NAV_SPEED_MAX)
 
         def validate():
             if self._uncertain or self._task is not None:
@@ -556,6 +562,15 @@ class ControlledSpatialPlugin:
             self._task = record
             self._persist()
 
+        def check_velocity_source(accepted_at):
+            # The chassis publishes the selected source as a latched value
+            # on changes. RobotState clears it when the ROS bridge reconnects.
+            source, _ = self.bundle.state.read('base_velocity_source')
+            if (source == 'nav_mpc_move_base'
+                    and time.monotonic() - accepted_at >= self.NAV_HANDOFF_GRACE):
+                raise RuntimeError('native_navigation_velocity_handoff_unconfirmed: '
+                                   'chassis_selected_nav_mpc_move_base')
+
         def worker():
             try:
                 if self._identity() != identity:
@@ -571,10 +586,13 @@ class ControlledSpatialPlugin:
                         self._uncertain = False
                         self._task = None
                         self._persist()
+                        if response.get('stage') == 'dispatch_handoff':
+                            raise RuntimeError('native_navigation_dispatch_handoff_rejected')
                         raise RuntimeError('native_navigation_goal_rejected')
                     task_id = response.get('task_id')
                     if response.get('success') is not True or not isinstance(task_id, str) or not task_id or len(task_id) > 160:
                         raise RuntimeError('native_navigation_task_id_missing')
+                    accepted_at = time.monotonic()
                     record['task_id'] = task_id
                     self._uncertain = False
                     self._persist()
@@ -588,15 +606,16 @@ class ControlledSpatialPlugin:
                         upper_velocity, _ = self.bundle.state.read('upper_velocity_enabled')
                         if upper_velocity is not False:
                             raise RuntimeError('upper_mpc_velocity_handoff_lost')
-                        source, source_at = self.bundle.state.read('base_velocity_source')
-                        if (time.monotonic()-issued > 5 and time.monotonic()-source_at < 2
-                                and source == 'nav_mpc_move_base'):
-                            raise RuntimeError('native_navigation_velocity_source_overridden_by_upper_mpc')
+                        check_velocity_source(accepted_at)
                     if time.monotonic() - issued >= self.NAV_TIMEOUT:
                         raise TimeoutError('navigation_timeout')
                     if self._identity() != identity:
                         raise RuntimeError('map_identity_changed_during_navigation')
-                    self._observation(navigable=True)
+                    try:
+                        self._observation(navigable=True)
+                    except NavigationStateUnavailable:
+                        check_velocity_source(accepted_at)
+                        raise
                     if cancelled.is_set():
                         return
                     # Status reads cannot mutate the controller. Do not hold
@@ -642,7 +661,8 @@ class ControlledSpatialPlugin:
         self._workers.add(thread)
         thread.start()
         return {'state': 'executing', 'action_id': aid, 'target': target, 'map': identity[0],
-                'control_preparation': preparation, 'completion_basis': 'native_task_id_arrival_and_map_pose'}
+                'linear_limit_m_s': speed, 'control_preparation': preparation,
+                'completion_basis': 'native_task_id_arrival_and_map_pose'}
 
     def cancel_remote(self):
         """Called outside tracker.lock, while bundle pause owns preparation.

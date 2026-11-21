@@ -1404,6 +1404,12 @@ class KuavoBundle:
         finally:
             self.tracker.lock.release()
         try:
+            if channel == 'base' and not upper_velocity and not velocity_ready:
+                # Resuming with upper velocity still enabled can publish to
+                # the competing chassis input before the native handoff.
+                self.confirm_control(token, '/enable_vel_control', 'std_srvs/SetBool',
+                    {'data': False}, 'success', 'upper_velocity_enabled', False)
+                preparation['velocity_owner'] = 'native_navigation'
             if enabled is not True:
                 resume_issued = time.monotonic()
                 self.confirm_control(token, '/enable_control', 'std_srvs/SetBool', {'data': True},
@@ -1420,14 +1426,16 @@ class KuavoBundle:
                     'kuavo_msgs/changeTorsoCtrlMode', {'control_mode': target_mode},
                     'result', 'mpc_mode', target_mode)
                 preparation['mode_changed'] = mode != target_mode
-            if channel == 'base' and not velocity_ready:
+            if channel == 'base' and upper_velocity and not velocity_ready:
                 self.confirm_control(token, '/enable_vel_control', 'std_srvs/SetBool',
-                    {'data': upper_velocity}, 'success', 'upper_velocity_enabled', upper_velocity)
-                preparation['velocity_owner'] = 'upper_mpc' if upper_velocity else 'native_navigation'
+                    {'data': True}, 'success', 'upper_velocity_enabled', True)
+                preparation['velocity_owner'] = 'upper_mpc'
             with self.tracker.lock:
                 self._check_transition(token)
                 if self._resume_unresolved() or self._mode_unresolved():
                     raise RuntimeError('remote control preparation is unresolved')
+                if channel == 'base' and self.state.read('upper_velocity_enabled')[0] is not upper_velocity:
+                    raise RuntimeError('base velocity ownership changed during preparation')
                 self.state.confirmed_enable()
                 self.state.motion_blocked = False
                 preparation['mode'] = target_mode

@@ -428,6 +428,19 @@ class SpatialTests(unittest.TestCase):
         self.assertIn(('check', {'task_id': 'native-task-1'}), self.client.calls)
         self.assertFalse(self.plugin.unresolved())
 
+    def test_native_handoff_rejects_unchanged_latched_move_base_source(self):
+        self.bundle.state.read = lambda key: (
+            False if key == 'upper_velocity_enabled' else 'nav_mpc_move_base',
+            time.monotonic() - 60.,
+        )
+        self.plugin.NAV_HANDOFF_GRACE = .3
+        self.client.check = {'success': True, 'status': 1, 'arrived': False}
+        self.assertEqual(self.navigate()['state'], 'executing')
+        status, result = self.completed()
+        self.assertEqual(status, 'error')
+        self.assertIn('chassis_selected_nav_mpc_move_base', result['reason'])
+        wait(lambda: ('cancel', {}) in self.client.calls)
+
     def test_pending_task_is_not_completed_by_close_pose(self):
         self.client.check = {'success': True, 'status': 0, 'arrived': False}
         self.navigate()
@@ -1055,8 +1068,16 @@ class NativePreparationTests(unittest.TestCase):
             if self.fail_after_release and 1 in self.events:
                 raise TimeoutError('feedback lost')
             return copy.copy(self.state)
+        def proxy(name, _type):
+            if name != '/move_base/move_to_target':
+                return command
+            def move(**kwargs):
+                self.events.append(('goal', kwargs))
+                return types.SimpleNamespace(__slots__=('success', 'task_id'),
+                                             success=True, task_id='task-1')
+            return move
         ros = types.SimpleNamespace(ERROR=1, init_node=lambda *a, **k: None,
-                                   ServiceProxy=lambda *a: command, wait_for_message=sample)
+                                   ServiceProxy=proxy, wait_for_message=sample)
         modules = {'rospy': ros,
             'rosgraph': types.SimpleNamespace(Master=lambda *a: types.SimpleNamespace(
                 getSystemState=lambda: [[], [], [(n, ['/leju_node']) for n in names]], lookupService=lambda n: n)),
@@ -1064,7 +1085,7 @@ class NativePreparationTests(unittest.TestCase):
                 get_service_headers=lambda n, uri: {'type': names[n], 'md5sum': names[n].split('/')[-1]}),
             'leju_mobile_base_msgs': types.ModuleType('leju_mobile_base_msgs'),
             'leju_mobile_base_msgs.srv': types.SimpleNamespace(**classes),
-            'leju_mobile_base_msgs.msg': types.SimpleNamespace(MoveToTargetOptions=object),
+            'leju_mobile_base_msgs.msg': types.SimpleNamespace(MoveToTargetOptions=types.SimpleNamespace),
             'nav_msgs': types.ModuleType('nav_msgs'), 'nav_msgs.msg': types.SimpleNamespace(Odometry=object),
             'jaten_msgs': types.ModuleType('jaten_msgs'),
             'jaten_msgs.msg': types.SimpleNamespace(RobotChassisState=object)}
@@ -1078,6 +1099,21 @@ class NativePreparationTests(unittest.TestCase):
 
     def call(self, operation='prepare'):
         return self.module.main({'master': 'http://test:11311', 'ros_ip': '127.0.0.1', 'operation': operation})
+
+    def test_navigation_returns_dispatch_control_before_sending_goal(self):
+        request = {'master': 'http://test:11311', 'ros_ip': '127.0.0.1', 'operation': 'navigate',
+                   'args': {'x': 1., 'y': 2., 'yaw': .3, 'speed': .5}}
+        self.reject = 4
+        self.assertEqual(self.module.main(request), {'success': False, 'stage': 'dispatch_handoff'})
+        self.assertEqual(self.events, [4])
+
+        self.reject = None
+        self.events.clear()
+        self.assertEqual(self.module.main(request), {'success': True, 'task_id': 'task-1'})
+        handoff, (goal, kwargs) = self.events
+        self.assertEqual((handoff, goal), (4, 'goal'))
+        self.assertEqual(kwargs['options'].linear_velocity, .5)
+        self.assertTrue(kwargs['options'].avoid_enabled)
 
     def test_rpc_distinguishes_completed_rejection_from_uncertain_transport(self):
         import io

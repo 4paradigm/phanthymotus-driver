@@ -420,6 +420,13 @@ def main(request):
         raise ValueError('unsupported_navigation_operation')
     proxy = rospy.ServiceProxy(names[operation], types[operation])
     if operation == 'navigate':
+        # The upper controller's velocity switch and the chassis dispatcher
+        # have independent ownership state. STATUS_IDLE gives the dispatcher
+        # control without changing the chassis AUTO mode or its safety limits.
+        # Keep the handoff in the same ordered RPC as goal submission.
+        dispatch = rospy.ServiceProxy(names['cancel'], types['cancel'])
+        if not dispatch(control_mode=4).success:  # SetDispatchMode.STATUS_IDLE
+            return {'success': False, 'stage': 'dispatch_handoff'}
         options = MoveToTargetOptions()
         options.avoid_enabled = True  # Never expose an obstacle-disable switch.
         options.allow_rotation = True
