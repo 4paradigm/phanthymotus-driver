@@ -1,0 +1,14 @@
+[Unit]
+Description=Tianyi read-only estimated capture-time body TF
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/phanthy/tianyi-motion-clock.env
+ExecStart=:/usr/bin/docker exec -e MOTION_CLOCK_PASSWORD embodied-x-humanoid-tianyi2.0 bash -c 'source /opt/ros/humble/setup.bash; source /tianyi_ws/install/setup.bash; export FASTRTPS_DEFAULT_PROFILES_FILE=/work/dds_profile.xml PYTHONPATH=/work:$PYTHONPATH; mkdir -p /tmp/tianyi-estimated-tf; echo $$ > /tmp/tianyi-estimated-tf/pid; exec python3 /work/estimated_body_tf.py'
+ExecStop=:/usr/bin/docker exec embodied-x-humanoid-tianyi2.0 bash -c 'kill -INT "$(cat /tmp/tianyi-estimated-tf/pid)"'
+Restart=always
+RestartSec=3
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target

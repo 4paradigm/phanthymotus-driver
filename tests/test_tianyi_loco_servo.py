@@ -253,8 +253,8 @@ def test_startup_is_inert_and_domain_routing_is_correct(setup):
 
 def test_declared_footprint_is_reported_and_survives_live_reconfiguration(setup):
     descriptor = setup.module.build_descriptor()
-    assert descriptor["footprint"] == {"half_width": 0.39,
-                                       "source": "estimate"}
+    assert descriptor["footprint"] == {"half_width": 0.275,
+                                       "source": "measured"}
 
     plugin = start(setup)
     assert plugin._info()["control_interface"]["footprint"] == descriptor["footprint"]
@@ -723,6 +723,17 @@ def test_timing_separates_input_ttl_age_from_receipt_watchdog_budget(setup):
     assert timing["execution_deadline_basis"] == "receive_watchdog"
     assert timing["receive_watchdog_ms"] == 500
     assert plugin._backend.deadlines[-1] == pytest.approx(original["stamp_ms"] + 90 + 500, abs=1)
+
+
+@pytest.mark.parametrize("age_ms,accepted", [(668, True), (830, True), (1201, False)])
+def test_tianyi_navigation_admits_briefly_delayed_observation(setup, age_ms, accepted):
+    plugin = start(setup)
+    now = int(setup.clock.time() * 1000)
+    send(plugin, command(setup, obs_stamp_ms=now - age_ms))
+    assert bool(plugin._counts["accepted"]) is accepted
+    rate = plugin._info()["control_interface"]["rate"]
+    assert rate["max_obs_age_ms"] == 1200
+    assert rate["max_feedback_gap_ms"] == 350
 
 
 def test_zero_is_prioritized_and_cannot_be_overwritten_by_a_later_motion(setup):

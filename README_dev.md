@@ -2457,3 +2457,8 @@ Checklist before you call it done:
 - [ ] the spec module is listed in the bundle's Dockerfile `COPY` lines
       (`tests/test_dockerfile_copies.py` checks this)
 - [ ] a unit test calls `parse()` on every declaration the driver can emit
+
+### RGB-D camera IMU attitude input
+
+The optional computation IMU port retains JSON `sensor/imu`. Its capture-time,
+axis and unit contract is documented in [Camera IMU input](docs/rgbd_imu_input.md).

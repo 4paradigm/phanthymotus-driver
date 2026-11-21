@@ -227,7 +227,7 @@ def test_outbound_metadata_preserves_the_requested_queue_depth(bridge):
     state, thread = bridge
     publisher = bp.BridgedPublisher(
         node=types.SimpleNamespace(), msg_type=FakeMsg,
-        topic="/nvidia_desktop/camera/head/depth/visual_depth",
+        topic="/nvidia_desktop/camera/head/depth",
         qos=QOS.QoSProfile(
             reliability=QOS.ReliabilityPolicy.BEST_EFFORT, depth=1),
     )
@@ -357,15 +357,18 @@ class _Executor:
         self.node = node
 
 
-def test_hardware_depth_is_raw_relayed_with_depth_one_qos(monkeypatch):
+@pytest.mark.parametrize("topic", [
+    "/nvidia_desktop/camera/head/depth",
+    "/nvidia_desktop/camera/head/depth/visual_depth",
+])
+def test_hardware_depth_is_raw_relayed_with_depth_one_qos(monkeypatch, topic):
     server = _server_module()
     monkeypatch.setattr(server, "Node", _ServerNode)
     monkeypatch.setattr(
         server, "QoSProfile", lambda **kwargs: types.SimpleNamespace(**kwargs))
     payload = bytes(range(256)) * 1200
     handler = server.TopicHandler(
-        "/nvidia_desktop/camera/head/depth/visual_depth",
-        "std_msgs/msg/FakeMsg", object(), _Executor(),
+        topic, "std_msgs/msg/FakeMsg", object(), _Executor(),
         {"reliability": "best_effort", "depth": 1},
     )
 
@@ -374,6 +377,7 @@ def test_hardware_depth_is_raw_relayed_with_depth_one_qos(monkeypatch):
     assert handler.node.published == [payload]
     assert handler.node.published[0] is payload
     assert handler.node.created_qos.depth == 1
+    assert handler.node.created_qos.history == server.HistoryPolicy.KEEP_LAST
     assert handler.msg_count == 1
     assert handler.max_publish_ms >= 0
 

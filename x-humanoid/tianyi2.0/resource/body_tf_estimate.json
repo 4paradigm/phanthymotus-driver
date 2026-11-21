@@ -1,0 +1,184 @@
+{
+  "body_frame": "base_link",
+  "camera_root": "ob_camera_head_link",
+  "optical_frame": "ob_camera_head_color_optical_frame",
+  "motion_host": "192.168.41.1",
+  "motion_user": "ubuntu",
+  "provenance": {
+    "calibration_kind": "estimate",
+    "accuracy_validated": false,
+    "model_version": "XARM V1.2.27",
+    "model_sha256": "2194d7d10ab0fc2ad0053e9ab5eb587597e7c327dd2ec689285834d098eb1e24",
+    "body_origin_assumption": "base_link coincides with vendor base_footprint; not measured",
+    "camera_mount_source": "existing public zero-head hand-eye candidate; not verified on this robot",
+    "joint_mapping_source": "installed tianyi_hardware 0b88baf765e746b7c0689eb88c12e618452f1671 callbacks",
+    "sync_mode": "bounded software mapping; not hardware acquisition timing"
+  },
+  "chain": [
+    {
+      "joint": "world_to_base_link",
+      "type": "fixed",
+      "xyz": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rpy": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        0,
+        0,
+        1
+      ]
+    },
+    {
+      "joint": "first_leg_pitch_joint",
+      "type": "revolute",
+      "xyz": [
+        0.049182,
+        0.0,
+        0.37
+      ],
+      "rpy": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        1.0,
+        0.0
+      ]
+    },
+    {
+      "joint": "second_leg_pitch_joint",
+      "type": "revolute",
+      "xyz": [
+        -0.20785,
+        0.0,
+        0.12
+      ],
+      "rpy": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        1.0,
+        0.0
+      ]
+    },
+    {
+      "joint": "waist_pitch_joint",
+      "type": "revolute",
+      "xyz": [
+        0.20785,
+        0.0,
+        0.12
+      ],
+      "rpy": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        1.0,
+        0.0
+      ]
+    },
+    {
+      "joint": "waist_yaw_joint",
+      "type": "revolute",
+      "xyz": [
+        0.0,
+        0.0,
+        0.07
+      ],
+      "rpy": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "joint": "head_yaw_joint",
+      "type": "revolute",
+      "xyz": [
+        -0.002,
+        0.0,
+        0.56508
+      ],
+      "rpy": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        0.0,
+        1.0
+      ]
+    },
+    {
+      "joint": "head_pitch_joint",
+      "type": "revolute",
+      "xyz": [
+        0.01455,
+        0.0,
+        0.0304
+      ],
+      "rpy": [
+        0.0,
+        0.2618,
+        0.0
+      ],
+      "axis": [
+        0.0,
+        1.0,
+        0.0
+      ]
+    },
+    {
+      "joint": "head_roll_joint",
+      "type": "revolute",
+      "xyz": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "rpy": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "axis": [
+        1.0,
+        0.0,
+        0.0
+      ]
+    }
+  ],
+  "head_from_optical": {
+    "position": [
+      0.07415025089928542,
+      0.007362941962304949,
+      0.07308700259475502
+    ],
+    "quaternion": [
+      -0.5535325976571677,
+      0.5589697065017892,
+      -0.4355933597907442,
+      0.43750766330479635
+    ]
+  }
+}

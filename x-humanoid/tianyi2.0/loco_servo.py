@@ -18,11 +18,12 @@ from slamtec_velocity import (ChassisBusy, CommandLeaseExpired,
 
 INPUT_TOPIC = "/actucore/navi/cmd"
 WATCHDOG_MS = 500
-MAX_OBS_AGE_MS = 600
+MAX_OBS_AGE_MS = 1200
+MAX_FEEDBACK_GAP_MS = 350
 CANCEL_AFTER_MS = 1000
 FOLLOW_KEYS = ("wz_limit",)
 SPEED_PRESETS = {"slow": 0.15, "normal": 0.30, "fast": 0.50}
-FOOTPRINT_HALF_WIDTH_M = 0.39  # Conservative envelope; measured width is 0.55 m.
+FOOTPRINT_HALF_WIDTH_M = 0.275  # Measured full width is 0.55 m.
 TOGGLES = {"dry_run": True, "rotate_only": False, "require_standing": False}
 CONFIG_KEYS = (*TOGGLES, "speed_preset", "min_vx",
                "linear_acceleration", "angular_acceleration", *FOLLOW_KEYS)
@@ -204,12 +205,12 @@ def build_descriptor(hz=10.0, max_vx=0.3, max_wz=1.0, min_vx=0.0,
                     "unit": "m/s", "resource": "base"}],
         "rate": {"max_hz": 20, "expected_hz": hz,
                  "watchdog_ms": WATCHDOG_MS, "max_obs_age_ms": MAX_OBS_AGE_MS,
+                 "max_feedback_gap_ms": MAX_FEEDBACK_GAP_MS,
                  "cancel_after_ms": CANCEL_AFTER_MS},
         "force_torque": None,
-        # Conservative static envelope for the normal navigation posture.
-        # Navi adds its own separate dynamic clearance margin.
+        # Measured width in the normal navigation posture. Navi adds clearance.
         "footprint": {"half_width": FOOTPRINT_HALF_WIDTH_M,
-                      "source": "estimate"},
+                      "source": "measured"},
     }
     if response is not None:
         descriptor["response"] = copy.deepcopy(response)

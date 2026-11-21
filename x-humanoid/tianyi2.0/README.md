@@ -6,66 +6,40 @@ exposes the capabilities as MCP tools.
 
 ## Hardware depth for visual navigation
 
-`camera_depth` forwards the newest Orbbec frame from
-`/ob_camera_head/depth/image_raw` on domain 0 to
-`/{namespace}/camera/head/depth/visual_depth` on domain 42. The `/visual_depth`
-suffix lets older Navi versions identify depth before ROS topic discovery;
-it does not mean a monocular model is involved. Following upstream driver
-PR #419, its output is `image/depth-zlib` on `sensor_msgs/CompressedImage`,
-with `format = "16UC1; compressedDepth zlib"`. The payload is a plain zlib
-stream containing exactly 640x480 little-endian uint16 millimetres; zero
-remains invalid depth. Compression preserves every original depth value and the
-source header. This replaces the previous raw `image/depth-z16` output and
-requires a consumer/bridge that supports `image/depth-zlib`.
+`camera_head` and `camera_depth` share one calibrated RGB-D source. The sole
+hardware depth output is `/{namespace}/camera/head/depth` on domain 42,
+with format `image/depth-zlib` on `sensor_msgs/CompressedImage`. Its payload
+is zlib-compressed 640x480 little-endian uint16 millimetres; zero is invalid
+depth. Consumers must support `image/depth-zlib`.
 
-The default rate is 15Hz (previously 8Hz), configurable with
-`plugins.camera_depth.hz` up to 30Hz. The source camera and available CPU/network
-still determine the actual rate. Both source and output retain only the newest
-frame; a frame waiting locally for 500ms is discarded. A single ROS timer
-has been replaced by one latest-only worker: the ROS callback only swaps the
-pending frame, while crop, zlib compression, and the synchronous bridge write
-run outside both executors. The worker never replays old frames or catches up
-in a burst. Compression uses libdeflate level 1 (still a standard zlib stream)
-instead of CPython's stock encoder on ARM. The compressed bytes are assigned
-to the ROS `uint8[]` using `array('B')`, which uses Humble's bulk buffer setter
-instead of validating every byte in Python. This preserves the exact compressed
-payload, source header and decoded depth pixels. `info` reports the
-active compression backend, target/average Hz,
-coalesced/stale/error counts, worker health, payload size, and
-transform/compress/message-pack/bridge/total processing and interval timings so
-compression and ROS message packing can be measured separately on the robot.
-The existing 500ms local stale-frame checks still apply.
+Both RGB and depth follow `plugins.camera_depth.hz` (default 8 Hz). The source
+keeps the newest paired frames and limits publication by capture time; the
+source camera and available CPU/network determine the actual rate. The shared
+source rectifies RGB and depth into a common valid centered 4:3 field with
+updated pinhole intrinsics. It preserves capture timing and requires the
+camera's global time mode. See [RGB-D input for generic visual odometry](#rgb-d-input-for-generic-visual-odometry)
+for calibration, startup diagnostics and input contracts.
 
 On the canvas, connect head RGB to `vop`, `vop` to `navi`, `camera_depth` to
 `navi`'s depth input, `loco_state` to its odometry input, and `navi` to
-`loco_servo`. Disconnect the `visual_depth` depth input when selecting hardware
-depth. After redeploying, refresh the card's port metadata and reconnect the
-depth wire to the new `/depth/visual_depth` topic with `image/depth-zlib`.
-No `lidar_depth` or `visual_depth` processing card is needed in this path.
+`loco_servo`. After redeploying, refresh the cards' port metadata and reconnect
+any old `/camera/head/depth/visual_depth` binding to
+`/{namespace}/camera/head/depth` with `image/depth-zlib`. The old suffixed topic
+has no publisher. No `lidar_depth` or `visual_depth` processing card is needed
+for this hardware-depth path. Restart the connected camera/VOP/Navi chain so
+its startup snapshots use the current dimensions and calibration.
 
-`camera_head.info.camera_info` now declares the actual RGB dimensions after the
-first successfully published JPEG, preserving the source header. The camera
-start call waits up to 10 seconds for this frame before reporting success, so
-downstream VOP/Navi can snapshot the correct dimensions for bounding boxes.
-Unknown intrinsics and field of view remain null. After redeploying, restart
-the connected camera/VOP/Navi chain to refresh those startup snapshots.
-`camera_depth.info.source_geometry` reports the source frame size, frame ID and
-crop; `registration_to_color` remains `unknown` until verified on hardware.
-Host camera setup now preserves existing vendor launch arguments while changing
-only the three point-cloud/IMU enable flags.
-
-This conversion does not register raw depth to RGB or change the existing
-centre-crop/nearest-neighbour resize to 640x480. RGB/depth correspondence,
-camera intrinsics, and the vendor's millimetre scale still require hardware
-verification. Keep the servo paused while checking reported target distance
-against lens-to-target tape measurements at 1, 1.5, and 2 metres, both centrally
-and off-centre, before testing approach/stop behaviour. The software tests
-verify the wire payload, not distance accuracy or navigation safety on hardware.
+The image cards report their calibrated geometry through `camera_info` and
+wait for calibration and the first paired output before reporting startup
+success. Software calibration and payload tests do not establish physical
+distance accuracy. Keep the servo paused while checking reported target
+distance against lens-to-target tape measurements at 1, 1.5, and 2 metres,
+both centrally and off-centre, before testing approach/stop behaviour.
 
 ## Locomotion state card
 
 `loco_state` starts with the driver and publishes JSON on
-`/{namespace}/loco/state` and the same poll as `motus.odom/1` on
+`/{namespace}/loco/state` and source-timestamped `motus.odom/1` on
 `/{namespace}/state/odom` (format `state/odom`). Its input schema is an empty
 object. The namespace comes from `ros_namespace` or the hostname.
 `nav_state` remains available with its existing map-localized pose output.
@@ -107,42 +81,113 @@ to null and reports `errors.length`, while valid pose and twist remain usable.
 request. HTTP latency can lower a lane's actual rate, but slow IMU or mileage
 requests cannot block pose/speed publication. MCP `stop` returns the canvas
 lifecycle marker `{"state": "idle"}` while leaving this always-active observer
-running, matching R1; driver shutdown stops both workers and their connections.
+running, matching R1; driver shutdown stops all telemetry and diagnostic workers and their connections.
 
-The standard output uses `common.odom` from the official driver repository:
-`twist = [vx, vy, null, null, null, omega]`, `frame = "body"`, SI units,
-and a host receive timestamp for the speed response. Partial speed responses
-retain each valid axis, including measured zero. Invalid or absent axes are
-null. There is one speed observation per publish, with no faster stream being
-discarded. The IMU boot-relative timestamp is never used as `stamp_ms`.
+The same standard port publishes REST measured body `twist` at every fast poll,
+with top-level `stamp_ms` equal to that speed reply's receive time. The declared
+`timing.stamp_source` is `received`; acquisition latency remains unknown and no
+`max_measurement_delay_ms` is claimed. Diagnostic callbacks retain that original
+REST stamp and clear cached twist after 250 ms or a future timestamp; a failed
+REST reading produces null axes. Diagnostic timing loss does not erase healthy
+REST motion feedback. No second odometry port is added.
 
-`info()` includes a validated `odom_interface` with `provides = ["vx", "vy", "wz"]`,
-the fast target rate, and `pose_drift = "unbounded"`: the source is uncorrected
-wheel odometry, not map localization. Its optional timing declaration is
-`{"stamp_source": "received"}` because the REST replies do not carry a usable
-measurement clock. It deliberately omits `max_measurement_delay_ms`: the HTTP
-timeout is a failure bound, not a measured sensor delay. Standard `pose` now
-contains measured position and an orientation quaternion derived from the same
-endpoint's roll/pitch/yaw:
+A separate read-only TCP connection on port 1445 subscribes to
+`base/deadreckon_with_gyro_yaw` and integrates every diagnostic displacement
+(metres) and yaw increment (radians), then publishes the latest source sample at
+`plugins.loco_state.hz`. The diagnostic queue is drained at least 20 Hz even
+when publication is slower. Planar integration treats XY as body-frame increments;
+this convention still requires a measured moving-robot acceptance test. The
+first timestamp group establishes a fresh origin. Pose position is `[x, y, 0]`,
+quaternion is XYZW, and covariance is null. The diagnostic integration remains
+independent of the REST feedback: `pose.stamp_ms` is mapped diagnostic source
+time, and `vendor.motus_slam.stamp_ns` preserves its exact nanoseconds. REST
+pose is telemetry only and never replaces this pose.
 
-```json
-{
-  "stamp_ms": 1792052530000,
-  "frame_id": "odom",
-  "child_frame_id": "base_link",
-  "position": {"x": 1.2, "y": -2.0, "z": 0.1},
-  "orientation": {"x": 0.0, "y": 0.0, "z": 0.70710678, "w": 0.70710678}
-}
-```
+The diagnostic event's uptime timestamp is mapped to host realtime using five
+bounded `/api/platform/v1/timestamp` request intervals. The offset is checked
+every 0.5 seconds and follows accepted observations with a continuous ramp in
+source time, limited to 1% rate correction and at least 250 ms per ramp. This
+keeps normal clock drift from expiring a fixed segment offset. Each ramp begins
+no earlier than the latest mapped source timestamp, so published timestamps and
+pending equal-timestamp groups are not rewritten. Integrated pose is unchanged. High-latency or inconclusive
+probes do not refresh the mapping and are retried on the next diagnostic drain;
+two seconds without an accepted clock probe invalidates it. An interval proving
+the mapping is outside its budget invalidates the segment immediately.
+HTTP clock requests run in a dedicated read-only helper process so camera-bundle
+thread scheduling cannot inflate the measured request interval. The helper
+returns its original request start/end and monotonic observation time; the
+parent retains calibration, the bounded offset history and all existing checks. IPC
+receipt is never treated as a fresh observation. A timed-out, broken or
+misordered helper channel retires the current segment and is closed/reaped.
+The diagnostic TCP subscription and increment integration are unchanged.
+Mapping evidence uses `chassis_clock_request_interval_slew`, version `2`, with
+the actual integer `offset_ns` for each capture. The arithmetic remains
+`source_ms * 1e6 + offset_ns == stamp_ns`; the declared bound stays 50 ms, and
+accepted probe intervals must remain inside the existing 25 ms verification
+envelope. Invalid probes do not alter the ramp or refresh its two-second TTL.
+The companion Perception PR #371/#395 `continuous_pose_clock` implementation
+accepts verified v2 chassis slews in the same segment only when every mapping
+field except `offset_ns` is unchanged and the offset change stays within 1% of
+elapsed source time. Changed clock identity, evidence or mapping version still
+requires a new segment. Use a Perception revision containing that implementation
+and the independent `pose.stamp_ms` decoder change described below; an older
+revision is not compatible. No fixed-offset rollback is required. This change
+has not been deployed over an active mapping session.
+`info().slam_odometry.timing` separates request/header/body time, total probe
+time, increment-read time and publication time. `last_loss` preserves the
+pre-failure timings across recovery. This instrumentation is not an accuracy
+claim or permission to reuse an expired clock mapping.
+Each sample retains the original
+source milliseconds and the mapping in `vendor.motus_slam.measurement`;
+`pose.stamp_ms` is mapped source time, never TCP or HTTP receipt time. The user-selected 50 ms
+uncertainty is a software clock-mapping budget, not a bound on sensor acquisition
+latency or hardware synchronization. REST pose and speed receive times remain
+separate observations and are never used as a SLAM pose fallback.
 
-This is the `pose` member of the existing JSON `motus.odom/1` message, not a
-ROS `nav_msgs/Odometry` message. Its frame is explicit: standard `frame = body`
-still describes the twist, whereas `pose.frame_id = odom` describes position.
-Quaternion components are named to avoid XYZW/WXYZ ambiguity. `pose.stamp_ms`
-is the host receive time of the pose reply; the message's top-level stamp is
-the independently received speed reply. Missing or malformed position or RPY
-produces `pose = null`, never a fabricated identity pose. No pose covariance,
-ground contact, or unmeasured velocity axes are invented.
+`info().odom_interface` declares `slam_pose = {"available": true,
+"profile": "motus_slam/1"}`, `provides = ["vx", "vy", "wz"]`,
+`pose_drift = "unbounded"` and `timing.stamp_source = "received"` for control feedback.
+`info().slam_odometry` reports the current tracking/lost state and reason,
+`synchronization = "bounded_software"` and `clock_mapping_budget_ms = 50`.
+The message uses the existing `motus.odom/1` JSON format, not ROS
+`nav_msgs/Odometry`. `pose.frame_id` identifies a unique odometry segment and
+`child_frame_id` is `base_link`; `frame = "body"` describes the twist.
+
+Connect `state/odom` to the SLAM card's odometry input. The pose includes the
+`motus_slam/1` quality metadata and source-time mapping accepted by its decoder.
+Deploy the companion Perception PR #371/#395 decoder/validator revision with
+this driver: it reads explicit `pose.stamp_ms`, falling back to top-level
+`stamp_ms` only for legacy packets without an independent pose timestamp. It
+checks exact `quality.stamp_ns` and diagnostic measurement evidence against the
+pose time. Older decoders reject a split-time packet through their existing
+precise-time mismatch check, rather than treating REST receipt as pose time.
+Repeated REST updates retain the same pose timestamp and do not refresh the
+SLAM consumer's diagnostic ingress age.
+The point cloud must independently have a verified clock relationship and a
+measured transform to the chassis reference; this adapter does not invent a
+camera mount transform or mark the native cloud's unknown timing as verified.
+Timestamp rollback, reordered increments, gaps over 100 ms, data older
+than 250 ms, disconnects, or failed clock checks publish `lost` with null pose
+and strict `vendor.motus_slam` loss metadata; independently healthy REST twist
+remains available for control. Recovery creates a new segment and origin, preventing interpolation
+across a reset. A stationary ten-minute native-cloud load probe in 50 ms
+software mode completed without loss or segment resets. Moving-robot mapping
+and production deployment still require acceptance; the observed publication
+interval reached 200 ms, independently of the clock-mapping budget.
+The diagnostic source has emitted distinct events with identical millisecond
+timestamps, including different IMU payloads. These are source event timestamps,
+not proven unique hardware acquisition times. In bounded software mode, equal
+source timestamps form a group; every increment is composed in subscription
+order, including equal timestamps split across reads. The newest group is held
+until a later timestamp closes it, then one final pose is emitted with the
+original group timestamp. No intermediate timestamps are invented and identical
+increments are not deduplicated. This adds one group of buffering and relies on
+the requested `exact_once` subscription delivering ordered increment records;
+the SDK does not expose a per-message sequence to independently detect replay.
+`vendor.motus_slam` includes `timestamp_semantics = "diagnostic_event_group"`
+and `source_events_in_group`. The 50 ms clock-mapping budget does not bound
+hardware acquisition latency or this buffering delay. Reconnect still starts a
+new trajectory segment.
 
 `displacement` is calculated from the first valid odometry pose during this
 driver instance. It contains `origin`, XYZ `translation` in the odom frame,
@@ -188,12 +233,9 @@ ratings. Non-finite values, unsupported axes and out-of-range commands are
 rejected. `ControlSink` checks the schema, TTL, observation age, sequence and
 source priority. Rejected/stale messages never feed the watchdog.
 
-The control descriptor declares a conservative navigation-posture footprint as
-`half_width: 0.39` m (`0.78` m overall envelope, source `estimate`), enlarged from the
-measured `0.55` m width. Navi owns the
-separate dynamic clearance margin; with its default 0.15 m on each side the
-displayed avoidance corridor is therefore 1.08 m wide. The fallback used when
-a chassis declares no footprint is 1.00 m wide.
+The control descriptor declares `half_width: 0.275` m (`source: measured`)
+from the measured navigation-posture width of 0.55 m. Navi adds its configured
+clearance margin. With 0.10 m on each side, the avoidance corridor is 0.75 m wide.
 
 The domain-42 input uses the existing socket subscription bridge. Output now
 uses the official Slamware C++ SDK, **not ROS `/cmd_vel`**: the Tianyi hardware
@@ -262,7 +304,7 @@ properties for a planner to consume, not operator tuning knobs. Tianyi leaves
 the block absent until the response has been measured or obtained from a
 traceable vendor specification; it does not publish guessed timing values.
 
-Input TTL and observation age (600ms) are admission checks: an already-stale
+Input TTL and observation age (800ms) are admission checks: an already-stale
 command is dropped and cannot resume motion or renew the watchdog. Once
 admitted, a command no longer stops motion at its producer's per-frame TTL
 (commonly 200ms). Its execution deadline ends 500ms after the original
@@ -276,9 +318,10 @@ without cancelling the held SDK action or its firmware heartbeat. A fresh
 accepted frame can then update the same action directly. If no new valid frame
 arrives for 1000ms, the action is cancelled and its heartbeat stops.
 IPC, local queue and SDK reply time consume the original receive budgets,
-never renew them. A detection older than 600ms is never admitted, however
+never renew them. A detection older than 800ms is never admitted, however
 many new packets reuse it. `control_interface.rate.watchdog_ms` reports 500 and
-`max_obs_age_ms` reports 600 (admission). Deploy Python and the native
+`max_obs_age_ms` reports 800 (admission). `max_feedback_gap_ms` declares a
+350ms maximum gap in received velocity feedback for Navi. Deploy Python and the native
 worker together; staged stopping requires the worker's advertised capability.
 Python uses the original monotonic receipt time for its silence watchdog; the
 native layer receives the remaining bounded execution deadline and independently
@@ -441,7 +484,7 @@ live lease updates the held SDK action to zero without cancelling it, so a
 following fresh command can update the same action. A zero received while idle
 is a no-op. Lifecycle stop/pause/handover still cancels immediately; the 500ms
 receive watchdog first commands zero and the one-second cancellation deadline
-then cancels a silent stream. The 600ms observation admission limit still
+then cancels a silent stream. The 800ms observation admission limit still
 rejects stale commands.
 
 Configure loco_servo exposes live settings via `action: config`:
@@ -913,3 +956,268 @@ It uses pyalsaaudio when a working one is installed and otherwise captures
 through `arecord`, so PC1 needs no pip install and no internet. If its capture
 fails, the process exits rather than keep an empty port open, and the next
 health check restarts it.
+
+## RGB-D input for generic visual odometry
+
+The existing `camera_head`, `camera_depth` and `imu` cards share one private
+calibrated source. The standalone `camera_rgbd` card is retired. The sole
+`camera_head` output on `/<ns>/camera/head` now carries calibrated RGB for both
+display and computation; the added `/camera/rgbd/color` output is removed.
+The sole `camera_depth` output stays on
+`/<ns>/camera/head/depth`: display, RGB-D odometry and Point Cloud all subscribe
+to the same 640×480 little-endian uint16 millimetre depth, zlib-compressed in
+`CompressedImage`; zero pixels are invalid. The old independent display depth
+crop/encoder and `/camera/rgbd/depth` publisher are removed. Geometry follows
+the calibrated computation path. Both images use a common valid centered 4:3
+field with updated K, cropping rays outside either lens instead of adding black
+padding or stretching RGB alone. The field of view may narrow. Both streams
+follow `plugins.camera_depth.hz` (default 8 Hz), including the RGB display.
+The original RGB service/watchdog remains active without a second JPEG publisher
+or encoder. `vision_capture` still captures the original raw photo/video stream.
+
+Each image card waits up to ten seconds for registration/time parameters,
+calibration and first pair before source startup returns. Color is sampled
+using its distortion and intrinsics onto the registered depth optical rays;
+both cards declare the common pinhole K on their actual output topics and
+retain source headers. Connect registered RGB and the original depth output
+to Perception's `rgbd_odometry`. The same depth output feeds Point Cloud with
+`metric_cloud=true`; its `sensor/pointcloud2` and the odometry's `state/odom`
+feed SLAM in the common camera frame. Existing display pointcloud packets are
+not metric SLAM inputs. This uses the existing runtime identical-frame route,
+not a new verified independent-clock/provenance protocol.
+
+A color/depth start that reaches this deadline returns `state=error` and the
+current waiting reason, so Core reports a source startup failure. Subsequent
+`info` stays `unavailable` until the source checks pass. Card `info`/`get_tool`
+and the private source expose a bounded
+`source_status`: parameter-service discovery, request/response or registration
+and global-clock validation; receipt of color/depth `CameraInfo`; rectified
+geometry; and the first calibrated output. `reason` names the current wait or
+validation failure. Only scalar flags and parameter values are included, with
+no source image payloads or history. Full source restarts require new
+`CameraInfo` messages; prior-start calibration is discarded. A pending parameter
+response is reported as waiting and is not automatically cancelled or retried.
+`source_status.streams` reports per-start color/depth receive counts and last
+capture/arrival times, the latest paired capture, forwarded-pair count and last
+publication time. These bounded counters distinguish missing callbacks,
+unmatched captures and stalled output without including image payloads.
+`imu_status.publication_attempts` counts local publish calls that returned
+successfully; `max_capture_gap_ns` tracks their largest capture interval. These
+do not certify downstream delivery or cover an ongoing interruption before its
+next publication. Inspect consumer capture/arrival times to locate delivery gaps.
+
+The existing `imu` card keeps its display output and appends the named optional
+`camera_imu` port (`sensor/imu`) on `/<ns>/camera/rgbd/imu`. It publishes
+`motus.imu/1` JSON through
+`std_msgs/String`, using the existing `/ob_camera_head/{gyro,accel}/sample`
+streams. Each raw vector keeps its actual source frame and capture timestamp;
+separate timestamped TF rotations express both source frames in the RGB-D
+camera optical frame. It reuses the RGB-D global header clock gate and pairs
+motion captures within 20 ms. Missing streams, TF, calibration or fresh captures
+withhold only IMU; `info.imu_status` explains availability independently of
+RGB-D readiness. Disabling `plugins.imu.enabled` removes the card and its
+computation subscriptions. No camera or vendor service is started for motion, and no body/head
+mount or native orientation is assumed. Consumer attitude assistance remains
+off until its `imu_assisted` option is enabled. A source restart or capture
+interruption over 500 ms creates a new motion epoch.
+
+Tianyi hosts running Orbbec ROS 2.5.4 need the separate camera-service
+[capture-clock patch](patches/README.md) for independent gyro/accel timestamps
+to honor `time_domain=global`. A Motus driver image update alone does not fix
+that host service. Samples still pass the unchanged 500 ms freshness and
+20 ms pairing checks. Superseded accel history is pruned, and
+missing captures cannot pin subsequent valid gyro/accel pairs.
+
+With IMU enabled, the camera input node runs on its own single-threaded
+executor in the existing vendor ROS context. It remains alive across source
+stop/start so stopped subscriptions discard old input; context shutdown stops
+the executor. Callback failure makes the source unavailable and requires a
+Driver restart. IMU-disabled sources retain the shared executor. Sampling uses
+depth capture time and the original `plugins.camera_depth.hz` limit (default
+8 Hz); arrival jitter does not change that sampling clock. This is a rate
+limit, not an exact delivery guarantee. Compressed payloads use ROS byte arrays to
+avoid Python's per-byte message setter validation without changing encoding.
+
+The internal sidecar publishes `motus.camera_mount/1` JSON on
+`camera/rgbd/body_mount`. Both RGB-D `camera_info.vendor.body_mount`
+entries declare this topic automatically, so the generic consumer needs no
+manual body matrix or extra input wire. Each packet queries TF from the actual
+rectified optical frame into `base_link` at the original depth capture
+nanoseconds and is published before its matching images. `CAMERA_BODY_FRAME`
+can select another body frame name; it does not supply a transform. The
+`matrix` field is a 4×4 body-from-camera transform with translations in metres.
+Head motion is supported by querying every capture rather than freezing a
+startup transform. A source restart creates a new body-mount epoch.
+
+Each card's start is idempotent; stopping it suppresses only its own outputs.
+The last user stops the shared worker, while persistent ROS subscriptions
+discard stopped input. Capture and per-card queue epochs prevent buffered
+frames from crossing a restart. IMU restart requires fresh gyro and accel.
+Depth geometry/clock failure stops shared depth rather than falling back to
+display-only pixels or arrival timestamps. Optional IMU/body-TF failure is
+reported separately and does not stop valid image pairs.
+
+Canvas migration: replace old `camera_rgbd` connections with `camera_head`'s
+single original RGB port, the single original `camera_depth` port and optional
+`imu`'s `camera_imu` port. Reconnect any `/camera/rgbd/color` links to
+`/<ns>/camera/head`; restart consumers to refresh their calibration. Existing
+original RGB/depth display links keep their topics and formats.
+This redistribution has offline regression/consumer checks only; earlier
+hardware IMU results do not validate this new card lifecycle or performance.
+
+Missing TF, invalid frames/timestamps or unavailable `tf2_ros` produce an
+explicit unavailable packet without a held matrix; images and IMU continue.
+Before publication, the image worker gives native TF a bounded 150 ms delivery wait
+for the latest capture in the pair, outside the camera lock so the shared
+executor can deliver TF. It then performs the original exact-time lookup for
+each published capture and rechecks stop/client epochs. This delivery wait
+does not relax synchronization accuracy or permit latest/held transforms;
+the optional capture-certificate path retains its existing admission checks.
+`info.body_mount_status` reports this independently of camera readiness. TF
+availability is not physical calibration: `accuracy_validated` stays false,
+and the local visualization URDF does not establish the installed optical
+chain. Real TF availability, timing and mount accuracy remain hardware checks.
+Camera odometry and pointcloud SLAM keep their camera reference; a compatible
+consumer may attach a separately named body pose from matching capture evidence.
+
+The native cloud budget is configured to 20 MB for the observed 1280×720
+source. Clock and physical alignment acceptance remain real-device checks;
+source declarations do not turn the unverified PR519 SLAM metadata into a
+verified clock relation. Sustained tracking and map save/reopen are pending
+the user's next test window, not established by offline source tests.
+
+### Generic RGB-D short-term compensation
+
+Perception's generic `rgbd_odometry` card supports the instance settings
+`imu_assisted=true`, `short_term_compensation=true`, `depth_geometry=true`.
+Connect the same RGB-D pair and optional camera IMU port. The driver reports
+full factory/TF sensor-origin translations in `motus.imu/1`; inspect
+`imu_status.fusion` for calibration availability. Rotation-only or unsupported
+motion sources still support the existing video/attitude modes but cannot
+provide translational compensation. No extra SDK owner or robot-specific
+fusion algorithm is added.
+
+Keep the camera still for at least0.5s of visual/IMU initialization. The
+consumer estimates camera pose using ESKF and conditionally uses observable
+depth geometry. Inertial/depth predictions are explicitly non-mapping; SLAM
+pauses during coasting/recovery. The hard visual correction timeout is1s
+and modeled position sigma limit0.10m; these are software/model thresholds,
+not measured robot accuracy. Source clock/mount identity must remain fixed.
+See the [2026-11-12 IMU validation](patches/validation-20261112.md) for
+the 600-second static IMU continuity result and remaining visual continuity
+and motion-accuracy limits.
+
+### Shared-depth RGB pixel consumers
+
+Consumers that combine RGB pixel coordinates with the shared depth must use
+`/<ns>/camera/head`, the shared calibrated RGB output. This also applies to
+VOP/Measure connections. If Measure overlays an RGB image, set its existing
+`camera_topic` to that topic rather than relying on its `/camera/color` or
+`/camera/rgb` default guesses.
+No camera-to-body matrix or guessed calibration is introduced by this wiring.
+
+### Opt-in estimated capture-time body chain
+
+`plugins.camera_depth.estimated_body_tf: true` enables the estimated mount
+certificate gate for the shared camera source. It defaults to false. Run
+`python3 /work/estimated_body_tf.py` in the driver container after sourcing
+ROS and `/tianyi_ws/install/setup.bash`, with the vendor DDS profile and
+`PYTHONPATH=/work`. Authenticate the read-only motion-board clock probe with
+`MOTION_CLOCK_PASSWORD` from the deployment environment, or an SSH key.
+Never put credentials in the image or configuration tracked in Git.
+
+`resource/body_tf_estimate.json` pins the audited XARM V1.2.27 chain and motor
+mapping: first leg pitch is motor 52; second leg pitch is motor 51 minus 52.
+The body origin and public head-camera extrinsic are **estimates**, not physical
+measurements. Their provenance and `accuracy_validated: false` remain in the
+configuration and mount diagnostics; no additional card prompt is needed.
+The companion composes base-to-camera-root with the inverse native optical
+transform, preserving the camera driver's existing optical TF parent.
+
+Persistent SSH round trips refresh the motion-to-host clock mapping every
+250 ms. A calibration round trip over 8 ms is rejected; the last accepted
+mapping expires after 2 seconds. Each image requires joint samples bracketing
+its capture, with bracket width plus clock uncertainty and drift allowance
+at most 50 ms. Expired mappings, clock discontinuities, stale captures and
+missing brackets produce no valid certificate. This is a bounded software
+synchronization policy, not proof of hardware acquisition accuracy.
+
+Internal exact-capture certificates travel on domain 0, outside the domain-42
+socket bridge. The camera publishes the corresponding body-mount packet through
+its normal bridge before each image. It never fills missing certificates using
+TF interpolation or a held matrix. The existing RGB-D consumer can attach a
+separate body pose; its main camera odometry and SLAM camera reference remain
+unchanged. This does not certify the raw native PointCloud2 input for direct
+chassis-odometry SLAM.
+
+For an opt-in persistent deployment, install `deploy/estimated-body-tf.service`
+as a user service and create `~/.config/phanthy/tianyi-motion-clock.env` with
+mode 0600 containing the clock credential. Enable with
+`systemctl --user enable --now estimated-body-tf.service`. The container must
+contain this version and enable the configuration above. The service retries
+when the driver restarts; boot startup also requires the user's service manager
+to be enabled at boot. To roll back, disable the user service, set
+`estimated_body_tf: false`, and restart the driver. The hardware camera must
+remain in global time mode throughout.
+
+
+### Capture helper packaging
+
+`common/camera_mount.py` contains the capture-time TF validation/publication
+shared by the Tianyi camera paths; it requires the consumer to supply NumPy,
+already present in this image. `common/capture_clock.py` is a stdlib-only helper
+for host clock/boot identity. Both are small Python sources copied with `common/`;
+they add source bytes but no new packages to other drivers. The Tianyi-only
+`ros-humble-tf2-ros` dependency supports `rgbd_camera.py` and
+`estimated_body_tf.py`; its image growth is limited to this driver, with
+`--no-install-recommends` and apt-list cleanup retained.
+
+The standalone estimated-TF companion installs `common.logsafe` before loading
+NumPy or ROS, just as the bundle entry point does. Importing its helpers leaves
+the caller's output streams unchanged.
+
+The shared capture-TF delivery wait is bounded at 150 ms. It does not change the
+50 ms synchronization-error contract, timestamps, or exact lookup semantics.
+No robot names, mounting angles or frames are embedded in this helper. Missing
+transforms still produce explicit unavailable packets. The change adds Python
+source only and no shared binary dependencies. Offline coverage includes delayed
+TF, stop during the wait, timeout without held-transform reuse, and repeated
+start/stop before a first camera frame.
+
+
+### Native cloud consumer compatibility
+
+The Point Cloud card keeps its packed `sensor/pointcloud` display port and
+separately advertises native `sensor/pointcloud2` on `/NS/camera/head/points_native`.
+The latter is a computation port supported by Core and Perception PR371, not a
+second packed display stream. See the repository's spatial computation formats.
+
+`/points_native/metadata` carries diagnostic source headers and payload hashes.
+Both topics are BEST_EFFORT; no cross-topic order or delivery is promised.
+PR371's static numeric input path accepts the cloud before, after or without
+that sidecar. It does not require provenance proof or a sidecar retry protocol.
+Physical pose/cloud timing and mounting remain provider responsibilities; raw
+Orbbec output is not thereby certified to match chassis odometry. Explicit
+dynamic mounting needs an actual numeric matrix. The RGB-D camera-reference
+route uses its paired depth-derived cloud and camera pose.
+
+Current PR371 accepts source/read/receipt integer timestamps and descriptive
+metadata under its [format-only policy](https://github.com/Nidhogg2002/phanthymotus/blob/feat/pointcloud-slam-offline-eval/perception/docs/spatial-inputs.md).
+Older capture-identity and freshness requirements described in historical
+validation notes are not current consumer admission requirements.
+
+### Companion stop and source timing
+
+The estimated-TF clock reader accumulates bounded pipe chunks while polling
+its stop event; a partial SSH response cannot block `readline()` during close.
+The worker's existing cleanup terminates and waits for its child. Tests use a
+real local child returning a partial line and verify both worker and child exit.
+ROS initialization installs its default signal handlers, and the existing
+`finally` block closes the clock worker before destroying the ROS node.
+
+`Restart=always` does not restart a unit explicitly stopped with `systemctl stop`
+or `disable --now`; see [systemd.service](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html#Restart=).
+The source-time chassis mapper checks age against read completion, so a delayed
+read increases age and cannot refresh an old source increment. RGB-D's positive
+capture-interval condition also skips regressed/repeated depth capture times;
+the tests cover both behaviors without adding new admission restrictions.
