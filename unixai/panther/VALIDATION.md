@@ -152,6 +152,35 @@ No goal was sent to the physical robot's Nav2 server.
 Actual driving, obstacle avoidance, arrival accuracy and interruption during
 physical movement remain to be verified on a complete map with an operator.
 
+## Image growth and base image reuse
+
+The Dockerfile diff against `upstream/main` adds five explicit ROS Humble
+runtime packages to Panther. Each supports a runtime path exercised by the driver.
+
+| Added package | Runtime use |
+|---|---|
+| `ros-humble-nav2-msgs` | Send and track `NavigateToPose` goals against the robot's Nav2 server |
+| `ros-humble-lifecycle-msgs` | Check that the Nav2 navigator is active before sending a goal |
+| `ros-humble-rcl-interfaces` | Read the controller's `cmd_vel_timeout` before arming continuous base control |
+| `ros-humble-std-srvs` | Call the vendor SLAM reset and localization mode services |
+| `ros-humble-tf2-ros` | Resolve map-frame localization and camera/IMU transforms |
+
+Panther reuses the shared `ros-base` image, which builds on Humble's
+`ros-base` and adds the shared audio interfaces. Apt reuses installed
+packages that satisfy the requested versions. Explicitly declaring the
+runtime dependencies lets the driver build against supported base revisions
+whose installed package sets may differ. Keeping these declarations in
+Panther confines any additional packages to this driver. The Nav2 stack
+itself already runs on the robot, so the driver needs only its client
+interfaces.
+
+Missing or upgraded packages and their required dependencies can increase the
+Panther image. The Dockerfile uses `--no-install-recommends` and removes apt
+lists in the same layer. The source copies package the new runtime modules.
+The PulseAudio discovery and vendor map mounts and the driver metadata do not
+add image layers. The incremental byte count has not been measured in a
+before-and-after build using the same base digest and architecture.
+
 ## Local checks
 
 Review follow-up (2026-11-21): 54 focused tests and 48 existing Panther tests
