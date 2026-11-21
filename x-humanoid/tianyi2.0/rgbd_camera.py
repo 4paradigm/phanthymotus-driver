@@ -157,6 +157,7 @@ class RgbdCameraPlugin:
         self.image_streams = {kind: dict(received=0, last_capture_ns=None, last_arrival_ns=None)
                               for kind in ('color', 'depth')}
         self.last_publish_ns = None
+        self.last_depth_timing = None
         self.error = None
         self.future = None
         self.parameter_stage = 'service'
@@ -379,7 +380,8 @@ class RgbdCameraPlugin:
                         first_calibrated_output=self.count > 0,
                         streams=dict({kind: dict(value) for kind, value in getattr(self, 'image_streams', {}).items()},
                                      paired_capture_ns=getattr(self, 'last_emit', 0), forwarded=self.count,
-                                     last_publish_ns=getattr(self, 'last_publish_ns', None)))
+                                     last_publish_ns=getattr(self, 'last_publish_ns', None),
+                                     last_depth_timing=getattr(self, 'last_depth_timing', None)))
 
     def start(self):
         from sensor_msgs.msg import Image, CameraInfo, CompressedImage
@@ -420,6 +422,7 @@ class RgbdCameraPlugin:
                 self.image_streams = {kind: dict(received=0, last_capture_ns=None, last_arrival_ns=None)
                                       for kind in ('color', 'depth')}
                 self.last_publish_ns = None
+                self.last_depth_timing = None
                 self.future = None
                 self.parameter_stage = 'service'
                 self.parameter_values = {}
@@ -677,6 +680,12 @@ class RgbdCameraPlugin:
     def _work(self):
         import cv2
         from sensor_msgs.msg import CompressedImage
+        try:
+            from deflate import zlib_compress
+            compression_backend = 'libdeflate'
+        except ImportError:
+            zlib_compress = zlib.compress
+            compression_backend = 'stdlib-zlib'
         while not self.stop_event.is_set():
             try:
                 item = self.pending.get(timeout=.1)
@@ -685,6 +694,8 @@ class RgbdCameraPlugin:
             except queue.Empty:
                 continue
             try:
+                started_ns = time.time_ns()
+                started = time.monotonic()
                 if not _fresh_images(color, depth):
                     continue
                 if (color.encoding not in ('rgb8', 'bgr8') or depth.encoding != '16UC1' or depth.is_bigendian or
@@ -705,11 +716,13 @@ class RgbdCameraPlugin:
                 out_color.header, out_depth.header = deepcopy(color.header), deepcopy(depth.header)
                 out_color.format, out_color.data = 'jpeg', array('B', jpg.tobytes())
                 out_depth.format = '16UC1; compressedDepth zlib'
-                out_depth.data = array('B', zlib.compress(metric.astype('<u2', copy=False).tobytes(), 1))
+                out_depth.data = array('B', zlib_compress(metric.astype('<u2', copy=False).tobytes(), 1))
+                encoded = time.monotonic()
                 # Publish the first pair immediately. Later pairs may wait for
                 # TF outside the lock if the 150 ms wait plus scheduling margin fits.
                 if self.count and _fresh_images(color, depth, reserve_ns=170_000_000):
                     self.body_mount.wait_for_capture(max(_stamp(color), _stamp(depth)))
+                tf_ready = time.monotonic()
                 with self.lock:
                     if not self.running or self.stop_event.is_set():
                         continue
@@ -729,7 +742,12 @@ class RgbdCameraPlugin:
                     if publish_color:
                         self.color_pub.publish(out_color)
                     if publish_depth:
-                        self.depth_pub.publish(out_depth)
+                        if self.depth_pub.publish(out_depth) is not False:
+                            self.last_depth_timing = dict(
+                                capture_ns=_stamp(depth), worker_started_ns=started_ns,
+                                published_ns=time.time_ns(), compression_backend=compression_backend,
+                                prepare_ms=round((encoded - started) * 1000, 1),
+                                tf_wait_ms=round((tf_ready - encoded) * 1000, 1))
                     self.count += 1
                     self.last_publish_ns = time.time_ns()
             except Exception as error:

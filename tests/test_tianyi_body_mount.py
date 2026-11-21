@@ -267,6 +267,28 @@ def test_missing_tf_emits_no_held_body_matrix_and_images_continue(source):
     assert source.count == 2 and source.running and source.error is None
 
 
+def test_depth_worker_uses_fast_lossless_codec_and_reports_the_same_frame(source, monkeypatch):
+    import zlib
+
+    calls = []
+
+    def compress(raw, level):
+        calls.append((raw, level))
+        return zlib.compress(raw, level)
+    monkeypatch.setitem(sys.modules, 'deflate', NS(zlib_compress=compress))
+
+    emit(source)
+
+    (raw, level), = calls
+    assert level == 1
+    depth, = [message for topic, message in source.events if topic == source.depth_topic]
+    assert zlib.decompress(depth.data) == raw
+    timing = source._source_status()['streams']['last_depth_timing']
+    assert timing['capture_ns'] == m._stamp(depth)
+    assert timing['published_ns'] <= source.last_publish_ns
+    assert timing['compression_backend'] == 'libdeflate'
+
+
 def test_missing_tf_dependency_preserves_real_image_worker(source, monkeypatch):
     source.stop()
     monkeypatch.setitem(sys.modules, 'tf2_ros', None)
