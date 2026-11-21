@@ -1,4 +1,4 @@
-"""Map snapshots stay recoverable, including failed restores."""
+"""Map transfers verify identity before installing or deleting files."""
 import base64
 import hashlib
 from pathlib import Path
@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from host.navigation_rpc import map_archive_read, map_archive_write
 
 
-def test_map_transfer_checks_identity_and_retains_quarantine(tmp_path):
+def test_map_transfer_checks_identity_and_removes_deleted_files(tmp_path):
     name = 'test1'
     upload = {'map_name': name, 'token': 'a' * 32}
     delete = {'map_name': name, 'token': 'b' * 32}
@@ -45,6 +45,6 @@ def test_map_transfer_checks_identity_and_retains_quarantine(tmp_path):
         run('map_upload_begin', {**upload, 'token': 'c' * 32})
     run('map_delete', {**delete, 'manifest': archived})
     quarantine = tmp_path / '.motus-map-transfers' / ('deleted-' + delete['token'])
-    for suffix, data in files.items():
+    for suffix in files:
         assert not (tmp_path / (name + suffix)).exists()
-        assert (quarantine / (name + suffix)).read_bytes() == data
+    assert not quarantine.exists()

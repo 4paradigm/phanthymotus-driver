@@ -77,6 +77,30 @@ class MapStorageTests(unittest.TestCase):
         self.assertEqual(self.current(), previous)
         self.assertFalse(list((self.archive.root/self.name/'versions').glob('.incoming-*')))
 
+    def test_delete_archive_only_map_removes_it_from_preview_and_navigation(self):
+        self.archive.sync(self.name)
+        client, bundle = Client(), Bundle()
+        plugin = ControlledSpatialPlugin(bundle, {'db_path': str(self.root/'spatial.db')}, client)
+        bundle.spatial = plugin
+        plugin.archive = self.archive
+        self.addCleanup(plugin.close)
+        identity = self.name, 'map-fingerprint'
+        pose = {'x': 1., 'y': 2., 'yaw': .3}
+        key = plugin.store.anchor_key(identity)
+        plugin.store.tag(identity, 'P1', '', pose)
+        plugin.store.state(key, pose)
+        plugin.store.state('unconfirmed:' + key, True)
+        args = {'map_name': self.name}
+        self.assertEqual(plugin.dispatch('delete_map', args)['error'], 'confirm_delete_required')
+        self.assertEqual(plugin.dispatch('delete_map', {**args, 'confirm_delete': True})['state'], 'executing')
+        wait(lambda: bool(bundle.tracker.events))
+        self.assertEqual(bundle.tracker.events[-1][0], 'completed')
+        self.assertFalse((self.archive.root / self.name).exists())
+        self.assertFalse(plugin.store.tags(identity))
+        self.assertIsNone(plugin.store.state(key))
+        self.assertIsNone(plugin.store.state('unconfirmed:' + key))
+        self.assertEqual(plugin.dispatch('load_map', args)['error'], 'grid_map_not_found')
+
     def test_remote_change_during_transfer_is_not_published(self):
         original = self.client.native
         calls = []

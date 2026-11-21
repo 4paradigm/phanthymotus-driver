@@ -337,7 +337,7 @@ sensor/actuator 卡片实现系统生命周期动作；`model` 为读取型 reso
 | `tag_place` | `name`，可选 `description` | 保存当前 map 系 x/y/yaw；建图期间先绑定当前建图会话 |
 | `untag_place` / `list_tags` | `name` / 无 | 删除/列出当前地图语义点，列表含相对距离和方向 |
 | `list_maps` / `load_map` | 无 / `map_name` | 列出底盘和上位机归档地图 / 如有需要从归档恢复到底盘，再载入并切回自动模式 |
-| `delete_map` | `map_name`、`confirm_delete: true` | 校验并备份完整地图，随后从底盘列表移除非活动地图，保留归档和点位 |
+| `delete_map` | `map_name`、`confirm_delete: true` | 永久删除非活动地图在底盘和上位机的文件，以及关联点位。支持仅存于上位机的地图 |
 | `unload_map` | 无 | 停止正在执行的卡片导航并退出驱动的当前地图。JaTen 继续保留地图，归档和点位仍可预览 |
 | `navigate_to_pose` | `x`、`y`（米）、`yaw`（弧度），可选 `speed` | 按 map 系目标导航 |
 | `navigate_to_tag` | `tag_name`，可选 `speed` | 只精确匹配当前地图中的语义点 |
@@ -389,7 +389,7 @@ SSH RPC 辅助源码随镜像构建，每次在底盘执行固定操作，使用
 
 - 语义点、地图身份、未确认操作和最近一次地图流程耗时：`/opt/phanthy-motus/data/kuavo5w/controlled_spatial.db`。
 - 地图文件备份：`/opt/phanthy-motus/data/maps/kuavo5w/<地图名>/versions/<快照指纹>/`，包含 `.pgm`、`.yaml`、`.pbstream`、`.path` 和 `manifest.json`；`<地图名>/current.json` 指向最后完整核验的快照。
-- 厂商运行原件仍在底盘 `/home/jt/jmap_config/jmaps/`，不移动、不删除，不把上位机目录伪装成厂商已加载地图。上位机备份用于持久保存；更换底盘后的恢复/导入仍需按厂商流程处理。
+- 厂商运行原件仍在底盘 `/home/jt/jmap_config/jmaps/`。上位机副本用于持久保存。显式调用 `delete_map` 会删除两处文件。
 
 升级首次启动会用 SQLite backup 将旧 `/config/controlled_spatial.db` 迁入新目录，保留旧文件；目标已存在时绝不覆盖，显式 `controlled_spatial.db_path` 也不会被改写。容器删除/重建保留宿主机数据。手工运行需设置 `KUAVO_DATA_DIR=/opt/phanthy-motus/data` 并挂载该目录；未设置时保持旧数据库路径，地图备份关闭。
 后台备份在启动和地图操作完成后触发，空闲时每分钟重试；建图/地图转换期间让路。逐块传输并核对大小、SHA256和传输前后文件状态，完整成功后才原子更新快照指针；失败不覆盖旧快照，也不阻断导航或ACP。`info.storage` 显示实际路径和备份状态。新增代码与数据卷不增加运行依赖，地图数据不进入镜像。

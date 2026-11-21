@@ -76,6 +76,16 @@ class SpatialStore:
             self.db().commit()
             return cursor.rowcount > 0
 
+    def delete_map(self, name):
+        with self.lock, self.db() as db:
+            db.execute('DELETE FROM tags WHERE map_id=?', (name,))
+            prefix = 'mapping_anchor:' + json.dumps([name], ensure_ascii=False)[:-1] + ','
+            for key_prefix in (prefix, 'unconfirmed:' + prefix):
+                db.execute('DELETE FROM state WHERE substr(key, 1, ?) = ?', (len(key_prefix), key_prefix))
+            row = db.execute("SELECT value FROM state WHERE key='loaded_map_identity'").fetchone()
+            if row and (json.loads(row[0]) or [None])[0] == name:
+                db.execute("DELETE FROM state WHERE key='loaded_map_identity'")
+
     def bind_mapping(self, previous, identity, start_pose=None):
         with self.lock:
             with self.db() as db:
@@ -109,7 +119,7 @@ class ControlledSpatialPlugin:
         'list_tags': ([], '列出当前地图语义点及相对位置'),
         'list_maps': ([], '列出底盘真实栅格地图'),
         'get_pose': ([], '读取当前地图定位，x/y 为米，yaw 为弧度'),
-        'delete_map': (['map_name', 'confirm_delete'], '备份并从底盘移除指定的非活动地图'),
+        'delete_map': (['map_name', 'confirm_delete'], '永久删除指定的非活动地图、上位机副本和关联点位'),
         'unload_map': ([], '退出驱动的地图导航并保留地图和点位，底盘继续保留厂商地图'),
         'load_map': (['map_name'], '在建图起点附近载入地图，以记录的起点辅助定位并核对结果'),
         'navigate_to_pose': (['x', 'y', 'yaw', 'speed'], '导航到map系位姿，按任务ID跟踪ACP'),
@@ -161,7 +171,7 @@ class ControlledSpatialPlugin:
         props = {'action': {'type': 'string', 'enum': list(self.ACTIONS)},
                  **{k: {'type': 'string'} for k in ('map_name', 'name', 'description', 'tag_name')},
                  **{k: {'type': 'number', 'description': 'map坐标系位置，米'} for k in ('x', 'y')},
-                 'confirm_delete': {'type': 'boolean', 'description': '确认移除指定的底盘地图'},
+                 'confirm_delete': {'type': 'boolean', 'description': '确认永久删除地图及关联点位'},
                  'yaw': {'type': 'number', 'description': 'map坐标系绝对朝向，弧度'},
                  'speed': {'type': 'number',
                            'description': f'{NAV_SPEED_MIN:g}–{NAV_SPEED_MAX:g} m/s；导航线速度上限，默认{NAV_SPEED_DEFAULT:g} m/s，实际速度由厂商规划及安全限速决定',
@@ -772,6 +782,11 @@ class ControlledSpatialPlugin:
             and self._map_pending.get('stage') == 'SaveCartoMap'
             and not any(w.is_alive() and w.name == 'kuavo-map-operation' for w in self._workers)
             and not self._task and not self._uncertain and self._preparation is None)
+        recovering_delete = (action == 'delete_map' and self._map_pending is not None
+            and self._map_pending.get('operation') == 'delete_map'
+            and self._map_pending.get('stage') == 'delete_local_map'
+            and self._map_pending.get('map_name') == args.get('map_name')
+            and not any(w.is_alive() and w.name == 'kuavo-map-operation' for w in self._workers))
         if action in ('list_tags', 'tag_place', 'untag_place'):
             if not mapping:
                 self._require_loaded_map()
@@ -807,8 +822,8 @@ class ControlledSpatialPlugin:
                 raise RuntimeError('no_confirmed_mapping_session_inspect_info')
         elif action == 'delete_map':
             safe_name(args.get('map_name'))
-            if mapping or self.archive is None:
-                raise RuntimeError('map_transfer_requires_archive_and_no_mapping_session')
+            if mapping:
+                raise RuntimeError('finish_or_reconcile_mapping_before_deleting')
             if args.get('confirm_delete') is not True:
                 raise ValueError('confirm_delete_required')
         elif action == 'load_map':
@@ -820,7 +835,10 @@ class ControlledSpatialPlugin:
         restore_archive = False
         if action in ('start_mapping', 'load_map', 'delete_map'):
             exists = args['map_name'] in [Path(m.get('fileName', '')).stem for m in self.client.maps()]
-            if action == 'load_map' and not exists and self.archive and args['map_name'] in self.archive.names():
+            if action == 'delete_map':
+                if not (exists or recovering_delete or (self.archive and self.archive.contains(args['map_name']))):
+                    raise ValueError('grid_map_not_found')
+            elif action == 'load_map' and not exists and self.archive and args['map_name'] in self.archive.names():
                 restore_archive = True
             elif exists == (action == 'start_mapping'):
                 raise ValueError('map_name_already_exists' if exists else 'grid_map_not_found')
@@ -843,12 +861,14 @@ class ControlledSpatialPlugin:
                 raise RuntimeError('map_request_superseded_by_stop')
             self.bundle.state.require_motion_enabled()
             if (self.bundle._transition is not None or 'base' in self.bundle.tracker._active
-                    or (self.unresolved() and not recovering_save)):
+                    or (self.unresolved() and not (recovering_save or recovering_delete))):
                 raise RuntimeError('base_busy_or_navigation_unresolved')
             aid, cancelled = self.bundle.tracker.begin('base', self.PREFIX)
             self._map_pending = {'operation': action, 'action_id': aid}
             if recovering_save:
                 self._map_pending['stage'] = 'SaveCartoMap'
+            if recovering_delete:
+                self._map_pending.update(stage='delete_local_map', map_name=args['map_name'])
             self._persist()
         self._map_deadline = time.monotonic() + (1800 if restore_archive or action in ('stop_mapping', 'delete_map') else 150)
         started = time.monotonic()
@@ -857,15 +877,15 @@ class ControlledSpatialPlugin:
         def worker():
             try:
                 if action == 'delete_map':
-                    result = self._transfer_map(action, args['map_name'], cancelled)
+                    result = self._delete_map(args['map_name'], cancelled)
                 else:
                     if restore_archive:
-                        self._transfer_map('restore_archive', args['map_name'], cancelled)
+                        self._restore_archive(args['map_name'], cancelled)
                         for key in ('stage', 'stage_started_at', 'map_name', 'transfer_id'):
                             self._map_pending.pop(key, None)
                         self._persist()
                     result = self._mutate_map(action, args, mapping, cancelled)
-                if cancelled.is_set():
+                if cancelled.is_set() and action != 'delete_map':
                     raise RuntimeError('map_operation_interrupted')
                 timing.update(state='completed', elapsed_s=time.monotonic()-started)
                 self.store.state('last_map_operation', timing)
@@ -900,53 +920,62 @@ class ControlledSpatialPlugin:
         thread.start()
         return {'state': 'executing', 'action_id': aid, 'operation': action}
 
-    def _transfer_map(self, action, name, cancelled):
+    def _delete_map(self, name, cancelled):
+        if self.client.current_map()['mapId'] == name:
+            raise ValueError('cannot_modify_active_map')
+        exists = name in {Path(m.get('fileName', '')).stem for m in self.client.maps()}
+        if exists:
+            if self._map_pending.get('stage') == 'delete_local_map':
+                raise RuntimeError('chassis_map_reappeared_during_delete')
+            manifest = self.client.native('map_archive_manifest', map_name=name)
+            MapArchive.validate(manifest, name)
+            self._require_stationary()
+            if cancelled.is_set() or time.monotonic() >= self._map_deadline:
+                raise RuntimeError('map_delete_interrupted')
+            token = uuid4().hex
+            self._map_pending.update(stage='map_delete', stage_started_at=time.time(),
+                                     map_name=name, transfer_id=token)
+            self._persist()
+            result = self.client.native('map_delete', map_name=name, token=token, manifest=manifest)
+            if result.get('success') is not True:
+                raise RuntimeError('chassis_map_delete_not_confirmed')
+            self._wait(lambda: name not in {Path(m.get('fileName', '')).stem
+                                            for m in self.client.maps()}, threading.Event(), 15)
+        elif cancelled.is_set() and self._map_pending.get('stage') != 'delete_local_map':
+            raise RuntimeError('map_delete_interrupted')
+        self._map_pending.update(stage='delete_local_map', stage_started_at=time.time(), map_name=name)
+        self._persist()
+        if self.archive:
+            self.archive.delete(name)
+        self.store.delete_map(name)
+        return {'state': 'completed', 'map_name': name, 'deleted': True}
+
+    def _restore_archive(self, name, cancelled):
         if self.client.current_map()['mapId'] == name:
             raise ValueError('cannot_modify_active_map')
         token = uuid4().hex
         transfer = {'map_name': name, 'token': token}
-        if action == 'delete_map':
-            # Use a private backup task so the normal archive worker remains
-            # suspended while the base is reserved by this operation.
-            backup = MapArchive(self.client, self.archive.root, cancelled,
-                                idle=lambda: time.monotonic() < self._map_deadline)
-            backup.sync(name)
-            _, manifest = backup.archived(name)
-            operation = 'map_delete'
-        else:
-            operation = 'map_upload_commit'
-            try:
-                manifest = self.archive.stage_upload(name, token, cancelled, self._map_deadline)
-            except Exception:
-                try:
-                    self.client.native('map_upload_abort', **transfer)
-                except Exception:
-                    pass
-                raise
-
         try:
+            manifest = self.archive.stage_upload(name, token, cancelled, self._map_deadline)
             if cancelled.is_set():
                 raise RuntimeError('map_transfer_interrupted')
             self._require_stationary()
             if cancelled.is_set() or time.monotonic() >= self._map_deadline:
                 raise RuntimeError('map_transfer_interrupted')
-            self._map_pending.update(stage=operation, stage_started_at=time.time(),
+            self._map_pending.update(stage='map_upload_commit', stage_started_at=time.time(),
                                      map_name=name, transfer_id=token)
             self._persist()
-            response = self.client.native(operation, **transfer, manifest=manifest)
+            response = self.client.native('map_upload_commit', **transfer, manifest=manifest)
             if response.get('success') is not True:
                 raise RuntimeError('map_transfer_not_confirmed')
             # Verify the native map catalog, not just the SSH response.
-            self._wait(lambda: (name in [Path(m.get('fileName', '')).stem
-                                         for m in self.client.maps()]) == (action == 'restore_archive'),
+            self._wait(lambda: name in {Path(m.get('fileName', '')).stem for m in self.client.maps()},
                        cancelled, 15)
-            return {'state': 'completed', 'map_name': name, 'archive_retained': True}
         finally:
-            if action == 'restore_archive':
-                try:
-                    self.client.native('map_upload_abort', **transfer)
-                except Exception:
-                    pass
+            try:
+                self.client.native('map_upload_abort', **transfer)
+            except Exception:
+                pass
 
     def _require_stationary(self):
         state = self.client.observe(required=('agvState', 'state'))['state']

@@ -1,4 +1,4 @@
-"""Host-persistent, verified snapshots of factory map files (no map mutations)."""
+"""Host-persistent, verified snapshots of factory map files."""
 import base64
 import hashlib
 import json
@@ -59,6 +59,7 @@ class MapArchive:
         self.client, self.root, self.closed, self.idle = client, Path(root), closed, idle
         self.wake = threading.Event()
         self.lock = threading.Lock()
+        self.file_lock = threading.Lock()
         self.thread = None
         self.status = {'state': 'idle', 'directory': str(self.root), 'role': 'upper_board_backup'}
 
@@ -141,6 +142,22 @@ class MapArchive:
             names.append(item.name)
         return sorted(names)
 
+    def contains(self, name):
+        return os.path.lexists(self.root / safe_name(name))
+
+    def delete(self, name):
+        directory = self.root / safe_name(name)
+        with self.file_lock:
+            if directory.is_symlink():
+                directory.unlink()
+            elif directory.exists():
+                shutil.rmtree(directory)
+            with self.lock:
+                if self.status.get('current_map') == name:
+                    self.status.update(current_map=None, current_directory=None)
+                if 'maps' in self.status:
+                    self.status['maps'] = [item for item in self.status['maps'] if item != name]
+
     def stage_upload(self, name, token, cancelled, deadline):
         directory, manifest = self.archived(name)
         identity = {'map_name': name, 'token': token}
@@ -162,6 +179,12 @@ class MapArchive:
 
     def sync(self, name):
         safe_name(name)
+        with self.file_lock:
+            if not self.idle():
+                raise InterruptedError('map_archive_interrupted')
+            self._sync(name)
+
+    def _sync(self, name):
         manifest = self.client.native('map_archive_manifest', map_name=name)
         version = self.validate(manifest, name)
         directory = self.root / name

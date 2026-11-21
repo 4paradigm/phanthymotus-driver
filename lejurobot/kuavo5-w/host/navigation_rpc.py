@@ -157,6 +157,7 @@ def map_archive_write(operation, args, root=Path('/home/jt/jmap_config/jmaps'),
                 for suffix in reversed(moved):
                     (stage / live[suffix].name).rename(live[suffix])
                 raise
+            shutil.rmtree(stage)
         else:
             raise ValueError('unsupported_map_archive_write')
     return {'success': True}
