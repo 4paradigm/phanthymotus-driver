@@ -2284,14 +2284,16 @@ def _run_camera_process(main_topic: str, left_topic: str, right_topic: str, dept
         buf = bytearray()
         CHUNK = 65536
         while proc.poll() is None:
-            data = proc.stdout.read(CHUNK)
+            # Read available bytes instead of waiting for a full 64 KiB.
+            data = proc.stdout.read1(CHUNK)
             if not data:
                 break
             buf.extend(data)
             while True:
                 soi = buf.find(b'\xff\xd8')
                 if soi == -1:
-                    buf.clear()
+                    # The JPEG start marker may straddle two pipe reads.
+                    buf[:] = b'\xff' if buf.endswith(b'\xff') else b''
                     break
                 eoi = buf.find(b'\xff\xd9', soi + 2)
                 if eoi == -1:
