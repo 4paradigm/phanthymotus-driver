@@ -95,11 +95,6 @@ class SpatialStore:
                 self.conn.execute("INSERT OR REPLACE INTO map_start_poses (map_name,x,y,yaw) VALUES(?,?,?,?)",
                                   (name, start_pose['x'], start_pose['y'], start_pose['yaw']))
 
-    def remember_map_start(self, name, pose):
-        with self.lock, self.conn:
-            self.conn.execute("INSERT OR IGNORE INTO map_start_poses (map_name,x,y,yaw) VALUES(?,?,?,?)",
-                              (name, pose['x'], pose['y'], pose['yaw']))
-
     def tag(self, name, map_name, pose, description):
         with self.lock, self.conn:
             self.conn.execute("INSERT OR REPLACE INTO poi (name,description,x,y,yaw,map_name) VALUES(?,?,?,?,?,?)",
@@ -120,7 +115,7 @@ class ControlledSpatialPlugin:
     ACTION_PARAMS = {
         'start': [], 'info': [], 'stop': [],
         'start_mapping': ['map_name'], 'stop_mapping': [],
-        'list_maps': [], 'load_map': ['map_name', 'x', 'y', 'yaw'], 'unload_map': [], 'delete_map': ['map_name'],
+        'list_maps': [], 'load_map': ['map_name'], 'unload_map': [], 'delete_map': ['map_name'],
         'tag_place': ['name', 'description'], 'untag_place': ['name'], 'list_tags': [],
         'navigate_to_tag': ['tag_name'], 'navigate_to_pose': ['x', 'y', 'yaw'],
         'stop_nav': [], 'get_pose': [],
@@ -173,7 +168,7 @@ class ControlledSpatialPlugin:
                  **{key: {'type': 'string'} for key in ('map_name', 'name', 'tag_name', 'description')},
                  **{key: {'type': 'number'} for key in ('x', 'y', 'yaw')}}
         return {'name': 'controlled_spatial', 'type': 'actuator', 'multiInstance': False,
-                'description': 'Panther controlled SLAM: map manually and tag places. Load a map at its saved mapping start pose, then unload it when switching to an idle chassis or deleting it. For legacy maps without a saved start, optionally supply the known map-frame x, y, yaw together on the first load. yaw is radians.',
+                'description': 'Panther controlled SLAM: map manually and tag places. Load a map by name from its saved mapping start position and heading, then unload it before deleting it. Navigation yaw is in radians.',
                 'inputSchema': {'type': 'object', 'properties': props, 'required': ['action'],
                     'additionalProperties': False, 'x-resource': 'base',
                     'x-completion': {'actions': ['navigate_to_tag', 'navigate_to_pose'],
@@ -558,14 +553,6 @@ class ControlledSpatialPlugin:
                 raise RuntimeError('Save the active mapping session first')
             name = safe_name(args.get('map_name', ''))
             seed = self.store.map_start_pose(name)
-            explicit_seed = None
-            pose_keys = ('x', 'y', 'yaw')
-            if any(key in args for key in pose_keys):
-                if not all(key in args for key in pose_keys):
-                    raise ValueError('Supply x, y and yaw together for a known mapping start pose')
-                explicit_seed = {key: float(args[key]) for key in pose_keys}
-                if not all(math.isfinite(value) for value in explicit_seed.values()):
-                    raise ValueError('Pose values must be finite')
             if name not in self._call('get_map_list').map_names:
                 # Restore only this card's archived artifacts; never overwrite a native map.
                 source = self.root / name
@@ -589,19 +576,17 @@ class ControlledSpatialPlugin:
             result = {'state': 'localizing', 'map_name': name}
             if not self._requires_localization():
                 return result
-            if explicit_seed is None and seed is None:
-                return {**result, 'message': 'Legacy map has no saved start pose. At the original mapping start, call load_map with its known x, y and yaw once.'}
-            result['seed_source'] = 'provided_start_pose' if explicit_seed is not None else 'mapping_start_pose'
+            if seed is None:
+                return {**result, 'message': 'This map has no saved start pose. Build and save a new map to use verified navigation.'}
+            result['seed_source'] = 'mapping_start_pose'
             try:
                 if not self._wait_until(lambda: self.grid is not None):
                     raise RuntimeError('No fresh occupancy grid after loading the map')
-                pose = self._localize(explicit_seed if explicit_seed is not None else seed)
+                pose = self._localize(seed)
             except RuntimeError as exc:
                 self.last_error = str(exc)
                 return {**result, 'error': str(exc),
                         'message': 'Return to the original mapping position and heading and retry load_map.'}
-            if explicit_seed is not None and seed is None:
-                self.store.remember_map_start(name, explicit_seed)
             return {**result, 'state': 'localized', 'pose': pose}
         if action == 'unload_map':
             if self.mapping:

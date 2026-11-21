@@ -248,10 +248,9 @@ Build a new map after enabling the filter because old saved maps can contain
 chassis returns. Stay still when calling `start_mapping` until it reports
 `mapping_start_pose` (also shown by `info`). The driver saves this starting
 `base_link` pose with the map. Return to that physical position and heading
-before calling `load_map`, which seeds SLAM automatically. For an older map
-without a saved start pose, pass its known map-frame `x`, `y`, and `yaw` to
-`load_map` once while physically at that start. If starting from another known
-location, provide the known start pose to `load_map` once so it can be stored for future loads.
+before calling `load_map(map_name)`, which seeds SLAM automatically.
+An older map without a saved start pose can still be loaded for viewing.
+Build and save a new map to use verified navigation.
 The driver requires fresh TF within 0.25 m and 20 degrees of the seed for one
 second before enabling navigation and tagging on a loaded map. `get_pose`
 reports `localization_verified`. The driver also checks

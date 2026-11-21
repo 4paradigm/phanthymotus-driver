@@ -278,6 +278,9 @@ class SpatialTest(unittest.TestCase):
         p._wait_until = Mock(return_value=True)
         p._localize = Mock(return_value=start)
 
+        actions = p.get_tool()['inputSchema']['x-action-params']
+        self.assertEqual(actions['load_map']['params'], ['map_name'])
+        self.assertEqual(actions['navigate_to_pose']['params'], ['x', 'y', 'yaw'])
         result = p.dispatch('load_map', {'map_name': 'room'})
         self.assertEqual(p.store.tags('room'), [])
         self.assertEqual(result['state'], 'localized')
@@ -286,18 +289,15 @@ class SpatialTest(unittest.TestCase):
 
         result = p.dispatch('load_map', {'map_name': 'old'})
         self.assertEqual(result['state'], 'localizing')
+        self.assertIn('no saved start pose', result['message'])
         self.assertFalse(p.localization_verified)
         p._localize.assert_called_once()
 
         p._localize.side_effect = RuntimeError('SLAM pose did not settle')
-        self.assertEqual(p.dispatch('load_map', {'map_name': 'old', **start})['state'], 'localizing')
-        self.assertIsNone(p.store.map_start_pose('old'))
-
-        p._localize.side_effect = None
-        result = p.dispatch('load_map', {'map_name': 'old', **start})
-        self.assertEqual(result['seed_source'], 'provided_start_pose')
-        self.assertEqual(p.store.map_start_pose('old'), start)
-        self.assertEqual(p.dispatch('load_map', {'map_name': 'old'})['seed_source'], 'mapping_start_pose')
+        result = p.dispatch('load_map', {'map_name': 'room', 'x': 99, 'y': 99, 'z': 99, 'yaw': 0})
+        self.assertEqual(result['state'], 'localizing')
+        self.assertEqual(result['error'], 'SLAM pose did not settle')
+        p._localize.assert_called_with(start)
 
     def test_native_archive_excludes_prefix_collisions(self):
         p = self.plugin
