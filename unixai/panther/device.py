@@ -297,6 +297,13 @@ class PantherDevice:
         self._camera = PantherCameraRuntime(
             self._node, self._bridge, config.get("plugins", {}).get("camera", {}), sensor_qos
         )
+        plugins = config.get("plugins", {})
+        self._stereo_camera = None
+        if any(plugins.get(card, {}).get("enabled") for card in ("camera_left", "camera_right")):
+            from stereo_camera import StereoCameraRuntime
+            self._stereo_camera = StereoCameraRuntime(
+                self._node, self._bridge, plugins.get("stereo_camera", {}), sensor_qos
+            )
 
     @property
     def topics(self):
@@ -324,6 +331,8 @@ class PantherDevice:
         self._closed = True
         self._stop_arm("driver_shutdown", wait_s=20.0)
         self._stop_head("driver_shutdown", wait_s=5.0)
+        if self._stereo_camera is not None:
+            self._stereo_camera.close()
         self._camera.close()
         self._bridge.stop()
         pending_stop = self._wait_for_pending_drive_stop(0.0)

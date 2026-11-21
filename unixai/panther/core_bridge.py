@@ -24,6 +24,8 @@ TOPIC_SUFFIXES = {
     "laser_scan": ("laser_scan/pointcloud", "sensor/pointcloud"),
     "camera_color": ("camera/rgb", "image/jpeg"),
     "camera_depth": ("camera/depth", "image/depth-zlib"),
+    "camera_left": ("camera/left", "image/jpeg"),
+    "camera_right": ("camera/right", "image/jpeg"),
 }
 XYZ_POINT_STEP = 12  # Three little-endian float32 coordinates.
 

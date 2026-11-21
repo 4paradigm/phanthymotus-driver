@@ -19,6 +19,8 @@ cards:
   - {name: laser_scan, type: sensor}
   - {name: camera_color, type: sensor}
   - {name: camera_depth, type: sensor}
+  - {name: camera_left, type: sensor}
+  - {name: camera_right, type: sensor}
   - {name: mic, type: sensor}
   - {name: speaker, type: actuator}
   - {name: base_drive, type: actuator}

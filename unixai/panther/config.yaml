@@ -40,6 +40,15 @@ plugins:
       rpy_rad: [0.0, 0.0, 0.0]
   camera_color: {enabled: true}
   camera_depth: {enabled: true}
+  camera_left: {enabled: true}
+  camera_right: {enabled: true}
+  stereo_camera:
+    # Start the vendor stereo source only when an eye card is armed.
+    manage_vendor_source: true
+    source_topic: "/ros_srt"
+    calibration_path: "/proc/1/root/home/unix_ai/work/srt/video/stereo.yaml"
+    publish_hz: 10.0
+    jpeg_quality: 75
 
   audio:
     server: "auto"

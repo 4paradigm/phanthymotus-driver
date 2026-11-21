@@ -75,7 +75,7 @@ Agent Core is unchanged. Topic paths below use `/<namespace>/panther` as `P`.
 | `imu.camera_imu`, `P/camera/rgbd/imu` | `sensor/imu`, `std_msgs/String`, `motus.imu/1` JSON | Raw camera gyro xyz in rad/s and acceleration xyz in m/s², source nanosecond times, optical-frame rotations and sensor origins from TF |
 | `odom`, `P/state/odom` | `state/odom`, `std_msgs/String`, `motus.odom/1` JSON | Body `[vx,vy,null,null,null,wz]`, m/s and rad/s; source pose, quaternion, covariance and its own measurement time. Connect this port to ActuCore `navi` for motion feedback. |
 
-Each camera retains exactly one image output. Both use live
+The two Gemini cards each retain one image output. They use live
 `/camera/{color,depth}/camera_info` to derive a common rectified pinhole ray
 window. Color distortion is removed; depth is sampled by nearest neighbour.
 The `camera_info` in tool declarations and action responses contains
@@ -83,6 +83,26 @@ The `camera_info` in tool declarations and action responses contains
 registration and clock provenance. No generic Gemini calibration is hardcoded.
 Missing or contradictory calibration pauses image forwarding and is reported.
 The effective field can be slightly cropped to keep all rays within both images.
+
+The Pixe XYZ stereo module has two separate cards, `camera_left` and
+`camera_right`. Each publishes one 1280×960 JPEG stream at up to 10 Hz on
+`P/camera/left` or `P/camera/right`. The two images from one source frame carry
+the same timestamp. The corresponding `camera_info` declaration includes native
+intrinsics and distortion derived from `M1/D1` or `M2/D2` in the host's vendor
+`stereo.yaml`. On the vendor I420 path, the per-eye camera matrix is preserved and the
+published distortion coefficients are zero. The YUYV path retains the original
+lens distortion. If the calibration file is missing or invalid, the cards keep streaming and report unknown optics.
+
+The cards share a domain-0 ROS image subscription to the 2560×960 I420 or YUYV
+feed on `/ros_srt`. On the first card start, a background check reuses an
+existing publisher or enables `cam_share_yuv` in the active compatible vendor
+template. If needed, the vendor monitor starts or restarts only the head video
+stream. This can briefly interrupt the vendor head video. Set
+`plugins.stereo_camera.manage_vendor_source` to false when the source is
+managed externally. Stopping the last card removes the subscription and
+leaves the vendor stream available to its other consumers. The ROS callback
+stores only the latest frame. A shared worker encodes the two eyes, and each
+output uses its own publish bridge.
 
 `plugins.camera.registered_depth` must describe a vendor-registered common
 optical frame (true on the development robot). For uint16 input,

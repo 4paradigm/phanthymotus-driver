@@ -197,6 +197,44 @@ class CameraPlugin:
         return result
 
 
+class StereoCameraPlugin:
+    def __init__(self, device, eye):
+        self.runtime = device._stereo_camera
+        self.eye = eye
+        self.name = f"camera_{eye}"
+        self.topic = device.topics[self.name]
+
+    def get_tool(self):
+        return {
+            "name": self.name,
+            "type": "sensor",
+            "multiInstance": False,
+            "description": f"Panther {self.eye} eye image from the Pixe XYZ stereo camera",
+            "inputSchema": _sensor_schema(),
+            **self._outputs(),
+        }
+
+    def _outputs(self):
+        return {
+            "topic_out": [self.topic],
+            "camera_info": [self.runtime.declaration(self.eye, self.topic)],
+        }
+
+    def start(self):
+        # Canvas dispatch controls the subscription.
+        return None
+
+    def stop(self):
+        self.runtime.stop(self.eye)
+
+    def dispatch(self, action, args):
+        if action == "start":
+            self.runtime.start(self.eye)
+        elif action == "stop":
+            self.stop()
+        return {**self.runtime.info(self.eye), **self._outputs()}
+
+
 def _action_schema(actions, properties, required_by_action=None, resource=None,
                    completion=None, interruptible=False):
     schema = {
@@ -253,6 +291,9 @@ def build_plugins(config, namespace, device):
         plugins.append(CameraPlugin(
             device, "camera_depth", "depth", "Panther Gemini 2 depth stream (zlib 16UC1)"
         ))
+    for eye in ("left", "right"):
+        if on(f"camera_{eye}"):
+            plugins.append(StereoCameraPlugin(device, eye))
     if on("mic") or on("speaker"):
         from audio import AudioPlugin
         for name in ("mic", "speaker"):
