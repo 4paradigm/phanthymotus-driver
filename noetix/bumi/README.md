@@ -390,8 +390,9 @@ additional worker. This card has not been validated on hardware.
 - `enable(confirm=true)` requires safe face-up placement on a flat, non-slip
   surface, free joints and a clear movement area. Enabling can move joints to
   zero; it does not stand the robot up or start walking.
-- From disabled (30), `enable` sends START once, releases it with DEFAULT, and
-  waits up to 4 seconds for enabled (0), cancellation, or another mode. This
+- From disabled (30), `enable` sends START once, then refreshes DEFAULT about
+  every 10 ms while waiting up to 4 seconds for enabled (0), cancellation, or
+  another mode, following the vendor example's command cadence. This
   cadence has not been validated on hardware. If already enabled, it sends nothing.
   Protection (26) and other modes are refused. Active chassis actions are
   refused; the streaming servo is paused and shared publishing is serialized.
@@ -415,6 +416,8 @@ or another SDK controller concurrently: the shared owner coordinates only this
 bundle. Inspect the robot and state after an unconfirmed attempt. `completed` means enabled mode was
 observed, not that physical joint motion has finished. Firmware protection is
 not bypassed. Hardware validation is still required for the installed firmware.
+The card logs the START attempt, observed mode, timeout, and DEFAULT count for
+diagnosis. The SDK provides no delivery acknowledgement or source timestamp.
 
 The former `switch_mode` tool is split into direct action cards. The following
 three cards complete their required `enable`, `ready` and `walk` transitions

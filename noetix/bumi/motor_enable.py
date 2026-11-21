@@ -119,6 +119,8 @@ class MotorEnablePlugin:
 
     def _enable_motors(self) -> dict:
         attempted = False
+        release_attempted = False
+        default_count = 0
         mode = None
         try:
             mode = int(self._high_ctrl.get_mode())
@@ -133,9 +135,11 @@ class MotorEnablePlugin:
             if mode == target_mode:
                 return {"state": "completed", "command_sent": False, "confirmed": True,
                         "workmode": mode, "workmode_name": _WORKMODE_NAMES[mode],
-                        "message": "Already in the requested mode."}
+                        "feedback_freshness": "unknown", "confirmation_scope": "sdk_cached_workmode",
+                        "message": "SDK 缓存显示已使能，无法确认反馈新鲜度或关节是否已停止。"}
             if mode != 30:
                 return self._enable_mode_error(mode)
+            print(f"[motor_enable] start_requested workmode={mode}", flush=True)
             try:
                 source_mode = mode
                 mode = self._owner.publish_mode_toggle(self._enable_cancel, source_mode, target_mode)
@@ -147,31 +151,54 @@ class MotorEnablePlugin:
                 return self._enable_mode_error(mode)
             # Release the event even if stop arrives after START. Never toggle
             # START again to cancel or compensate for missing feedback.
+            print("[motor_enable] START published to SDK; delivery unknown", flush=True)
             time.sleep(0.01)
-            self._owner._publish_cmd(0, 0, 0, _get_default_cmd(), 0)
             deadline = time.monotonic() + 4.0
             while True:
+                # Follow the vendor example's DEFAULT refresh while this card
+                # owns the chassis; never repeat the START edge.
+                release_attempted = True
+                self._owner._publish_cmd(0, 0, 0, _get_default_cmd(), 0)
+                default_count += 1
                 mode = int(self._high_ctrl.get_mode())
                 if mode == target_mode:
                     self._owner._enable_unconfirmed = False
+                    print(f"[motor_enable] target_observed workmode={mode} defaults={default_count}", flush=True)
                     return {"state": "completed", "command_sent": True, "confirmed": True,
                             "workmode": mode, "workmode_name": _WORKMODE_NAMES[mode],
-                            "message": "Requested mode observed; physical motion or settling is not confirmed."}
+                            "feedback_freshness": "unknown", "confirmation_scope": "sdk_cached_workmode",
+                            "delivery": "unknown",
+                            "message": "已观察到 SDK 缓存的使能模式；反馈新鲜度和关节状态尚未确认。"}
                 if mode != source_mode:
+                    print(f"[motor_enable] mode_changed workmode={mode} defaults={default_count}", flush=True)
                     return self._enable_mode_error(mode, command_sent=True)
                 if self._enable_cancel.is_set():
+                    print(f"[motor_enable] cancelled workmode={mode} defaults={default_count}", flush=True)
                     return {"state": "cancelled", "command_sent": True, "confirmed": False,
                             "message": "Stopped waiting; enable may still take effect. Inspect motion_state."}
-                if time.monotonic() >= deadline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    print(f"[motor_enable] timeout workmode={mode} defaults={default_count}", flush=True)
                     return {"state": "error", "command_sent": True, "confirmed": False,
                             "code": "ENABLE_TIMEOUT", "workmode": mode,
-                            "retry_available": False,
+                            "retry_available": False, "feedback_freshness": "unknown",
+                            "delivery": "unknown",
                             "error": "等待使能反馈超时（4 秒），未自动重发 START。",
                             "message": "机器人实际状态尚未确认。请检查机器人及控制链路，并遵循厂商确认的恢复流程。"}
-                self._enable_cancel.wait(0.05)
+                self._enable_cancel.wait(min(0.01, remaining))
         except Exception as exc:
+            # The SDK may have accepted START before raising; try to release it
+            # once, but never issue another START on an uncertain outcome.
+            if attempted and not release_attempted:
+                try:
+                    self._owner._publish_cmd(0, 0, 0, _get_default_cmd(), 0)
+                    default_count += 1
+                except Exception:
+                    pass
+            print(f"[motor_enable] sdk_error attempted={attempted} defaults={default_count} "
+                  f"error_type={type(exc).__name__}", flush=True)
             return {"state": "error", "command_sent": None if attempted else False,
-                    "command_attempted": attempted, "confirmed": False,
+                    "command_attempted": attempted, "confirmed": False, "delivery": "unknown",
                     "code": "ENABLE_SDK_ERROR", "error": str(exc),
                     "message": "Inspect motion_state before further commands; delivery may be uncertain."}
 

@@ -138,12 +138,36 @@ def test_timeout_blocks_confirmed_retry_and_automatic_preparation(card, monkeypa
     assert clock[0] == 104.0
     assert plugin._owner._prepare_workmode(1, "stand_up")["state"] == "error"
     commands = [c[3] for c in ctrl.commands]
-    assert commands == ["START", "DEFAULT"]
+    assert commands[0] == "START" and commands.count("START") == 1
+    assert len(commands) > 2 and set(commands[1:]) == {"DEFAULT"}
     assert plugin.dispatch("enable", {})["code"] == "CONFIRM_REQUIRED"
     retry = call(plugin)
     assert retry["code"] == "ENABLE_UNCONFIRMED"
     assert retry["command_sent"] is False
     assert [c[3] for c in ctrl.commands] == commands
+
+
+def test_default_refresh_stops_when_enabled_mode_is_observed(card, monkeypatch):
+    module, plugin, ctrl = card
+    ctrl.next_mode = 30
+    clock = [100.0]
+    waits = []
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    def wait(delay):
+        waits.append(delay)
+        clock[0] += delay
+    monkeypatch.setattr(plugin._enable_cancel, "wait", wait)
+    publish = ctrl.publish_cmd
+    def acknowledge_after_three_defaults(*args):
+        publish(*args)
+        if [command[3] for command in ctrl.commands].count("DEFAULT") == 3:
+            ctrl.mode = 0
+    monkeypatch.setattr(ctrl, "publish_cmd", acknowledge_after_three_defaults)
+    result = call(plugin)
+    assert result["state"] == "completed" and result["workmode"] == 0
+    assert result["feedback_freshness"] == "unknown"
+    assert [command[3] for command in ctrl.commands] == ["START", "DEFAULT", "DEFAULT", "DEFAULT"]
+    assert waits == [0.01, 0.01]
 
 
 @pytest.mark.parametrize("action", ["info", "status"])
@@ -193,6 +217,8 @@ def test_uncertain_delivery_is_not_retried(card, monkeypatch, failed_command):
     assert result["command_sent"] is None
     assert call(plugin)["code"] == "ENABLE_UNCONFIRMED"
     assert len([c for c in ctrl.commands if c[3] == "START"]) == 1
+    if failed_command == "START":
+        assert [c[3] for c in ctrl.commands] == ["START", "DEFAULT"]
 
 
 def test_concurrent_enable_calls_are_serialized(card, monkeypatch):
