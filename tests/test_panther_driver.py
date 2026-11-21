@@ -616,7 +616,7 @@ class PantherDriverTest(unittest.TestCase):
         topics = core_bridge.output_topics("test")
         self.assertEqual(topics["robot_state"]["format"], "data/json")
         self.assertEqual(topics["battery"]["topic"], "/test/panther/battery")
-        self.assertEqual(topics["laser_scan"]["topic"], "/test/panther/laser_scan")
+        self.assertEqual(topics["laser_scan"]["topic"], "/test/panther/laser_scan/pointcloud")
         self.assertEqual(topics["laser_scan"]["format"], "sensor/pointcloud")
         self.assertNotIn("laser_view", topics)
         self.assertEqual(topics["camera_color"]["format"], "image/jpeg")
@@ -693,7 +693,7 @@ class PantherDriverTest(unittest.TestCase):
         }
         with patch.dict(sys.modules, modules), patch.dict(os.environ, {}, clear=False):
             core_bridge._run_lane(Messages(), "/profile.xml", 42, "test", "laser_scan")
-        self.assertEqual(created["publishers"], [(UInt8MultiArray, "/test/panther/laser_scan")])
+        self.assertEqual(created["publishers"], [(UInt8MultiArray, "/test/panther/laser_scan/pointcloud")])
         self.assertEqual(created["subscriptions"], [])
         self.assertEqual(bytes(created["messages"][0].data),
                          b"\x0c\x00\x00\x00\x01\x00\x00\x00" + bytes(12))

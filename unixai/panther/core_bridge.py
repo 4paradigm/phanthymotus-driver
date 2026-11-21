@@ -20,7 +20,8 @@ TOPIC_SUFFIXES = {
     "camera_imu": ("camera/rgbd/imu", "sensor/imu"),
     "body_mount": ("camera/body_mount", "state/extrinsic"),
     "odom": ("state/odom", "state/odom"),
-    "laser_scan": ("laser_scan", "sensor/pointcloud"),
+    # Keep the binary type off the legacy laser_scan JSON topic.
+    "laser_scan": ("laser_scan/pointcloud", "sensor/pointcloud"),
     "camera_color": ("camera/rgb", "image/jpeg"),
     "camera_depth": ("camera/depth", "image/depth-zlib"),
 }

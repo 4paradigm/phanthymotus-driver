@@ -31,7 +31,7 @@ def test_laser_card_publishes_xyz_and_preserves_scan_header_for_ros():
     ))
 
     spec = build_plugins({"plugins": {"laser_scan": {"enabled": True}}}, "test", device)[0].get_tool()
-    assert spec["topic_out"] == [{"topic": "/test/panther/laser_scan", "format": "sensor/pointcloud"}]
+    assert spec["topic_out"] == [{"topic": "/test/panther/laser_scan/pointcloud", "format": "sensor/pointcloud"}]
     card, raw = device._bridge.publish.call_args.args
     cloud, = device._laser_cloud_pub.publish.call_args.args
     assert cloud.header is header

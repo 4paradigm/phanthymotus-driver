@@ -273,7 +273,9 @@ instead of failing the card lifecycle.
 summaries. Battery measurements use the separate `battery` card; gripper and
 lifting feedback are available from their actuator cards. `laser_scan`
 projects valid returns from `/scan` to XYZ in the scan frame, with Z set to
-zero. The card publishes `sensor/pointcloud` at up to 5 Hz. ROS consumers on
+zero. The card publishes `sensor/pointcloud` at up to 5 Hz on
+`/<namespace>/panther/laser_scan/pointcloud`, keeping the binary stream separate
+from the legacy JSON topic. ROS consumers on
 the body domain can subscribe to `/<namespace>/panther/laser_scan/points`
 as `sensor_msgs/msg/PointCloud2`, with the source frame and scan timestamp.
 

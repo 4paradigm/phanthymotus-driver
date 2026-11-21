@@ -253,7 +253,7 @@ class PantherDevice:
             for index, axis in enumerate(("x", "y", "z"))
         ]
         self._laser_cloud_pub = self._node.create_publisher(
-            PointCloud2, self._topics["laser_scan"]["topic"] + "/points", sensor_qos
+            PointCloud2, f"/{namespace}/panther/laser_scan/points", sensor_qos
         )
         self._node.create_subscription(
             LaserScan, "/scan", guarded("laser_scan", self._on_laser), sensor_qos,
