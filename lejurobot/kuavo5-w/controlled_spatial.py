@@ -120,7 +120,6 @@ class ControlledSpatialPlugin:
         'list_maps': ([], '列出底盘真实栅格地图'),
         'get_pose': ([], '读取当前地图定位，x/y 为米，yaw 为弧度'),
         'delete_map': (['map_name', 'confirm_delete'], '永久删除指定的非活动地图、上位机副本和关联点位'),
-        'unload_map': ([], '退出驱动的地图导航并保留地图和点位，底盘继续保留厂商地图'),
         'load_map': (['map_name'], '在建图起点附近载入地图，以记录的起点辅助定位并核对结果'),
         'navigate_to_pose': (['x', 'y', 'yaw', 'speed'], '导航到map系位姿，按任务ID跟踪ACP'),
         'navigate_to_tag': (['tag_name', 'speed'], '导航到当前地图的语义点'),
@@ -440,11 +439,11 @@ class ControlledSpatialPlugin:
 
     def preview_pose_updates(self, active):
         self._restore()
-        if self._map_pending is not None or self.store.state('map_unloaded'):
+        if self._map_pending is not None:
             return
         identity = self._identity()
         for observation, stamp in self.client.pose_observations(active):
-            if self._map_pending is not None or self.store.state('map_unloaded'):
+            if self._map_pending is not None:
                 return
             position = observation['state'].get('agvPosition', {})
             if (position.get('mapId') != identity[0]
@@ -464,7 +463,6 @@ class ControlledSpatialPlugin:
 
     def get_pose(self):
         self._restore()
-        self._require_loaded_map()
         if self._map_pending is not None:
             raise RuntimeError('map_transition_in_progress_or_unconfirmed')
         identity = self._identity()
@@ -480,7 +478,6 @@ class ControlledSpatialPlugin:
         if (position.get('mapId') != identity[0] or current['mapId'] != identity[0]
                 or current['mapMd5'] != identity[1].partition(':')[2]):
             raise RuntimeError('pose_map_identity_mismatch')
-        self._require_loaded_map()
         if self._map_pending is not None or time.monotonic() - received > 1.:
             raise RuntimeError('map_pose_no_longer_fresh')
         score = localization.get('score')
@@ -515,10 +512,6 @@ class ControlledSpatialPlugin:
                 except Exception:
                     result['map'] = None
                     result['map_status'] = {'state': 'unavailable'}
-                if self.store.state('map_unloaded'):
-                    result['chassis_map'] = result['map']
-                    result['map'] = None
-                    result['map_status'] = {'state': 'unloaded', 'scope': 'driver'}
                 try:
                     result['feedback'] = self.client.observe()
                     result['feedback_status'] = {'state': 'ready'}
@@ -552,7 +545,6 @@ class ControlledSpatialPlugin:
     def _navigate(self, action, args):
         if self.store.state('mapping'):
             raise RuntimeError('stop_mapping_before_navigation')
-        self._require_loaded_map()
         identity = self._identity()
         if self.store.state('unconfirmed:' + self.store.anchor_key(identity)):
             raise RuntimeError('map_relocalization_unconfirmed_load_map_again')
@@ -747,10 +739,6 @@ class ControlledSpatialPlugin:
             self._task = None
             self._persist()
 
-    def _require_loaded_map(self):
-        if self.store.state('map_unloaded'):
-            raise RuntimeError('load_map_before_using_navigation_map')
-
     def _map_action(self, action, args):
         epoch = self.bundle._stop_epoch
         if action == 'list_maps':
@@ -761,21 +749,9 @@ class ControlledSpatialPlugin:
                            for name in archived if name not in names]
             chassis = self.client.current_map()
             return {'state': 'ready', 'maps': maps,
-                    'current_map': None if self.store.state('map_unloaded') else chassis,
+                    'current_map': chassis,
                     'chassis_map': chassis}
         mapping = self.store.state('mapping')
-        if action == 'unload_map':
-            if mapping or self._map_pending is not None:
-                raise RuntimeError('finish_or_reconcile_mapping_before_unloading')
-            if self._task is not None or self._uncertain:
-                result = self.bundle.pause('map_unloaded')
-                if result.get('state') != 'paused':
-                    raise RuntimeError('native_navigation_stop_unconfirmed')
-            with self.bundle.tracker.lock:
-                if self.unresolved() or self.bundle._transition or 'base' in self.bundle.tracker._active:
-                    raise RuntimeError('base_busy_or_navigation_unresolved')
-                self.store.state('map_unloaded', True)
-            return {'state': 'unloaded', 'scope': 'driver', 'chassis_map_retained': True}
         recovering_save = (action == 'stop_mapping' and mapping and mapping.get('phase') == 'saving'
             and self._map_pending is not None
             and self._map_pending.get('operation') == 'stop_mapping'
@@ -788,8 +764,6 @@ class ControlledSpatialPlugin:
             and self._map_pending.get('map_name') == args.get('map_name')
             and not any(w.is_alive() and w.name == 'kuavo-map-operation' for w in self._workers))
         if action in ('list_tags', 'tag_place', 'untag_place'):
-            if not mapping:
-                self._require_loaded_map()
             identity = (mapping['name'], mapping['token']) if mapping else self._identity()
             if action == 'tag_place':
                 if self._map_pending is not None or (mapping and mapping['phase'] != 'mapping'):
@@ -1053,7 +1027,6 @@ class ControlledSpatialPlugin:
             self.store.bind_mapping((mapping['name'], mapping['token']), new_identity,
                                     mapping.get('start_pose'))
             self.store.state('mapping', None)
-            self.store.state('map_unloaded', None)
             return {'state': 'completed', 'map_name': new_identity[0], 'map_fingerprint': new_identity[1],
                     'mapping_start_pose': mapping.get('start_pose')}
         if action == 'load_map':
@@ -1074,7 +1047,6 @@ class ControlledSpatialPlugin:
                 if (correction.get('state') not in ('corrected', 'already_aligned')
                         or self.store.state('unconfirmed:' + self.store.anchor_key(identity))):
                     localization.update(state='unconfirmed', reason='anchor_relocalization_not_verified')
-            self.store.state('map_unloaded', None)
             return {'state': 'completed', 'map_name': name,
                     'localization_required': localization['state'] != 'initialized',
                     'localization': localization, 'feedback': feedback}
