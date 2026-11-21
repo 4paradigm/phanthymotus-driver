@@ -13,6 +13,10 @@ import threading
 import time
 
 
+MAX_POINTS = 80000  # Matches the Agent Core mapping renderer.
+MAX_TAG_POINTS = 20000
+
+
 def save_grid(path, msg):
     import numpy as np
     q = msg.info.origin.orientation
@@ -38,6 +42,33 @@ def grid_points(data, width, height, resolution, origin):
     c, s = math.cos(origin[2]), math.sin(origin[2])
     return np.column_stack((origin[0] + c*x - s*y, origin[1] + s*x + c*y,
                             np.zeros(len(x)))).astype('<f4')
+
+
+def tag_points(tags):
+    """Render each tag as a raised pillar and a heading arrow in map coordinates."""
+    import numpy as np
+
+    if not tags:
+        return np.empty((0, 3), dtype='<f4')
+    angles = np.linspace(0, math.tau, 24, endpoint=False)
+    ring = [(0.14 * math.cos(angle), 0.14 * math.sin(angle)) for angle in angles]
+    marker = [(0, 0, 0.82)]
+    marker.extend((x, y, z) for z in np.linspace(0.04, 0.82, 20) for x, y in ring)
+    marker.extend((x, y, 0.14) for x in np.linspace(0, 0.38, 28) for y in (-0.035, 0, 0.035))
+    for x in np.linspace(0.30, 0.55, 18):
+        half_width = 0.16 * (0.55 - x) / 0.25
+        marker.extend((x, y, 0.14) for y in np.linspace(-half_width, half_width, 9))
+
+    tags = tags[:MAX_TAG_POINTS]
+    samples = min(len(marker), MAX_TAG_POINTS // len(tags))
+    indices = np.linspace(0, len(marker) - 1, samples, dtype=np.intp)
+    template = np.asarray(marker)[indices]
+    points = []
+    for tag in tags:
+        c, s = math.cos(tag['yaw']), math.sin(tag['yaw'])
+        rotated = template @ np.array([[c, s, 0], [-s, c, 0], [0, 0, 1]])
+        points.append(rotated + [tag['x'], tag['y'], 0])
+    return np.concatenate(points).astype('<f4')
 
 
 def _publisher(messages, topic):
@@ -172,11 +203,15 @@ class SpatialMapPlugin:
         except RuntimeError:
             pose = None
         tags = self.spatial.store.tags(name) if name else []
+        markers = tag_points(tags)
+        grid_budget = MAX_POINTS - len(markers)
+        if len(points) > grid_budget:
+            points = points[np.linspace(0, len(points) - 1, grid_budget, dtype=np.intp)]
         meta = {'version': 3, 'active_map': name, 'maps': self.spatial.store.maps(), 'tags': tags,
                 'robot': {**(pose or {'x': 0, 'y': 0, 'yaw': 0}), 'pose_available': pose is not None},
                 'grid_points': len(points), 'laser_points': 0, 'trajectory_points': 0,
                 'artifacts': {'walls': [], 'tracks': [], 'areas': {}, 'pois': []}}
         robot = meta['robot']
         metadata = json.dumps(meta, ensure_ascii=False, allow_nan=False).encode()
-        return (struct.pack('<fffBI', robot['x'], robot['y'], -robot['yaw'], 7, len(points))
-                + points.tobytes() + struct.pack('<I', len(metadata)) + metadata)
+        return (struct.pack('<fffBI', robot['x'], robot['y'], -robot['yaw'], 7, len(points) + len(markers))
+                + points.tobytes() + markers.tobytes() + struct.pack('<I', len(metadata)) + metadata)

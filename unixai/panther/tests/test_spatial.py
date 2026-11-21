@@ -368,20 +368,43 @@ class MapRenderingTest(unittest.TestCase):
                     orientation=SimpleNamespace(w=1,x=0,y=0,z=0))))
             save_grid(path/'occupancy.npz', msg)
             p.store.save_map('room', path)
-            p.store.tag('P1','room',{'x':1,'y':2,'yaw':0},'desk')
+            p.store.tag('P1', 'room', {'x': 1, 'y': 2, 'yaw': np.pi / 2}, 'desk')
+            p.store.tag('P2', 'other', {'x': 10, 'y': 20, 'yaw': 0}, '')
             display = SpatialMapPlugin(p, 'test')
             payload = display._payload()
             x,y,yaw,flags,count = struct.unpack_from('<fffBI', payload)
-            self.assertEqual((flags,count), (7,2))
+            self.assertEqual(flags, 7)
+            self.assertGreater(count, 2)
             offset = 17 + count*12
             length, = struct.unpack_from('<I', payload, offset)
             meta = json.loads(payload[offset+4:])
             self.assertEqual(length, len(payload)-offset-4)
             self.assertFalse(meta['robot']['pose_available'])
             self.assertEqual(meta['tags'][0]['name'], 'P1')
+            self.assertEqual(meta['grid_points'], 2)
+            points = np.frombuffer(payload, dtype='<f4', count=count * 3, offset=17).reshape(-1, 3)
+            self.assertTrue(np.all(points[:2, 2] == 0))
+            markers = points[2:]
+            np.testing.assert_allclose(markers[:, 0].mean(), 1, atol=0.001)
+            self.assertAlmostEqual(float(markers[:, 2].max()), 0.82, places=5)
+            np.testing.assert_allclose(markers[markers[:, 1].argmax()], [1, 2.55, 0.14], atol=0.001)
             # A live grid must never change the saved-map rendering.
             p.grid = SimpleNamespace(data=[])
             self.assertEqual(display._payload(), payload)
+            # Keep every marker visible when a dense grid fills the renderer budget.
+            dense = SimpleNamespace(data=np.full(78000, 100), info=SimpleNamespace(
+                width=780, height=100, resolution=0.5, origin=msg.info.origin))
+            save_grid(path/'occupancy.npz', dense)
+            dense_payload = display._payload()
+            dense_count = struct.unpack_from('<I', dense_payload, 13)[0]
+            self.assertEqual(dense_count, 78000 + len(markers))
+            for index in range(2, 5):
+                p.store.tag(f'P{index}', 'room', {'x': index, 'y': 2, 'yaw': 0}, '')
+            dense_payload = display._payload()
+            dense_count = struct.unpack_from('<I', dense_payload, 13)[0]
+            self.assertEqual(dense_count, 80000)
+            last_point = np.frombuffer(dense_payload, dtype='<f4', count=3, offset=17 + (dense_count - 1) * 12)
+            np.testing.assert_allclose(last_point, [4.55, 2, 0.14], atol=0.001)
             p.stop()
 
     def test_corrupt_grid_dimensions_are_rejected(self):
