@@ -392,6 +392,12 @@ class LocoPlugin:
         self._rotate_stop_event = threading.Event()
         self._rotate_state: dict = {"state": "idle", "last_result": None}
         self._body_action: str | None = None
+        # START is a toggle. Block subsequent local attempts while its outcome
+        # remains unconfirmed.
+        self._enable_unconfirmed = False
+        self._mode_toggle_target = None
+        self._motor_enable_pending = False
+        self._motor_enable_marker = None
         # ACP async completion for rotate: worker thread + the single active
         # action whose terminal callback fires exactly once.
         self._rotate_worker: threading.Thread | None = None
@@ -417,6 +423,49 @@ class LocoPlugin:
     def attach_servo(self, servo) -> None:
         """Let the streaming chassis card be paused before we drive it ourselves."""
         self._servo = servo
+
+    def reserve_motor_enable(self) -> bool:
+        with self._rotate_lock:
+            if self.is_moving():
+                return False
+            self._body_action = "motor_enable.enable"
+            return True
+
+    def release_motor_enable(self) -> None:
+        with self._rotate_lock:
+            self._body_action = None
+
+    def pause_servo_for_motor_enable(self) -> None:
+        self._preempt_servo("motor_enable.enable")
+        # A paused stream normally refreshes zero. Temporarily give this
+        # operation sole velocity ownership until its mode edge is released.
+        self._set_servo_velocity_owner(True)
+
+    def publish_mode_toggle(self, cancel_event, expected_mode: int, target_mode: int, feedback) -> int | None:
+        """Issue START only if the mode remains the observed source mode."""
+        with self._lock:
+            delay = 0.002 - (time.monotonic() - self._last_cmd_time)
+            if delay > 0:
+                time.sleep(delay)
+            if cancel_event.is_set():
+                return None
+            mode = feedback.require_recent_mode()
+            if mode != expected_mode:
+                return mode
+            command = _get_control_cmd("START")
+            if cancel_event.is_set():
+                return None
+            self._mode_toggle_target = target_mode
+            self._enable_unconfirmed = True
+            self._motor_enable_pending = True
+            self._motor_enable_marker = None
+            # If publishing raises, delivery can still be uncertain.
+            try:
+                self._high_ctrl.publish_cmd(0, 0, 0, command, 0)
+            finally:
+                self._motor_enable_marker = feedback.mark()
+            self._last_cmd_time = time.monotonic()
+            return 30
 
     def _distance_full_scale(self):
         """Measured normalised-command-to-m/s calibration from the servo card.
@@ -1543,6 +1592,12 @@ class LocoPlugin:
 
         steps = []
         mode = int(self._high_ctrl.get_mode())
+        if self._motor_enable_pending:
+            return self._preparation_error(
+                requested_action, steps, mode,
+                "Previous motor_enable START is unconfirmed; inspect its live status before proceeding.")
+        if self._enable_unconfirmed and mode == self._mode_toggle_target:
+            self._enable_unconfirmed = False
         if mode == 26:
             return self._protection_error(requested_action, steps, mode)
 
@@ -1562,6 +1617,10 @@ class LocoPlugin:
                     "The current robot action has not finished. No further mode transition was sent; wait for the action to finish and try again.")
 
         if mode == 30:
+            if self._enable_unconfirmed:
+                return self._preparation_error(
+                    requested_action, steps, mode,
+                    "Previous START delivery is uncertain; inspect the robot and mode before retrying.")
             mode = self._run_preparation_step("enable", "START", {0}, steps)
             if mode == 26:
                 return self._protection_error(requested_action, steps, mode)
@@ -1590,8 +1649,13 @@ class LocoPlugin:
 
     def _run_preparation_step(self, step: str, command_name: str,
                               expected_modes: set[int], steps: list[dict]) -> int:
+        if command_name == "START":
+            self._mode_toggle_target = 0
+            self._enable_unconfirmed = True
         observed = self._send_edge_and_wait(
             _get_control_cmd(command_name), expected_modes | {26}, timeout_s=3.0)
+        if command_name == "START" and observed == 0:
+            self._enable_unconfirmed = False
         steps.append({
             "step": step,
             "command": command_name,

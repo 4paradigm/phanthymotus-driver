@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 import types
 from pathlib import Path
 
@@ -25,6 +26,10 @@ class FakeLocoPlugin:
         self.executor = executor
         self.high_ctrl = high_ctrl
         self.servo = None
+        self._enable_unconfirmed = False
+        self._mode_toggle_target = None
+        self._body_action = None
+        self._rotate_lock = threading.Lock()
         self.started = False
         self.stopped = False
 
@@ -130,7 +135,7 @@ def test_loco_servo_enablement_is_not_coupled_to_loco_card(bundle_module):
         _config(loco=False), "bumi_test", object(), FakeHighCtrl(), None)
 
     assert [tool["name"] for tool in bundle.get_all_tools()] == ["loco_servo"]
-    assert bundle._plugins[0]._loco is None
+    assert isinstance(bundle._plugins[0]._loco, FakeLocoPlugin)
 
 
 @pytest.mark.parametrize(
@@ -169,4 +174,25 @@ def test_existing_bumi_plugin_loading_is_unchanged(bundle_module):
 
     assert [tool["name"] for tool in bundle.get_all_tools()] == [
         "loco", "loco_servo", "speaker"]
+
+
+def test_motor_enable_registers_without_locomotion_cards(bundle_module):
+    config = _config(loco=False, loco_servo=False)
+    config["plugins"]["motor_enable"] = {"enabled": True}
+    ctrl = FakeHighCtrl()
+    ctrl.get_mode = lambda: 30
+    bundle = bundle_module.BumiDeviceBundle(config, "bumi_test", object(), ctrl, None)
+
+    assert [tool["name"] for tool in bundle.get_all_tools()] == ["motor_enable"]
+    assert bundle.dispatch("motor_enable", {"action": "start"})["state"] == "ready"
+    assert bundle.dispatch("motor_enable", {"action": "info"})["workmode"] == 30
+    status = bundle.dispatch("motor_enable", {"action": "status"})
+    assert status["workmode"] == 30 and status["feedback_freshness"] == "unknown"
+
+
+def test_disabled_motor_enable_is_not_registered(bundle_module):
+    config = _config(loco=False, loco_servo=False)
+    config["plugins"]["motor_enable"] = {"enabled": False}
+    bundle = bundle_module.BumiDeviceBundle(config, "bumi_test", object(), FakeHighCtrl(), None)
+    assert "motor_enable" not in [tool["name"] for tool in bundle.get_all_tools()]
 
