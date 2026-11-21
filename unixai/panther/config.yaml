@@ -25,17 +25,29 @@ plugins:
     rgb_hz: 10.0
     depth_hz: 8.0
     jpeg_quality: 70
-    max_width: 640
+    # Shared rectified RGB-D outputs are always 640x480.
+    registered_depth: true
+    # Vendor ROS depth is uint16 millimetres; float32 input is always metres.
+    source_depth_unit_mm: 1.0
+    body_frame: "base_link"
+    estimated_body_mount:
+      enabled: true
+      model_frame: "link_rgbd"
+      source_frame: "camera_link"
+      # Assembly estimate: CAD RGB-D origin coincides with vendor camera origin.
+      # Not a measured optical/installation calibration; adjust after calibration.
+      translation_m: [0.0, 0.0, 0.0]
+      rpy_rad: [0.0, 0.0, 0.0]
   camera_color: {enabled: true}
   camera_depth: {enabled: true}
 
   audio:
-    server: "unix:/run/user/1001/pulse/native"
+    server: "auto"
     uid: 1001
     gid: 1002
-    # Confirm physical routing on Panther before changing these names.
-    source: "alsa_input.platform-sound.analog-stereo"
-    sink: "alsa_output.platform-sound.analog-stereo"
+    # Physical USB devices verified on Panther; avoid onboard sound and monitor sources.
+    source: "alsa_input.usb-AISpeech.in_Mic_Arry_8_4169385A3935-00.multichannel-input"
+    sink: "alsa_output.usb-C-Media_Electronics_Inc._USB_Audio_Device-00.analog-stereo"
   mic: {enabled: true}
   speaker: {enabled: true}
 
@@ -51,6 +63,21 @@ plugins:
     stop_repetitions: 5
     stop_publish_duration_s: 1.0
     stop_match_timeout_s: 3.0
+  base_servo:
+    enabled: true
+    dry_run: false
+    rotate_only: false
+    expected_hz: 10.0
+    # Defaults to the existing base_drive caps (0.50 m/s, 45 deg/s).
+    # Set max_linear_mps/max_angular_rad_s here only for lower servo limits.
+    linear_acceleration_mps2: 0.30
+    angular_acceleration_rad_s2: 0.60
+    footprint:
+      shape: "circle"
+      half_width: 0.33
+      radius: 0.37
+      source: "configured"
+      provenance: "Operator-selected 0.33 m chassis half-width, checked against vendor CAD; retain vendor Nav2 0.37 m turning radius"
   arm_control:
     enabled: true
     max_duration_s: 20.0
@@ -105,3 +132,21 @@ plugins:
   # has been measured on Panther hardware.
   servo: {enabled: false}
 
+  controlled_spatial:
+    enabled: true
+    # This robot has one active lidar. Preserve its frame and timestamp when
+    # feeding the vendor SLAM/Nav2 /scan input; do not wait for a rear sensor.
+    # Set to "" on dual-lidar variants whose native merger already works.
+    single_lidar_topic: "/lidar_front/scan"
+    base_frame: "base_link"
+    # Box in base_link x/y, covering the self returns seen in all 26 saved
+    # scans of test. Ray frame and time stay intact for SLAM's own TF lookup.
+    self_filter_box_m: [-0.15, 0.15, -0.14, 0.14]
+    require_origin_localization: true
+    navigator_state_service: "/bt_navigator/get_state"
+    native_slam_pcd_dir: "/opt/phanthy-motus/data/maps"
+    native_slam_db_path: "/opt/phanthy-motus/data/controlled_spatial.db"
+    vendor_map_dir: "/home/unix_ai/map_dir"
+    service_timeout_s: 20
+    navigation_timeout_s: 180
+  spatial_map: {enabled: true}

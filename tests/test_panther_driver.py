@@ -77,7 +77,7 @@ class PantherDriverTest(unittest.TestCase):
                        "format": "image/jpeg" if name == "camera_color" else
                                  "image/depth-zlib" if name == "camera_depth" else
                                  "data/json"}
-                for name in (*card_names, "laser_view")
+                for name in card_names
             }
 
             def __getattr__(self, _name):
@@ -616,8 +616,9 @@ class PantherDriverTest(unittest.TestCase):
         topics = core_bridge.output_topics("test")
         self.assertEqual(topics["robot_state"]["format"], "data/json")
         self.assertEqual(topics["battery"]["topic"], "/test/panther/battery")
-        self.assertEqual(topics["laser_scan"]["topic"], "/test/panther/laser_scan")
-        self.assertEqual(topics["laser_view"]["format"], "image/jpeg")
+        self.assertEqual(topics["laser_scan"]["topic"], "/test/panther/laser_scan/pointcloud")
+        self.assertEqual(topics["laser_scan"]["format"], "sensor/pointcloud")
+        self.assertNotIn("laser_view", topics)
         self.assertEqual(topics["camera_color"]["format"], "image/jpeg")
         self.assertEqual(topics["camera_depth"]["format"], "image/depth-zlib")
         self.assertFalse({"laser_front", "laser_rear", "laser_fused"} & set(topics))
@@ -627,7 +628,7 @@ class PantherDriverTest(unittest.TestCase):
 
         class Messages:
             def __init__(self):
-                self.items = [{"source_topic": "/scan", "ranges": [1.0]}, None]
+                self.items = [bytes(12), None]
 
             def get(self):
                 return self.items.pop(0)
@@ -660,6 +661,9 @@ class PantherDriverTest(unittest.TestCase):
             def __init__(self):
                 self.data = ""
 
+        class UInt8MultiArray:
+            pass
+
         class CompressedImage:
             pass
 
@@ -680,6 +684,7 @@ class PantherDriverTest(unittest.TestCase):
         std_msgs = ModuleType("std_msgs")
         std_msgs_msg = ModuleType("std_msgs.msg")
         std_msgs_msg.String = String
+        std_msgs_msg.UInt8MultiArray = UInt8MultiArray
         std_msgs.msg = std_msgs_msg
         modules = {
             "rclpy": rclpy, "rclpy.node": rclpy_node, "rclpy.qos": rclpy_qos,
@@ -688,65 +693,10 @@ class PantherDriverTest(unittest.TestCase):
         }
         with patch.dict(sys.modules, modules), patch.dict(os.environ, {}, clear=False):
             core_bridge._run_lane(Messages(), "/profile.xml", 42, "test", "laser_scan")
-        self.assertEqual(len(created["publishers"]), 1)
-        self.assertEqual(created["publishers"][0][1], "/test/panther/laser_scan")
+        self.assertEqual(created["publishers"], [(UInt8MultiArray, "/test/panther/laser_scan/pointcloud")])
         self.assertEqual(created["subscriptions"], [])
-        self.assertEqual(json.loads(created["messages"][0].data)["source_topic"], "/scan")
-
-    def test_lidar_callback_matches_bridge_json_and_jpeg_contracts(self):
-        class FakeImage:
-            def __setitem__(self, _key, _value):
-                pass
-
-        class FakeEncoded:
-            @staticmethod
-            def tobytes():
-                return b"\xff\xd8test-jpeg\xff\xd9"
-
-        numpy = ModuleType("numpy")
-        numpy.uint8 = object()
-        numpy.zeros = lambda *_args, **_kwargs: FakeImage()
-        cv2 = ModuleType("cv2")
-        cv2.IMWRITE_JPEG_QUALITY = 1
-        cv2.circle = lambda *_args, **_kwargs: None
-        cv2.imencode = lambda *_args, **_kwargs: (True, FakeEncoded())
-
-        device = object.__new__(device_module.PantherDevice)
-        device._lock = threading.RLock()
-        device._cache = {}
-        device._last_card_publish = {}
-        device._laser_render_failures = 0
-        device._log_laser_render_failure = (
-            lambda exc: (_ for _ in ()).throw(exc)
-        )
-        captured = {}
-        device._publish_limited = (
-            lambda card, payload, _rate, force=False: captured.setdefault(card, payload)
-        )
-        scan = SimpleNamespace(
-            header=SimpleNamespace(frame_id="laser"),
-            ranges=[1.0, float("inf"), 2.0],
-            angle_min=-1.0, angle_max=1.0, angle_increment=1.0,
-            range_min=0.1, range_max=10.0,
-        )
-        with patch.dict(sys.modules, {"cv2": cv2, "numpy": numpy}), patch.object(
-            device_module.time, "monotonic", return_value=10.0
-        ):
-            device._on_laser(scan)
-
-        scan_wire = core_bridge.encode_bridge_payload("laser_scan", captured["laser_scan"])
-        scan_json = json.loads(scan_wire["data"])
-        self.assertEqual(scan_wire["kind"], "string")
-        self.assertEqual(scan_json["source_topic"], "/scan")
-        self.assertEqual(scan_json["ranges"], [1.0, None, 2.0])
-        view_wire = core_bridge.encode_bridge_payload("laser_view", captured["laser_view"])
-        self.assertEqual(view_wire["kind"], "compressed_image")
-        self.assertEqual(view_wire["message_format"], "jpeg")
-        self.assertTrue(view_wire["data"].startswith(b"\xff\xd8"))
-        with self.assertRaisesRegex(ValueError, "not JPEG"):
-            core_bridge.encode_bridge_payload(
-                "laser_view", {"message_format": "jpeg", "data": b"not-jpeg"}
-            )
+        self.assertEqual(bytes(created["messages"][0].data),
+                         b"\x0c\x00\x00\x00\x01\x00\x00\x00" + bytes(12))
 
     def test_removed_nav_and_ultrasonic_have_no_runtime_code(self):
         plugins = (DRIVER / "plugins.py").read_text()
@@ -865,23 +815,6 @@ class PantherDriverTest(unittest.TestCase):
         self.assertIn("#100:", lines[1])
         self.assertIn("#200:", lines[2])
         self.assertTrue(all(len(line) < 300 for line in lines))
-
-    def test_laser_render_failures_are_bounded_and_sampled(self):
-        device = object.__new__(device_module.PantherDevice)
-        device._lock = threading.RLock()
-        device._laser_render_failures = 0
-        output = io.StringIO()
-        noisy = ValueError("bad\nlayout " + "x" * 400)
-        with contextlib.redirect_stdout(output):
-            for _ in range(200):
-                device._log_laser_render_failure(noisy)
-        lines = output.getvalue().splitlines()
-        self.assertEqual(len(lines), 3)
-        self.assertIn("#1:", lines[0])
-        self.assertIn("#100:", lines[1])
-        self.assertIn("#200:", lines[2])
-        self.assertTrue(all(len(line) < 320 for line in lines))
-        self.assertIn("laser_view_attempt", (DRIVER / "device.py").read_text())
 
     def test_container_dependency_contract_is_apt_only_and_explained(self):
         dockerfile = (DRIVER / "Dockerfile").read_text()

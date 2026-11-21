@@ -6,8 +6,10 @@ import json
 import multiprocessing as mp
 import os
 import queue
+import struct
 import sys
 import threading
+from array import array
 
 
 TOPIC_SUFFIXES = {
@@ -15,12 +17,15 @@ TOPIC_SUFFIXES = {
     "robot_state": ("robot_state", "data/json"),
     "battery": ("battery", "data/json"),
     "imu": ("imu", "data/json"),
-    "odom": ("odom", "state/odom"),
-    "laser_scan": ("laser_scan", "data/json"),
-    "laser_view": ("laser_scan/view", "image/jpeg"),
+    "camera_imu": ("camera/rgbd/imu", "sensor/imu"),
+    "body_mount": ("camera/body_mount", "state/extrinsic"),
+    "odom": ("state/odom", "state/odom"),
+    # Keep the binary type off the legacy laser_scan JSON topic.
+    "laser_scan": ("laser_scan/pointcloud", "sensor/pointcloud"),
     "camera_color": ("camera/rgb", "image/jpeg"),
     "camera_depth": ("camera/depth", "image/depth-zlib"),
 }
+XYZ_POINT_STEP = 12  # Three little-endian float32 coordinates.
 
 
 def output_topics(namespace: str) -> dict[str, dict[str, str]]:
@@ -36,6 +41,12 @@ def encode_bridge_payload(card: str, payload) -> dict:
     if card not in TOPIC_SUFFIXES:
         raise ValueError(f"unknown bridge card: {card}")
     data_format = TOPIC_SUFFIXES[card][1]
+    if data_format == "sensor/pointcloud":
+        if not isinstance(payload, bytes) or len(payload) % XYZ_POINT_STEP:
+            raise ValueError(f"{card} requires packed XYZ float32 points")
+        return {"kind": "pointcloud", "data": (
+            struct.pack("<II", XYZ_POINT_STEP, len(payload) // XYZ_POINT_STEP) + payload
+        )}
     if data_format.startswith("image/"):
         if not isinstance(payload, dict):
             raise ValueError(f"{card} image payload must be an object")
@@ -188,7 +199,13 @@ def _run_lane(messages, profile: str, domain: int, namespace: str, card: str) ->
     qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                      history=HistoryPolicy.KEEP_LAST, depth=1)
     spec = output_topics(namespace)[card]
-    message_type = CompressedImage if spec["format"].startswith("image/") else String
+    if spec["format"] == "sensor/pointcloud":
+        from std_msgs.msg import UInt8MultiArray
+        message_type = UInt8MultiArray
+    elif spec["format"].startswith("image/"):
+        message_type = CompressedImage
+    else:
+        message_type = String
     publisher = node.create_publisher(message_type, spec["topic"], qos)
     print(f"[bridge] ready lane={card} domain={domain} topic={spec['topic']}", flush=True)
     try:
@@ -197,7 +214,10 @@ def _run_lane(messages, profile: str, domain: int, namespace: str, card: str) ->
             if payload is None:
                 break
             wire = encode_bridge_payload(card, payload)
-            if message_type is CompressedImage:
+            if wire["kind"] == "pointcloud":
+                message = message_type()
+                message.data = array("B", wire["data"])
+            elif wire["kind"] == "compressed_image":
                 message = CompressedImage()
                 message.format = wire["message_format"]
                 message.data = wire["data"]
