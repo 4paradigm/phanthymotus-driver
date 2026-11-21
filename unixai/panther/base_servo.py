@@ -16,13 +16,15 @@ import re
 import threading
 import time
 
-from common.control import ControlSink, parse_descriptor
+from common.control import ControlSink, Verdict, parse_descriptor
 
 INPUT_TOPIC = "/actucore/navi/cmd"
 MAX_HZ = 20.
 WATCHDOG_MS = 300
 MAX_OBS_AGE_MS = 500
 MAX_TTL_MS = 500
+FUTURE_TOLERANCE_MS = 50
+RESUME_LOG_INTERVAL_S = 2.0
 ZERO = (0.,) * 6
 
 
@@ -123,14 +125,15 @@ class BaseServoPlugin:
         self._input = ""
         self._values = ZERO
         self._lease_until = 0.
-        self._arm_time = self._arm_wall = 0.
+        self._arm_time = 0.
         self._last_publish = self._last_apply = 0.
-        self._candidate_lease = 0.
         self._pending = None
         self._zero_count = 0
         self._stop_confirmed = True
         self._error = ""
         self._last_command = None
+        self._resume_reason = None
+        self._last_resume_log = float("-inf")
         self._applied = self._holds = self._rejected = 0
 
     def get_tool(self):
@@ -176,7 +179,7 @@ class BaseServoPlugin:
                     self.device.servo_prepare(self._dry_run)
                     if self._process is None or not self._process.is_alive():
                         raise RuntimeError("control input receiver exited; stop and start again")
-                    self._arm()
+                    self._arm(resume_reason="explicit resume")
                 elif action == "config":
                     if self._reserved:
                         raise RuntimeError("pause/stop and confirm zero output before configuration")
@@ -191,16 +194,27 @@ class BaseServoPlugin:
         except Exception as exc:
             return {"state": "error", "error": str(exc), "stop_confirmed": self._stop_confirmed}
 
-    def _arm(self):
-        self._sink = ControlSink(self._descriptor, self._apply,
-                                 on_watchdog=self._hold, on_abort=self._hold)
+    def _arm(self, resume_reason=None):
+        self._arm_time = time.monotonic()
+        self._sink = ControlSink(
+            self._descriptor, self._apply,
+            on_watchdog=lambda: self._hold("watchdog hold"),
+            on_abort=lambda: self._hold("watchdog stand-down"),
+            clock=lambda: time.monotonic() * 1000,
+            wall_clock=lambda: time.time() * 1000,
+            max_ttl_ms=MAX_TTL_MS,
+            future_tolerance_ms=FUTURE_TOLERANCE_MS,
+            require_observation=True,
+            min_stamp_ms=time.time() * 1000,
+            require_live_lease=True,
+        )
+        self._resume_reason = resume_reason
         self._sink.rebase(ZERO)
         self._paused = False
         self._reserved = True
         self._pending = None
         self._values = ZERO
         self._lease_until = 0.
-        self._arm_time, self._arm_wall = time.monotonic(), time.time() * 1000
         self._zero_count = 0
         self._stop_confirmed = False
         self._error = ""
@@ -214,7 +228,9 @@ class BaseServoPlugin:
             if self._running:
                 if topic != self._input:
                     raise RuntimeError("stop before changing the input topic")
-                return self.info()
+                if self._paused:
+                    raise RuntimeError("base_servo is paused; use resume")
+                return {**self.info(), "state": "ready"}
             if self._reserved:
                 raise RuntimeError("previous stop is unconfirmed")
             self.device.base_check_available("base_servo")
@@ -246,7 +262,7 @@ class BaseServoPlugin:
         if not ready.wait(8) or not self._process.is_alive():
             self._halt(stop=True)
             raise RuntimeError("control input receiver did not start")
-        return self.info()
+        return {**self.info(), "state": "ready"}
 
     def _halt(self, stop=False):
         with self._lock:
@@ -297,13 +313,20 @@ class BaseServoPlugin:
         if any(values) and not matched:
             raise RuntimeError("nonzero stream output has no matched subscriber")
         self._values = values
-        self._lease_until = self._candidate_lease
         self._last_publish = self._last_apply = time.monotonic()
         self._zero_count = 0 if any(values) or not matched else self._zero_count + 1
         self._stop_confirmed = self._zero_count >= 3
         self._applied += 1
+        if any(values) and self._resume_reason:
+            reason, self._resume_reason = self._resume_reason, None
+            if self._last_apply - self._last_resume_log >= RESUME_LOG_INTERVAL_S:
+                self._last_resume_log = self._last_apply
+                print(f"[base_servo] nonzero control resumed after {reason} (dry_run={self._dry_run})",
+                      flush=True)
 
-    def _hold(self):
+    def _hold(self, resume_reason=None):
+        if resume_reason:
+            self._resume_reason = resume_reason
         self._values = ZERO
         self._lease_until = 0.
         self._holds += 1
@@ -328,31 +351,23 @@ class BaseServoPlugin:
             self._error = str(exc)
 
     def _accept(self, command, received):
-        now, wall = time.monotonic(), time.time() * 1000
         try:
-            if not isinstance(command, dict):
-                raise ValueError("command must be an object")
-            stamp, ttl, obs = (command.get(key) for key in ("stamp_ms", "ttl_ms", "obs_stamp_ms"))
-            if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in (stamp, ttl, obs)):
-                raise ValueError("finite stamp_ms, ttl_ms and obs_stamp_ms are required")
-            if received < self._arm_time or stamp < self._arm_wall:
-                raise ValueError("command predates the current start/resume")
-            if stamp > wall + 50 or obs > wall + 50 or not 0 < ttl <= MAX_TTL_MS:
-                raise ValueError("future timestamp or ttl_ms outside (0, 500]")
-            lease_ms = min(WATCHDOG_MS, stamp + ttl - wall, obs + MAX_OBS_AGE_MS - wall)
-            if lease_ms <= 0:
-                raise ValueError("expired command or observation")
-            values = command.get("values")
+            # The receiver's arrival time is local to this adapter. The sink
+            # owns all checks on the timestamps inside the command.
+            if received < self._arm_time:
+                raise ValueError("command arrived before the current start/resume")
+            values = command.get("values") if isinstance(command, dict) else None
             if isinstance(values, (list, tuple)) and len(values) == 6 and any(values[i] != 0 for i in (2, 3, 4)):
                 raise ValueError("vz, wx and wy are unsupported and must be zero")
-            self._candidate_lease = now + lease_ms / 1000
             outcome = self._sink.submit(command)
             self._last_command = {"verdict": outcome.verdict.value, "reason": outcome.reason}
-            if not outcome.applied:
+            if outcome.applied:
+                self._lease_until = outcome.expires_at_ms / 1000
+            else:
                 self._rejected += 1
         except (ValueError, TypeError) as exc:
             self._rejected += 1
-            self._last_command = {"verdict": "REJECTED", "reason": str(exc)}
+            self._last_command = {"verdict": Verdict.REJECTED.value, "reason": str(exc)}
 
     def _step(self):
         with self._lock:
@@ -363,6 +378,9 @@ class BaseServoPlugin:
                     self._paused = True
                     self._hold()
                 else:
+                    if any(self._values) and now >= self._lease_until:
+                        self._hold("command expiry")
+                        self._zero()
                     if self._inbox is not None:
                         try:
                             self._pending = self._inbox.get_nowait()
@@ -375,6 +393,7 @@ class BaseServoPlugin:
                             self._pending = None
                             self._accept(cmd, received)
                     self._sink.tick()
+            now = time.monotonic()
             if self._reserved and now - self._last_publish >= 1 / MAX_HZ:
                 if self._running and not self._paused and self._lease_until > now and any(self._values):
                     if not self._dry_run:
@@ -382,7 +401,7 @@ class BaseServoPlugin:
                     self._last_publish = now
                 else:
                     if any(self._values):
-                        self._hold()
+                        self._hold("command expiry")
                     self._zero()
 
     def _loop(self):
@@ -400,8 +419,16 @@ class BaseServoPlugin:
 
     def info(self):
         with self._lock:
-            state = ("stop_unconfirmed" if self._reserved and self._paused and not self._stop_confirmed else
-                     "paused" if self._running and self._paused else "running" if self._running else "idle")
+            if self._reserved and self._paused and not self._stop_confirmed:
+                state = "stop_unconfirmed"
+            elif not self._running:
+                state = "idle"
+            elif self._paused:
+                state = "paused"
+            elif self._lease_until > time.monotonic() and any(self._values):
+                state = "running"
+            else:
+                state = "ready"
             return {"state": state, "input_topic": self._input, "dry_run": self._dry_run,
                     "rotate_only": self._rotate_only, "reserved": self._reserved,
                     "stop_confirmed": self._stop_confirmed, "error": self._error,

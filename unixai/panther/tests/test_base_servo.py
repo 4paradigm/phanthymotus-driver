@@ -113,6 +113,51 @@ class StreamTest(unittest.TestCase):
             self.clock.advance(.1); self.servo._step()
         self.assertTrue(all(v == ZERO for v in self.device.output[count:]))
 
+    def test_observation_expiry_stops_even_before_the_next_publish_slot(self):
+        self.clock.advance(.2)
+        msg = command(self.clock)
+        msg["obs_stamp_ms"] = int(self.clock.wall() * 1000) - 480
+        self.send(msg)
+        self.assertTrue(any(self.device.output[-1]))
+
+        self.clock.advance(.01)
+        self.send({"values": list(ZERO)})  # Rejected input cannot replace the lease.
+        self.assertTrue(any(self.device.output[-1]))
+        self.clock.advance(.02)
+        self.servo._step()
+        self.assertEqual(self.device.output[-1], ZERO)
+        self.assertEqual(self.servo.info()["state"], "ready")
+
+    def test_resume_logs_only_after_nonzero_output_and_throttles_repeated_holds(self):
+        self.assertEqual(self.servo.info()["state"], "ready")
+        with patch("builtins.print") as log:
+            self.send(command(self.clock))
+            self.assertEqual(self.servo.info()["state"], "running")
+            log.assert_not_called()
+
+            self.clock.advance(.31)
+            self.servo._step()
+            self.assertEqual(self.servo.info()["state"], "ready")
+            self.send(command(self.clock, seq=2, values=list(ZERO)))
+            log.assert_not_called()
+
+            self.clock.advance(.06)
+            self.send(command(self.clock, seq=3))
+            self.assertIn("watchdog hold", log.call_args.args[0])
+            self.clock.advance(.31)
+            self.servo._step()
+            self.send(command(self.clock, seq=4))
+            self.assertEqual(log.call_count, 1)
+
+            self.clock.advance(2)
+            self.servo._process = NS(is_alive=lambda: True)
+            self.servo._paused = True
+            self.servo._stop_confirmed = True
+            self.assertEqual(self.servo.dispatch("resume", {})["state"], "ready")
+            self.send(command(self.clock, seq=5))
+            self.assertIn("explicit resume", log.call_args.args[0])
+            self.assertEqual(log.call_count, 2)
+
     def test_receiver_exit_pauses_and_confirms_zero_before_releasing(self):
         self.send(command(self.clock))
         self.servo._process = NS(is_alive=lambda: False)
@@ -153,7 +198,8 @@ class StreamTest(unittest.TestCase):
         self.clock.advance(.2)
         self.servo._arm()
         self.send(old)
-        self.assertEqual(self.servo._last_command['verdict'], 'REJECTED')
+        self.assertEqual(self.servo._last_command['verdict'], 'rejected')
+        self.assertIn('predates', self.servo._last_command['reason'])
 
     def test_nav2_and_call_motion_block_stream_acquisition(self):
         self.servo._reserved = False
@@ -185,6 +231,19 @@ class LifecycleTest(unittest.TestCase):
         self.assertEqual(tool['control_interface']['frame'], 'base_link')
         self.assertTrue(tool['control_interface']['limits']['zero_immediate'])
         self.assertEqual(tool['inputSchema']['x-resource'], 'base')
+
+    def test_explicit_start_arms_and_reports_ready(self):
+        device = Device()
+        servo = BaseServoPlugin(device, {})
+        with patch.object(servo, "_ctx") as ctx, patch("base_servo.threading.Thread"):
+            ctx.Event.return_value.wait.return_value = True
+            ctx.Process.return_value.is_alive.return_value = True
+            result = servo.dispatch("start", {})
+        self.assertEqual(result["state"], "ready")
+        self.assertTrue(result["reserved"])
+        self.assertEqual(device.output, [])
+        servo._paused = True
+        self.assertIn("use resume", servo.dispatch("start", {})["error"])
 
     def test_watchdog_runs_without_ros_executor_progress(self):
         d = Device(); p = BaseServoPlugin(d, {}); d._base_servo = p
