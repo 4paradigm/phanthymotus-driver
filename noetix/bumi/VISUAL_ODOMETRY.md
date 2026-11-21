@@ -20,8 +20,7 @@ uses. Disabled means no raw branch, no estimator child, no extra DDS traffic.
 | --- | --- |
 | Tool / card | `rgbd_visual_odometry` (sensor, read-only) |
 | MCP actions | `start`, `stop`, `info` (system actions only; no execution form/button) |
-| Canvas output | `/<namespace>/bumi_visual_odometry/status`, `std_msgs/msg/String`, port format `data/json`, about 5 Hz |
-| Full ROS output | `/<namespace>/bumi_visual_odometry/state/odom`, `std_msgs/msg/String`, `motus.odom/1`, 20 Hz |
+| Canvas / ROS output | full sample: `/<namespace>/bumi_visual_odometry/state/odom`, `std_msgs/msg/String`, `motus.odom/1`, port format `state/odom`, 20 Hz — status summary: `/<namespace>/bumi_visual_odometry/status`, `std_msgs/msg/String`, `data/json`, 200 ms same-state throttle |
 | Consumer | none; it is not wired into `loco_target`/`loco_servo` |
 
 `stop` reaps the estimator/filter children and the card's private topics, and sends a
@@ -33,8 +32,10 @@ to disabled. `start` sends `Bool(true)` and resumes it. The shared camera pipeli
 `camera`/`depth` cards, photo/video capture, audio and every motion card keep
 running; only the visual-odometry branch and estimator are affected.
 
-The canvas displays `status`, `turn_angle_deg`, `displacement_m`, `position_m`,
-`pose_reference`, `age_ms` and `reason`. Positions and displacement are rounded
+Core renders the `state/odom` sample; the canvas status panel renders the
+concise `data/json` summary. Segment turn angle and displacement
+are carried in `vendor.turn_angle_deg` and `vendor.displacement_m`, alongside
+`vendor.pose_reference` and `vendor.reason`; position is in `pose.position`. Positions and displacement are rounded
 to millimetres and the turn angle to 0.1 degree for display; the full odometry
 retains its original precision. `turn_angle_deg` is the body yaw relative to the
 first IMU orientation in the current segment, wrapped to -180..180 degrees. It
@@ -42,16 +43,25 @@ is derived from the IMU quaternion, not integrated angular velocity, and resets
 with each segment.
 Displacement is the 3-D straight-line distance from the **first tracking pose of
 the current segment**, not accumulated walking distance or validated accuracy.
-The shipping `config.yaml` sets a permanent **body-axis convention** for the
-standard level, forward-facing camera: `x` forward, `y` left, `z` up
-(`pose_reference=body_axes`). It is an axis assumption, not a measured extrinsic;
-the pose origin is the camera because the default translation is zero. Reset
-starts a new segment and distance origin.
+The shipping `config.yaml` uses a level-forward
+optical-to-body mount: `x` forward, `y` left, `z` up
+(`pose_reference=body_axes`, `extrinsic.calibrated=false`). The zero translation
+keeps the reference at the camera; it is not a measured body or IMU origin.
+The numeric rotation remains usable for body-IMU assistance. Reset starts a new
+segment and distance origin.
 
-The canvas declares two outputs: the 5 Hz `status` summary (`data/json`) and the
-full `state/odom` sample (`motus.odom/1`) so other cards can consume the pose
-without a second converter. Existing ROS subscribers can also use
-`/<namespace>/bumi_visual_odometry/state/odom` directly. The card's details button fetches `info`, whose
+The card declares two outputs, both pre-existing contracts: the full
+`state/odom` sample (`motus.odom/1`, used by renderers and downstream consumers)
+and the concise `data/json` status summary on
+`/<namespace>/bumi_visual_odometry/status`. The summary is the display payload
+the canvas status panel has always rendered — `status`, `turn_angle_deg`,
+`displacement_m`, `position_m`, `pose_reference`, `age_ms`, `reason` — with the
+legacy 200 ms same-state throttle; a state transition is published immediately.
+Both are built from the same sample, so `status` and the full sample's
+`vendor.status`/`vendor.motus_slam.status` never disagree. Keeping the summary
+is required for compatibility: removing it would drop a declared port from saved
+canvas layouts and stop the ROS status topic. Existing ROS subscribers can also
+use `/<namespace>/bumi_visual_odometry/state/odom` directly. The card's details button fetches `info`, whose
 description contains the complete current sample, including covariance, timing,
 segment/calibration IDs and visual diagnostics; the same sample is returned as
 `sample`, with `odom_topic` pointing to the original ROS output. Details are a
@@ -66,7 +76,7 @@ reports `lost` or falls below the inlier floor ends the segment immediately
 (the current pose is cleared, not published as tracking); the delayed restart
 then starts a **new segment** (fresh estimator, fresh odom frame). Sustained
 gaps and repeated pose discontinuities do the same. Status transitions publish
-immediately even between 5 Hz summary updates. Lost or stopped output clears
+on the odometry stream immediately. Lost or stopped output clears
 both displayed position and displacement rather than repeating the last valid
 pose.
 
@@ -159,3 +169,84 @@ plugin lifecycle/actions, static TF/mount and the gated camera raw branch.
 On-robot verification: the body-IMU path reaches `tracking`; controller-source
 direct polling and stop/start behavior still need hardware stress validation.
 The camera-IMU RSUSB build path and its modules have been removed.
+
+
+## Generic pointcloud SLAM input evidence
+
+The visual-odometry `motus.odom/1` stream retains its existing status and pose
+ports. Each sample now carries `vendor.motus_slam.source_id`,
+`clock_mapping`, `clock_verified=false`, and, once the optical frame is known,
+`vendor.motus_slam.extrinsic`. This describes the same `base -> optical`
+mount used to launch RTAB-Map. The shipping preset retains `assumed: true` and
+`calibrated=false`, with ID `assumed-level-forward-optical-to-body`. These labels
+describe its provenance; PR371 accepts its numeric matrix without requiring
+calibration proof. Supply an actual measured installation transform before
+claiming a measured body origin.
+
+The public depth port now carries the normalized native-color optical grid,
+with its actual `motus.camera/1` calibration and capture clock. It no longer
+advertises the old color-aligned `vendor.slam_geometry` hint or its old depth
+provenance sidecar. Use registered RGB plus this shared depth with generic
+Perception RGB-D odometry, and the same depth with metric Point Cloud. Their
+camera-reference poses/clouds use the existing runtime identical-frame SLAM
+route; no verified independent-clock/provenance protocol is implied.
+
+The private legacy RTAB-Map raw branch remains aligned to color with its
+existing contract. The public pair uses corrected color-camera Z and measured
+rectified color intrinsics; consume its own declarations rather than raw-branch
+pixel metadata. This does not create or verify a physical camera-to-body mount.
+
+
+The cross-robot field definitions and clock/extrinsic trust requirements live
+in [Spatial SLAM Input Contract](../../docs/spatial_slam_input.md). The Driver
+code validates the published mount using the ROS-free
+`common.spatial_slam.validate_mount` helper. PR371's live consumer uses numeric
+format admission: `calibrated=false` does not prevent using the supplied matrix,
+and absent transforms assume already aligned incoming coordinates. Those
+arithmetic choices do not establish physical calibration.
+
+
+## Shared public depth safety
+
+The original `depth` card is the sole `image/depth-zlib` source at
+`/<namespace>/camera/depth`. It reuses `rgbd_camera.RgbdCameraPublisher`:
+640×480 rectified native-color optical geometry, measured little-endian uint16
+millimetres, zero invalid. Its matched RGB is the `camera` card's sole output
+at `/<namespace>/camera/color`; display, photos, videos and generic VO all use
+the original RGB field, rectified on valid color rays. SDK depth-to-color
+alignment retains source depth-camera Z: actual SDK rotation/translation and
+the sampled color ray convert this to color-camera Z. RGB stays visible at
+depth holes and outside the original depth-to-color overlap. There is no `/camera/rgbd/color` or `/camera/rgbd/depth` publisher,
+duplicate JPEG/depth encoder, arrival-stamp fallback or uncorrected aligned-depth
+fallback on the public image topics.
+
+The producer requires finite SDK depth scale strictly within `(0, 0.1)` metres
+per unit, measured pinhole intrinsics with zero source distortion, exact uint16 source shape,
+and valid monotonic capture clock mapping with the existing skew/drift bounds.
+Nonzero distortion is rejected rather than silently ignored by optimized SDK
+alignment. The original RGB field is retained.
+Invalid input pauses both public images and removes their ready declarations;
+native RGB is not published as a fallback. Missing optional body IMU or
+body-camera TF does not disable valid images. Bumi's arrival-derived hardware-clock mapping remains
+explicitly unverified; this is not hardware timing or navigation acceptance.
+
+The optional bundle-local RTAB-Map raw branch still uses its own color-grid
+inputs and existing metadata. It does not publish public compressed depth.
+Generic Perception VO and Point Cloud consume the public pair's real matching
+camera_info directly. The original body IMU display port remains data/json;
+use `imu.body_imu` (`/NS/state/imu_calibrated`, `sensor/imu`) for computation.
+It uses HighController body gyro/acceleration and the configured fixed mounting
+rotation, with explicit unverified SDK read-completion timestamps. No RealSense
+motion streams are requested. The consumer accepts read/receipt timestamps for every selected mode. This
+adapter currently omits the two translation vectors needed by full fusion;
+use attitude mode until those numeric fields are supplied. The camera-origin
+mount preset is not a physical IMU translation calibration.
+
+Tests in `tests/test_bumi_rgbd_adapter.py`, `tests/test_bumi_camera_imu.py` and
+`tests/bumi_visual_odometry/test_bundle_hook.py` exercise scale, geometry,
+capture headers, missing optional inputs, independent card controls and one
+capture owner. Migration requires rewiring the retired `camera_rgbd` card to
+the original camera/depth/imu cards. Existing `camera.registered_rgb` wires and
+`/<namespace>/camera/rgbd/color` topic selectors must move to the single
+`camera` output at `/<namespace>/camera/color`. Hardware/USB throughput,
+motion timing, TF installation and physical accuracy remain untested offline.

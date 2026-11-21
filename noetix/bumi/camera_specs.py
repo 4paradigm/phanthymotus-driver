@@ -109,7 +109,8 @@ SPECS = {
                            "rs.align(rs.stream.color) 把它重投影到 RGB 像素网格。"
                            "因此这个输出声明 RGB 的几何；相机起来后会被 RGB "
                            "运行时内参顶掉。",
-                   "depth_aligned_to": "color"},
+                   "depth_aligned_to": "color",
+                   "depth_unit": "mm"},
     },
 }
 
@@ -228,11 +229,41 @@ def declare(tool_name: str, topic: str, fmt: str, intrinsics: dict = None) -> li
         "measured_on": spec.get("measured_on", ""),
         "vendor": spec.get("vendor"),
     }
+    if tool_name == "depth":
+        # The projected point cloud uses the namespaced RGB optical frame.
+        namespace = topic.strip("/").split("/", 1)[0]
+        fields["vendor"] = {
+            **(fields.get("vendor") or {}),
+            "slam_geometry": {
+                "frame_id": f"{namespace}_rgb_optical",
+                "observation_model": "pinhole",
+                "cloud_semantics": "depth_frame",
+            },
+        }
     stream = (intrinsics or {}).get(_STREAM_OF_TOOL.get(tool_name, ""))
     if isinstance(stream, dict):
         runtime = _from_intrinsics(spec, stream)
         if runtime:
+            # Runtime K replaces datasheet optics, not the SLAM input identity.
+            # _from_intrinsics returns its own vendor dict: preserve the
+            # geometry hint rather than silently losing it after startup.
+            slam_geometry = (fields.get("vendor") or {}).get("slam_geometry")
             fields.update(runtime)
+            if slam_geometry is not None:
+                fields["vendor"] = {**(fields.get("vendor") or {}),
+                                    "slam_geometry": slam_geometry}
 
     return [build(topic=topic, format=fmt, id=spec["id"],
                   pipeline=spec.get("pipeline") or [spec["id"]], **fields)]
+
+
+def depth_slam_source_declaration(topic: str, namespace: str) -> dict:
+    """Routing and numeric units for depth projection to PointCloud2."""
+    return {
+        'schema': 'motus.slam_input/1',
+        'topic': topic, 'format': 'image/depth-zlib', 'kind': 'depth',
+        'frame_id': f'{namespace}_rgb_optical',
+        'length_unit': 'mm',
+        'frame_metadata_topic': topic + '/metadata',
+        'depth_unit': 'mm',
+    }

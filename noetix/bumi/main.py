@@ -122,6 +122,7 @@ class BumiDeviceBundle:
         self._plugins: list = []
         plugins_cfg = cfg.get("plugins", {})
         camera_plugin = None
+        state_plugin = None
         loco_plugin = None
         # The camera subprocess reads this env var; set it before any plugin can
         # start that subprocess, so the raw RGB-D branch is published only when
@@ -177,8 +178,12 @@ class BumiDeviceBundle:
 
         if plugins_cfg.get("camera", {}).get("enabled", False):
             from device import CameraPlugin
-            camera_plugin = CameraPlugin(plugins_cfg["camera"], namespace, executor)
+            camera_config = dict(plugins_cfg["camera"], body_imu_calibration=
+                                 plugins_cfg.get("visual_odometry", {}).get("calibration"))
+            camera_plugin = CameraPlugin(camera_config, namespace, executor)
             self._plugins.append(camera_plugin)
+            if state_plugin is not None:
+                state_plugin._camera_plugin = camera_plugin
             print("[bundle] CameraPlugin loaded")
 
         if plugins_cfg.get("visual_odometry", {}).get("enabled", False):
@@ -190,6 +195,16 @@ class BumiDeviceBundle:
                     plugins_cfg["visual_odometry"], namespace, executor,
                     high_ctrl=high_ctrl))
                 print("[bundle] VisualOdometryPlugin loaded")
+
+        # Independent leg kinematics: visual correction is a Perception concern.
+        if plugins_cfg.get("leg_odometry", {}).get("enabled", False):
+            if high_ctrl is None:
+                print("[bundle] LegOdometryPlugin needs HighController; skipped")
+            else:
+                from leg_odometry_sensor import LegOdometryPlugin
+                self._plugins.append(LegOdometryPlugin(
+                    plugins_cfg["leg_odometry"], namespace, executor, high_ctrl))
+                print("[bundle] LegOdometryPlugin loaded")
 
         if plugins_cfg.get("motion_state", {}).get("enabled", False) and high_ctrl is not None:
             from device import MotionStatePlugin

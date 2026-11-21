@@ -14,6 +14,15 @@ def test_parameters_are_visual_only():
     assert visual['wait_imu_to_init'] is False
     assert visual['subscribe_rgbd'] is True
     assert visual['Odom/ResetCountdown'] == '0'
+    turn_tuning = {
+        'Vis/MaxFeatures': '1500',
+        'Vis/CorGuessWinSize': '60',
+        'Odom/KeyFrameThr': '0.5',
+        'OdomF2M/MaxSize': '3000',
+    }
+    for key, expected in turn_tuning.items():
+        assert visual[key] == expected
+        assert parameters('seg', 'robot_rgb_optical', imu_assisted=True)[key] == expected
     # None of the EKF/fusion parameters may come back.
     for key in ('imu0', 'odom0', 'world_frame', 'two_d_mode', 'odom_frame',
                 'smooth_lagged_data', 'imu0_config'):
