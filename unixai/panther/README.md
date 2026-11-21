@@ -239,13 +239,17 @@ fusion. A second USB serial interface is not evidence of a second physical
 lidar; no rear-device alias or udev rule is installed by this driver.
 
 Build a new map after enabling the filter because old saved maps can contain
-chassis returns. After saving or loading a map, stand at a recorded tag with
-its recorded heading and call `relocalize_at_tag(tag_name)`. This seeds vendor
-SLAM in the map frame using the tag's `base_link` pose. The driver checks for
-fresh TF within 0.25 m and 20 degrees of the tag for one second. With
-`require_tag_localization` enabled, navigation and tagging on a loaded map
-wait for this check. `get_pose` reports `localization_verified` alongside
-the pose. The driver also checks `/bt_navigator/get_state` before sending a goal.
+chassis returns. Stay still when calling `start_mapping` until it reports
+`mapping_start_pose` (also shown by `info`). The driver saves this starting
+`base_link` pose with the map. Return to that physical position and heading
+before calling `load_map`, which seeds SLAM automatically. For an older map
+without a saved start pose, pass its known map-frame `x`, `y`, and `yaw` to
+`load_map` once while physically at that start. If starting from another known
+location, `relocalize_at_tag(tag_name)` is available as an optional recovery.
+The driver requires fresh TF within 0.25 m and 20 degrees of the seed for one
+second before enabling navigation and tagging on a loaded map. `get_pose`
+reports `localization_verified`. The driver also checks
+`/bt_navigator/get_state` before sending a goal.
 
 `model` falls back to the bundled, verbatim vendor `pmm_urdf` model before the robot
 publishes anything. Once a live `/robot_description` is available, reading the

@@ -142,7 +142,7 @@ plugins:
     # Box in base_link x/y, covering the self returns seen in all 26 saved
     # scans of test. Ray frame and time stay intact for SLAM's own TF lookup.
     self_filter_box_m: [-0.15, 0.15, -0.14, 0.14]
-    require_tag_localization: true
+    require_origin_localization: true
     navigator_state_service: "/bt_navigator/get_state"
     native_slam_pcd_dir: "/opt/phanthy-motus/data/maps"
     native_slam_db_path: "/opt/phanthy-motus/data/controlled_spatial.db"

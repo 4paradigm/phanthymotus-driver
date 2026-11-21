@@ -207,10 +207,10 @@ class SpatialTest(unittest.TestCase):
                 with patch('controlled_spatial.time.monotonic', lambda: fake_now), \
                      patch('controlled_spatial.time.sleep', spin):
                     if matches:
-                        self.assertEqual(p._relocalize_at_tag(tag)['state'], 'localized')
+                        self.assertAlmostEqual(p._localize(tag)['y'], tag['y'])
                     else:
                         with self.assertRaisesRegex(RuntimeError, 'did not settle'):
-                            p._relocalize_at_tag(tag)
+                            p._localize(tag)
                     self.assertEqual(p.localization_verified, matches)
                 sent = p.initial_pose_pub.publish.call_args.args[0]
                 self.assertEqual(sent.header.frame_id, 'map')
@@ -218,13 +218,45 @@ class SpatialTest(unittest.TestCase):
         finally:
             p.node = None
 
+    def test_load_at_mapping_start_requires_no_tag(self):
+        p = self.plugin
+        p.config['require_origin_localization'] = True
+        start = {'x': .04, 'y': -.1, 'yaw': .35}
+        p.store.save_map('room', p.root / 'room', start)
+        p._call.return_value.map_names = ['room', 'old']
+        p._wait_until = Mock(return_value=True)
+        p._localize = Mock(return_value=start)
+
+        result = p.dispatch('load_map', {'map_name': 'room'})
+        self.assertEqual(p.store.tags('room'), [])
+        self.assertEqual(result['state'], 'localized')
+        self.assertEqual(result['seed_source'], 'mapping_start_pose')
+        p._localize.assert_called_once_with(start)
+
+        result = p.dispatch('load_map', {'map_name': 'old'})
+        self.assertEqual(result['state'], 'localizing')
+        self.assertFalse(p.localization_verified)
+        p._localize.assert_called_once()
+
+        p._localize.side_effect = RuntimeError('SLAM pose did not settle')
+        self.assertEqual(p.dispatch('load_map', {'map_name': 'old', **start})['state'], 'localizing')
+        self.assertIsNone(p.store.map_start_pose('old'))
+
+        p._localize.side_effect = None
+        result = p.dispatch('load_map', {'map_name': 'old', **start})
+        self.assertEqual(result['seed_source'], 'provided_start_pose')
+        self.assertEqual(p.store.map_start_pose('old'), start)
+        self.assertEqual(p.dispatch('load_map', {'map_name': 'old'})['seed_source'], 'mapping_start_pose')
+
     def test_native_archive_excludes_prefix_collisions(self):
         p = self.plugin
+        p.mapping_start_pose = {'x': .02, 'y': .05, 'yaw': .3}
         for name in ['room.posegraph', 'room.data', 'room2.posegraph']:
             (p.vendor_dir/name).write_text(name)
         target = p._archive('room')
         self.assertEqual({f.name for f in target.iterdir()}, {'room.posegraph', 'room.data'})
         self.assertEqual(p.store.maps()[0]['name'], 'room')
+        self.assertEqual(p.store.map_start_pose('room'), p.mapping_start_pose)
 
     def test_no_fake_save_without_native_files(self):
         with self.assertRaises(RuntimeError):
