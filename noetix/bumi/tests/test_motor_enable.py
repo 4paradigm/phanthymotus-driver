@@ -26,6 +26,27 @@ class Controller:
             self.mode = self.next_mode
 
 
+class StatusObserver:
+    """Simulate ongoing, locally received DDS samples without hardware."""
+    def __init__(self, ctrl):
+        self.ctrl = ctrl
+        self.clock = 0
+        self.age_ms = 0
+        self.frozen = False
+        self.sample = {"workmode": ctrl.mode, "age_ms": 0, "sequence": 0, "received_ns": 0}
+
+    def snapshot(self):
+        if not self.frozen:
+            self.clock += 1
+            self.sample = {"workmode": self.ctrl.mode, "age_ms": self.age_ms,
+                           "sequence": self.clock, "received_ns": self.clock}
+        return dict(self.sample)
+
+    def mark(self):
+        self.clock += 1
+        return self.clock
+
+
 @pytest.fixture
 def card(monkeypatch):
     path = Path(__file__).resolve().parents[1] / "motor_enable.py"
@@ -40,6 +61,7 @@ def card(monkeypatch):
     monkeypatch.setattr(device, "_get_default_cmd", lambda: "DEFAULT")
     owner = device.LocoPlugin({}, "test", None, ctrl)
     plugin = module.MotorEnablePlugin({}, "test", None, ctrl, chassis_owner=owner)
+    plugin._feedback = StatusObserver(ctrl)
     return module, plugin, ctrl
 
 
@@ -89,7 +111,7 @@ def test_lifecycle_and_info_are_read_only(card):
     assert call(plugin, "info")["workmode"] == 30
     status = call(plugin, "status")
     assert status["workmode"] == 30
-    assert status["feedback_freshness"] == "unknown"
+    assert status["feedback_freshness"] == "recent"
     assert status["command_sent"] is False
     assert call(plugin, "stop")["state"] == "idle"
     assert call(plugin, "unsupported") is None
@@ -102,17 +124,88 @@ def test_missing_or_failed_feedback_never_sends_start(card, monkeypatch):
     assert call(plugin)["command_sent"] is False
     plugin._high_ctrl = ctrl
     def fail():
-        raise RuntimeError("DDS unavailable")
-    monkeypatch.setattr(ctrl, "get_mode", fail)
+        raise module.FeedbackUnavailable("DDS unavailable")
+    module, _, _ = card
+    monkeypatch.setattr(plugin, "_snapshot", fail)
     assert call(plugin)["command_sent"] is False
     assert call(plugin, "info")["state"] == "error"
     assert ctrl.commands == []
 
 
+@pytest.mark.parametrize("age_ms", [1001, 10000])
+def test_stale_status_does_not_authorize_start(card, age_ms):
+    _, plugin, ctrl = card
+    plugin._feedback.age_ms = age_ms
+    assert call(plugin, "status")["feedback_freshness"] == "stale"
+    assert call(plugin)["code"] == "FEEDBACK_UNAVAILABLE"
+    assert ctrl.commands == []
+
+
+def test_no_status_sample_does_not_authorize_start(card):
+    _, plugin, ctrl = card
+    plugin._feedback.sample = {"workmode": None, "age_ms": None,
+                               "sequence": 0, "received_ns": None}
+    plugin._feedback.frozen = True
+    assert call(plugin)["code"] == "FEEDBACK_UNAVAILABLE"
+    assert ctrl.commands == []
+
+
+def test_pre_command_sample_cannot_clear_pending_guard(card):
+    _, plugin, ctrl = card
+    observer = plugin._feedback
+    ctrl.mode = 0
+    old_sample = observer.snapshot()
+    plugin._owner._mode_toggle_target = 0
+    plugin._owner._enable_unconfirmed = True
+    plugin._owner._motor_enable_pending = True
+    plugin._owner._motor_enable_marker = observer.mark()
+    observer.frozen = True
+    assert old_sample["received_ns"] < plugin._owner._motor_enable_marker
+    assert call(plugin, "status")["enable_unconfirmed"] is True
+    assert call(plugin)["code"] == "ENABLE_UNCONFIRMED"
+    assert plugin._owner._prepare_workmode(1, "stand_up")["state"] == "error"
+    assert ctrl.commands == []
+    observer.frozen = False
+    assert call(plugin, "status")["enable_unconfirmed"] is False
+
+
+def test_failed_post_send_marker_cannot_reuse_old_marker(card, monkeypatch):
+    _, plugin, ctrl = card
+    plugin._owner._motor_enable_marker = -100
+    def fail_mark():
+        raise RuntimeError("clock unavailable")
+    monkeypatch.setattr(plugin._feedback, "mark", fail_mark)
+    result = call(plugin)
+    assert result["code"] == "ENABLE_SDK_ERROR"
+    assert plugin._owner._motor_enable_marker is None
+    assert call(plugin, "status")["enable_unconfirmed"] is True
+    assert [command[3] for command in ctrl.commands] == ["START", "DEFAULT"]
+
+
+def test_stale_enabled_sample_after_start_does_not_confirm(card, monkeypatch):
+    module, plugin, ctrl = card
+    clock = [100.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(plugin._enable_cancel, "wait", lambda _: clock.__setitem__(0, clock[0] + 1))
+    publish = ctrl.publish_cmd
+    def lose_feedback(*args):
+        publish(*args)
+        if args[3] == "START":
+            plugin._feedback.age_ms = 2000
+    monkeypatch.setattr(ctrl, "publish_cmd", lose_feedback)
+    result = call(plugin)
+    assert result["code"] == "ENABLE_TIMEOUT"
+    assert result["feedback_freshness"] == "stale"
+    assert plugin._owner._enable_unconfirmed is True
+    assert call(plugin, "status")["enable_unconfirmed"] is True
+    assert plugin._owner._prepare_workmode(1, "stand_up")["state"] == "error"
+    assert [command[3] for command in ctrl.commands].count("START") == 1
+
+
 def test_mode_is_rechecked_before_publish(card, monkeypatch):
     _, plugin, ctrl = card
     modes = iter([30, 2])
-    monkeypatch.setattr(ctrl, "get_mode", lambda: next(modes))
+    monkeypatch.setattr(plugin, "require_recent_mode", lambda: next(modes))
     assert call(plugin)["command_sent"] is False
     assert ctrl.commands == []
 
@@ -165,7 +258,7 @@ def test_default_refresh_stops_when_enabled_mode_is_observed(card, monkeypatch):
     monkeypatch.setattr(ctrl, "publish_cmd", acknowledge_after_three_defaults)
     result = call(plugin)
     assert result["state"] == "completed" and result["workmode"] == 0
-    assert result["feedback_freshness"] == "unknown"
+    assert result["feedback_freshness"] == "recent"
     assert [command[3] for command in ctrl.commands] == ["START", "DEFAULT", "DEFAULT", "DEFAULT"]
     assert waits == [0.01, 0.01]
 
@@ -193,6 +286,8 @@ def test_info_does_not_clear_uncertainty_during_body_action(card, action):
     ctrl.mode = 0
     plugin._owner._enable_unconfirmed = True
     plugin._owner._mode_toggle_target = 0
+    plugin._owner._motor_enable_pending = True
+    plugin._owner._motor_enable_marker = -1
     plugin._owner._body_action = "another_action"
     assert call(plugin, action)["enable_unconfirmed"] is True
     assert ctrl.commands == []
@@ -330,7 +425,7 @@ def test_stop_during_final_mode_check_prevents_start(card, monkeypatch):
             entered.set()
             assert release.wait(2)
         return 30
-    monkeypatch.setattr(ctrl, "get_mode", get_mode)
+    monkeypatch.setattr(plugin, "require_recent_mode", get_mode)
     worker = threading.Thread(target=lambda: results.append(call(plugin)))
     worker.start()
     try:

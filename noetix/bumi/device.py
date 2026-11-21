@@ -396,6 +396,8 @@ class LocoPlugin:
         # remains unconfirmed.
         self._enable_unconfirmed = False
         self._mode_toggle_target = None
+        self._motor_enable_pending = False
+        self._motor_enable_marker = None
         # ACP async completion for rotate: worker thread + the single active
         # action whose terminal callback fires exactly once.
         self._rotate_worker: threading.Thread | None = None
@@ -439,7 +441,7 @@ class LocoPlugin:
         # operation sole velocity ownership until its mode edge is released.
         self._set_servo_velocity_owner(True)
 
-    def publish_mode_toggle(self, cancel_event, expected_mode: int, target_mode: int) -> int | None:
+    def publish_mode_toggle(self, cancel_event, expected_mode: int, target_mode: int, feedback) -> int | None:
         """Issue START only if the mode remains the observed source mode."""
         with self._lock:
             delay = 0.002 - (time.monotonic() - self._last_cmd_time)
@@ -447,7 +449,7 @@ class LocoPlugin:
                 time.sleep(delay)
             if cancel_event.is_set():
                 return None
-            mode = int(self._high_ctrl.get_mode())
+            mode = feedback.require_recent_mode()
             if mode != expected_mode:
                 return mode
             command = _get_control_cmd("START")
@@ -455,7 +457,13 @@ class LocoPlugin:
                 return None
             self._mode_toggle_target = target_mode
             self._enable_unconfirmed = True
-            self._high_ctrl.publish_cmd(0, 0, 0, command, 0)
+            self._motor_enable_pending = True
+            self._motor_enable_marker = None
+            # If publishing raises, delivery can still be uncertain.
+            try:
+                self._high_ctrl.publish_cmd(0, 0, 0, command, 0)
+            finally:
+                self._motor_enable_marker = feedback.mark()
             self._last_cmd_time = time.monotonic()
             return 30
 
@@ -1584,6 +1592,10 @@ class LocoPlugin:
 
         steps = []
         mode = int(self._high_ctrl.get_mode())
+        if self._motor_enable_pending:
+            return self._preparation_error(
+                requested_action, steps, mode,
+                "Previous motor_enable START is unconfirmed; inspect its live status before proceeding.")
         if self._enable_unconfirmed and mode == self._mode_toggle_target:
             self._enable_unconfirmed = False
         if mode == 26:

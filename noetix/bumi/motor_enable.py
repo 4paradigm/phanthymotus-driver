@@ -12,6 +12,12 @@ _WORKMODE_NAMES = {0: "enabled", 1: "ready", 2: "walking", 5: "dance",
                    29: "save_teach_2", 30: "disabled", 31: "dance1",
                    32: "dance2", 33: "tear"}
 
+_MAX_FEEDBACK_AGE_MS = 1000
+
+
+class FeedbackUnavailable(Exception):
+    pass
+
 
 def _get_control_cmd(name):
     from highcontrol_py import ControlCmd
@@ -31,9 +37,53 @@ class MotorEnablePlugin:
         self._action_lock = threading.Lock()
         self._cancel_lock = threading.Lock()
         self._enable_cancel = threading.Event()
+        self._feedback_lock = threading.Lock()
+        self._feedback = None
+
+    def _observer(self):
+        with self._feedback_lock:
+            if self._feedback is None:
+                try:
+                    from highcontrol_py import RobotStatusObserver
+                    self._feedback = RobotStatusObserver()
+                except Exception as exc:
+                    raise FeedbackUnavailable(f"状态订阅不可用: {exc}") from exc
+            return self._feedback
+
+    def _snapshot(self):
+        try:
+            return self._observer().snapshot()
+        except Exception as exc:
+            raise FeedbackUnavailable(f"无法读取状态订阅: {exc}") from exc
+
+    @staticmethod
+    def _recent(snapshot):
+        age = snapshot.get("age_ms")
+        return snapshot.get("workmode") is not None and age is not None and 0 <= age <= _MAX_FEEDBACK_AGE_MS
+
+    def require_recent_mode(self):
+        snapshot = self._snapshot()
+        if not self._recent(snapshot):
+            raise FeedbackUnavailable("最近 1 秒未收到机器人状态，无法安全发送 START。")
+        return int(snapshot["workmode"])
+
+    def mark(self):
+        return self._observer().mark()
+
+    def _reconcile(self, snapshot):
+        marker = self._owner._motor_enable_marker
+        received = snapshot.get("received_ns")
+        if (self._owner._motor_enable_pending and marker is not None and received is not None
+                and received > marker and self._recent(snapshot)
+                and snapshot.get("workmode") == self._owner._mode_toggle_target):
+            self._owner._enable_unconfirmed = False
+            self._owner._motor_enable_pending = False
 
     def start(self) -> None:
-        pass
+        try:
+            self._observer()
+        except FeedbackUnavailable as exc:
+            print(f"[motor_enable] {exc}", flush=True)
 
     def stop(self) -> None:
         with self._cancel_lock:
@@ -52,7 +102,7 @@ class MotorEnablePlugin:
                 "required": ["action"],
                 "x-action-params": {
                     "enable": {"params": ["confirm"], "required": ["confirm"], "description": "确认安全放置后退出失能；使能前将机器人仰面平躺并确保关节活动范围安全。"},
-                    "status": {"params": [], "description": "查询报告的工作模式和未确认状态；反馈新鲜度未知。"},
+                    "status": {"params": [], "description": "查询订阅到的工作模式、接收时间和未确认状态。"},
                     "info": {"params": [], "description": "只读查询当前模式及上次使能是否仍未确认。"},
                     "start": {"params": [], "description": "将卡片置为就绪，不发送使能指令。"},
                     "stop": {"params": [], "description": "取消等待使能反馈，不发送失能指令，也不会撤回已发送的使能指令。"},
@@ -65,6 +115,7 @@ class MotorEnablePlugin:
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
+            self.start()
             return {"state": "ready", "command_sent": False}
         if action == "stop":
             self.stop()
@@ -76,21 +127,22 @@ class MotorEnablePlugin:
             return {"state": "error", "command_sent": False, "error": "Robot controller unavailable"}
         if action in {"status", "info"}:
             try:
-                # Do not reconcile against a potentially stale pre-command
-                # reading while any explicit body action is in flight.
                 with self._owner._rotate_lock:
-                    mode = int(self._high_ctrl.get_mode())
-                    if (not self._owner._body_action and self._owner._enable_unconfirmed
-                            and mode == self._owner._mode_toggle_target):
-                        self._owner._enable_unconfirmed = False
+                    snapshot = self._snapshot()
+                    if not self._owner._body_action:
+                        self._reconcile(snapshot)
                     unconfirmed = self._owner._enable_unconfirmed
-            except Exception as exc:
-                return {"state": "error", "command_sent": False, "error": str(exc)}
+            except FeedbackUnavailable as exc:
+                return {"state": "error", "command_sent": False, "code": "FEEDBACK_UNAVAILABLE", "error": str(exc)}
+            mode = snapshot.get("workmode")
             return {"state": "completed", "command_sent": False,
                     "workmode": mode, "workmode_name": _WORKMODE_NAMES.get(mode, "unknown"),
                     "enable_unconfirmed": unconfirmed,
-                    "feedback_freshness": "unknown",
-                    "message": "模式为 SDK 缓存值，无法确认反馈新鲜度或关节是否已停止运动。"}
+                    "feedback_freshness": ("recent" if self._recent(snapshot) else
+                                           "unavailable" if snapshot.get("workmode") is None else "stale"),
+                    "feedback_age_ms": snapshot.get("age_ms"),
+                    "feedback_sequence": snapshot.get("sequence"),
+                    "message": "时间为本机收到状态的时间；不代表机器人源时间、命令回执或关节已停止。"}
         if args.get("confirm") is not True:
             return {"state": "error", "command_sent": False, "code": "CONFIRM_REQUIRED",
                     "error": "Confirm safe face-up placement and a clear joint movement area before enabling."}
@@ -123,26 +175,26 @@ class MotorEnablePlugin:
         default_count = 0
         mode = None
         try:
-            mode = int(self._high_ctrl.get_mode())
             target_mode = 0
+            snapshot = self._snapshot()
             if self._owner._enable_unconfirmed:
-                if mode == self._owner._mode_toggle_target:
-                    self._owner._enable_unconfirmed = False
-                else:
+                self._reconcile(snapshot)
+                if self._owner._enable_unconfirmed:
                     return {"state": "error", "command_sent": False, "code": "ENABLE_UNCONFIRMED",
                             "retry_available": False,
                             "error": "上次 START 的结果尚未确认，不会再次发送。请检查机器人及控制链路，并遵循厂商确认的恢复流程。"}
+            mode = self.require_recent_mode()
             if mode == target_mode:
                 return {"state": "completed", "command_sent": False, "confirmed": True,
                         "workmode": mode, "workmode_name": _WORKMODE_NAMES[mode],
-                        "feedback_freshness": "unknown", "confirmation_scope": "sdk_cached_workmode",
-                        "message": "SDK 缓存显示已使能，无法确认反馈新鲜度或关节是否已停止。"}
+                        "feedback_freshness": "recent", "confirmation_scope": "locally_received_workmode",
+                        "message": "最近收到的状态显示已使能；不能确认关节是否已停止。"}
             if mode != 30:
                 return self._enable_mode_error(mode)
             print(f"[motor_enable] start_requested workmode={mode}", flush=True)
             try:
                 source_mode = mode
-                mode = self._owner.publish_mode_toggle(self._enable_cancel, source_mode, target_mode)
+                mode = self._owner.publish_mode_toggle(self._enable_cancel, source_mode, target_mode, self)
             finally:
                 attempted = self._owner._enable_unconfirmed
             if mode is None:
@@ -160,16 +212,20 @@ class MotorEnablePlugin:
                 release_attempted = True
                 self._owner._publish_cmd(0, 0, 0, _get_default_cmd(), 0)
                 default_count += 1
-                mode = int(self._high_ctrl.get_mode())
-                if mode == target_mode:
-                    self._owner._enable_unconfirmed = False
+                snapshot = self._snapshot()
+                mode = snapshot.get("workmode")
+                self._reconcile(snapshot)
+                if not self._owner._enable_unconfirmed:
                     print(f"[motor_enable] target_observed workmode={mode} defaults={default_count}", flush=True)
                     return {"state": "completed", "command_sent": True, "confirmed": True,
                             "workmode": mode, "workmode_name": _WORKMODE_NAMES[mode],
-                            "feedback_freshness": "unknown", "confirmation_scope": "sdk_cached_workmode",
+                            "feedback_freshness": "recent", "confirmation_scope": "locally_received_workmode_after_start",
                             "delivery": "unknown",
-                            "message": "已观察到 SDK 缓存的使能模式；反馈新鲜度和关节状态尚未确认。"}
-                if mode != source_mode:
+                            "message": "发送后收到使能状态；不能证明命令送达或关节已停止。"}
+                marker = self._owner._motor_enable_marker
+                received = snapshot.get("received_ns")
+                if (self._recent(snapshot) and received is not None and marker is not None
+                        and received > marker and mode not in (source_mode, target_mode)):
                     print(f"[motor_enable] mode_changed workmode={mode} defaults={default_count}", flush=True)
                     return self._enable_mode_error(mode, command_sent=True)
                 if self._enable_cancel.is_set():
@@ -181,11 +237,21 @@ class MotorEnablePlugin:
                     print(f"[motor_enable] timeout workmode={mode} defaults={default_count}", flush=True)
                     return {"state": "error", "command_sent": True, "confirmed": False,
                             "code": "ENABLE_TIMEOUT", "workmode": mode,
-                            "retry_available": False, "feedback_freshness": "unknown",
+                            "retry_available": False, "feedback_freshness": "recent" if self._recent(snapshot) else "stale",
+                            "feedback_age_ms": snapshot.get("age_ms"),
                             "delivery": "unknown",
                             "error": "等待使能反馈超时（4 秒），未自动重发 START。",
                             "message": "机器人实际状态尚未确认。请检查机器人及控制链路，并遵循厂商确认的恢复流程。"}
                 self._enable_cancel.wait(min(0.01, remaining))
+        except FeedbackUnavailable as exc:
+            if attempted and not release_attempted:
+                try:
+                    self._owner._publish_cmd(0, 0, 0, _get_default_cmd(), 0)
+                except Exception:
+                    pass
+            return {"state": "error", "command_sent": None if attempted else False,
+                    "command_attempted": attempted, "confirmed": False,
+                    "code": "FEEDBACK_UNAVAILABLE", "retry_available": False, "error": str(exc)}
         except Exception as exc:
             # The SDK may have accepted START before raising; try to release it
             # once, but never issue another START on an uncertain outcome.
