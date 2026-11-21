@@ -244,8 +244,7 @@ class ControlledSpatialPlugin:
             self.executor.remove_node(self.node)
             self.node.destroy_node()
             self.node = None
-        with self.store.lock:
-            self.store.conn.close()
+        # The registered map display and a later start still share this store.
 
     def _pose(self, msg):
         if msg.header.frame_id.lstrip('/') != 'map':
@@ -755,21 +754,38 @@ class ControlledSpatialPlugin:
 
     @staticmethod
     def _notify(action_id, status, result):
-        import urllib.request
         import ssl
-        # Fleet core exposes a local HTTPS endpoint with a self-signed certificate.
-        context = ssl._create_unverified_context()
-        url = os.environ.get('AGENT_CORE_URL', 'https://localhost:15678') + '/api/acp/complete'
+        from urllib.parse import urlsplit
+        import urllib.request
+
+        endpoint = os.environ.get('AGENT_CORE_URL', 'https://localhost:15678').rstrip('/')
+        try:
+            parsed = urlsplit(endpoint)
+            if parsed.scheme != 'https' or not parsed.hostname or parsed.username is not None:
+                raise ValueError('AGENT_CORE_URL must be an HTTPS URL without user credentials')
+            ca_file = os.environ.get('AGENT_CORE_CA_CERT') or None
+            local_cert = ca_file is None and parsed.hostname in ('localhost', '127.0.0.1', '::1')
+            if local_cert:
+                ca_file = '/opt/phanthy-motus/data/certs/cert.pem'
+            context = ssl.create_default_context(cafile=ca_file)
+            if local_cert:
+                # Use only the shared self-signed certificate as the loopback
+                # trust anchor. Its name is phanthy-motus, not localhost.
+                context.check_hostname = False
+        except (OSError, ValueError) as exc:
+            print(f'[controlled_spatial] completion callback {action_id} TLS setup failed: {exc}', flush=True)
+            return
         payload = json.dumps({'action_id': action_id, 'status': status, 'result': result,
                               'tool': 'controlled_spatial', 'ts': time.time()}).encode()
-        request = urllib.request.Request(url, data=payload, headers={'Content-Type': 'application/json'})
+        request = urllib.request.Request(endpoint + '/api/acp/complete', data=payload,
+                                         headers={'Content-Type': 'application/json'})
         for attempt in range(3):
             try:
                 with urllib.request.urlopen(request, timeout=3, context=context):
                     return
             except Exception as exc:
                 if attempt == 2:
-                    print('[controlled_spatial] completion callback failed:', exc, flush=True)
+                    print(f'[controlled_spatial] completion callback {action_id} failed: {exc}', flush=True)
                 else:
                     time.sleep(0.5)
 

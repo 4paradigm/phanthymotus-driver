@@ -1,6 +1,7 @@
 """Focused regression tests for map isolation, persistence and navigation guards."""
 import os
 from pathlib import Path
+import ssl
 import sys
 import tempfile
 import threading
@@ -48,7 +49,34 @@ class SpatialTest(unittest.TestCase):
 
     def tearDown(self):
         self.plugin.stop()
+        self.plugin.store.conn.close()
         self.tmp.cleanup()
+
+    def test_saved_maps_are_accessible_during_and_after_ros_restart(self):
+        from spatial_map import SpatialMapPlugin
+
+        p = self.plugin
+        p.store.save_map('room', p.root / 'room')
+        p.store.tag('P1', 'room', {'x': 1, 'y': 2, 'yaw': 0}, 'desk')
+        display = SpatialMapPlugin(p, 'test')
+        p.executor = Mock()
+        first, second = Mock(), Mock()
+        modules = {name: Mock() for name in (
+            'rclpy.node', 'rclpy.callback_groups', 'rclpy.action', 'rclpy.qos',
+            'geometry_msgs.msg', 'nav_msgs.msg', 'sensor_msgs.msg', 'nav2_msgs.action',
+            'tf2_ros', 'std_srvs.srv', 'unix_msgs.srv',
+        )}
+        modules['rclpy.node'].Node.side_effect = [first, second]
+        with patch.dict(sys.modules, modules):
+            p.start()
+            p.stop()
+            self.assertEqual(display.dispatch('list_maps', {})['maps'][0]['name'], 'room')
+            p.start()
+        p.executor.remove_node.assert_called_once_with(first)
+        first.destroy_node.assert_called_once()
+        p.executor.add_node.assert_called_with(second)
+        self.assertEqual(p.dispatch('list_maps', {})['maps'][0]['name'], 'room')
+        self.assertEqual(p.store.tags('room')[0]['name'], 'P1')
 
     def test_start_is_ready_without_claiming_mapping_or_localization(self):
         p = self.plugin
@@ -360,6 +388,35 @@ class StoreCompatibilityTest(unittest.TestCase):
             self.assertEqual(store.tags('room')[0]['description'], 'desk')
             store.conn.close()
 
+
+
+class CompletionTLS(unittest.TestCase):
+    def test_completion_uses_verified_context_for_local_and_configured_ca(self):
+        cases = (
+            ({}, '/opt/phanthy-motus/data/certs/cert.pem', False),
+            ({'AGENT_CORE_URL': 'https://core.example', 'AGENT_CORE_CA_CERT': '/run/core-ca.pem'},
+             '/run/core-ca.pem', True),
+            ({'AGENT_CORE_URL': 'https://core.example'}, None, True),
+        )
+        for env, ca_file, check_hostname in cases:
+            with self.subTest(env=env):
+                context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                with patch.dict(os.environ, env, clear=True), \
+                     patch('ssl.create_default_context', return_value=context) as create, \
+                     patch('urllib.request.urlopen') as send:
+                    ControlledSpatialPlugin._notify('nav-id', 'completed', {})
+                create.assert_called_once_with(cafile=ca_file)
+                send.assert_called_once()
+                self.assertIs(send.call_args.kwargs['context'], context)
+                self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+                self.assertEqual(context.check_hostname, check_hostname)
+
+    def test_completion_does_not_send_when_tls_setup_fails(self):
+        with patch.dict(os.environ, {'AGENT_CORE_CA_CERT': '/missing/core-ca.pem'}, clear=True), \
+             patch('urllib.request.urlopen') as send, patch('builtins.print') as log:
+            ControlledSpatialPlugin._notify('nav-id', 'completed', {})
+        send.assert_not_called()
+        self.assertIn('nav-id', log.call_args.args[0])
 
 
 class MapRenderingTest(unittest.TestCase):

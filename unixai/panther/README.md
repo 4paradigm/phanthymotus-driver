@@ -209,6 +209,12 @@ another navigation stack or change controller parameters.
 - `info` / `get_pose`: expose mapping, localization, scan freshness and
   navigation status. No stale pose is used for tagging or navigation.
 
+Navigation completion verifies Agent Core over HTTPS. For the default loopback
+endpoint, the driver trusts the self-signed certificate at
+`/opt/phanthy-motus/data/certs/cert.pem` through the existing data mount. An
+explicit `AGENT_CORE_CA_CERT` overrides this default and requires the certificate
+hostname to match `AGENT_CORE_URL`, as does system CA verification for other hosts.
+
 `spatial_map` provides a `sensor/mapping` stream with the same binary and
 metadata contract as Tianyi/G1. Use `start`, `list_maps`, `select_map(map_name)`
 and `stop` to display occupied cells, robot pose and semantic tags. Saved grids
