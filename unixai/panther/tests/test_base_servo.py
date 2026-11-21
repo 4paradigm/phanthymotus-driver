@@ -75,8 +75,8 @@ class StreamTest(unittest.TestCase):
 
     def test_command_is_bounded_and_explicit_zero_is_immediate(self):
         self.send(command(self.clock))
-        self.assertAlmostEqual(self.device.output[-1][0], .015)
-        self.assertAlmostEqual(self.device.output[-1][5], .03)
+        self.assertAlmostEqual(self.device.output[-1][0], .03)
+        self.assertAlmostEqual(self.device.output[-1][5], .06)
         self.send(command(self.clock, seq=2, values=list(ZERO)))
         self.assertEqual(self.device.output[-1], ZERO)
 
@@ -207,6 +207,19 @@ class LifecycleTest(unittest.TestCase):
             self.assertEqual(d.output[-1], ZERO)
         finally:
             p._thread_end.set(); thread.join(timeout=1)
+
+    def test_descriptor_acceleration_steps_follow_expected_rate(self):
+        drive = Device()._cfg['plugins']['base_drive']
+        for config, hz, linear, angular in (({}, 10., .03, .06),
+                                            ({'expected_hz': 15.}, 15., .02, .04)):
+            with self.subTest(config=config):
+                result = descriptor(config, drive)
+                self.assertEqual(result['rate']['expected_hz'], hz)
+                self.assertEqual(result['rate']['max_hz'], 20.)
+                steps = result['limits']['max_delta_per_step']
+                self.assertAlmostEqual(steps[0], linear)
+                self.assertAlmostEqual(steps[1], linear)
+                self.assertAlmostEqual(steps[5], angular)
 
     def test_descriptor_cannot_widen_base_limits(self):
         for cfg in ({'max_linear_mps': .6}, {'max_angular_rad_s': 1.}, {'expected_hz': 25},

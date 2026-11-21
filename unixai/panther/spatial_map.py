@@ -112,13 +112,15 @@ class SpatialMapPlugin:
         self.error = ''
 
     def get_tool(self):
+        actions = {action: {'params': []} for action in ('start', 'stop', 'info', 'list_maps')}
+        actions['select_map'] = {'params': ['map_name'], 'required': ['map_name']}
         return {'name': 'spatial_map', 'type': 'actuator', 'multiInstance': False,
                 'description': 'Panther saved occupancy map, live pose and semantic tags.',
                 'topic_out': [{'topic': self.topic, 'format': 'sensor/mapping'}],
                 'inputSchema': {'type': 'object', 'required': ['action'], 'additionalProperties': False,
-                    'properties': {'action': {'type': 'string', 'enum': ['start', 'stop', 'info', 'list_maps', 'select_map']},
+                    'properties': {'action': {'type': 'string', 'enum': list(actions)},
                                    'map_name': {'type': 'string'}},
-                    'x-action-params': {'select_map': {'params': ['map_name']}, 'list_maps': {'params': []}}}}
+                    'x-action-params': actions}}
 
     def start(self):
         # Map stream is lazy, like the audio and camera cards.

@@ -39,8 +39,8 @@ def descriptor(config, drive_config):
     wz = positive("max_angular_rad_s", drive_angular)
     if hz > MAX_HZ or vx > drive_linear or wz > drive_angular:
         raise ValueError("base_servo rate/speed exceeds Panther base limits")
-    linear_step = positive("linear_acceleration_mps2", .3) / MAX_HZ
-    angular_step = positive("angular_acceleration_rad_s2", .6) / MAX_HZ
+    linear_step = positive("linear_acceleration_mps2", .3) / hz
+    angular_step = positive("angular_acceleration_rad_s2", .6) / hz
     result = {"control_interface": "motus.control/1", "mode": "twist", "dof": 6,
               "joint_names": ["vx", "vy", "vz", "wx", "wy", "wz"],
               "units": {"linear": "m/s", "angular": "rad/s", "time": "s"},

@@ -363,6 +363,17 @@ class StoreCompatibilityTest(unittest.TestCase):
 
 
 class MapRenderingTest(unittest.TestCase):
+    def test_map_selection_requires_name_without_affecting_other_actions(self):
+        from spatial_map import SpatialMapPlugin
+        schema = SpatialMapPlugin(None, 'test').get_tool()['inputSchema']
+        actions = schema['x-action-params']
+        self.assertEqual(set(actions), set(schema['properties']['action']['enum']))
+        self.assertEqual(actions['select_map']['params'], ['map_name'])
+        self.assertEqual(actions['select_map']['required'], ['map_name'])
+        self.assertNotIn('map_name', schema['required'])
+        for action in ('start', 'stop', 'info', 'list_maps'):
+            self.assertEqual(actions[action]['params'], [])
+
     def test_grid_uses_cell_centers_and_rotated_origin(self):
         import numpy as np
         from spatial_map import grid_points
