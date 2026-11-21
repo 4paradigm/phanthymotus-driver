@@ -4,12 +4,58 @@ import struct
 import sys
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from audio import AudioPlugin, _speaker_pcm
+from audio import AudioPlugin, FORMAT, _speaker_pcm, _worker
 
 CONFIG = {'server': 'auto', 'uid': 1001, 'gid': 1002, 'source': 'mic', 'sink': 'speaker'}
+
+
+class PlaybackLifecycleTest(unittest.TestCase):
+    def test_overflow_reaps_playback_before_next_command(self):
+        from common import logsafe
+
+        commands, replies = queue.Queue(), queue.Queue()
+        commands.put(('start', {'input_topic': '/test/audio'}))
+        node, playback = Mock(), Mock()
+        playback.poll.return_value = None
+
+        def overflow(*args, **kwargs):
+            callback = node.create_subscription.call_args.args[2]
+            callback(SimpleNamespace(format=FORMAT, data=bytes(257 * 4096)))
+            playback.terminate.assert_not_called()
+            node.destroy_subscription.assert_not_called()
+            commands.put(('info', {}))
+
+        def close(*args, **kwargs):
+            playback.terminate.assert_called_once()
+            playback.wait.assert_called_once_with(timeout=2)
+            commands.put(('close', {}))
+
+        rclpy = ModuleType('rclpy')
+        rclpy.init, rclpy.shutdown = Mock(), Mock()
+        spins = iter((lambda *args, **kwargs: None, overflow, close))
+        rclpy.spin_once = lambda *args, **kwargs: next(spins)(*args, **kwargs)
+        modules = {
+            'rclpy': rclpy,
+            'rclpy.node': SimpleNamespace(Node=Mock(return_value=node)),
+            'rclpy.qos': SimpleNamespace(QoSProfile=Mock(), ReliabilityPolicy=Mock(), HistoryPolicy=Mock()),
+            'audio_msgs.msg': SimpleNamespace(AudioChunk=object()),
+        }
+        with patch.dict(sys.modules, modules), patch.dict('os.environ'), \
+             patch.object(logsafe, 'install'), patch('audio._resolve_pulse', return_value={'server': 'test'}), \
+             patch('audio._pulse_user', return_value={}), patch('audio.time.sleep'), \
+             patch('audio.subprocess.Popen', return_value=playback), patch('audio.threading.Thread'):
+            _worker('speaker', '', {'server': 'test', 'device': 'test'}, commands, replies)
+
+        self.assertEqual(replies.get_nowait()['state'], 'running')
+        info = replies.get_nowait()
+        self.assertEqual(info['state'], 'error')
+        self.assertIn('speaker buffer full', info['error'])
+        self.assertEqual(info['dropped'], 1)
+        self.assertEqual(info['queued_chunks'], 0)
 
 
 class VolumeTest(unittest.TestCase):

@@ -161,7 +161,8 @@ def _worker(mode, topic, config, commands, replies):
                 proc.stdin.flush()
                 stop_event.wait(max(0.0, deadline - time.monotonic() - 0.08))
         except Exception as exc:
-            state["error"] = f"playback failed: {exc}"
+            if not stop_event.is_set() and not state["error"]:
+                state["error"] = f"playback failed: {exc}"
         finally:
             if not stop_event.is_set():
                 state["running"] = False
@@ -224,6 +225,9 @@ def _worker(mode, topic, config, commands, replies):
     try:
         while True:
             rclpy.spin_once(node, timeout_sec=0.02)
+            # Reap failed playback after the ROS callback has returned.
+            if mode == "speaker" and process is not None and not state["running"]:
+                stop()
             try:
                 action, arguments = commands.get_nowait()
             except queue.Empty:
