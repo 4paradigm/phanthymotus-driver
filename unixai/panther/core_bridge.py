@@ -17,7 +17,7 @@ TOPIC_SUFFIXES = {
     "imu": ("imu", "data/json"),
     "camera_imu": ("camera/rgbd/imu", "sensor/imu"),
     "body_mount": ("camera/body_mount", "state/extrinsic"),
-    "odom": ("odom", "state/odom"),
+    "odom": ("state/odom", "state/odom"),
     "laser_scan": ("laser_scan", "data/json"),
     "laser_view": ("laser_scan/view", "image/jpeg"),
     "camera_color": ("camera/rgb", "image/jpeg"),
@@ -31,11 +31,6 @@ def output_topics(namespace: str) -> dict[str, dict[str, str]]:
         name: {"topic": f"{prefix}/{suffix}", "format": data_format}
         for name, (suffix, data_format) in TOPIC_SUFFIXES.items()
     }
-
-
-def navi_odom_output(odom_topic: str) -> dict[str, str]:
-    prefix = odom_topic.rsplit("/", 1)[0]
-    return {"topic": f"{prefix}/state/odom", "format": "state/odom", "name": "navi_odom"}
 
 
 def encode_bridge_payload(card: str, payload) -> dict:
@@ -196,12 +191,9 @@ def _run_lane(messages, profile: str, domain: int, namespace: str, card: str) ->
                      history=HistoryPolicy.KEEP_LAST, depth=1)
     spec = output_topics(namespace)[card]
     message_type = CompressedImage if spec["format"].startswith("image/") else String
-    topics = [spec["topic"]]
-    if card == "odom":
-        topics.append(navi_odom_output(spec["topic"])["topic"])
+    publisher = node.create_publisher(message_type, spec["topic"], qos)
+    print(f"[bridge] ready lane={card} domain={domain} topic={spec['topic']}", flush=True)
     try:
-        publishers = [node.create_publisher(message_type, topic, qos) for topic in topics]
-        print(f"[bridge] ready lane={card} domain={domain} topics={', '.join(topics)}", flush=True)
         while True:
             payload = messages.get()
             if payload is None:
@@ -218,8 +210,7 @@ def _run_lane(messages, profile: str, domain: int, namespace: str, card: str) ->
             else:
                 message = String()
                 message.data = wire["data"]
-            for publisher in publishers:
-                publisher.publish(message)
+            publisher.publish(message)
     finally:
         node.destroy_node()
         if rclpy.ok():

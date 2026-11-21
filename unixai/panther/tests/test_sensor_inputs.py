@@ -213,15 +213,14 @@ class RuntimeContractTest(unittest.TestCase):
         self.assertEqual(encode_bridge_payload('camera_imu', {'schema': 'motus.imu/1'})['kind'], 'string')
         self.assertEqual(OdomPlugin(d, 'odom', 'test', ['odom']).get_tool()['odom_interface']['pose_drift'], 'unbounded')
 
-    def test_odom_keeps_original_port_and_advertises_navi_port(self):
+    def test_odom_advertises_one_navi_compatible_port(self):
         from core_bridge import output_topics
         from plugins import OdomPlugin
 
         topics = output_topics('test')
         device = NS(topics=topics, sensor_info=lambda _: {'available': True, 'fresh': True})
         odom = OdomPlugin(device, 'odom', 'test', ['odom'])
-        expected = [topics['odom'], {'topic': '/test/panther/state/odom',
-                                     'format': 'state/odom', 'name': 'navi_odom'}]
+        expected = [{'topic': '/test/panther/state/odom', 'format': 'state/odom'}]
         self.assertEqual(odom.get_tool()['topic_out'], expected)
         for action in ('start', 'info'):
             with self.subTest(action=action):
