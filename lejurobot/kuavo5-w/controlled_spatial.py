@@ -9,7 +9,7 @@ import time
 from uuid import uuid4
 
 from spatial_client import JatenClient, MapCommandRejected, NavigationStateUnavailable
-from map_storage import MapArchive, migrate_database
+from map_storage import MapArchive, migrate_database, safe_name
 
 
 def text(value, field):
@@ -96,6 +96,8 @@ class ControlledSpatialPlugin:
         'untag_place': (['name'], '删除当前地图中的语义点'),
         'list_tags': ([], '列出当前地图语义点及相对位置'),
         'list_maps': ([], '列出底盘真实栅格地图'),
+        'delete_map': (['map_name', 'confirm_delete'], '备份并从底盘移除指定的非活动地图'),
+        'upload_map': (['map_name'], '从上位机归档恢复完整地图到厂商底盘，可随后载入'),
         'load_map': (['map_name'], '载入已有地图，确认地图身份；不伪造初始定位'),
         'navigate_to_pose': (['x', 'y', 'yaw', 'speed'], '导航到map系位姿，按任务ID跟踪ACP'),
         'navigate_to_tag': (['tag_name', 'speed'], '导航到当前地图的语义点'),
@@ -146,16 +148,18 @@ class ControlledSpatialPlugin:
         props = {'action': {'type': 'string', 'enum': list(self.ACTIONS)},
                  **{k: {'type': 'string'} for k in ('map_name', 'name', 'description', 'tag_name')},
                  **{k: {'type': 'number', 'description': 'map坐标系位置，米'} for k in ('x', 'y')},
+                 'confirm_delete': {'type': 'boolean', 'description': '确认移除指定的底盘地图'},
                  'yaw': {'type': 'number', 'description': 'map坐标系绝对朝向，弧度'},
                  'speed': {'type': 'number', 'description': '0.05–0.3 m/s；导航线速度，默认0.15 m/s', 'minimum': .05, 'maximum': .3, 'default': .15}}
         required = {'start_mapping': ['map_name'], 'tag_place': ['name'], 'untag_place': ['name'],
-                    'load_map': ['map_name'], 'navigate_to_pose': ['x', 'y', 'yaw'],
+                    'load_map': ['map_name'], 'delete_map': ['map_name', 'confirm_delete'],
+                    'upload_map': ['map_name'], 'navigate_to_pose': ['x', 'y', 'yaw'],
                     'navigate_to_tag': ['tag_name']}
         return {'name': self.PREFIX, 'type': 'actuator', 'multiInstance': False,
                 'description': '0.05–0.3 m/s；Kuavo 5-W人工建图、打点与厂商底盘原生导航；导航独占底盘速度，保持全身BaseArm，可并行控制手臂/头部/下肢。',
                 'inputSchema': {'type': 'object', 'properties': props, 'required': ['action'],
                     'x-resource': 'base', 'x-hooks': {'on_interrupt_motion': {'action': 'stop_nav'}},
-                    'x-completion': {'actions': ['navigate_to_pose', 'navigate_to_tag', 'start_mapping', 'stop_mapping', 'load_map'], 'timeout': 1830},
+                    'x-completion': {'actions': ['navigate_to_pose', 'navigate_to_tag', 'start_mapping', 'stop_mapping', 'load_map', 'delete_map', 'upload_map'], 'timeout': 1830},
                     'x-action-params': {k: {'params': p, 'description': d, 'required': required.get(k, [])}
                                         for k, (p, d) in self.ACTIONS.items()}}}
 
@@ -662,15 +666,23 @@ class ControlledSpatialPlugin:
         elif action == 'stop_mapping':
             if not mapping or (mapping['phase'] != 'mapping' and not recovering_save):
                 raise RuntimeError('no_confirmed_mapping_session_inspect_info')
+        elif action in ('delete_map', 'upload_map'):
+            safe_name(args.get('map_name'))
+            if mapping or self.archive is None:
+                raise RuntimeError('map_transfer_requires_archive_and_no_mapping_session')
+            if action == 'delete_map' and args.get('confirm_delete') is not True:
+                raise ValueError('confirm_delete_required')
+            if action == 'upload_map':
+                self.archive.archived(args['map_name'])
         elif action == 'load_map':
             text(args.get('map_name'), 'map_name')
             if mapping:
                 raise RuntimeError('finish_or_reconcile_mapping_before_loading')
         else:
             raise ValueError('unsupported_map_action')
-        if action in ('start_mapping', 'load_map'):
+        if action in ('start_mapping', 'load_map', 'delete_map', 'upload_map'):
             exists = args['map_name'] in [Path(m.get('fileName', '')).stem for m in self.client.maps()]
-            if exists == (action == 'start_mapping'):
+            if exists == (action in ('start_mapping', 'upload_map')):
                 raise ValueError('map_name_already_exists' if exists else 'grid_map_not_found')
 
         if recovering_save:
@@ -698,13 +710,16 @@ class ControlledSpatialPlugin:
             if recovering_save:
                 self._map_pending['stage'] = 'SaveCartoMap'
             self._persist()
-        self._map_deadline = time.monotonic() + (1800 if action == 'stop_mapping' else 150)
+        self._map_deadline = time.monotonic() + (1800 if action in ('stop_mapping', 'upload_map', 'delete_map') else 150)
         started = time.monotonic()
         timing = {'operation': action, 'started_at': time.time(), 'stages': []}
         self._map_timing = timing
         def worker():
             try:
-                result = self._mutate_map(action, args, mapping, cancelled)
+                if action in ('upload_map', 'delete_map'):
+                    result = self._transfer_map(action, args['map_name'], cancelled)
+                else:
+                    result = self._mutate_map(action, args, mapping, cancelled)
                 if cancelled.is_set():
                     raise RuntimeError('map_operation_interrupted')
                 timing.update(state='completed', elapsed_s=time.monotonic()-started)
@@ -739,6 +754,54 @@ class ControlledSpatialPlugin:
         self._workers.add(thread)
         thread.start()
         return {'state': 'executing', 'action_id': aid, 'operation': action}
+
+    def _transfer_map(self, action, name, cancelled):
+        if self.client.current_map()['mapId'] == name:
+            raise ValueError('cannot_modify_active_map')
+        token = uuid4().hex
+        transfer = {'map_name': name, 'token': token}
+        if action == 'delete_map':
+            # Use a private backup task so the normal archive worker remains
+            # suspended while the base is reserved by this operation.
+            backup = MapArchive(self.client, self.archive.root, cancelled,
+                                idle=lambda: time.monotonic() < self._map_deadline)
+            backup.sync(name)
+            _, manifest = backup.archived(name)
+            operation = 'map_delete'
+        else:
+            operation = 'map_upload_commit'
+            try:
+                manifest = self.archive.stage_upload(name, token, cancelled, self._map_deadline)
+            except Exception:
+                try:
+                    self.client.native('map_upload_abort', **transfer)
+                except Exception:
+                    pass
+                raise
+
+        try:
+            if cancelled.is_set():
+                raise RuntimeError('map_transfer_interrupted')
+            self._require_stationary()
+            if cancelled.is_set() or time.monotonic() >= self._map_deadline:
+                raise RuntimeError('map_transfer_interrupted')
+            self._map_pending.update(stage=operation, stage_started_at=time.time(),
+                                     map_name=name, transfer_id=token)
+            self._persist()
+            response = self.client.native(operation, **transfer, manifest=manifest)
+            if response.get('success') is not True:
+                raise RuntimeError('map_transfer_not_confirmed')
+            # Verify the native map catalog, not just the SSH response.
+            self._wait(lambda: (name in [Path(m.get('fileName', '')).stem
+                                         for m in self.client.maps()]) == (action == 'upload_map'),
+                       cancelled, 15)
+            return {'state': 'completed', 'map_name': name, 'archive_retained': True}
+        finally:
+            if action == 'upload_map':
+                try:
+                    self.client.native('map_upload_abort', **transfer)
+                except Exception:
+                    pass
 
     def _require_stationary(self):
         state = self.client.observe(required=('agvState', 'state'))['state']

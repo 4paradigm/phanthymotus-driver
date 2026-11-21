@@ -24,6 +24,7 @@ from speaker import Speaker
 from microphone import Microphones
 from startup import StartupChecks
 from controlled_spatial import ControlledSpatialPlugin
+from spatial_map import SpatialMap
 from base_servo import BaseServo
 from base_limits import LINEAR_LIMIT, ANGULAR_LIMIT, SPEED_FRACTIONS
 
@@ -1199,6 +1200,7 @@ class KuavoBundle:
         self.plugins = [BaseDrivePlugin(self), ArmPlugin(self), LowerBodyPlugin(self),
                         HeadPlugin(self)]
         self.spatial = ControlledSpatialPlugin(self, config.get('controlled_spatial', {}))
+        self.spatial_map = SpatialMap(ros2_node, namespace, self.spatial.archive, self.spatial.store)
         self.base_servo = BaseServo(self, ros2_node)
         if "plugins" in config:
             plugin_config = dict(config['plugins'])
@@ -1206,9 +1208,12 @@ class KuavoBundle:
             if 'base_drive' not in plugin_config and 'loco' in plugin_config:
                 plugin_config['base_drive'] = plugin_config['loco']
             plugin_config.pop('loco', None)
+            if ('controlled_spatial' in plugin_config
+                    and plugin_config['controlled_spatial'].get('enabled', True)):
+                plugin_config.setdefault('spatial_map', {'enabled': True})
             self._enabled = {name for name, cfg in plugin_config.items() if cfg.get('enabled', True)}
         else:
-            self._enabled = {"base_drive", "base_servo", "controlled_spatial", "arm", "leg", "head", "speaker", "ext_mic",
+            self._enabled = {"base_drive", "base_servo", "controlled_spatial", "spatial_map", "arm", "leg", "head", "speaker", "ext_mic",
                              *SENSOR_CARDS, *PERIPHERAL_CARDS}
         aliases = {'loco': 'base_drive', 'camera_rgb': 'camera_left', 'camera_rgb_right': 'camera_right'}
         self._enabled = {aliases.get(name, name) for name in self._enabled if name not in ('state', 'switch_mode', 'waist', 'mic')}
@@ -1684,6 +1689,7 @@ class KuavoBundle:
         return (tools + [t for t in self.sensors.tools() if t['name'] in self._enabled]
                 + [t for t in self.peripherals.tools() if t['name'] in self._enabled]
                 + ([self.spatial.get_tool()] if 'controlled_spatial' in self._enabled else [])
+                + ([self.spatial_map.tool()] if 'spatial_map' in self._enabled else [])
                 + ([self.speaker.tool()] if 'speaker' in self._enabled else [])
                 + [t for t in self.microphones.tools() if t['name'] in self._enabled]
                 + ([self.base_servo.tool()] if 'base_servo' in self._enabled else []))
@@ -1718,6 +1724,8 @@ class KuavoBundle:
             return self.microphones.dispatch(name, action, args)
         if name == 'speaker':
             return self.speaker.dispatch(action, args)
+        if name == 'spatial_map':
+            return self.spatial_map.dispatch(action, args)
         if name == 'controlled_spatial':
             return self.spatial.dispatch(action, args)
         if name in PERIPHERAL_CARDS:
@@ -1746,6 +1754,7 @@ class KuavoBundle:
                 print(f"[shutdown] {_safe_log(result.get('error'))}", flush=True)
         self.base_servo.close()
         self.state.close()
+        self.spatial_map.close()
         self.spatial.close()
         self.startup_checks.close()
         self.peripherals.close()

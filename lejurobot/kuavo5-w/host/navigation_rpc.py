@@ -12,6 +12,9 @@ import os
 import sys
 import time
 import base64
+import fcntl
+import shutil
+import urllib.request
 
 
 def map_archive_read(operation, args, root=Path('/home/jt/jmap_config/jmaps')):
@@ -53,6 +56,110 @@ def map_archive_read(operation, args, root=Path('/home/jt/jmap_config/jmaps')):
         stream.seek(offset)
         data = stream.read(min(1024*1024, stat.st_size-offset))
     return {'data': base64.b64encode(data).decode('ascii')}
+
+
+_MAP_FILES = ('.yaml', '.pbstream', '.path', '.pgm')
+_MAP_CHUNK = 1024 * 1024
+
+
+def _assert_inactive_map(name):
+    request = 'http://127.0.0.1:8888/map/current?returnMapData=false'
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(request, timeout=5) as response:
+        result = json.loads(response.read(65536))
+    current = result.get('data')
+    if result.get('success') is not True or not isinstance(current, dict) or not current.get('mapId'):
+        raise RuntimeError('current_map_identity_unavailable')
+    if current['mapId'] == name:
+        raise ValueError('cannot_modify_active_map')
+
+
+def map_archive_write(operation, args, root=Path('/home/jt/jmap_config/jmaps'),
+                      assert_inactive=_assert_inactive_map):
+    name, token = args.get('map_name'), args.get('token')
+    if (not isinstance(name, str) or not name.strip() or len(name) > 80 or name in ('.', '..')
+            or any(c in name for c in '/\\') or any(ord(c) < 32 for c in name)):
+        raise ValueError('invalid_map_name')
+    if not isinstance(token, str) or not re.fullmatch(r'[a-f0-9]{32}', token):
+        raise ValueError('invalid_map_transfer_id')
+
+    # Private staging/quarantine on the same filesystem as the factory maps.
+    work = root / '.motus-map-transfers'
+    work.mkdir(mode=0o700, exist_ok=True)
+    if work.is_symlink() or work.stat().st_mode & 0o077:
+        raise RuntimeError('invalid_map_transfer_directory')
+    stage = work / (('deleted-' if operation == 'map_delete' else 'upload-') + token)
+    live = {suffix: root / (name + suffix) for suffix in _MAP_FILES}
+    with (work / 'lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if operation == 'map_upload_begin':
+            assert_inactive(name)
+            if any(os.path.lexists(path) for path in live.values()):
+                raise ValueError('map_name_already_exists')
+            stage.mkdir(mode=0o700)
+        elif operation == 'map_upload_abort':
+            if stage.is_dir():
+                shutil.rmtree(stage)
+        elif operation == 'map_upload_chunk':
+            suffix, offset = args.get('suffix'), args.get('offset')
+            if suffix not in live or type(offset) is not int or offset < 0 or offset % _MAP_CHUNK:
+                raise ValueError('invalid_map_archive_chunk')
+            data = base64.b64decode(args['data'], validate=True)
+            if not 0 < len(data) <= _MAP_CHUNK or offset + len(data) > 512 * _MAP_CHUNK:
+                raise ValueError('invalid_map_archive_chunk_size')
+            path = stage / suffix
+            with path.open('xb' if offset == 0 else 'r+b') as stream:
+                if stream.seek(0, os.SEEK_END) != offset:
+                    raise ValueError('unexpected_map_archive_offset')
+                stream.write(data)
+        elif operation == 'map_upload_commit':
+            manifest = args['manifest']
+            if manifest['map_name'] != name or set(manifest['files']) != set(live):
+                raise ValueError('invalid_map_archive_manifest')
+            for suffix, item in manifest['files'].items():
+                path = stage / suffix
+                digest = hashlib.sha256()
+                with path.open('rb') as stream:
+                    for chunk in iter(lambda: stream.read(_MAP_CHUNK), b''):
+                        digest.update(chunk)
+                    os.fsync(stream.fileno())
+                if path.stat().st_size != item['size'] or digest.hexdigest() != item['sha256']:
+                    raise ValueError('map_archive_digest_mismatch')
+            # The backup verifier uses the road-map write as the completion fence.
+            # Restore that ordering regardless of chunk transfer order.
+            newest = max((stage / suffix).stat().st_mtime_ns for suffix in _MAP_FILES)
+            os.utime(stage / '.path', ns=(newest, newest))
+            assert_inactive(name)
+            installed = []
+            try:
+                # The factory lists maps via PGM. Publish that file last.
+                for suffix in _MAP_FILES:
+                    os.link(stage / suffix, live[suffix])
+                    installed.append(live[suffix])
+            except Exception:
+                for path in reversed(installed):
+                    path.unlink()
+                raise
+            shutil.rmtree(stage)
+        elif operation == 'map_delete':
+            manifest = map_archive_read('map_archive_manifest', args, root)
+            if manifest != args['manifest']:
+                raise ValueError('map_changed_since_backup')
+            assert_inactive(name)
+            stage.mkdir(mode=0o700)
+            moved = []
+            try:
+                # Remove the entry from the factory list before its sidecars.
+                for suffix in reversed(_MAP_FILES):
+                    live[suffix].rename(stage / live[suffix].name)
+                    moved.append(suffix)
+            except Exception:
+                for suffix in reversed(moved):
+                    (stage / live[suffix].name).rename(live[suffix])
+                raise
+        else:
+            raise ValueError('unsupported_map_archive_write')
+    return {'success': True}
 
 
 def dispatch_service_class(service_class, server_md5):
@@ -188,6 +295,9 @@ def map_save_status(name, root=Path('/home/jt/jmap_config/jmaps')):
 
 
 def main(request):
+    if request['operation'] in ('map_upload_begin', 'map_upload_abort', 'map_upload_chunk',
+                                'map_upload_commit', 'map_delete'):
+        return map_archive_write(request['operation'], request.get('args', {}))
     if request['operation'] in ('map_archive_manifest', 'map_archive_chunk'):
         return map_archive_read(request['operation'], request.get('args', {}))
     if request['operation'] == 'map_save_status':

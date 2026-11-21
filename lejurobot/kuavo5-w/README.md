@@ -337,6 +337,8 @@ sensor/actuator 卡片实现系统生命周期动作；`model` 为读取型 reso
 | `tag_place` | `name`，可选 `description` | 保存当前 map 系 x/y/yaw；建图期间先绑定当前建图会话 |
 | `untag_place` / `list_tags` | `name` / 无 | 删除/列出当前地图语义点，列表含相对距离和方向 |
 | `list_maps` / `load_map` | 无 / `map_name` | 列出真实 PGM 地图 / 载入并切回自动模式 |
+| `delete_map` | `map_name`、`confirm_delete: true` | 校验并备份完整地图，随后从底盘列表移除非活动地图，保留归档和点位 |
+| `upload_map` | `map_name` | 将上位机同名归档的四个 JaTen 文件恢复到底盘，拒绝覆盖；可另行载入 |
 | `navigate_to_pose` | `x`、`y`（米）、`yaw`（弧度），可选 `speed` | 按 map 系目标导航 |
 | `navigate_to_tag` | `tag_name`，可选 `speed` | 只精确匹配当前地图中的语义点 |
 | `stop_nav` | 无 | 全身暂停，同时取消原生导航并核实新鲜里程计停稳 |
@@ -353,6 +355,11 @@ sensor/actuator 卡片实现系统生命周期动作；`model` 为读取型 reso
 明确返回的拒绝或反馈异常在重新确认软急停后可重试 start。
 把新卡片加入画布后使用。已有 `/config/config.yaml` 不会被镜像覆盖，旧部署需在
 `plugins` 下增加 `controlled_spatial: {enabled: true}`；新部署的镜像默认已开启。
+`spatial_map` 是独立的地图预览卡，读取上位机的 `<data>/maps/kuavo5w` 快照，
+默认展示最近归档的地图版本。`list_maps` 列出可预览地图，`select_map` 切换预览。
+画面显示占据栅格、点位标记及其方向，`info` 返回点位名称和坐标。
+点位按栅格和路网指纹匹配，活动导航地图仍由 `controlled_spatial.load_map` 切换。
+
 连接参数共用 `provisioning.chassis`，不需要每张卡重复填写 SSH 信息。
 SSH RPC 辅助源码随镜像构建，每次在底盘执行固定操作，使用当地已安装的 ROS 消息类；
 不需要手工安装新服务，不额外开端口或复制一个可能不兼容的消息工作区。

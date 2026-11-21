@@ -35,7 +35,7 @@ RUN set -eu; \
 RUN /bin/bash -c 'source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && python3 -c "from audio_msgs.msg import AudioChunk"'
 WORKDIR /work
 COPY common/ /work/common/
-COPY main.py device.py base_servo.py base_limits.py rosbridge_client.py kuavo_sensors.py peripherals.py camera_specs.py spatial_telemetry.py speaker.py microphone.py startup.py bootstrap.py connection_defaults.py controlled_spatial.py spatial_client.py map_storage.py config.yaml driver.yaml /work/
+COPY main.py device.py base_servo.py base_limits.py rosbridge_client.py kuavo_sensors.py peripherals.py camera_specs.py spatial_telemetry.py speaker.py microphone.py startup.py bootstrap.py connection_defaults.py controlled_spatial.py spatial_client.py map_storage.py spatial_map.py config.yaml driver.yaml /work/
 COPY host/ /work/host/
 COPY resource/ /work/resource/
 COPY deploy/ /deploy/

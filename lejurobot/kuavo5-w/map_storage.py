@@ -116,6 +116,38 @@ class MapArchive:
                 raise RuntimeError('invalid_map_archive_file')
         return hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
 
+    def archived(self, name):
+        directory = self.root / safe_name(name)
+        pointer = json.loads((directory / 'current.json').read_text())
+        version = pointer['version']
+        if (pointer['map_name'] != name or not isinstance(version, str) or len(version) != 64
+                or any(c not in '0123456789abcdef' for c in version)):
+            raise ValueError('invalid_map_archive_pointer')
+        snapshot = directory / 'versions' / version
+        manifest = json.loads((snapshot / 'manifest.json').read_text())
+        if self.validate(manifest, name) != version:
+            raise ValueError('invalid_map_archive_manifest')
+        return snapshot, manifest
+
+    def stage_upload(self, name, token, cancelled, deadline):
+        directory, manifest = self.archived(name)
+        identity = {'map_name': name, 'token': token}
+        self.client.native('map_upload_begin', **identity)
+        for suffix, item in manifest['files'].items():
+            path = directory / (name + suffix)
+            if path.is_symlink() or not path.is_file() or path.stat().st_size != item['size']:
+                raise RuntimeError('invalid_upload_source')
+            with path.open('rb') as stream:
+                for offset in range(0, item['size'], CHUNK_SIZE):
+                    if cancelled.is_set() or time.monotonic() >= deadline:
+                        raise InterruptedError('map_upload_interrupted')
+                    data = stream.read(CHUNK_SIZE)
+                    if len(data) != min(CHUNK_SIZE, item['size'] - offset):
+                        raise RuntimeError('invalid_upload_source')
+                    self.client.native('map_upload_chunk', **identity, suffix=suffix,
+                                       offset=offset, data=base64.b64encode(data).decode('ascii'))
+        return manifest
+
     def sync(self, name):
         safe_name(name)
         manifest = self.client.native('map_archive_manifest', map_name=name)
