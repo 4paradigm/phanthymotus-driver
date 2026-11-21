@@ -197,7 +197,7 @@ another navigation stack or change controller parameters.
 - `stop_mapping`: save the native pose graph and map, archive native files and
   a display occupancy grid, then switch to localization. Failed operations
   retain an error rather than report a successful save.
-- `list_maps`, `load_map(map_name)`, `delete_map(map_name)`: preserve map-scoped
+- `list_maps`, `load_map(map_name)`, `unload_map()`, `delete_map(map_name)`: unload the active chassis map before deleting it, while preserving map-scoped
   tags, wait for a fresh pose after loading, and reject deletion of the active
   map or a map not managed by this card.
 - `navigate_to_tag(tag_name)`, `navigate_to_pose(x, y, yaw)`: require a loaded
@@ -245,7 +245,7 @@ chassis returns. Stay still when calling `start_mapping` until it reports
 before calling `load_map`, which seeds SLAM automatically. For an older map
 without a saved start pose, pass its known map-frame `x`, `y`, and `yaw` to
 `load_map` once while physically at that start. If starting from another known
-location, `relocalize_at_tag(tag_name)` is available as an optional recovery.
+location, provide the known start pose to `load_map` once so it can be stored for future loads.
 The driver requires fresh TF within 0.25 m and 20 degrees of the seed for one
 second before enabling navigation and tagging on a loaded map. `get_pose`
 reports `localization_verified`. The driver also checks

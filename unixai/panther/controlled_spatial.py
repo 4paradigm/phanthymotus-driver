@@ -120,9 +120,8 @@ class ControlledSpatialPlugin:
     ACTION_PARAMS = {
         'start': [], 'info': [], 'stop': [],
         'start_mapping': ['map_name'], 'stop_mapping': [],
-        'list_maps': [], 'load_map': ['map_name', 'x', 'y', 'yaw'], 'delete_map': ['map_name'],
+        'list_maps': [], 'load_map': ['map_name', 'x', 'y', 'yaw'], 'unload_map': [], 'delete_map': ['map_name'],
         'tag_place': ['name', 'description'], 'untag_place': ['name'], 'list_tags': [],
-        'relocalize_at_tag': ['tag_name'],
         'navigate_to_tag': ['tag_name'], 'navigate_to_pose': ['x', 'y', 'yaw'],
         'stop_nav': [], 'get_pose': [],
     }
@@ -174,7 +173,7 @@ class ControlledSpatialPlugin:
                  **{key: {'type': 'string'} for key in ('map_name', 'name', 'tag_name', 'description')},
                  **{key: {'type': 'number'} for key in ('x', 'y', 'yaw')}}
         return {'name': 'controlled_spatial', 'type': 'actuator', 'multiInstance': False,
-                'description': 'Panther controlled SLAM: map manually and tag places. To load a map, return to its mapping start position and heading. For legacy maps without a saved start, optionally supply the known map-frame x, y, yaw together on the first load. relocalize_at_tag is optional recovery at a known tag. yaw is radians.',
+                'description': 'Panther controlled SLAM: map manually and tag places. Load a map at its saved mapping start pose, then unload it when switching to an idle chassis or deleting it. For legacy maps without a saved start, optionally supply the known map-frame x, y, yaw together on the first load. yaw is radians.',
                 'inputSchema': {'type': 'object', 'properties': props, 'required': ['action'],
                     'additionalProperties': False, 'x-resource': 'base',
                     'x-completion': {'actions': ['navigate_to_tag', 'navigate_to_pose'],
@@ -592,7 +591,7 @@ class ControlledSpatialPlugin:
             if not self._requires_localization():
                 return result
             if explicit_seed is None and seed is None:
-                return {**result, 'message': 'Legacy map has no saved start pose. At the original mapping start, call load_map with its known x, y and yaw once, or relocalize at a known tag.'}
+                return {**result, 'message': 'Legacy map has no saved start pose. At the original mapping start, call load_map with its known x, y and yaw once.'}
             result['seed_source'] = 'provided_start_pose' if explicit_seed is not None else 'mapping_start_pose'
             try:
                 if not self._wait_until(lambda: self.grid is not None):
@@ -605,11 +604,30 @@ class ControlledSpatialPlugin:
             if explicit_seed is not None and seed is None:
                 self.store.remember_map_start(name, explicit_seed)
             return {**result, 'state': 'localized', 'pose': pose}
-        if action == 'relocalize_at_tag':
-            tag = next((p for p in self.store.tags(self.active_map) if p['name'] == args.get('tag_name')), None)
-            if tag is None:
-                raise ValueError('Unknown tag on the loaded map')
-            return {'state': 'localized', 'tag_name': tag['name'], 'pose': self._localize(tag)}
+        if action == 'unload_map':
+            if self.mapping:
+                raise RuntimeError('Stop mapping before unloading the map')
+            with self.lock:
+                active = self.active_map
+                has_nav = self.nav is not None
+            if active is None:
+                return {'state': 'idle', 'message': 'No map is loaded'}
+            if has_nav:
+                self.stop_nav()
+            # The vendor API has no separate unload call. Disabling localization
+            # and resetting SLAM clears the chassis-side map while leaving the
+            # archived map and its tags available for a later load_map.
+            self._call('set_localization_mode', data=False)
+            self._call('reset')
+            with self.lock:
+                self.localized_after = time.monotonic()
+                self.pose_stamp_after = self.node.get_clock().now().nanoseconds / 1e9 if self.node else 0.0
+                self.pose = None
+                self.localization_verified = False
+                self.mapping_start_pose = None
+                self.grid = None
+                self.active_map = None
+            return {'state': 'idle', 'map_name': active}
         if action == 'delete_map':
             name = safe_name(args.get('map_name', ''))
             if name == self.active_map:
@@ -629,7 +647,7 @@ class ControlledSpatialPlugin:
                 if self.mapping and self._requires_localization() and self.mapping_start_pose is None:
                     raise RuntimeError('Wait for the mapping start pose before saving tags')
                 if not self.mapping and self._requires_localization() and not self.localization_verified:
-                    raise RuntimeError('Confirm localization with load_map at the start pose or relocalize_at_tag before saving tags')
+                    raise RuntimeError('Confirm localization with load_map at the mapping start pose before saving tags')
                 self.store.tag(safe_name(args.get('name', '')), self.active_map,
                                self.current_pose(), str(args.get('description', ''))[:1024])
             elif action == 'untag_place':
@@ -642,7 +660,7 @@ class ControlledSpatialPlugin:
             self.current_pose()
             self._require_scan()
             if self._requires_localization() and not self.localization_verified:
-                raise RuntimeError('Confirm localization with load_map at the start pose or relocalize_at_tag before navigation')
+                raise RuntimeError('Confirm localization with load_map at the mapping start pose before navigation')
             if action == 'navigate_to_tag':
                 target = next((p for p in self.store.tags(self.active_map) if p['name'] == args.get('tag_name')), None)
                 if target is None:

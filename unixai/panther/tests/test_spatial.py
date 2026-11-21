@@ -176,11 +176,34 @@ class SpatialTest(unittest.TestCase):
         p._navigate = Mock()
         self.assertEqual(p.info()['state'], 'localizing')
         self.assertFalse(p.dispatch('get_pose', {})['localization_verified'])
-        self.assertIn('relocalize_at_tag', p.dispatch('tag_place', {'name': 'P0'})['error'])
+        self.assertIn('load_map', p.dispatch('tag_place', {'name': 'P0'})['error'])
         self.assertEqual(p.store.tags('room'), [])
         result = p.dispatch('navigate_to_pose', {'x': 0., 'y': 0., 'yaw': 0.})
-        self.assertIn('relocalize_at_tag', result['error'])
+        self.assertIn('load_map', result['error'])
         p._navigate.assert_not_called()
+
+    def test_unload_map_clears_active_state_and_preserves_archive(self):
+        p = self.plugin
+        p.active_map = 'room'
+        p.store.save_map('room', p.root / 'room', {'x': 0.0, 'y': 0.0, 'yaw': 0.0})
+        p._call.reset_mock()
+
+        result = p.dispatch('unload_map', {})
+
+        self.assertEqual(result, {'state': 'idle', 'map_name': 'room'})
+        self.assertIsNone(p.active_map)
+        self.assertIsNone(p.grid)
+        self.assertFalse(p.localization_verified)
+        self.assertEqual(p.store.maps()[0]['name'], 'room')
+        self.assertEqual(p._call.call_args_list[0].args, ('set_localization_mode',))
+        self.assertEqual(p._call.call_args_list[1].args, ('reset',))
+
+    def test_unload_map_is_exposed_and_relocalize_action_is_removed(self):
+        actions = ControlledSpatialPlugin({'native_slam_pcd_dir': str(Path(self.tmp.name) / 'maps'),
+                                           'native_slam_db_path': str(Path(self.tmp.name) / 'other.db')},
+                                          'test', None).get_tool()['inputSchema']['properties']['action']['enum']
+        self.assertIn('unload_map', actions)
+        self.assertNotIn('relocalize_at_tag', actions)
 
     def test_tag_seed_checks_new_tf_for_agreement_before_enabling_navigation(self):
         p = self.plugin
