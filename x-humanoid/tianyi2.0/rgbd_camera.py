@@ -42,10 +42,11 @@ def make_geometry(color, depth, *, registered):
     crop_w, crop_h = min(width, height * 4 // 3), min(height, width * 3 // 4)
     left, top = (width - crop_w) // 2, (height - crop_h) // 2
     k = np.asarray(depth.k, float).reshape(3, 3).copy()
-    k[0] *= 640 / crop_w
-    k[1] *= 480 / crop_h
-    k[0, 2] -= left * 640 / crop_w
-    k[1, 2] -= top * 480 / crop_h
+    sx, sy = 640 / crop_w, 480 / crop_h
+    k[0, 0] *= sx
+    k[1, 1] *= sy
+    k[0, 2] = (k[0, 2] - left + .5) * sx - .5
+    k[1, 2] = (k[1, 2] - top + .5) * sy - .5
     u, v = np.meshgrid(np.arange(640), np.arange(480))
     def project(matrix):
         x, y = (u - matrix[0, 2]) / matrix[0, 0], (v - matrix[1, 2]) / matrix[1, 1]

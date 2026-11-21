@@ -74,6 +74,8 @@ class CompressedImage:
 def depth_plugin(monkeypatch):
     # Isolate the production class from unrelated joint/ROS imports in device.py.
     source = Path(__file__).parents[1] / "device.py"
+    monkeypatch.syspath_prepend(str(source.parent))
+    monkeypatch.syspath_prepend(str(source.parents[2]))
     tree = ast.parse(source.read_text(encoding="utf-8"))
     definition = next(node for node in tree.body
                       if isinstance(node, ast.ClassDef) and node.name == "DepthCameraPlugin")
@@ -86,6 +88,7 @@ def depth_plugin(monkeypatch):
     exec(compile(ast.Module(body=[definition], type_ignores=[]), str(source), "exec"), namespace)
     messages = types.ModuleType("sensor_msgs.msg")
     messages.Image = type("Image", (), {})
+    messages.CameraInfo = type("CameraInfo", (), {})
     messages.CompressedImage = CompressedImage
     package = types.ModuleType("sensor_msgs")
     package.msg = messages
@@ -94,7 +97,7 @@ def depth_plugin(monkeypatch):
     monkeypatch.setitem(sys.modules, "sensor_msgs", package)
     monkeypatch.setitem(sys.modules, "sensor_msgs.msg", messages)
     monkeypatch.setitem(sys.modules, "deflate", accelerated_zlib)
-    # These tests use native 640x480 frames; resizing is not part of this change.
+    # Wire-only tests do not need OpenCV; geometry tests load it explicitly.
     monkeypatch.setitem(sys.modules, "cv2", types.ModuleType("cv2"))
     monkeypatch.setitem(sys.modules, "numpy", np)
     executor = types.SimpleNamespace(add_node=lambda node: None)
@@ -104,6 +107,7 @@ def depth_plugin(monkeypatch):
     # Wire-format tests drive one pending frame synchronously. Background
     # scheduling has its own real-clock fixture below.
     plugin._start_worker = lambda: None
+    plugin._CALIBRATION_WAIT_S = 0.
     plugin.start()
     yield plugin, clock, messages
     plugin.stop()
@@ -431,3 +435,121 @@ def test_worker_coalesces_while_bridge_publish_is_busy(depth_plugin):
             plugin._worker_shutdown = True
             plugin._frame_ready.notify_all()
         plugin._worker.join(timeout=1)
+
+
+def native_camera_info(*, frame_id="depth_optical", width=640, height=480, fx=370., cx=320.):
+    return types.SimpleNamespace(
+        header=types.SimpleNamespace(frame_id=frame_id), width=width, height=height,
+        distortion_model="plumb_bob", d=[0.] * 5,
+        k=[fx, 0., cx, 0., fx, 240., 0., 0., 1.],
+        binning_x=0, binning_y=0,
+        roi=types.SimpleNamespace(x_offset=0, y_offset=0, width=0, height=0))
+
+
+def test_native_intrinsics_are_declared_on_the_depth_output(depth_plugin):
+    plugin, _, _ = depth_plugin
+    plugin._on_camera_info("depth", native_camera_info())
+    plugin._on_image(frame()[0])
+    plugin._publish_latest()
+    declaration, = plugin.dispatch("info", {})["camera_info"]
+    assert declaration["topic"] == plugin._topic
+    assert declaration["id"].endswith("/head/depth")
+    assert declaration["K"] == native_camera_info().k
+    assert declaration["width"] == 640 and declaration["height"] == 480
+
+
+def test_same_frame_depth_is_sampled_on_the_rgb_pixel_grid(depth_plugin, monkeypatch):
+    plugin, _, _ = depth_plugin
+    monkeypatch.delitem(sys.modules, "cv2")
+    plugin._cv2 = pytest.importorskip("cv2")
+    native = native_camera_info(fx=370., cx=320.)
+    rgb = native_camera_info(fx=460., cx=320.)
+    plugin._on_camera_info("depth", native)
+    plugin._on_camera_info("color", rgb)
+    image, pixels = frame()
+    pixels[:] = 0
+    pixels[240, 357] = 1350  # x/z = 0.1 in the native depth grid.
+    image.data = pixels.tobytes()
+    plugin._on_image(image)
+    plugin._publish_latest()
+    output, = plugin._pub.messages
+    projected = np.frombuffer(zlib.decompress(output.data), dtype="<u2").reshape(480, 640)
+    assert projected[240, 366] == 1350  # The same ray in the RGB grid.
+    assert output.header is image.header
+    declaration, = plugin.dispatch("info", {})["camera_info"]
+    assert declaration["id"].endswith("/head/color")
+    assert declaration["K"] == rgb.k
+
+
+def test_native_depth_does_not_claim_rgb_identity_with_unmatched_frame(depth_plugin):
+    plugin, _, _ = depth_plugin
+    plugin._on_camera_info("depth", native_camera_info())
+    plugin._on_camera_info("color", native_camera_info(frame_id="different_optical", fx=460.))
+    plugin._on_image(frame()[0])
+    plugin._publish_latest()
+    info = plugin.dispatch("info", {})
+    assert info["registration_to_color"] == "unknown"
+    declaration, = info["camera_info"]
+    assert declaration["id"].endswith("/head/depth")
+
+
+def test_native_crop_and_resize_declare_the_output_principal_point(depth_plugin, monkeypatch):
+    plugin, _, _ = depth_plugin
+    monkeypatch.delitem(sys.modules, "cv2")
+    plugin._cv2 = pytest.importorskip("cv2")
+    image, _ = frame()
+    image.width, image.height, image.step = 1280, 720, 2560
+    image.data = np.full((720, 1280), 1200, dtype="<u2").tobytes()
+    plugin._on_camera_info("depth", native_camera_info(width=1280, height=720, fx=750., cx=638.))
+    plugin._on_image(image)
+    plugin._publish_latest()
+    info = plugin.dispatch("info", {})
+    assert info["source_geometry"]["crop_xywh"] == [160, 0, 960, 720]
+    declaration, = info["camera_info"]
+    assert declaration["K"][0] == pytest.approx(500.)
+    assert declaration["K"][2] == pytest.approx((638. - 160 + .5) * (2 / 3) - .5)
+
+
+def test_registered_stream_stops_publishing_if_optics_change_midstream(depth_plugin, monkeypatch):
+    plugin, _, _ = depth_plugin
+    monkeypatch.delitem(sys.modules, "cv2")
+    plugin._cv2 = pytest.importorskip("cv2")
+    native = native_camera_info()
+    plugin._on_camera_info("depth", native)
+    plugin._on_camera_info("color", native_camera_info(fx=460.))
+    plugin._on_image(frame()[0])
+    plugin._publish_latest()
+
+    plugin._on_camera_info("color", native_camera_info(fx=470.))
+    plugin._on_image(frame()[0])
+    plugin._publish_latest()
+
+    assert len(plugin._pub.messages) == 1
+    info = plugin.dispatch("info", {})
+    assert info["camera_info"][0]["K"][0] == 460.
+    assert info["last_error"] == "depth calibration changed during streaming"
+
+
+def test_start_returns_the_declaration_after_the_first_registered_publish(depth_plugin, monkeypatch):
+    plugin, _, _ = depth_plugin
+    monkeypatch.delitem(sys.modules, "cv2")
+    plugin._cv2 = pytest.importorskip("cv2")
+    plugin.stop()
+    plugin._CALIBRATION_WAIT_S = 1.
+    armed = threading.Event()
+    plugin._start_worker = armed.set
+    started = []
+    request = threading.Thread(target=lambda: started.append(plugin.dispatch("start", {})))
+    request.start()
+    try:
+        assert armed.wait(1.)
+        assert request.is_alive()
+        plugin._on_camera_info("depth", native_camera_info())
+        plugin._on_camera_info("color", native_camera_info(fx=460.))
+        plugin._on_image(frame()[0])
+        plugin._publish_latest()
+    finally:
+        request.join(2.)
+    result, = started
+    assert result["registration_to_color"] == "registered"
+    assert result["camera_info"][0]["K"][0] == 460.

@@ -38,9 +38,19 @@ def test_crop_scales_intrinsics_using_actual_depth_optical_geometry():
     result=m.make_geometry(color,depth,registered=True)
     # The narrower RGB vertical field limits the common 4:3 viewport.
     assert 689.25*480/720 <= result['K'][0,0] <= 689.25*480/720*1.02
-    assert result['K'][0,2]==pytest.approx(320.)
     assert result['color_x'].shape==(480,640)
-    assert result['depth_x'][240,320]==pytest.approx(640.)
+    center = result['K'][0,2]
+    assert np.interp(center, np.arange(640), result['depth_x'][240]) == pytest.approx(640.)
+
+
+def test_output_pixel_centres_use_the_cropped_depth_calibration():
+    color = info(400, width=1280, height=720)
+    depth = info(750, width=1280, height=720)
+    depth.k[2] = 638.
+    result = m.make_geometry(color, depth, registered=True)
+    assert result['K'][0, 2] == pytest.approx(318.5)
+    assert result['depth_x'][0, 0] == pytest.approx(160.25)
+    assert result['depth_y'][0, 0] == pytest.approx(.25)
 
 
 @pytest.mark.parametrize('change',[

@@ -57,7 +57,7 @@ RUN sh /tmp/tianyi-loco-sdk-src/build_sdk.sh "${TARGETARCH:-$(uname -m)}" && \
 
 COPY resource/ /work/resource/
 COPY common/ /work/common/
-COPY main.py device.py wrist_cameras.py wrist_camera_devices.py servo.py joints_bridge.py light.py nav_client.py loco_state.py loco_odometry.py clock_probe.py loco_servo.py loco_servo_process.py slamtec_velocity.py ext_devices.py audio_sender.py config.yaml driver.yaml controlled_spatial.py controlled_spatial_map.py socket_bridge.py bridge_integration.py bridged_publisher.py slam_pointcloud.py rgbd_camera.py estimated_body_tf.py /work/
+COPY main.py device.py head_depth_calibration.py wrist_cameras.py wrist_camera_devices.py servo.py joints_bridge.py light.py nav_client.py loco_state.py loco_odometry.py clock_probe.py loco_servo.py loco_servo_process.py slamtec_velocity.py ext_devices.py audio_sender.py config.yaml driver.yaml controlled_spatial.py controlled_spatial_map.py socket_bridge.py bridge_integration.py bridged_publisher.py slam_pointcloud.py rgbd_camera.py estimated_body_tf.py /work/
 COPY dds-local.xml /opt/phanthy-motus/
 COPY deploy/     /deploy/
 RUN mkdir -p /opt/phanthy-motus/data/maps

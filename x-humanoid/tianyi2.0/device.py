@@ -1973,6 +1973,8 @@ class DepthCameraPlugin:
     Cropping, compression, and the synchronous socket-bridge write all run on
     one dedicated worker, never on either ROS executor.
     """
+    _CALIBRATION_WAIT_S = 2.0
+
     def __init__(self, plugin_config, namespace, ros2):
         self._running = False
         # Legacy Navi binds /visual_depth before consulting the ROS graph.
@@ -1986,6 +1988,11 @@ class DepthCameraPlugin:
         self._received_frames = self._invalid_frames = self._stale_frames = 0
         self._coalesced_frames = self._publish_errors = 0
         self._source_geometry = None
+        self._native_intrinsics = {}
+        self._camera_declaration = None
+        self._registration_map = None
+        self._registered_to_color = False
+        self._camera_info_subscriptions = []
         self._latest_image = None
         self._latest_image_lock = threading.Lock()
         self._frame_ready = threading.Condition(self._latest_image_lock)
@@ -2024,7 +2031,7 @@ class DepthCameraPlugin:
                 raise
 
     def _start_stream(self):
-        from sensor_msgs.msg import Image
+        from sensor_msgs.msg import CameraInfo, Image
         import cv2
         import numpy as np
         self._cv2, self._np = cv2, np
@@ -2051,6 +2058,12 @@ class DepthCameraPlugin:
         from sensor_msgs.msg import CompressedImage as _CI
         if self._pub is None:
             self._pub = self._pub_node.create_publisher(_CI, self._topic, latest_qos)
+        if not self._camera_info_subscriptions:
+            for stream in ("depth", "color"):
+                subscription = self._sub_node.create_subscription(
+                    CameraInfo, f"/ob_camera_head/{stream}/camera_info",
+                    lambda msg, kind=stream: self._on_camera_info(kind, msg), ingress_qos)
+                self._camera_info_subscriptions.append(subscription)
         if self._subscription is None:
             self._subscription = self._sub_node.create_subscription(
                 Image, "/ob_camera_head/depth/image_raw", self._on_image, ingress_qos)
@@ -2063,6 +2076,8 @@ class DepthCameraPlugin:
             self._invalid_frames = self._stale_frames = self._coalesced_frames = 0
             self._publish_errors = 0
             self._source_geometry = self._latest_image = None
+            self._camera_declaration = None
+            self._registered_to_color = False
             self._next_publish_due = 0.0
             self._last_transform_ms = self._max_transform_ms = 0.0
             self._last_compress_ms = self._max_compress_ms = 0.0
@@ -2099,6 +2114,13 @@ class DepthCameraPlugin:
                 self._latest_image = None
                 self._next_publish_due = 0.0
                 self._frame_ready.notify_all()
+
+    def _on_camera_info(self, stream, msg):
+        from head_depth_calibration import Intrinsics
+
+        calibration = Intrinsics.from_camera_info(msg)
+        with self._frame_ready:
+            self._native_intrinsics[stream] = calibration
 
     def _on_image(self, msg):
         with self._frame_ready:
@@ -2160,12 +2182,22 @@ class DepthCameraPlugin:
             self._record_stale(generation)
             return
         try:
-            dashboard = self._to_dashboard_depth(msg)
-            if dashboard is None:
+            converted = self._to_dashboard_depth(msg)
+            if converted is None:
                 with self._frame_ready:
                     if generation == self._generation:
                         self._invalid_frames += 1
                 return
+            dashboard, geometry, declaration, registered = converted
+            with self._frame_ready:
+                if not self._running or generation != self._generation:
+                    return
+                # Core snapshots camera_info at start. An aligned stream must
+                # stay in the geometry already supplied to its consumers.
+                if self._registered_to_color and declaration != self._camera_declaration:
+                    self._invalid_frames += 1
+                    self._last_error = "depth calibration changed during streaming"
+                    return
             raw_depth = dashboard.astype("<u2", copy=False).tobytes()
             transformed_at = time.monotonic()
             transform_ms = (transformed_at - started) * 1000
@@ -2199,25 +2231,15 @@ class DepthCameraPlugin:
                 raise ConnectionError("socket bridge did not accept depth frame")
             finished = time.monotonic()
             bridge_ms = (finished - bridge_started) * 1000
-            width, height = int(msg.width), int(msg.height)
-            crop_width, crop_height = width, height
-            if width * 3 > height * 4:
-                crop_width = height * 4 // 3
-            elif width * 3 < height * 4:
-                crop_height = width * 3 // 4
-            geometry = {
-                "width": width, "height": height,
-                "frame_id": str(getattr(msg.header, "frame_id", "")),
-                "encoding": str(msg.encoding),
-                "crop_xywh": [(width - crop_width) // 2, (height - crop_height) // 2,
-                              crop_width, crop_height],
-                "output_size": [640, 480],
-            }
             with self._frame_ready:
                 if not self._running or generation != self._generation:
                     return
                 previous = self._last_published_at if self._forwarded_frames else None
                 self._source_geometry = geometry
+                self._camera_declaration = declaration
+                self._registered_to_color = registered
+                if registered:
+                    self._frame_ready.notify_all()
                 self._last_published_at = finished
                 if self._first_published_at is None:
                     self._first_published_at = finished
@@ -2266,17 +2288,53 @@ class DepthCameraPlugin:
         if raw.size < needed:
             return None
         depth = raw[:needed].reshape(height, step)[:, :width * 2].view(self._np.uint16).reshape(height, width)
-        if width == 640 and height == 480:
-            return depth
-        if width * 3 > height * 4:
-            crop_width = height * 4 // 3
-            left = (width - crop_width) // 2
-            depth = depth[:, left:left + crop_width]
-        elif width * 3 < height * 4:
-            crop_height = width * 3 // 4
-            top = (height - crop_height) // 2
-            depth = depth[top:top + crop_height, :]
-        return self._cv2.resize(depth, (640, 480), interpolation=self._cv2.INTER_NEAREST)
+        from common.camera_info import build
+        from head_depth_calibration import center_crop, color_to_depth_map
+
+        frame_id = str(msg.header.frame_id)
+        crop = center_crop(width, height)
+        left, top, crop_width, crop_height = crop
+        if not crop_width or not crop_height:
+            return None
+        with self._frame_ready:
+            native = self._native_intrinsics.get("depth")
+            color = self._native_intrinsics.get("color")
+        if native is not None and (frame_id, width, height) != (native.frame_id, native.width, native.height):
+            native = None
+        registered = native is not None and color is not None and frame_id == color.frame_id
+        if registered:
+            output_camera = color.cropped((0, 0, color.width, color.height), 640, 480)
+            key = (native, output_camera)
+            if self._registration_map is None or self._registration_map[0] != key:
+                mapping = color_to_depth_map(native, output_camera, self._cv2, self._np)
+                self._registration_map = (key, mapping)
+            depth = self._cv2.remap(depth, self._registration_map[1], None, self._cv2.INTER_NEAREST)
+        else:
+            output_camera = native.cropped(crop, 640, 480) if native is not None else None
+            if (width, height) != (640, 480):
+                depth = depth[top:top + crop_height, left:left + crop_width]
+                interpolation = (self._cv2.INTER_NEAREST_EXACT if output_camera is not None
+                                 else self._cv2.INTER_NEAREST)
+                depth = self._cv2.resize(depth, (640, 480), interpolation=interpolation)
+
+        geometry = {
+            "width": width, "height": height, "frame_id": frame_id, "encoding": str(msg.encoding),
+            "crop_xywh": None if registered else list(crop), "output_size": [640, 480],
+        }
+        declaration = None
+        if output_camera is not None:
+            target = "color" if registered else "depth"
+            declaration = build(
+                topic=self._topic, id=f"x-humanoid/tianyi2.0/head/{target}",
+                format="image/depth-zlib", width=640, height=480, distortion_model="pinhole",
+                K=output_camera.k, D=output_camera.d, source="derived-from-K",
+                measured_on=f"/ob_camera_head/{target}/camera_info",
+                pipeline=["x-humanoid/tianyi2.0/camera_depth"],
+                vendor={"input_topic": "/ob_camera_head/depth/image_raw", "frame_id": frame_id,
+                        "registration_to_color": "registered" if registered else "unknown"},
+            )
+        return depth, geometry, declaration, registered
+
     def dispatch(self, action, args):
         # main.py only invokes start() for the first lazy start in a process.
         # Every later lifecycle transition is delivered here, so handle both
@@ -2285,19 +2343,30 @@ class DepthCameraPlugin:
         if action == "start":
             try:
                 self.start()
+                with self._frame_ready:
+                    generation = self._generation
+                    self._frame_ready.wait_for(
+                        lambda: (self._registered_to_color or not self._running
+                                 or self._generation != generation),
+                        timeout=self._CALIBRATION_WAIT_S)
             except Exception as exc:
                 return {"state": "error", "error": str(exc)}
         elif action == "stop":
             self.stop()
         now = time.monotonic()
         duration = now - self._first_published_at if self._first_published_at is not None else 0
-        geometry = self._source_geometry
+        with self._frame_ready:
+            geometry = self._source_geometry
+            declaration = self._camera_declaration
+            registered = self._registered_to_color
         return {"state": "running" if self._running else "idle",
                 "topic_out": [{"topic": self._topic, "format": "image/depth-zlib"}],
                 "input_topic": "/ob_camera_head/depth/image_raw", "target_hz": self._max_hz,
                 "source_geometry": dict(geometry) if geometry else None,
-                "registration_to_color": "unknown",
-                "registration_note": "输入为厂商原生 depth/image_raw；仅作居中裁剪及缩放，未验证已投影到 RGB 视角。",
+                **({"camera_info": [declaration]} if declaration is not None else {}),
+                "registration_to_color": "registered" if registered else "unknown",
+                "registration_note": ("按同一光学坐标系的厂商深度和 RGB 内参重采样。"
+                                      if registered else "原生深度经居中裁剪及缩放，尚无同坐标系 RGB 配对内参。"),
                 "compression_backend": self._compression_backend,
                 "compression_level": 1,
                 "received_frames": self._received_frames, "published_frames": self._forwarded_frames,
