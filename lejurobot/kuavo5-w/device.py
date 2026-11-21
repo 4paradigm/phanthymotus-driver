@@ -1200,7 +1200,8 @@ class KuavoBundle:
         self.plugins = [BaseDrivePlugin(self), ArmPlugin(self), LowerBodyPlugin(self),
                         HeadPlugin(self)]
         self.spatial = ControlledSpatialPlugin(self, config.get('controlled_spatial', {}))
-        self.spatial_map = SpatialMap(ros2_node, namespace, self.spatial.archive, self.spatial.store)
+        self.spatial_map = SpatialMap(ros2_node, namespace, self.spatial.archive,
+                                      self.spatial.store, self.spatial.preview_pose_updates)
         self.base_servo = BaseServo(self, ros2_node)
         if "plugins" in config:
             plugin_config = dict(config['plugins'])

@@ -101,6 +101,41 @@ class JatenClient:
             raise RuntimeError('invalid_navigation_websocket_frame')
         return value
 
+    @staticmethod
+    def _observation_frame(frame):
+        key, data = frame.get('type'), frame.get('data')
+        if not isinstance(data, dict):
+            return None, None
+        if key == 'state':
+            return key, data
+        if key in ('pose2d', 'agvState', 'localizationStatus') and isinstance(data.get('data'), dict):
+            return key, data['data']
+        return None, None
+
+    def pose_observations(self, active):
+        """Read the JaTen broadcast without making a request per pose sample."""
+        import websocket
+        required = {'pose2d', 'agvState', 'state', 'localizationStatus'}
+        seen, received = {}, {}
+        # Bound each subscription to the lifetime of its verified map identity.
+        end = time.monotonic() + 10
+        try:
+            with closing(websocket.create_connection(self.ws_url, timeout=2, http_proxy_host=None)) as ws:
+                ws.settimeout(.5)
+                while active() and time.monotonic() < end:
+                    try:
+                        key, data = self._observation_frame(self._frame(ws.recv()))
+                    except websocket.WebSocketTimeoutException:
+                        continue
+                    if key is None:
+                        continue
+                    now = time.monotonic()
+                    seen[key], received[key] = data, now
+                    if required <= {key for key, at in received.items() if now-at <= 2.}:
+                        yield dict(seen), received['pose2d']
+        except (OSError, websocket.WebSocketException):
+            return
+
     def observe(self, required=None):
         # Base readiness needs fresh faults/driving, not map localization. A
         # navigation request still uses all four fields by default.
@@ -121,14 +156,9 @@ class JatenClient:
                         frame = self._frame(ws.recv())
                     except websocket.WebSocketTimeoutException:
                         continue
-                    key, data = frame.get('type'), frame.get('data')
-                    if key == 'state' and isinstance(data, dict):
-                        seen[key] = data
-                        received[key] = time.monotonic()
-                    elif key in ('pose2d', 'agvState', 'localizationStatus') and isinstance(data, dict):
-                        if isinstance(data.get('data'), dict):
-                            seen[key] = data['data']
-                            received[key] = time.monotonic()
+                    key, data = self._observation_frame(frame)
+                    if key is not None:
+                        seen[key], received[key] = data, time.monotonic()
                     if not missing():
                         return seen
         except (OSError, socket.timeout, websocket.WebSocketException):

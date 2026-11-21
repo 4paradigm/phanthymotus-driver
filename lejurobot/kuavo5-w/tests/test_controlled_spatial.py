@@ -218,6 +218,35 @@ class SpatialTests(unittest.TestCase):
         wait(lambda: bool(self.bundle.tracker.events))
         return self.bundle.tracker.events[-1]
 
+    def test_preview_stream_updates_pose_and_clears_it_on_map_mismatch(self):
+        first = copy.deepcopy(self.client.feedback)
+        second = copy.deepcopy(first)
+        second['pose2d'].update(x=1.4, y=2.1, theta=-.2)
+        other_map = copy.deepcopy(second)
+        other_map['state']['agvPosition']['mapId'] = 'other'
+        self.client.pose_observations = lambda active: iter(
+            [(first, 4.), (second, 4.2), (other_map, 4.4)])
+        samples = list(self.plugin.preview_pose_updates(lambda: True))
+        self.assertEqual(samples, [
+            (self.client.identity, {'x': 1., 'y': 2., 'yaw': .3}, 4.),
+            (self.client.identity, {'x': 1.4, 'y': 2.1, 'yaw': -.2}, 4.2),
+            None,
+        ])
+
+    def test_get_pose_requires_localized_matching_map_but_not_auto_control(self):
+        self.client.feedback['agvState'].update(runningMode='MANUAL', softwareEstop=True)
+        response = self.call('get_pose')
+        self.assertEqual(response['pose'], {'x': 1., 'y': 2., 'yaw': .3})
+        self.assertEqual(response['frame'], 'map')
+        self.assertEqual(response['map_fingerprint'], 'grid-A:road-A')
+        self.assertFalse(self.client.commands)
+
+        self.client.feedback['state']['agvPosition']['mapId'] = 'different'
+        self.assertEqual(self.call('get_pose')['error'], 'pose_map_identity_mismatch')
+        self.client.feedback['state']['agvPosition']['mapId'] = 'factory'
+        self.client.feedback['localizationStatus']['cartoStatusId'] = 0
+        self.assertEqual(self.call('get_pose')['error'], 'cartographer_localization_not_ready')
+
     def test_start_retries_read_only_state_before_preparing_exactly_once(self):
         original = self.client.observe
         calls = []

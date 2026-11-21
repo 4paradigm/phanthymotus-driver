@@ -96,6 +96,7 @@ class ControlledSpatialPlugin:
         'untag_place': (['name'], '删除当前地图中的语义点'),
         'list_tags': ([], '列出当前地图语义点及相对位置'),
         'list_maps': ([], '列出底盘真实栅格地图'),
+        'get_pose': ([], '读取当前地图定位，x/y 为米，yaw 为弧度'),
         'delete_map': (['map_name', 'confirm_delete'], '备份并从底盘移除指定的非活动地图'),
         'upload_map': (['map_name'], '从上位机归档恢复完整地图到厂商底盘，可随后载入'),
         'load_map': (['map_name'], '载入已有地图，确认地图身份；不伪造初始定位'),
@@ -413,6 +414,54 @@ class ControlledSpatialPlugin:
             raise RuntimeError('pose_map_identity_mismatch')
         return result, observation
 
+    def preview_pose_updates(self, active):
+        self._restore()
+        if self._map_pending is not None:
+            return
+        identity = self._identity()
+        for observation, stamp in self.client.pose_observations(active):
+            if self._map_pending is not None:
+                return
+            position = observation['state'].get('agvPosition', {})
+            if (position.get('mapId') != identity[0]
+                    or position.get('positionInitialized') is not True
+                    or observation['agvState'].get('isMapping') is not False
+                    or observation['localizationStatus'].get('cartoStatusId') != 1):
+                yield None
+                continue
+            raw = observation['pose2d']
+            try:
+                pose = {axis: number(raw.get(key), axis)
+                        for axis, key in (('x', 'x'), ('y', 'y'), ('yaw', 'theta'))}
+            except ValueError:
+                yield None
+                continue
+            yield identity, pose, stamp
+
+    def get_pose(self):
+        self._restore()
+        if self._map_pending is not None:
+            raise RuntimeError('map_transition_in_progress_or_unconfirmed')
+        identity = self._identity()
+        pose, observation = self._observation()
+        received = time.monotonic()
+        localization = observation['localizationStatus']
+        if observation['agvState'].get('isMapping') is not False:
+            raise RuntimeError('map_localization_unavailable_while_mapping')
+        if localization.get('cartoStatusId') != 1:
+            raise RuntimeError('cartographer_localization_not_ready')
+        position = observation['state']['agvPosition']
+        current = self.client.current_map()
+        if (position.get('mapId') != identity[0] or current['mapId'] != identity[0]
+                or current['mapMd5'] != identity[1].partition(':')[2]):
+            raise RuntimeError('pose_map_identity_mismatch')
+        if self._map_pending is not None or time.monotonic() - received > 1.:
+            raise RuntimeError('map_pose_no_longer_fresh')
+        score = localization.get('score')
+        return {'state': 'ready', 'map': identity[0], 'map_fingerprint': identity[1],
+                'frame': 'map', 'pose': pose, 'units': {'x': 'm', 'y': 'm', 'yaw': 'rad'},
+                'localization_score': score if type(score) in (float, int) and math.isfinite(score) else None}
+
     def dispatch(self, action, args):
         try:
             self._restore()
@@ -461,6 +510,8 @@ class ControlledSpatialPlugin:
             try:
                 if action in ('navigate_to_pose', 'navigate_to_tag'):
                     return self._navigate(action, args)
+                if action == 'get_pose':
+                    return self.get_pose()
                 return self._map_action(action, args)
             finally:
                 self._operations.release()

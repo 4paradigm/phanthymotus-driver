@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import struct
 import threading
+import time
 
 import yaml
 
@@ -96,7 +97,7 @@ def read_snapshot(name, directory, version):
     return (name, grid_sha.hexdigest() + ':' + road_md5), grid, boundary
 
 
-def encode_frame(name, grid, boundary, tags, maps):
+def encode_frame(name, grid, boundary, tags, maps, pose=None):
     points = bytearray(grid)
     for tag in tags:
         x, y, yaw = (tag[key] for key in ('x', 'y', 'yaw'))
@@ -110,18 +111,27 @@ def encode_frame(name, grid, boundary, tags, maps):
                                       y + distance * math.sin(yaw), .15))
     x, y, width, height = boundary
     center_x, center_y = x + width / 2, y + height / 2
+    robot = dict(pose, pose_available=True) if pose is not None else {'pose_available': False}
+    # The legacy renderer ignores metadata and always draws the cone. A NaN
+    # yaw hides its geometry while its finite XY keeps the view centered.
+    header = (pose['x'], pose['y'], -pose['yaw']) if pose is not None else (center_x, center_y, math.nan)
     metadata = json.dumps({
         'version': 3, 'active_map': name, 'maps': [{'name': item} for item in maps],
         'tags': tags, 'boundary': boundary, 'grid_points': len(grid) // 12,
-        'robot': {'x': center_x, 'y': center_y, 'yaw': 0.0, 'pose_available': False},
+        'robot': robot,
     }, ensure_ascii=False, allow_nan=False).encode()
-    return (struct.pack('<fffBI', center_x, center_y, 0.0, 7, len(points) // 12)
+    return (struct.pack('<fffBI', *header, 7, len(points) // 12)
             + points + struct.pack('<I', len(metadata)) + metadata)
 
 
 class SpatialMap:
-    def __init__(self, node, namespace, archive, store):
+    def __init__(self, node, namespace, archive, store, pose_updates):
         self.node, self.archive, self.store = node, archive, store
+        self.pose_updates = pose_updates
+        self.latest_pose = None
+        self.pose_thread = None
+        self.started = threading.Event()
+        self.pose = None
         self.topic = '/' + '/'.join(filter(None, (namespace.strip('/'), 'state', 'spatial_map')))
         self.output = [{'topic': self.topic, 'format': 'sensor/mapping'}]
         self.lock = threading.RLock()
@@ -138,14 +148,15 @@ class SpatialMap:
 
     def tool(self):
         return {
-            'name': 'spatial_map', 'type': 'sensor', 'multiInstance': False,
+            'name': 'spatial_map', 'type': 'actuator', 'multiInstance': False,
             'description': '预览上位机已归档的底盘地图和点位；可选择历史地图。',
             'inputSchema': {'type': 'object', 'properties': {
                 'action': {'type': 'string', 'enum': ['list_maps', 'select_map']},
                 'map_name': {'type': 'string'},
-            }, 'x-action-params': {
-                'list_maps': {'params': [], 'description': 'List archived maps.'},
-                'select_map': {'params': ['map_name'], 'description': 'Select an archived map for display.'},
+            }, 'required': ['action'], 'x-resource': 'spatial_map',
+                'x-completion': {'actions': []}, 'x-action-params': {
+                'list_maps': {'params': [], 'required': [], 'description': 'List archived maps.'},
+                'select_map': {'params': ['map_name'], 'required': ['map_name'], 'description': 'Select an archived map for display.'},
             }},
             'topic_out': self.output,
         }
@@ -183,6 +194,7 @@ class SpatialMap:
                 self.selected = name
                 self.current = self.error = None
                 self.tags = []
+                self.pose = None
                 self.wake.set()
             return {'state': 'completed', 'selected_map': name}
         with self.lock:
@@ -195,29 +207,57 @@ class SpatialMap:
                     self.publisher = self.node.create_publisher(UInt8MultiArray, self.topic, 1)
                     self.thread = threading.Thread(target=self.run, name='spatial-map', daemon=True)
                     self.thread.start()
+                    self.pose_thread = threading.Thread(target=self.track_pose, name='spatial-map-pose', daemon=True)
+                    self.pose_thread.start()
                 self.running = True
+                self.started.set()
                 self.wake.set()
             elif action == 'stop':
                 self.running = False
+                self.started.clear()
+                self.latest_pose = None
                 return {'state': 'idle'}
             elif action != 'info':
                 return {'state': 'error', 'error': 'unsupported_action'}
-            return {'state': 'running' if self.running else 'idle', 'topic_out': self.output,
+            return {'state': 'ready' if self.running else 'idle', 'topic_out': self.output,
                     'selected_map': self.selected, 'displayed_map': self.current,
-                    'tags': self.tags, 'error': self.error}
+                    'tags': self.tags, 'pose': self.pose if self.running else None, 'error': self.error}
+
+    def track_pose(self):
+        def active():
+            return self.started.is_set() and not self.closed.is_set()
+
+        while not self.closed.is_set():
+            if not self.started.wait(.5) or not active():
+                continue
+            try:
+                for sample in self.pose_updates(active):
+                    with self.lock:
+                        if active():
+                            self.latest_pose = sample
+            except (OSError, ValueError, RuntimeError):
+                pass  # The map stays visible when the pose source is unavailable.
+            finally:
+                with self.lock:
+                    self.latest_pose = None
+            self.closed.wait(.2)
 
     def run(self):
         while not self.closed.is_set():
-            self.wake.wait(1)
+            self.wake.wait(.2)
             self.wake.clear()
             with self.lock:
                 if self.closed.is_set() or not self.running:
                     continue
                 selected = self.selected
-            name, frame, error, tags = None, None, None, []
+            name, frame, error, tags, pose = None, None, None, [], None
             try:
                 snapshots = self.snapshots()
-                name = selected or max(snapshots, key=lambda key: snapshots[key][2], default=None)
+                with self.lock:
+                    sample = self.latest_pose
+                active = sample[0][0] if sample else None
+                name = selected or (active if active in snapshots else
+                                    max(snapshots, key=lambda key: snapshots[key][2], default=None))
                 if name is not None:
                     version, directory, _ = snapshots[name]
                     key = name, version
@@ -225,13 +265,16 @@ class SpatialMap:
                         self.cached = key, read_snapshot(name, directory, version)
                     _, (identity, grid, boundary) = self.cached
                     tags = self.store.tags(identity)[:MAX_TAGS]
-                    frame = encode_frame(name, grid, boundary, tags, sorted(snapshots))
+                    if sample and sample[0] == identity and time.monotonic() - sample[2] <= 1.:
+                        pose = sample[1]
+                    frame = encode_frame(name, grid, boundary, tags, sorted(snapshots), pose)
             except (OSError, ValueError, RuntimeError, KeyError, TypeError, OverflowError, yaml.YAMLError) as exc:
                 error = f'map_preview_unavailable: {type(exc).__name__}'
             with self.lock:
                 if self.running and not self.closed.is_set() and selected == self.selected:
                     self.current = name if frame is not None else None
                     self.tags = tags if frame is not None else []
+                    self.pose = pose if frame is not None else None
                     self.error = error
                     msg = self.message_type()
                     msg.data = array('B', frame if frame is not None
@@ -241,6 +284,9 @@ class SpatialMap:
     def close(self):
         self.closed.set()
         self.wake.set()
+        self.started.set()
+        if self.pose_thread is not None:
+            self.pose_thread.join()
         if self.thread is not None:
             self.thread.join()
             self.node.destroy_publisher(self.publisher)
