@@ -30,12 +30,12 @@ plugins:
   camera_depth: {enabled: true}
 
   audio:
-    server: "unix:/run/user/1001/pulse/native"
+    server: "auto"
     uid: 1001
     gid: 1002
-    # Confirm physical routing on Panther before changing these names.
-    source: "alsa_input.platform-sound.analog-stereo"
-    sink: "alsa_output.platform-sound.analog-stereo"
+    # Physical USB devices verified on Panther; avoid onboard sound and monitor sources.
+    source: "alsa_input.usb-AISpeech.in_Mic_Arry_8_4169385A3935-00.multichannel-input"
+    sink: "alsa_output.usb-C-Media_Electronics_Inc._USB_Audio_Device-00.analog-stereo"
   mic: {enabled: true}
   speaker: {enabled: true}
 
@@ -105,3 +105,16 @@ plugins:
   # has been measured on Panther hardware.
   servo: {enabled: false}
 
+  controlled_spatial:
+    enabled: true
+    # This robot has one active lidar. Preserve its frame and timestamp when
+    # feeding the vendor SLAM/Nav2 /scan input; do not wait for a rear sensor.
+    # Set to "" on dual-lidar variants whose native merger already works.
+    single_lidar_topic: "/lidar_front/scan"
+    base_frame: "base_link"
+    native_slam_pcd_dir: "/opt/phanthy-motus/data/maps"
+    native_slam_db_path: "/opt/phanthy-motus/data/controlled_spatial.db"
+    vendor_map_dir: "/home/unix_ai/map_dir"
+    service_timeout_s: 20
+    navigation_timeout_s: 180
+  spatial_map: {enabled: true}

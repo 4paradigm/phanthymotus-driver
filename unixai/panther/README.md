@@ -21,20 +21,81 @@ required for discovery.
   `speaker` plays a canvas-connected `audio/pcm-16k` stream through its sink.
 
 The audio cards run in separate domain-42 processes and use the host PulseAudio
-server at `/run/user/1001/pulse/native`; they never open ALSA devices directly.
-The Compose fragment mounts the Pulse socket directory and the authentication
-cookie. Set `PANTHER_PULSE_COOKIE_PATH` to the host cookie path if it differs
-from `/home/unix_ai/.config/pulse/cookie`. Set `PANTHER_PULSE_SOURCE` and
-`PANTHER_PULSE_SINK` to override the configured Pulse device names after
-checking `pactl list sources` and `pactl list sinks` on the robot.
-Pulse clients run as host UID 1001/GID 1002 because the host server rejected
-container root; override `PANTHER_PULSE_UID` and `PANTHER_PULSE_GID` if the host
-audio user differs. The driver and ROS bridge retain their existing identities.
-The reported `platform-sound` names have not yet been verified against the physical M8 mic
-and speaker. Before enabling a project, verify container-side `pactl info`,
-then test `mic -> ASR` and `TTS -> speaker` on Panther. For simultaneous
-listening and speaking, insert the perception echo-cancellation card before
-ASR and check interaction with the robot's native AIUI conversation service.
+server; they never open ALSA devices directly. `PANTHER_PULSE_SERVER=auto`
+(the default) probes the usual runtime socket and the vendor's randomly named
+`/tmp/pulse-*/native` sockets on every start. Compose exposes host `/tmp` at
+`/run/panther-host-tmp` read-only, so a reboot does not bake an obsolete socket
+name into the deployment. The cookie is mounted read-only; override
+`PANTHER_PULSE_COOKIE_PATH` if it differs from
+`/home/unix_ai/.config/pulse/cookie`.
+
+Verified physical routes on the development robot are the AISpeech USB
+`Mic Arry 8` source and C-Media USB Audio Device sink. `platform-sound` is the
+onboard sound card, not these devices. Override `PANTHER_PULSE_SOURCE` and
+`PANTHER_PULSE_SINK` after checking `pactl list short sources/sinks` on another
+robot. Pulse clients run as host UID 1001/GID 1002; override
+`PANTHER_PULSE_UID/GID` if the audio user differs. PCM is signed 16-bit
+little-endian, mono, 16000 Hz; microphone packets contain 2048 bytes (64 ms).
+`speaker.start(input_topic=...)` subscribes to `audio_msgs/AudioChunk` on the
+connected domain-42 topic. Playback validates format/sample alignment, handles
+partial pipe writes, and reports buffer overflow rather than silently dropping
+speech. Use `mic -> ASR` and `TTS -> speaker` on the canvas. For simultaneous
+listening and speaking, insert the perception echo-cancellation card before ASR.
+
+## Controlled mapping and navigation
+
+`controlled_spatial` is a new independent card; existing body, camera and lidar
+cards retain their behavior. It uses the already-running vendor ROS services:
+`/unix_slam/reset`, `set_localization_mode`, `save_map`, `load_map`,
+`get_map_list`, `delete_map`, and Nav2 `/navigate_to_pose`. It does not launch
+another navigation stack or change controller parameters.
+
+- `start_mapping(map_name)`: require fresh `/scan` input, reject existing
+  names, reset SLAM and enable mapping. Drive manually using the remote control.
+- `tag_place(name, description)`, `list_tags`, `untag_place(name)`: store
+  map-specific semantic tags with fresh map-frame position and yaw (radians).
+- `stop_mapping`: save the native pose graph and map, archive native files and
+  a display occupancy grid, then switch to localization. Failed operations
+  retain an error rather than report a successful save.
+- `list_maps`, `load_map(map_name)`, `delete_map(map_name)`: preserve map-scoped
+  tags, wait for a fresh pose after loading, and reject deletion of the active
+  map or a map not managed by this card.
+- `navigate_to_tag(tag_name)`, `navigate_to_pose(x, y, yaw)`: require a loaded
+  map, fresh localization and live scans. Tag names match exactly. Nav2 terminal
+  results determine completion; timeout requests cancellation and retains
+  ownership until Nav2 confirms termination.
+- `stop_nav` / `stop`: cancel the owned navigation goal, including a goal still
+  being accepted. Interrupt hooks share the existing `base` resource.
+- `info` / `get_pose`: expose mapping, localization, scan freshness and
+  navigation status. No stale pose is used for tagging or navigation.
+
+`spatial_map` provides a `sensor/mapping` stream with the same binary and
+metadata contract as Tianyi/G1. Use `start`, `list_maps`, `select_map(map_name)`
+and `stop` to display occupied cells, robot pose and semantic tags. Saved grids
+are immutable display sources; a live grid cannot alter a saved-map view.
+
+Persistence uses the same host mount as Tianyi/G1:
+`/opt/phanthy-motus/data:/opt/phanthy-motus/data`. Native artifacts and occupancy
+snapshots are archived under `/opt/phanthy-motus/data/maps/<map_name>/`, and
+semantic tags are in `/opt/phanthy-motus/data/controlled_spatial.db`.
+The vendor node independently writes `/home/unix_ai/map_dir`; Compose mounts
+that path at the same location to archive/restore its files. Keep both trees
+when backing up a robot. Runtime active-map state is deliberately not restored
+as localized after a restart: explicitly load the intended map again.
+
+### Single-lidar Panther
+
+The development robot has one observed live lidar topic, `/lidar_front/scan`.
+The vendor defaults start a dual-lidar merger that waits for an absent rear
+input (`rear_missing`), so `/scan` and consequently SLAM have no data.
+`controlled_spatial.single_lidar_topic` explicitly selects the live sensor and
+relays its unmodified `LaserScan` to the vendor `/scan` input. Sensor frame,
+timestamps, beam angles, ranges and timing remain intact; the vendor TF handles
+its physical extrinsic. No existing lidar card implementation is changed.
+If the vendor merger starts publishing real merged scans, the relay yields.
+Set this setting to `""` on a verified dual-lidar model with working native
+fusion. A second USB serial interface is not evidence of a second physical
+lidar; no rear-device alias or udev rule is installed by this driver.
 
 `model` falls back to the bundled, verbatim vendor `pmm_urdf` model before the robot
 publishes anything. Once a live `/robot_description` is available, reading the

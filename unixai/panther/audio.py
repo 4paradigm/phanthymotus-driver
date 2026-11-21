@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import multiprocessing as mp
+import glob
 import os
 import queue
 import subprocess
@@ -33,10 +34,42 @@ def _pulse_identity(config: dict) -> dict[str, int]:
     return {"user": int(config["uid"]), "group": int(config["gid"])}
 
 
+def _pulse_user(config: dict) -> dict[str, int]:
+    if os.geteuid() != 0:
+        if os.geteuid() != int(config["uid"]):
+            raise RuntimeError("audio must run as the configured PulseAudio user or root")
+        return {}
+    return _pulse_identity(config)
+
+
+def _resolve_pulse(config: dict) -> dict:
+    """Discover a live host server on every start; vendor sockets change on reboot."""
+    resolved = dict(config)
+    server = config["server"]
+    candidates = [server] if server != "auto" else [
+        f"unix:/run/user/{config['uid']}/pulse/native",
+        *[f"unix:{p}" for p in sorted(glob.glob("/run/panther-host-tmp/pulse-*/native"))],
+        *[f"unix:{p}" for p in sorted(glob.glob("/tmp/pulse-*/native"))],
+    ]
+    failures = []
+    for candidate in candidates:
+        env = dict(os.environ, PULSE_SERVER=candidate)
+        try:
+            probe = subprocess.run(["pactl", "info"], env=env, timeout=1,
+                                   capture_output=True, text=True, **_pulse_user(config))
+        except subprocess.TimeoutExpired:
+            failures.append(candidate + ": connection timed out")
+            continue
+        if probe.returncode == 0:
+            resolved["server"] = candidate
+            return resolved
+        failures.append(probe.stderr.strip()[-120:])
+    raise RuntimeError("No reachable host PulseAudio server: " + "; ".join(failures))
+
+
 def _worker(mode, topic, config, commands, replies):
     os.environ["ROS_DOMAIN_ID"] = os.environ.get("AGENT_CORE_ROS_DOMAIN_ID", "42")
     os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
-    os.environ["PULSE_SERVER"] = config["server"]
     import rclpy
     from rclpy.node import Node
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
@@ -47,7 +80,7 @@ def _worker(mode, topic, config, commands, replies):
     qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                      history=HistoryPolicy.KEEP_LAST, depth=10)
     stop_event = threading.Event()
-    pcm_queue = queue.Queue(maxsize=8)
+    pcm_queue = queue.Queue(maxsize=256)  # At most 32 seconds of 4096-byte blocks.
     state = {"running": False, "frames": 0, "dropped": 0, "last_frame": 0.0, "error": "",
              "input_topic": ""}
     process = None
@@ -89,7 +122,13 @@ def _worker(mode, topic, config, commands, replies):
                 except queue.Empty:
                     continue
                 deadline = max(deadline, time.monotonic()) + len(raw) / 32000
-                proc.stdin.write(raw)
+                # Unbuffered pipe writes may be partial, especially for large frames.
+                remaining = memoryview(raw)
+                while remaining and not stop_event.is_set():
+                    written = proc.stdin.write(remaining)
+                    if not written:
+                        raise RuntimeError("speaker pipe closed")
+                    remaining = remaining[written:]
                 proc.stdin.flush()
                 stop_event.wait(max(0.0, deadline - time.monotonic() - 0.08))
         except Exception as exc:
@@ -112,12 +151,11 @@ def _worker(mode, topic, config, commands, replies):
             try:
                 pcm_queue.put_nowait(block)
             except queue.Full:
-                try:
-                    pcm_queue.get_nowait()
-                    pcm_queue.put_nowait(block)
-                    state["dropped"] += 1
-                except queue.Empty:
-                    pass
+                state["dropped"] += 1
+                state["error"] = "speaker buffer full; restart the card before sending more audio"
+                state["running"] = False
+                stop_event.set()
+                break
 
     def stop():
         nonlocal process, thread, subscription
@@ -147,7 +185,7 @@ def _worker(mode, topic, config, commands, replies):
     def info():
         healthy = state["running"] and process is not None and process.poll() is None
         return {"state": "error" if state["error"] else "running" if healthy else "idle",
-                "pulse_server": config["server"], "pulse_device": config["device"],
+                "pulse_server": os.environ.get("PULSE_SERVER", config["server"]), "pulse_device": config["device"],
                 "frames": state["frames"], "dropped": state["dropped"], "last_frame_age_ms":
                 int((time.monotonic() - state["last_frame"]) * 1000) if state["last_frame"] else None,
                 "input_topic": state["input_topic"], "queued_chunks": pcm_queue.qsize(),
@@ -175,18 +213,14 @@ def _worker(mode, topic, config, commands, replies):
                 state.update(error="", frames=0, dropped=0, last_frame=0.0, input_topic=input_topic)
                 stop_event.clear()
                 try:
-                    probe = subprocess.run(
-                        ["pactl", "info"], timeout=3, stdout=subprocess.DEVNULL,
-                        stderr=subprocess.PIPE, text=True, **_pulse_identity(config))
-                    if probe.returncode != 0:
-                        raise RuntimeError(
-                            f"PulseAudio connection failed: {probe.stderr.strip()[-200:]}")
+                    resolved = _resolve_pulse(config)
+                    os.environ["PULSE_SERVER"] = resolved["server"]
                     process = subprocess.Popen(
                         _pulse_command(mode, config["device"]),
                         stdin=subprocess.PIPE if mode == "speaker" else subprocess.DEVNULL,
                         stdout=subprocess.PIPE if mode == "mic" else subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL, bufsize=0,
-                        **_pulse_identity(config))
+                        **_pulse_user(config))
                     time.sleep(0.1)
                     if process.poll() is not None:
                         raise RuntimeError(f"PulseAudio process exited ({process.returncode})")
@@ -228,6 +262,7 @@ class AudioPlugin:
         self._commands = None
         self._replies = None
         self._process = None
+        self._rpc_lock = threading.RLock()
 
     def get_tool(self):
         schema = {"type": "object", "properties": {
@@ -259,6 +294,11 @@ class AudioPlugin:
             self._process = None
 
     def dispatch(self, action, args):
+        # Each command must consume its own reply, including concurrent MCP calls.
+        with self._rpc_lock:
+            return self._dispatch(action, args)
+
+    def _dispatch(self, action, args):
         if action not in {"start", "stop", "info"}:
             return {"error": "unknown action"}
         if action != "start" and (self._process is None or not self._process.is_alive()):

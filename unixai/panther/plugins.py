@@ -217,6 +217,14 @@ def build_plugins(config, namespace, device):
             if on(name):
                 plugins.append(AudioPlugin(name, namespace, enabled["audio"]))
 
+    if on("controlled_spatial"):
+        from controlled_spatial import ControlledSpatialPlugin
+        spatial = ControlledSpatialPlugin(enabled["controlled_spatial"], namespace, device._executor)
+        plugins.append(spatial)
+        if on("spatial_map"):
+            from spatial_map import SpatialMapPlugin
+            plugins.append(SpatialMapPlugin(spatial, namespace))
+
     if on("base_drive"):
         cfg = enabled["base_drive"]
         schema = _action_schema(
