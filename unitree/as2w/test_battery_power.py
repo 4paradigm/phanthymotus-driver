@@ -410,6 +410,54 @@ class TestPowerCardIntegration(unittest.TestCase):
             self.assertAlmostEqual(77.6*185/3600, card.core.energy_wh)
             self.assertFalse(card.logical_running)
 
+    def test_other_card_stops_preserve_power_logical_state_and_window(self):
+        plugin = self.make_plugin()
+        node, card = plugin._state, plugin._power_card
+        args = {'_tool_name': 'battery_power'}
+        clock = [0.0]
+        with patch.object(self.device.time, 'monotonic',
+                          side_effect=lambda: clock[0]):
+            self.assertEqual('running',
+                             plugin.dispatch('start', args)['state'])
+            for n in range(1851):
+                clock[0] = n/10
+                node._on_bms(types.SimpleNamespace(**bms()))
+                node._process_battery_power()
+            self.assertEqual('available', card.info()['diagnostics'][
+                'snapshot']['runtime_status'])
+            for name in (
+                    'imu', 'joints', 'battery', 'joint_state', 'loco_state'):
+                energy, covered = card.core.energy_wh, card.core.covered
+                plugin.dispatch('stop', {'_tool_name': name})
+                info = plugin.dispatch('info', args)
+                self.assertEqual('running', info['state'])
+                self.assertEqual('running', info['stream_state'])
+                self.assertEqual(energy, card.core.energy_wh)
+                self.assertEqual(covered, card.core.covered)
+                self.assertIs(node, plugin._state)
+                self.assertFalse(node._bms.closed)
+                clock[0] += .1
+                node._on_bms(types.SimpleNamespace(**bms()))
+                node._process_battery_power()
+                self.assertAlmostEqual(covered+.1, card.core.covered)
+                self.assertAlmostEqual(energy+77.6*.1/3600,
+                                       card.core.energy_wh)
+            energy, covered = card.core.energy_wh, card.core.covered
+            info = plugin.dispatch('stop', args)
+            self.assertEqual('idle', info['state'])
+            self.assertEqual('running', info['stream_state'])
+            self.assertEqual(energy, card.core.energy_wh)
+            self.assertEqual(covered, card.core.covered)
+            clock[0] += .1
+            node._on_bms(types.SimpleNamespace(**bms()))
+            node._process_battery_power()
+            self.assertAlmostEqual(covered+.1, card.core.covered)
+            self.assertGreater(card.core.energy_wh, energy)
+            plugin.shutdown()
+            self.assertFalse(card.running)
+            self.assertTrue(node._bms.closed)
+            self.assertTrue(node.node.destroyed)
+
     def test_shared_sensor_stops_keep_both_battery_streams_alive(self):
         p = self.make_plugin()
         node = p._state

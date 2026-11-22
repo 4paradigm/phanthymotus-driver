@@ -828,7 +828,7 @@ class StatePlugin:
             if card is not None and not getattr(self, '_shutdown', False):
                 # Core may stop any card in this shared plugin. Keep the node
                 # alive for Battery Power and the established Battery stream.
-                card.stop()
+                # Each card's dispatch owns its logical state independently.
                 return
             if self._state is not None:
                 self._state.close()
