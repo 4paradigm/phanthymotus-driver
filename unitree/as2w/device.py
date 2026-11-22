@@ -2,6 +2,7 @@
 import json
 import logging
 from collections import deque
+from copy import copy
 import math
 import struct
 import threading
@@ -598,14 +599,22 @@ class _StateNode:
 
 
 class _BatteryPowerCard:
-    """Logical card on the shared node; no worker or DDS subscription of its own."""
+    """Always-on monitor; Canvas lifecycle never owns the shared data stream."""
+    _LIFECYCLE_FIELDS = {
+        "always_on": True,
+        "lifecycle": "logical",
+        "stop_behavior": "detach_only",
+        "physical_shutdown": "driver_bundle_stop",
+    }
+
     def __init__(self, config, namespace):
         self._lock = threading.RLock()
         self.core = BatteryPower(PowerConfig(**{
             k: v for k, v in config.items() if k in PowerConfig.__dataclass_fields__}))
         self.topic = f"/{namespace}/state/battery_power"
         self.node = None
-        self.running = False
+        self.running = False  # Physical stream; enabled by bind, not Canvas start.
+        self.logical_running = False
         self.last_publish = None
         self.last_status = None
         self.skip_sequence = 0
@@ -615,36 +624,43 @@ class _BatteryPowerCard:
 
     def tool(self):
         return {"name": "battery_power", "type": "sensor", "multiInstance": False,
-                "description": "AS2-W discharge power and process-lifetime energy; runtime requires confirmed capacity. V1 voltage source and current sign await hardware confirmation.",
-                "inputSchema": {"type": "object", "properties": {}},
+                "description": (
+                    "Always-on AS2-W battery power monitoring from Driver "
+                    "startup; intelligent control is not required. Canvas stop "
+                    "only detaches the logical card; monitoring continues until "
+                    "Driver shutdown. Runtime uses recent power after at least "
+                    "180 valid seconds, with a 300-second window."),
+                "inputSchema": {"type": "object", "properties": {},
+                                "x-action-descriptions": {
+                                    "start": "Attach to the existing always-on monitor without resetting statistics.",
+                                    "stop": "Detach the logical card; power calculation and publication continue.",
+                                    "info": "Report logical lifecycle and physical stream state."}},
                 "topic_out": [{"topic": self.topic, "format": "data/json"}]}
 
     def bind(self, node):
         with self._lock:
+            if self.node is node and self.running:
+                return
+            publisher = node.node.create_publisher(
+                String, self.topic, _LOW_LAT_QOS or 1)
             self.node = node
-            self.publisher = node.node.create_publisher(String, self.topic, _LOW_LAT_QOS or 1)
+            self.publisher = publisher
+            self.core.reset()  # Preserve process energy, break node epochs.
+            self.skip_sequence = 0  # Accept this new node's retained samples.
+            self.last_publish = self.last_status = None
+            self.logical_running = False
+            self.running = True
             node._power_card = self
-            self.running = False
-            self.core.reset()
 
     def start(self):
-        # The caller holds the StatePlugin lifecycle lock. Snapshot the sequence
-        # before enabling so cached data from before start cannot become a baseline.
-        with self.node._latest_lock:
-            sequence = self.node._bms_generation
         with self._lock:
-            if not self.running:
-                self.core.reset()
-                self.skip_sequence = sequence
-                self.last_publish = self.last_status = None
-                self.running = True
+            if self.running and self.node is not None:
+                self.logical_running = True
 
     def stop(self):
         with self._lock:
-            if self.running:
-                self.running = False
-                self.core.reset()
-                self._publish_invalid(self.node)
+            # Canvas/intelligent-control stop does not own the physical stream.
+            self.logical_running = False
 
     def _record_error(self, exc):
         self.error_count += 1
@@ -677,6 +693,7 @@ class _BatteryPowerCard:
             if self.node is node:
                 was_running = self.running
                 self.running = False
+                self.logical_running = False
                 self.node = None
                 self.core.reset()
                 if was_running:
@@ -686,8 +703,8 @@ class _BatteryPowerCard:
         self.tick_samples(node, ((msg, sequence, received, stamp),))
 
     def tick_samples(self, node, samples):
-        # Bounded computations and publication serialize with stop: after stop
-        # returns this card cannot publish or integrate. No shared cache lock held.
+        # Processing serializes with physical detach/shutdown. Canvas stop only
+        # changes logical state; no shared cache lock is held during computation.
         with self._lock:
             if not self.running or self.node is not node:
                 return
@@ -706,10 +723,17 @@ class _BatteryPowerCard:
 
     def info(self):
         with self._lock:
-            return {"state": "running" if self.running and self.node is not None else "idle",
+            stream_running = self.running and self.node is not None
+            # MCP status queries must not expire the live accumulator before
+            # the worker consumes continuous samples waiting in the BMS queue.
+            view = copy(self.core)
+            view.segments = self.core.segments.copy()
+            return {"state": "running" if self.logical_running and stream_running else "idle",
+                    "stream_state": "running" if stream_running else "idle",
+                    **self._LIFECYCLE_FIELDS,
                     "topic_out": self.tool()['topic_out'],
                     "diagnostics": {
-                        **self.core.diagnostics(time.monotonic()),
+                        **view.diagnostics(time.monotonic()),
                         "processing_error_count": self.error_count,
                         "last_processing_error": self.last_error,
                         "bms_queue_capacity": _BMS_QUEUE_CAPACITY,
@@ -791,13 +815,21 @@ class StatePlugin:
         with getattr(self, '_lifecycle_lock', nullcontext()):
             if getattr(self, '_shutdown', False):
                 return
-            if self._state is None:
+            state = self._state
+            stopped = getattr(state, '_stop_event', None)
+            if state is None or (stopped is not None and stopped.is_set()):
                 self._state = _StateNode(self._namespace, self._executor)
                 if getattr(self, '_power_card', None) is not None:
                     self._power_card.bind(self._state)
 
     def stop(self):
         with getattr(self, '_lifecycle_lock', nullcontext()):
+            card = getattr(self, '_power_card', None)
+            if card is not None and not getattr(self, '_shutdown', False):
+                # Core may stop any card in this shared plugin. Keep the node
+                # alive for Battery Power and the established Battery stream.
+                card.stop()
+                return
             if self._state is not None:
                 self._state.close()
                 self._state = None
@@ -813,10 +845,10 @@ class StatePlugin:
 
     def _dispatch(self, action, args):
         name = args.get("_tool_name")
+        if action == 'start' and getattr(self, '_shutdown', False):
+            return {"state": "idle", "error": "driver shutdown"}
         if name == "battery_power" and getattr(self, '_power_card', None) is not None:
             if action == 'start':
-                if self._shutdown:
-                    return {"state": "idle", "error": "driver shutdown"}
                 self.start()
                 self._power_card.start()
             elif action == 'stop':

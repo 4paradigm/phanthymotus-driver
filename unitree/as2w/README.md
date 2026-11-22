@@ -249,6 +249,26 @@ shared IMU, joint, or battery subscription. `active` is an observation for
 future operator-takeover logic; this driver does not turn it into a motion
 command.
 
+`battery_power` is an **Always-on** sensor. With
+`plugins.battery_power.enabled: true` (and the shared state plugin enabled),
+Driver startup automatically processes BMS samples and publishes
+`/<namespace>/state/battery_power`; Dashboard intelligent control is not a
+prerequisite. Canvas `start` and `stop` only attach/detach the logical card.
+They do not reset the average-power window or discharged energy and do not
+interrupt calculation or ROS publication. MCP `info` distinguishes logical
+`state` from physical `stream_state` and advertises `always_on: true`.
+
+While Battery Power is enabled, ordinary `StatePlugin.stop()` also retains the
+shared node, so stopping another shared state card cannot interrupt battery
+monitoring. Driver Bundle shutdown is the physical teardown boundary: it
+stops processing and releases the shared DDS/ROS resources and worker. A newly
+created state node starts a new observation window; old-node batches are
+rejected, while process-lifetime discharged energy is retained. A new Driver
+process starts its own energy counter. Runtime estimation requires at least
+180 seconds of valid discharge observations with at least 90% time coverage;
+the full sliding window is 300 seconds. Stale, charging, and invalid-data
+handling is unchanged.
+
 `battery_power` uses the confirmed AS2-W nominal battery capacity of **648 Wh
 (15000 mAh)** by default, in both `config.yaml` and `PowerConfig`. Override
 `capacity_wh` for a different battery, or explicitly set it to `null` (`None`
@@ -263,9 +283,11 @@ discharged energy, and remaining runtime. The real sliding window reached
 and queue overflows were all zero. At 95% SOC and 99.24177 W average power,
 the 648 Wh estimate was 372.182 minutes, consistent with the formula. Independent
 Card stop/start passed, discharged energy was retained, and the original
-Battery Card continued publishing while Battery Power was stopped. These
-observations validate the previously tested image; the default-capacity change
-has not been rebuilt or deployed as part of this update. The runtime value
+Battery Card continued publishing while Battery Power was stopped. That test
+used the earlier physical-stop semantics; the Always-on lifecycle update needs
+fresh on-device acceptance with intelligent control left off. These
+observations validate the previously tested image; the Always-on lifecycle
+change has not been rebuilt or deployed as part of this update. The runtime value
 remains an estimate at recent power demand, not a guarantee for future loads.
 
 For a no-hardware check, run `python3 test_driver.py` in `as2w`. In a built

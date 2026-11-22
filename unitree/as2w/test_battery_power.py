@@ -1,5 +1,6 @@
 """Offline synthetic tests; optional real JSONL via AS2W_BMS_REPLAY."""
 import io
+from contextlib import nullcontext
 import json
 from decimal import Decimal, localcontext
 import os
@@ -306,7 +307,7 @@ class TestPowerCardIntegration(unittest.TestCase):
         cls.main = _load('as2w_power_main_test', ROOT/'main.py')
         cls.root = ROOT
 
-    def make_plugin(self):
+    def make_plugin(self, real_worker=False, power_enabled=True):
         d = self.device
 
         class Node:
@@ -317,17 +318,28 @@ class TestPowerCardIntegration(unittest.TestCase):
 
             def destroy_node(self): self.destroyed = True
 
+        subscribers = []
+
         class Subscriber:
-            def __init__(self, *args): self.closed = False
+            def __init__(self, *args):
+                self.closed = False
+                subscribers.append(self)
+
             def Init(self, callback, *args): self.callback = callback
             def Close(self): self.closed = True
+        worker = types.SimpleNamespace(
+            start=lambda: None, join=lambda **kwargs: None,
+            is_alive=lambda: False)
+        worker_context = (nullcontext() if real_worker else patch.object(
+            d.threading, 'Thread', return_value=worker))
         with patch('rclpy.node.Node', Node), patch.object(
-                d, 'ChannelSubscriber',
-                Subscriber):
+                d, 'ChannelSubscriber', Subscriber), worker_context:
             plugin = d.StatePlugin(
                 {},
                 'offline', types.SimpleNamespace(add_node=lambda n: None),
-                battery_power_config={'enabled': True, 'capacity_wh': 600})
+                battery_power_config={
+                    'enabled': power_enabled, 'capacity_wh': 600})
+        plugin.test_subscribers = subscribers
         self.addCleanup(plugin.shutdown)
         return plugin
 
@@ -352,6 +364,130 @@ class TestPowerCardIntegration(unittest.TestCase):
         for sequence in range(1801):
             card.core.update(bms(), sequence, sequence / 10, sequence * 100)
         return card.core.config, card.core.snapshot(180)
+
+    def test_driver_initialization_publishes_without_mcp_start(self):
+        p = self.make_plugin(real_worker=True)
+        node, card = p._state, p._power_card
+        received = threading.Event()
+        original = node._publish
+
+        def publish(publisher, value):
+            original(publisher, value)
+            if publisher is card.publisher and value['fresh']:
+                received.set()
+        with patch.object(node, '_publish', side_effect=publish):
+            node._on_bms(types.SimpleNamespace(**bms()))
+            self.assertTrue(received.wait(2))
+        self.assertFalse(card.logical_running)
+        self.assertTrue(card.running)
+        worker = node._publisher_thread
+        p.shutdown()
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(node._low.closed)
+        self.assertTrue(node._bms.closed)
+        self.assertTrue(node._sport.closed)
+        self.assertTrue(node.node.destroyed)
+
+    def test_always_on_window_reaches_runtime_and_survives_canvas_cycles(self):
+        node, card, output = self.make_queue_node()
+        clock = [0.0]
+        with patch.object(
+                self.device.time, 'monotonic',
+                side_effect=lambda: clock[0]):
+            for n in range(1851):
+                clock[0] = n/10
+                node._on_bms(types.SimpleNamespace(**bms()))
+                node._process_battery_power()
+                if n in (500, 1000, 1800):
+                    energy, covered = card.core.energy_wh, card.core.covered
+                    for _ in range(3):
+                        card.start()
+                        card.stop()
+                    self.assertEqual(energy, card.core.energy_wh)
+                    self.assertEqual(covered, card.core.covered)
+            self.assertEqual('available', output[-1][1]['runtime_status'])
+            self.assertAlmostEqual(185, card.core.covered)
+            self.assertAlmostEqual(77.6*185/3600, card.core.energy_wh)
+            self.assertFalse(card.logical_running)
+
+    def test_shared_sensor_stops_keep_both_battery_streams_alive(self):
+        p = self.make_plugin()
+        node = p._state
+        for name in (
+                'battery_power', 'battery', 'imu',
+                'joint_state', 'loco_state'):
+            self.assertEqual('idle', p.dispatch(
+                'stop', {'_tool_name': name})['state'])
+            self.assertIs(node, p._state)
+            self.assertTrue(p._power_card.running)
+            self.assertFalse(node._bms.closed)
+        published = []
+        with patch.object(
+                node, '_publish',
+                side_effect=lambda pub, data: published.append(pub)):
+            node._on_bms(types.SimpleNamespace(**bms()))
+            # Use the production shared loop; no Dashboard start was issued.
+            with patch.object(
+                    node._stop_event, 'wait',
+                    side_effect=lambda _: node._stop_event.set()):
+                node._publish_loop()
+        self.assertIn(node.battery, published)
+        self.assertIn(p._power_card.publisher, published)
+
+    def test_detached_logical_card_still_handles_charge_invalid_gap_and_stale(
+            self):
+        node, card, output = self.make_queue_node()
+        clock = [0.0]
+        with patch.object(
+                self.device.time, 'monotonic',
+                side_effect=lambda: clock[0]):
+            for n in range(2):
+                clock[0] = n*.1
+                node._on_bms(types.SimpleNamespace(**bms()))
+                node._process_battery_power()
+            energy = card.core.energy_wh
+            card.stop()
+            for now, current, status in ((.2, 1000, 'charging'),
+                                         (.3, None, 'invalid')):
+                clock[0] = now
+                node._on_bms(types.SimpleNamespace(**bms(current=current)))
+                node._process_battery_power()
+                self.assertEqual(status, output[-1][1]['status'])
+                self.assertIsNone(output[-1][1]['remaining_runtime_minutes'])
+                self.assertEqual(energy, card.core.energy_wh)
+            for now in (.4, .8):
+                clock[0] = now
+                node._on_bms(types.SimpleNamespace(**bms()))
+                node._process_battery_power()
+            self.assertEqual(1, card.core.skipped_intervals)
+            self.assertEqual(0, card.core.covered)
+            self.assertEqual(energy, card.core.energy_wh)
+            clock[0] = 1.81
+            node._process_battery_power()
+            self.assertEqual('stale', output[-1][1]['status'])
+            self.assertEqual(energy, card.core.energy_wh)
+
+    def test_new_driver_instance_starts_new_energy_counter(self):
+        first = self.make_plugin()
+        first._power_card.core.update(bms(), 1, 0, 0)
+        first._power_card.core.update(bms(), 2, .1, 100)
+        self.assertGreater(first._power_card.core.energy_wh, 0)
+        first.shutdown()
+        second = self.make_plugin()
+        self.assertTrue(second._power_card.running)
+        self.assertEqual(0, second._power_card.core.energy_wh)
+        self.assertEqual(0, second._power_card.core.covered)
+        self.assertIsNot(first._state, second._state)
+        self.assertEqual(3, len(second.test_subscribers))
+
+    def test_disabled_power_retains_legacy_shared_lifecycle(self):
+        p = self.make_plugin(power_enabled=False)
+        node = p._state
+        self.assertIsNone(p._power_card)
+        self.assertNotIn('battery_power', [t['name'] for t in p.get_tools()])
+        p.stop()
+        self.assertTrue(node._bms.closed)
+        self.assertTrue(node.node.destroyed)
 
     def test_default_yaml_capacity_matches_core_default(self):
         config, snapshot = self.capacity_config_snapshot()
@@ -380,43 +516,38 @@ class TestPowerCardIntegration(unittest.TestCase):
 
     def test_lifecycle_registration_other_cards_and_shutdown(self):
         p = self.make_plugin()
-        node = p._state
-        card = p._power_card
-        self.assertIn('battery_power', [t['name'] for t in p.get_tools()])
-        self.assertEqual('idle', p.dispatch(
-            'info', {'_tool_name': 'battery_power'})['state'])
-        for _ in range(2):
-            p.dispatch('start', {'_tool_name': 'battery_power'})
-        self.assertTrue(card.running)
-        with patch.object(self.device.time, 'monotonic', return_value=10):
-            node._on_bms(types.SimpleNamespace(**bms()))
-            self.assertEqual(10, node._bms_received_mono)
-            card.tick(node, node._latest_bms, node._bms_generation, 10, 10000)
-        with patch.object(self.device.time, 'monotonic', return_value=10.1):
-            node._on_bms(types.SimpleNamespace(**bms()))
-            card.tick(node, node._latest_bms,
-                      node._bms_generation, 10.1, 10100)
-        energy = card.core.energy_wh
-        self.assertGreater(energy, 0)
-        for _ in range(2):
-            p.dispatch('stop', {'_tool_name': 'battery_power'})
+        node, card = p._state, p._power_card
+        info = p.dispatch('info', {'_tool_name': 'battery_power'})
+        self.assertEqual('idle', info['state'])
+        self.assertEqual('running', info['stream_state'])
+        self.assertTrue(info['always_on'])
+        for n in range(3):
+            with patch.object(
+                    self.device.time, 'monotonic',
+                    return_value=10+n*.1):
+                node._on_bms(types.SimpleNamespace(**bms()))
+                node._process_battery_power()
+        energy, covered = card.core.energy_wh, card.core.covered
+        with patch.object(self.device.time, 'monotonic', return_value=10.2):
+            for _ in range(2):
+                p.dispatch('stop', {'_tool_name': 'battery_power'})
+                p.stop()  # Shared stop is logical while power is enabled.
+                p.dispatch('start', {'_tool_name': 'battery_power'})
+        self.assertEqual(energy, card.core.energy_wh)
+        self.assertEqual(covered, card.core.covered)
         self.assertIs(node, p._state)
+        self.assertEqual(3, len(p.test_subscribers))
         self.assertFalse(node._bms.closed)
         self.assertTrue(node.remote_enabled())
         self.assertFalse(node.node.destroyed)
-        card.tick(node, types.SimpleNamespace(**bms()), 3, 10.2, 10200)
-        self.assertEqual(energy, card.core.energy_wh)
-        p.dispatch('start', {'_tool_name': 'battery_power'})
-        self.assertEqual(energy, card.core.energy_wh)
-        self.assertEqual(0, len(card.core.segments))
-        p.stop()
+        p.shutdown()
         self.assertFalse(card.running)
         self.assertIsNone(card.node)
-        self.assertEqual('idle', p.dispatch(
-            'info', {'_tool_name': 'battery_power'})['state'])
-        p.shutdown()
-        self.assertEqual('idle', p.dispatch(
-            'start', {'_tool_name': 'battery_power'})['state'])
+        self.assertTrue(node._bms.closed)
+        self.assertTrue(node.node.destroyed)
+        for name in ('battery_power', 'battery', 'remote_controller'):
+            self.assertEqual('idle', p.dispatch(
+                'start', {'_tool_name': name})['state'])
 
     def test_shared_node_rebuild_retains_energy_without_old_baseline(self):
         p = self.make_plugin()
@@ -427,7 +558,7 @@ class TestPowerCardIntegration(unittest.TestCase):
             c.core.update(bms(), 1, 0, 0)
             c.core.update(bms(), 2, .1, 100)
             energy = c.core.energy_wh
-        p.stop()
+        old.close()  # An actual node teardown creates a new observation epoch.
         replacement = types.SimpleNamespace(
             _latest_lock=threading.Lock(), _bms_generation=0,
             node=types.SimpleNamespace(create_publisher=lambda *args: None),
@@ -444,12 +575,14 @@ class TestPowerCardIntegration(unittest.TestCase):
         self.assertEqual(0, len(c.core.segments))
 
     def test_concurrent_start_stop_shutdown(self):
-        p = self.make_plugin()
+        p = self.make_plugin(real_worker=True)
+        node = p._state
         errors = []
 
         def work():
             try:
                 for _ in range(80):
+                    node._on_bms(types.SimpleNamespace(**bms()))
                     p.dispatch('start', {'_tool_name': 'battery_power'})
                     p.dispatch('info', {'_tool_name': 'battery_power'})
                     p.dispatch('stop', {'_tool_name': 'battery_power'})
@@ -464,8 +597,10 @@ class TestPowerCardIntegration(unittest.TestCase):
             self.assertFalse(t.is_alive())
         self.assertFalse(errors)
         self.assertFalse(p._power_card.running)
+        self.assertFalse(node._publisher_thread.is_alive())
+        self.assertTrue(node._bms.closed)
 
-    def test_one_hz_stale_event_and_stop_publication(self):
+    def test_one_hz_stale_event_logical_stop_and_physical_shutdown(self):
         p = self.make_plugin()
         node = p._state
         c = p._power_card
@@ -488,7 +623,15 @@ class TestPowerCardIntegration(unittest.TestCase):
             self.assertIsNone(output[-1]['remaining_runtime_minutes'])
             c.stop()
             count = len(output)
-            c.tick(node, bms(), 22, 12.1, 12100)
+            with patch.object(
+                    self.device.time, 'monotonic',
+                    return_value=12.1):
+                c.tick(node, bms(), 22, 12.1, 12100)
+            self.assertGreater(len(output), count)
+            self.assertTrue(output[-1]['fresh'])
+            p.shutdown()
+            count = len(output)
+            c.tick(node, bms(), 23, 12.2, 12200)
             self.assertEqual(count, len(output))
 
     def test_real_mcp_handler_and_bundle(self):
@@ -573,7 +716,6 @@ class TestPowerCardIntegration(unittest.TestCase):
         node._maybe_publish_remote = lambda: None
         card = d._BatteryPowerCard({'capacity_wh': 600}, 'offline')
         card.bind(node)
-        card.start()
         return node, card, output
 
     def test_100_to_200ms_worker_delay_preserves_185s_window(self):
@@ -696,6 +838,31 @@ class TestPowerCardIntegration(unittest.TestCase):
                     self.assertEqual(
                         'warming_up', output[-1][1]['runtime_status'])
 
+    def test_lifecycle_info_during_backlog_cannot_clear_live_window(self):
+        node, card, _ = self.make_queue_node()
+        clock = [0.0]
+        with patch.object(self.device.time, 'monotonic',
+                          side_effect=lambda: clock[0]):
+            for n in range(3701):
+                clock[0] = n*.05
+                node._on_bms(types.SimpleNamespace(**bms()))
+                node._process_battery_power()
+            for n in range(1, 25):
+                clock[0] = 185+n*.05
+                node._on_bms(types.SimpleNamespace(**bms()))
+            energy = card.core.energy_wh
+            card.stop()
+            self.assertEqual('stale', card.info()['diagnostics']['snapshot'][
+                'status'])
+            card.start()
+            card.info()
+            self.assertAlmostEqual(185, card.core.covered)
+            self.assertEqual(energy, card.core.energy_wh)
+            node._process_battery_power()
+            self.assertAlmostEqual(186.2, card.core.covered)
+            self.assertEqual('available', card.info()['diagnostics'][
+                'snapshot']['runtime_status'])
+
     def test_legacy_battery_uses_latest_value_once_per_worker_pass(self):
         node, c, output = self.make_queue_node()
         clock = [10.0]
@@ -806,25 +973,27 @@ class TestPowerCardIntegration(unittest.TestCase):
             self.assertEqual('warming_up', c.core.snapshot(
                 clock[0])['runtime_status'])
 
-    def test_queued_samples_respect_stop_resume_and_old_batches(self):
-        node, c, output = self.make_queue_node()
+    def test_queued_samples_survive_logical_stop_without_duplicates(self):
+        node, c, _ = self.make_queue_node()
         msg = types.SimpleNamespace(**bms())
-        node._on_bms(msg)
-        pending = node._drain_bms_samples()
-        c.stop()
-        count = len(output)
-        c.tick_samples(node, pending)
-        self.assertEqual(count, len(output))
-        self.assertIsNone(c.core.sequence)
-        node._on_bms(msg)  # Received while stopped, still waiting in queue.
-        c.start()
-        c.tick_samples(node, pending)
-        node._process_battery_power()
-        self.assertIsNone(c.core.sequence)
-        node._on_bms(msg)
-        node._process_battery_power()
-        self.assertEqual(3, c.core.sequence)
-        self.assertEqual(0, c.core.energy_wh)
+        clock = [10.0]
+        with patch.object(
+                self.device.time, 'monotonic',
+                side_effect=lambda: clock[0]):
+            node._on_bms(msg)
+            pending = node._drain_bms_samples()
+            c.stop()
+            c.tick_samples(node, pending)
+            self.assertEqual(1, c.core.sequence)
+            clock[0] = 10.1
+            node._on_bms(msg)
+            c.start()
+            # Old cache from this node is deduplicated.
+            c.tick_samples(node, pending)
+            node._process_battery_power()
+            self.assertEqual(2, c.core.sequence)
+            self.assertAlmostEqual(77.6*.1/3600, c.core.energy_wh)
+            self.assertAlmostEqual(.1, c.core.covered)
 
     def test_old_node_queued_batch_rejected_after_rebind(self):
         old, c, _ = self.make_queue_node()
@@ -892,25 +1061,34 @@ class TestPowerCardIntegration(unittest.TestCase):
                 node._process_battery_power()
                 self.assertIsNotNone(c.core.sequence)
 
-    def test_stop_publishes_one_invalid_state_and_clears_soh(self):
+    def test_logical_stop_keeps_fresh_publication_and_statistics(self):
         node, c, output = self.make_queue_node()
-        node._on_bms(types.SimpleNamespace(**bms()))
-        node._process_battery_power()
-        self.assertTrue(output[-1][1]['fresh'])
-        count = len(output)
-        c.stop()
-        self.assertEqual(count+1, len(output))
-        value = output[-1][1]
-        self.assertFalse(value['fresh'])
-        self.assertEqual('stale', value['status'])
-        for key in (
-            'voltage_v', 'soh_percent', 'power_w', 'average_power_w',
-                'remaining_runtime_minutes'):
-            self.assertIsNone(value[key])
-        c.stop()
-        node._on_bms(types.SimpleNamespace(**bms()))
-        node._process_battery_power()
-        self.assertEqual(count+1, len(output))
+        clock = [10.0]
+        with patch.object(
+                self.device.time, 'monotonic',
+                side_effect=lambda: clock[0]):
+            for n in range(3):
+                clock[0] = 10+n*.05
+                node._on_bms(types.SimpleNamespace(**bms()))
+                node._process_battery_power()
+            count, energy, covered = len(
+                output), c.core.energy_wh, c.core.covered
+            c.stop()
+            c.stop()
+            self.assertEqual(count, len(output))  # No misleading invalidation.
+            self.assertEqual(energy, c.core.energy_wh)
+            self.assertEqual(covered, c.core.covered)
+            self.assertEqual('idle', c.info()['state'])
+            self.assertEqual('running', c.info()['stream_state'])
+            for n in range(3, 24):
+                clock[0] = 10+n*.05
+                node._on_bms(types.SimpleNamespace(**bms()))
+                node._process_battery_power()
+            self.assertGreater(len(output), count)
+            self.assertTrue(output[-1][1]['fresh'])
+            self.assertEqual(99, output[-1][1]['soh_percent'])
+            self.assertGreater(c.core.energy_wh, energy)
+            self.assertAlmostEqual(1.15, c.core.covered)
 
     def test_expired_soh_is_null_while_raw_diagnostic_is_retained(self):
         core = BatteryPower()
