@@ -204,6 +204,15 @@ class BumiDeviceBundle:
                 plugins_cfg["vision_capture"], camera_plugin))
             print("[bundle] VisionCapturePlugin loaded")
 
+        if plugins_cfg.get("tf_tree", {}).get("enabled", False):
+            # Not gated on a controller or on the camera: tf is structural —
+            # it needs only the URDF and the joint-state topic, both of which
+            # exist regardless of which other cards are enabled.
+            from tf_tree_card import TfTreePlugin
+            self._plugins.append(TfTreePlugin(
+                plugins_cfg["tf_tree"], namespace, executor))
+            print("[bundle] TfTreePlugin loaded")
+
     def start_all(self) -> None:
         failed = 0
         for i, p in enumerate(self._plugins):
