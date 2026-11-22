@@ -7,8 +7,9 @@ It publishes `std_msgs/msg/String` containing JSON on
 
 ## Dashboard
 
-Add **TF Integrity Monitor** from the Bumi driver and connect its JSON output to a
-**Monitor**. Start the TF source and the sensor. A separate `tf_tree` card may
+Search for **tf_integrity_monitor**, open its configuration, and enter the required
+chains as comma-separated ancestor>descendant pairs. Drag the sensor onto the canvas.
+Open **Monitor** to subscribe to the card's advertised JSON output. Start the TF source and the sensor. A separate `tf_tree` card may
 provide the TF source via ROS, so no canvas wire is needed between them. The sensor
 starts idle, and `start` and `stop` are idempotent. `info` returns lifecycle,
 output port, and the current diagnostics while running.
@@ -17,8 +18,9 @@ output port, and the current diagnostics while running.
 
 Use `plugins.tf_integrity_monitor` in the development driver's `config.yaml`.
 List expected names in `required_frames` and directional ancestor-to-descendant
-pairs in `required_chains`. The default requires only `base_link`. For production
-coverage, enumerate the chains relevant to the task using actual TF names.
+pairs in `required_chains`. The shipped Bumi config checks the base-to-elbow and
+base-to-ankle chains on both sides. Adapt the shared Dashboard setting to your
+actual TF names when using a different model tree.
 
 `stale_s`, `future_s`, and `skew_s` are seconds. Run replay with
 `use_sim_time: true` and `ros2 bag play <bag> --clock`. In simulated time,
@@ -100,3 +102,29 @@ SQLite fixture read and republished with its recorded clock. Run it on a
 separate ROS domain or in a container with networking disabled. On Bumi, validate
 normal motion envelopes, measured optical and surveyed marker transforms, replay
 from the target recorder, DDS visibility from Dashboard Core, and Monitor rendering.
+
+### Independent rosbag replay
+
+Run in a native ROS 2 Humble environment with rosbag2 and the same Fast DDS
+profile as the deployment. This test starts a separate static publisher before
+the Card and runs `ros2 bag play --clock` as a separate process. It checks
+retained static TF, ROS playback time, and healthy reports across multiple
+seconds of recorded data.
+
+```sh
+source /opt/ros/humble/setup.bash
+ROS_DOMAIN_ID=78 RMW_IMPLEMENTATION=rmw_fastrtps_cpp \
+  FASTRTPS_DEFAULT_PROFILES_FILE=/path/to/dds-local.xml \
+  python3 tests/bumi_tf_integrity_bag.py
+```
+
+The deployment profile restricts UDPv4 to 127.0.0.1. Core, TF publishers
+and the Card must share a network namespace to communicate through that
+profile. The deployed services use host networking. Keep the deployment
+profile intact and use an isolated namespace and domain for local tests.
+
+In the tested WSL ARM64 user-mode emulation, `IP_MULTICAST_IF` returned
+`ENOPROTOOPT` and a separate process received zero DDS messages. Native
+amd64 with the same profile exchanged messages and completed the bag test.
+Use native ROS for cross-process acceptance when this emulator exhibits the
+socket failure. The independent replay remains to be confirmed on native ARM64.

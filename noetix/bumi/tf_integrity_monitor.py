@@ -24,6 +24,13 @@ class TfIntegrityMonitor:
                     inputSchema={"type": "object", "properties": {
                         "action": {"type": "string", "enum": ["start", "stop", "info"]}},
                         "required": ["action"]},
+                    configSchema={"type": "object", "properties": {
+                        "required_chains": {
+                            "type": "string", "scope": "shared", "title": "Required TF chains",
+                            "description": "Comma-separated ancestor>descendant frame pairs.",
+                            "default": ", ".join(">".join(pair) for pair in
+                                                 self.cfg.get("required_chains", [])),
+                        }}},
                     topic_out=[{"topic": self.output, "format": "data/json"}])
 
     def start(self):
@@ -225,6 +232,24 @@ class TfIntegrityMonitor:
                 ("healthy", "insufficient_evidence"))
 
     def dispatch(self, action, args):
+        if action == "config":
+            with self.lock:
+                if "required_chains" in args:
+                    value = args["required_chains"]
+                    if not isinstance(value, str):
+                        return {"state": "error", "error": "Required TF chains must be text"}
+                    pairs = [tuple(frame.strip() for frame in item.split(">"))
+                             for item in value.split(",") if item.strip()]
+                    if any(len(pair) != 2 or pair[0] == pair[1]
+                           or not all(map(valid_frame, pair)) for pair in pairs):
+                        return {"state": "error", "error": "Expected ancestor>descendant frame pairs"}
+                    cfg = dict(self.cfg, required_chains=pairs)
+                    policy = Integrity(cfg)
+                    self.cfg = cfg
+                    self.view.chains = policy.chains
+                    self.view.required = policy.required
+                return {"config": {"required_chains": self.get_tool()["configSchema"]
+                                   ["properties"]["required_chains"]["default"]}}
         if action == "stop":
             self.stop()
             return {"state": "idle"}

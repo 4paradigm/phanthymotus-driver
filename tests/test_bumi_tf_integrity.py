@@ -136,3 +136,27 @@ def test_inactive_publisher_does_not_create_permanent_parent_conflict():
     report = view.snapshot(4*NS, 4)
     assert report["state"] == "healthy"
     assert not report["stale_frames"] and not report["conflicting_frames"]
+
+
+def test_empty_tf_and_stock_bumi_chains():
+    import yaml
+    config = yaml.safe_load((BUMI / "config.yaml").read_text(encoding="utf-8"))
+    view = Integrity(config["plugins"]["tf_integrity_monitor"])
+    assert view.snapshot(NS, 1)["state"] != "healthy"
+    send(view, parent="base_link", child="camera", static=True)
+    report = view.snapshot(NS, 1)
+    assert report["state"] == "degraded"
+    assert report["missing_frames"] == [
+        "l_ankle_roll_link", "l_elbow_pitch_link", "r_ankle_roll_link", "r_elbow_pitch_link"]
+    assert len(report["disconnected_frames"]) == 4
+
+
+def test_canvas_chain_configuration_keeps_valid_policy_on_invalid_update():
+    card = TfIntegrityMonitor({"required_frames": ["base_link"]}, "bumi", None)
+    field = card.get_tool()["configSchema"]["properties"]["required_chains"]
+    assert field["scope"] == "shared"
+    assert card.dispatch("config", {"required_chains": "base_link>tool"}) == {
+        "config": {"required_chains": "base_link>tool"}}
+    assert card.dispatch("config", {"required_chains": "base_link>base_link"})["state"] == "error"
+    assert card.dispatch("config", {})["config"]["required_chains"] == "base_link>tool"
+    assert card.view.snapshot(NS, 1)["disconnected_frames"] == [["base_link", "tool"]]

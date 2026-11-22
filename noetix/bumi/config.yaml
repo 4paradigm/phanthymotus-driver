@@ -6,7 +6,11 @@ plugins:
     enabled: true
     use_sim_time: false
     required_frames: [base_link]
-    required_chains: []
+    required_chains:
+      - [base_link, l_elbow_pitch_link]
+      - [base_link, r_elbow_pitch_link]
+      - [base_link, l_ankle_roll_link]
+      - [base_link, r_ankle_roll_link]
     stale_s: 2.0
     future_s: 0.25
     skew_s: 0.5
