@@ -11,6 +11,7 @@ from noetix.bumi.leg_odometry_source import LegOdometrySource
 
 IDENTITY = [0.0, 0.0, 0.0, 1.0]
 ZERO_GYRO = [0.0, 0.0, 0.0]
+IDENTITY_ROTATION = [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
 
 
 def joints(pitch=0.0):
@@ -186,7 +187,7 @@ def test_invalid_stance_does_not_publish_a_measured_zero_speed(pitch, elapsed_ms
     assert not read(source, pitch, stamp_ns=stamp_ns, monotonic_s=1.02 + elapsed_ms / 1000)
     packet = source.sample(stamp_ns)
     assert packet['pose'] is None
-    assert packet['twist'] == [None] * 6
+    assert packet['twist'] == [None, None, None, *ZERO_GYRO]
     assert packet['vendor']['status'] != 'tracking'
 
 
@@ -242,3 +243,163 @@ def test_published_packet_cannot_mutate_the_integrator_state():
     assert fresh['pose']['position'] == expected
     assert fresh['pose']['quaternion'] == IDENTITY
     assert fresh['twist'][0] != 99.0
+
+
+@pytest.mark.parametrize('roll', [0.0, math.pi / 2])
+def test_lower_world_foot_stays_in_support_through_a_direction_reversal(roll):
+    source = LegOdometrySource('robot')
+    c, s = math.cos(roll), math.sin(roll)
+    rotation = [[1, 0, 0], [0, c, -s], [0, s, c]]
+    for step in range(16):
+        progress = step if step <= 10 else 20 - step
+        world = [[.03 - .005 * progress, .1, -.48], [.03 + .002 * progress, -.1, -.43]]
+        # Inverse roll creates the identical physical trajectory in tilted body axes.
+        feet = [[x, c*y + s*z, -s*y + c*z] for x, y, z in world]
+        source.leg.observe_feet(feet, rotation, step * .025)
+        assert source.leg.position == pytest.approx([.005 * progress, 0, 0])
+
+
+@pytest.mark.parametrize('interval_ms', [10, 25, 50, 75])
+def test_equal_height_disagreement_selects_one_support_at_every_sample_rate(interval_ms):
+    source = LegOdometrySource('robot')
+    for elapsed_ms in range(0, 301, interval_ms):
+        t = elapsed_ms / 1000
+        feet = [[.03 - .2*t, .1, -.48], [.03 - .5*t, -.1, -.48]]
+        source.leg.observe_feet(feet, IDENTITY_ROTATION, t)
+    assert source.leg.position == pytest.approx([.06, 0, 0])
+    assert not source.leg.double_support
+
+
+def test_equal_length_steps_separated_by_45_degrees_do_not_indicate_double_support():
+    leg = LegOdometrySource('robot').leg
+    leg.observe_feet([[0, .1, -.48], [0, -.1, -.48]], IDENTITY_ROTATION, 0)
+    d = .005 / math.sqrt(2)
+    leg.observe_feet([[-.005, .1, -.48], [-d, -.1-d, -.48]], IDENTITY_ROTATION, .025)
+    assert not leg.double_support
+
+
+def test_support_persistence_resolves_small_speed_ambiguities():
+    leg = LegOdometrySource('robot').leg
+    for step, (left_x, right_x) in enumerate([(0., 0.), (-.005, .01), (0., .0051)]):
+        leg.observe_feet([[left_x, .1, -.48], [right_x, -.1, -.48]],
+                         IDENTITY_ROTATION, step * .025)
+    # Both candidates reversed. Left remains planted despite 0.1 mm more travel.
+    assert leg.position == pytest.approx([0, 0, 0])
+
+
+def test_rejected_spike_withdraws_translation_then_recovers_clean_endpoint_and_covariance():
+    clean, noisy = LegOdometrySource('robot'), LegOdometrySource('robot')
+    original_frame = noisy.frame_id
+    proc_before = None
+    for i, (good, bad) in enumerate(zip([0, .01, .02, .03, .04], [0, .01, .60, .03, .04])):
+        stamp = 1_000_000_000 + 25_000_000 * i
+        times = dict(stamp_ns=stamp, monotonic_s=1 + i * .025, angular_velocity=[.1, -.2, .3])
+        read(clean, good, **times)
+        read(noisy, bad, **times)
+        packet = noisy.sample(stamp)
+        if i == 1:
+            proc_before = packet['pose'].get('process_covariance')
+        if i == 2:
+            assert packet['pose'] is None
+            assert packet['twist'] == [None, None, None, .1, -.2, .3]
+            assert noisy.sample(stamp + 100_000_000)['stamp_ms'] == 1050
+            assert noisy.sample(stamp + 250_000_001)['twist'] == [None] * 6
+        if i >= 3:
+            ref = clean.sample(stamp)['pose']
+            pose = packet['pose']
+            assert pose['frame_id'] == original_frame
+            assert pose['position'] == pytest.approx(ref['position'])
+            assert len(proc_before) == len(pose['process_covariance']) == 36
+            for j in range(0, 36, 7):
+                assert pose['process_covariance'][j] > proc_before[j] > 0
+                assert pose['covariance'][j] > pose['process_covariance'][j]
+            assert pose['process_covariance'][0] > ref['process_covariance'][0]
+
+
+def test_failed_endpoint_followed_by_long_gap_starts_a_new_origin():
+    source = walking_source()
+    original_frame = source.frame_id
+    for tick in range(1, 5):
+        assert not read(source, .6, stamp_ns=1_020_000_000 + tick * 20_000_000,
+                        monotonic_s=1.02 + tick * .02)
+    # 110 ms from the accepted endpoint, but only 30 ms from the last rejected read.
+    assert not read(source, .04, stamp_ns=1_130_000_000, monotonic_s=1.13)
+    assert read(source, .04, stamp_ns=1_150_000_000, monotonic_s=1.15)
+    recovered = source.sample(1_150_000_000)['pose']
+    assert recovered['frame_id'] != original_frame
+    assert recovered['position'] == pytest.approx([0, 0, 0])
+
+
+def test_process_noise_increases_with_disagreement_at_the_same_elapsed_time_and_distance():
+    def pose_after(right_pitch):
+        source = LegOdometrySource('robot')
+        read(source)
+        q = joints(.01)
+        q[JOINT_INDEX['r_leg_pitch_joint']] = right_pitch
+        source.observe(q, IDENTITY, ZERO_GYRO, stamp_ns=1_025_000_000, monotonic_s=1.025)
+        return source.sample(1_025_000_000)['pose']
+
+    agree, disagree = pose_after(.01), pose_after(.03)
+    assert disagree['position'] == pytest.approx(agree['position'])
+    for pose in (agree, disagree):
+        process = pose['process_covariance']
+        assert len(process) == 36 and all(math.isfinite(x) for x in process)
+        assert all(process[i] == 0 for i in range(36) if i % 7)
+        assert all(process[i] > 0 for i in range(0, 36, 7))
+        assert pose['covariance'][0] - process[0] == pytest.approx(.03**2)
+    assert disagree['process_covariance'][0] > agree['process_covariance'][0]
+
+
+def test_nearly_stationary_orthogonal_steps_do_not_claim_double_support():
+    leg = LegOdometrySource('robot').leg
+    leg.observe_feet([[0, .1, -.48], [0, -.1, -.48]], IDENTITY_ROTATION, 0)
+    leg.observe_feet([[-.0002, .1, -.48], [0, -.1002, -.48]], IDENTITY_ROTATION, .025)
+    assert not leg.double_support
+
+
+@pytest.mark.parametrize('endpoint_ms', [1025, 570])
+@pytest.mark.parametrize(('extra_stamp_ns', 'extra_monotonic_ns', 'accepted'), [
+    (0, 0, True),
+    (1, 0, False),
+    (0, 1, False),
+])
+def test_recovery_100_ms_boundary_for_both_clocks(endpoint_ms, extra_stamp_ns,
+                                                   extra_monotonic_ns, accepted):
+    source = LegOdometrySource('robot')
+    for offset_ms, angle in [(-25, 0), (0, .01), (25, .60)]:
+        ms = endpoint_ms + offset_ms
+        read(source, angle, stamp_ns=ms * 1_000_000, monotonic_s=ms / 1000)
+    frame = source.frame_id
+    deadline_ns = (endpoint_ms + 100) * 1_000_000
+    result = read(source, .04, stamp_ns=deadline_ns + extra_stamp_ns,
+                  monotonic_s=(deadline_ns + extra_monotonic_ns) / 1_000_000_000)
+    assert result is accepted
+    assert (source.frame_id == frame) is accepted
+
+
+def test_elevated_only_velocity_plausible_foot_cannot_certify_a_step():
+    leg = LegOdometrySource('robot').leg
+    leg.observe_feet([[0, .1, -.48], [0, -.1, -.43]], IDENTITY_ROTATION, 0)
+    leg.observe_feet([[-.10, .1, -.48], [.002, -.1, -.43]], IDENTITY_ROTATION, .025)
+    assert leg.stance_samples == 0
+    leg.observe_feet([[-.01, .1, -.48], [.004, -.1, -.43]], IDENTITY_ROTATION, .050)
+    assert leg.position == pytest.approx([.01, 0, 0])
+
+
+def test_recovery_with_opposite_feet_lifted_at_each_endpoint_cannot_bridge_translation():
+    leg = LegOdometrySource('robot').leg
+    leg.observe_feet([[0, .1, -.48], [0, -.1, -.44]], IDENTITY_ROTATION, 0)
+    leg.observe_feet([[.20, .1, -.48], [.20, -.1, -.44]], IDENTITY_ROTATION, .025)
+    leg.observe_feet([[.003, .1, -.44], [-.008, -.1, -.48]], IDENTITY_ROTATION, .075)
+    assert leg.stance_samples == 0
+
+
+def test_clear_stance_height_reduces_ambiguity_when_velocity_evidence_is_equal():
+    def ambiguity(right_z):
+        leg = LegOdometrySource('robot').leg
+        leg.observe_feet([[0, .1, -.48], [0, -.1, right_z]], IDENTITY_ROTATION, 0)
+        leg.observe_feet([[-.005, .1, -.48], [.005, -.1, right_z]], IDENTITY_ROTATION, .025)
+        assert not leg.double_support
+        return leg.support_ambiguity
+
+    assert ambiguity(-.43) < ambiguity(-.48)

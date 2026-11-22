@@ -13,13 +13,18 @@ import uuid
 from common.odom import build_sample
 
 try:
-    from .leg_odometry import LegOdometry, joint_angles, rotation_from_quaternion
+    from .leg_odometry import (MAX_INTERVAL_S, LegOdometry, interval_too_long, joint_angles,
+                               rotation_from_quaternion)
 except ImportError:  # The Bumi image copies these modules directly into /work.
-    from leg_odometry import LegOdometry, joint_angles, rotation_from_quaternion
+    from leg_odometry import (MAX_INTERVAL_S, LegOdometry, interval_too_long, joint_angles,
+                              rotation_from_quaternion)
 
 
 MAX_SAMPLE_AGE_NS = 250_000_000
-MAX_INTERVAL_S = 0.1
+# Finite sole/contact and SDK attitude uncertainty at the origin, in world
+# xyz metres and rotation-vector radians (variances on the diagonal).
+_ORIGIN_VARIANCE = (0.03**2, 0.03**2, 0.05**2, math.radians(3.0)**2,
+                    math.radians(3.0)**2, math.radians(5.0)**2)
 
 
 def _vector(values, length, name):
@@ -58,7 +63,10 @@ class LegOdometrySource:
         self.frame_id = f'{self.namespace}_leg_odom_{self.session_id}'
         # Existing locomotion retains its own configured slip corrections.
         # Visual and scale correction belong to the generic consumer.
-        self.leg = LegOdometry(slip_scale=1.0, max_step_velocity_m_s=1.0)
+        self.leg = LegOdometry(slip_scale=1.0, max_step_velocity_m_s=1.0,
+                               contact_confidence=True)
+        self._baseline_stamp_ns = None
+        self._baseline_monotonic_s = None
         self._last_stamp_ns = None
         self._last_monotonic_s = None
         self._needs_baseline = False
@@ -68,11 +76,7 @@ class LegOdometrySource:
         self._reason = 'waiting for leg samples'
         self.sample_count = 0
         self.accepted_count = 0
-        # Diagonal process approximation in m^2 and rad^2. The positive initial
-        # variances cover a finite foot/contact and SDK attitude uncertainty.
-        self._variance = [0.03**2, 0.03**2, 0.05**2,
-                          math.radians(3.0)**2, math.radians(3.0)**2,
-                          math.radians(5.0)**2]
+        self._process_variance = [0.0] * 6
 
     def invalidate(self, reason):
         """Immediately withdraw the last estimate without refreshing its time."""
@@ -103,16 +107,17 @@ class LegOdometrySource:
             self.invalidate(str(exc))
             raise ValueError(str(exc)) from exc
 
-        previous_mono = self._last_monotonic_s
-        previous_stamp = self._last_stamp_ns
-        discontinuity = previous_mono is not None and (
-            not 0.0 < monotonic_s - previous_mono <= MAX_INTERVAL_S
-            or not 0 < stamp_ns - previous_stamp <= int(MAX_INTERVAL_S * 1e9)
+        # Require read chronology as well as a short span from the last usable
+        # foot endpoint. Rejected feet never move that endpoint forward.
+        discontinuity = self._baseline_stamp_ns is not None and (
+            monotonic_s <= self._last_monotonic_s or stamp_ns <= self._last_stamp_ns
+            or interval_too_long(self._baseline_monotonic_s, monotonic_s)
+            or stamp_ns - self._baseline_stamp_ns > int(MAX_INTERVAL_S * 1e9)
         )
         if self._needs_baseline or discontinuity:
             self.reset()
-            previous_mono = None
-
+        previous_mono = self._baseline_monotonic_s
+        recovering = self._last_stamp_ns != self._baseline_stamp_ns
         previous_position = list(self.leg.position)
         previous_stance = self.leg.stance_samples
         try:
@@ -124,39 +129,49 @@ class LegOdometrySource:
         self._last_monotonic_s = monotonic_s
         self.sample_count += 1
 
+        if previous_mono is not None and self.leg.stance_samples == previous_stance:
+            self._pose = None
+            self._twist = [None, None, None, *angular]
+            self._status = 'lost'
+            self._reason = 'leg support step unavailable'
+            return False
+        self._baseline_stamp_ns = stamp_ns
+        self._baseline_monotonic_s = monotonic_s
         if previous_mono is None:
             self._reason = 'establishing leg baseline'
-            return False
-        if self.leg.stance_samples == previous_stance:
-            # LegOdometry uses zero velocity internally for rejected contact
-            # steps. Such a step is not a measured standstill. Rebase before
-            # resuming so its missing displacement cannot silently bridge frames.
-            self.invalidate('leg support step unavailable')
             return False
 
         dt = monotonic_s - previous_mono
         distance = math.dist(self.leg.position, previous_position)
         angular_distance = math.hypot(*angular) * dt
-        # Translational random walk grows with elapsed time and travelled
-        # distance (variance per second / metre); attitude grows with time and
-        # angular travel. These remain nonzero while stationary and never shrink
-        # without an external correction, which belongs to the consumer.
+        # Diagonal world-frame random walk. The floor grows even at rest.
+        # Vector disagreement (m/s) and ambiguous support inflate translation;
+        # a change of stance adds uncertainty about the new sole contact.
+        # Bridging missing samples adds variance over the full elapsed interval.
+        quality_factor = (1.0 + self.leg.support_ambiguity
+                          + min(self.leg.residual_speed / 0.1, 10.0))
+        gap_factor = 2.0 if recovering else 1.0
         for axis in range(3):
-            self._variance[axis] += (0.01 if axis < 2 else 0.02)**2 * dt
-            self._variance[axis] += (0.20 if axis < 2 else 0.30)**2 * distance
+            time_noise = (0.01 if axis < 2 else 0.02)**2 * dt
+            travel_noise = (0.20 if axis < 2 else 0.30)**2 * distance
+            self._process_variance[axis] += gap_factor * quality_factor * (time_noise + travel_noise)
+            if self.leg.support_switched:
+                self._process_variance[axis] += 0.005**2
         for axis in range(3, 6):
-            self._variance[axis] += math.radians(0.5)**2 * dt
-            self._variance[axis] += math.radians(1.0)**2 * angular_distance
+            self._process_variance[axis] += gap_factor * (
+                math.radians(0.5)**2 * dt + math.radians(1.0)**2 * angular_distance)
         covariance = [0.0] * 36
-        for axis, variance in enumerate(self._variance):
-            covariance[axis * 7] = variance
+        process_covariance = [0.0] * 36
+        for axis, variance in enumerate(self._process_variance):
+            process_covariance[axis * 7] = variance
+            covariance[axis * 7] = _ORIGIN_VARIANCE[axis] + variance
 
         rotation = rotation_from_quaternion(orientation)
         body_velocity = [sum(rotation[row][axis] * self.leg.velocity[row]
                              for row in range(3)) for axis in range(3)]
         self._pose = dict(position=list(self.leg.position), quaternion=orientation,
                           frame_id=self.frame_id, child_frame_id=self.child_frame_id,
-                          covariance=covariance)
+                          covariance=covariance, process_covariance=process_covariance)
         self._twist = [*body_velocity, *angular]
         self._status = 'tracking'
         self._reason = None
@@ -166,17 +181,17 @@ class LegOdometrySource:
     def sample(self, now_ns):
         """Return a fresh packet, retaining the last actual SDK read timestamp."""
         status, reason = self._status, self._reason
-        valid = self._pose is not None
+        fresh = self._last_stamp_ns is not None
         if self._last_stamp_ns is not None:
             age_ns = now_ns - self._last_stamp_ns
             if age_ns < 0 or age_ns > MAX_SAMPLE_AGE_NS:
-                valid = False
+                fresh = False
                 status = 'lost'
                 reason = 'leg sample is in the future' if age_ns < 0 else 'leg sample stale'
         return build_sample(
             stamp_ms=(self._last_stamp_ns or 0) // 1_000_000,
-            twist=list(self._twist) if valid else [None] * 6,
-            frame='body', pose=deepcopy(self._pose) if valid else None,
+            twist=list(self._twist) if fresh and self._twist is not None else [None] * 6,
+            frame='body', pose=deepcopy(self._pose) if fresh else None,
             vendor=dict(source='bumi_leg_kinematics', status=status, reason=reason,
                         segment_id=self.session_id),
         )
