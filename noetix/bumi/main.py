@@ -181,6 +181,12 @@ class BumiDeviceBundle:
             self._plugins.append(camera_plugin)
             print("[bundle] CameraPlugin loaded")
 
+        if plugins_cfg.get("food_segmentation", {}).get("enabled", False):
+            from food_segmentation import FoodSegmentationPlugin
+            self._plugins.append(FoodSegmentationPlugin(
+                plugins_cfg["food_segmentation"], namespace, executor))
+            print("[bundle] FoodSegmentationPlugin loaded")
+
         if plugins_cfg.get("visual_odometry", {}).get("enabled", False):
             if camera_plugin is None:
                 print("[bundle] VisualOdometryPlugin needs plugins.camera.enabled; skipped")

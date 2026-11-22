@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 import sys
+import json
+import http.client
+import threading
 import types
+from concurrent.futures import ThreadPoolExecutor
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -61,6 +66,31 @@ class FakeSpeakerPlugin:
         pass
 
 
+class FakeFoodSegmentationPlugin:
+    PREFIX = "food_segmentation"
+
+    def __init__(self, plugin_config, namespace, executor):
+        self.plugin_config = plugin_config
+        self.namespace = namespace
+        self.executor = executor
+        self.started = False
+        self.stopped = False
+
+    def get_tool(self):
+        return {"name": "food_segmentation", "type": "processor"}
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        self.stopped = True
+
+    def dispatch(self, action, _args):
+        if action in ("start", "stop", "info"):
+            return {"state": action}
+        return None
+
+
 @pytest.fixture
 def bundle_module(monkeypatch):
     """Load the real bundle and servo card with hardware imports replaced."""
@@ -74,6 +104,9 @@ def bundle_module(monkeypatch):
     fake_device.LocoPlugin = FakeLocoPlugin
     fake_device.SpeakerPlugin = FakeSpeakerPlugin
     monkeypatch.setitem(sys.modules, "device", fake_device)
+    fake_food = types.ModuleType("food_segmentation")
+    fake_food.FoodSegmentationPlugin = FakeFoodSegmentationPlugin
+    monkeypatch.setitem(sys.modules, "food_segmentation", fake_food)
     monkeypatch.syspath_prepend(str(BUMI))
     previous_loco_servo = sys.modules.pop("loco_servo", None)
 
@@ -169,4 +202,93 @@ def test_existing_bumi_plugin_loading_is_unchanged(bundle_module):
 
     assert [tool["name"] for tool in bundle.get_all_tools()] == [
         "loco", "loco_servo", "speaker"]
+
+
+def test_food_segmentation_registration_coexists_with_existing_plugins(bundle_module):
+    config = _config()
+    config["plugins"]["food_segmentation"] = {
+        "enabled": True, "model_path": "/models/yolo11n-seg.pt"}
+    executor = object()
+    bundle = bundle_module.BumiDeviceBundle(
+        config, "bumi_test", executor, FakeHighCtrl(), media_ctrl=None)
+
+    assert [tool["name"] for tool in bundle.get_all_tools()] == [
+        "loco", "loco_servo", "food_segmentation"]
+    food = bundle._plugins[-1]
+    assert food.PREFIX == "food_segmentation"
+    assert food.plugin_config["model_path"] == "/models/yolo11n-seg.pt"
+    assert food.executor is executor
+    bundle.start_all()
+    assert food.started is True
+    assert bundle.dispatch(
+        "food_segmentation", {"action": "info"}) == {"state": "info"}
+    bundle.stop_all()
+    assert food.stopped is True
+
+
+def test_food_segmentation_disabled_is_not_registered(bundle_module):
+    config = _config(loco=False, loco_servo=False)
+    config["plugins"]["food_segmentation"] = {"enabled": False}
+    bundle = bundle_module.BumiDeviceBundle(
+        config, "bumi_test", object(), high_ctrl=None, media_ctrl=None)
+    assert bundle.get_all_tools() == []
+    assert bundle._plugins == []
+
+
+def test_food_segmentation_real_mcp_http_lifecycle_and_concurrency(bundle_module):
+    config = _config(loco=False, loco_servo=False)
+    config["plugins"]["food_segmentation"] = {
+        "enabled": True, "model_path": "/models/yolo11n-seg.pt"}
+    bundle = bundle_module.BumiDeviceBundle(
+        config, "bumi_test", object(), high_ctrl=None, media_ctrl=None)
+    bundle_module._bundle = bundle
+    server = ThreadingHTTPServer(("127.0.0.1", 0), bundle_module.make_handler())
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    def rpc(method, params=None, request_id=1):
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", server.server_address[1], timeout=2)
+        body = json.dumps({
+            "jsonrpc": "2.0", "id": request_id,
+            "method": method, "params": params or {},
+        })
+        connection.request("POST", "/mcp", body, {
+            "Content-Type": "application/json"})
+        response = connection.getresponse()
+        payload = json.loads(response.read())
+        connection.close()
+        assert response.status == 200
+        return payload
+
+    try:
+        assert rpc("initialize")["result"]["protocolVersion"] == "2024-11-05"
+        tools = rpc("tools/list")["result"]["tools"]
+        assert tools == [{"name": "food_segmentation", "type": "processor"}]
+
+        for action in ("info", "start", "start", "stop", "stop"):
+            response = rpc("tools/call", {
+                "name": "food_segmentation", "arguments": {"action": action}})
+            content = json.loads(response["result"]["content"][0]["text"])
+            assert content == {"state": action}
+
+        unknown_tool = rpc("tools/call", {
+            "name": "missing", "arguments": {"action": "info"}})
+        assert unknown_tool["error"]["code"] == -32601
+        unknown_action = rpc("tools/call", {
+            "name": "food_segmentation", "arguments": {"action": "bad"}})
+        assert unknown_action["error"]["code"] == -32601
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            responses = list(pool.map(
+                lambda index: rpc("tools/call", {
+                    "name": "food_segmentation",
+                    "arguments": {"action": "info"}}, index + 10),
+                range(16),
+            ))
+        assert all("result" in response for response in responses)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(2)
 

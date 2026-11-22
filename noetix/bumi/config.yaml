@@ -50,6 +50,23 @@ plugins:
     #   systemctl disable --now noetix-video-capture.service
     # Set false only when official App video transfer must retain the camera.
     disable_vendor_capture_service: true
+  # Optional processor: consumes camera JPEG over DDS and publishes JSON
+  # instance masks plus a JPEG overlay.  Kept off until the local checkpoint,
+  # Jetson runtime and Ultralytics licensing have been approved.
+  food_segmentation:
+    enabled: false
+    model_path: ""              # Required local path; never downloaded implicitly.
+    input_topic: ""             # Empty defaults to /<namespace>/camera/color.
+    metadata_topic: ""          # Empty defaults to /<namespace>/food_segmentation/metadata.
+    overlay_topic: ""           # Empty defaults to /<namespace>/food_segmentation/overlay.
+    confidence_threshold: 0.25
+    mask_threshold: 0.5
+    imgsz: 640
+    device: ""                  # Empty lets the approved runtime select its device.
+    max_rate_hz: 2
+    input_timeout_s: 2
+    stop_timeout_s: 10
+    jpeg_quality: 85
   # 只读 RGB-D 视觉里程计（RTAB-Map rgbd_odometry，在 bundle 进程内运行）。
   # 内置 IMU 只辅助旋转初值；无惯性位移积分/EKF，不参与运动控制；
   # 停止本卡片只回收它自己的估计子进程和私有话题，不影响相机/媒体/动作卡。
