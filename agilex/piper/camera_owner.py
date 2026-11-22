@@ -1,6 +1,7 @@
 """Shared nonblocking camera ownership for live video and one-shot capture."""
 import fcntl
 import hashlib
+import stat
 from pathlib import Path
 
 
@@ -8,7 +9,15 @@ class CameraOwner:
     def __init__(self, data_dir, device):
         directory = Path(data_dir)
         directory.mkdir(parents=True, exist_ok=True)
-        identity = hashlib.sha256(str(device).encode()).hexdigest()[:16]
+        path = Path(device)
+        key = str(path.resolve())
+        try:
+            metadata = path.stat()
+            if stat.S_ISCHR(metadata.st_mode):
+                key = f"char:{metadata.st_rdev}"
+        except FileNotFoundError:
+            pass
+        identity = hashlib.sha256(key.encode()).hexdigest()[:16]
         self.handle = (directory / ('camera-owner-' + identity + '.lock')).open('a+')
         try:
             fcntl.flock(self.handle, fcntl.LOCK_EX | fcntl.LOCK_NB)

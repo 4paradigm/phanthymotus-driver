@@ -1,0 +1,11 @@
+# Compose override for a single PiPER service with two explicit color devices.
+services:
+  agilex-piper:
+    devices:
+      - "${PIPER_CAMERA_A:?Set the verified Camera A V4L2 by-id path}:${PIPER_CAMERA_A}:rw"
+      - "${PIPER_CAMERA_B:?Set the verified Camera B V4L2 by-id path}:${PIPER_CAMERA_B}:rw"
+    volumes:
+      - "${PIPER_DUAL_CAMERA_CONFIG:?Set the dual-camera config path}:/work/piper-dual-camera.yaml:ro"
+    environment:
+      PIPER_CAMERA_ENABLED: "1"
+      CONFIG_PATH: /work/piper-dual-camera.yaml

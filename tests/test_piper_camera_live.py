@@ -12,7 +12,7 @@ from unittest.mock import patch
 import cv2
 import numpy as np
 
-from agilex.piper.camera_live import PiperCameraLive, add_camera_live, camera_settings, offline_image
+from agilex.piper.camera_live import OFFLINE_FRAME, PiperCameraLive, add_camera_live, camera_settings, offline_image
 from agilex.piper.camera_owner import CameraOwner
 from agilex.piper.camera_worker import CameraSession, Mailbox, encode_frame
 from common.vendor_runtime import DriverBundle
@@ -29,8 +29,10 @@ class Transport:
     def __init__(self, *args):
         self.messages = []
         self.closed = 0
-    def publish(self, jpeg, stamp):
+        self.headers = []
+    def publish(self, jpeg, stamp, frame_id=None):
         self.messages.append((jpeg, stamp))
+        self.headers.append(frame_id)
     def close(self):
         self.closed += 1
 
@@ -91,6 +93,56 @@ class LiveCameraTests(unittest.TestCase):
                 self.fail('timed out waiting for camera test condition')
             time.sleep(.01)
 
+    def configure_dual(self):
+        camera = self.runtime.config["camera"]
+        camera.update(camera_id="bench_a", device="/dev/v4l/by-id/fixture-a-video-index0")
+        camera["secondary"] = dict(camera_id="bench_b", device="/dev/v4l/by-id/fixture-b-video-index0",
+                                   live={"enabled": True})
+        self.runtime.capture = lambda args: None
+        self.runtime.get_tools = lambda: []
+
+    def test_dual_registration_uses_one_runtime_and_distinct_topics(self):
+        self.configure_dual()
+        runtime, a, b = add_camera_live([self.runtime], self.runtime.config, None, sensor_card=True)
+        self.assertIs(runtime, self.runtime)
+        self.assertIs(a.runtime, b.runtime)
+        self.assertNotEqual(a.topic, b.topic)
+        self.assertEqual(a.get_tools()[0]["name"], "piper_camera_live")
+        self.assertEqual(b.get_tools()[0]["name"], "piper_camera_live_b")
+        secondary = self.runtime.config["camera"]["secondary"]
+        for key, value in (("device", "/dev/video1"), ("camera_id", "bench_a"),
+                           ("device", "/dev/v4l/by-id/fixture-a-video-index1")):
+            original = secondary[key]
+            secondary[key] = value
+            with self.assertRaises(ValueError):
+                add_camera_live([self.runtime], self.runtime.config, None, sensor_card=True)
+            secondary[key] = original
+
+    def test_provenance_retry_changes_session_and_omits_placeholder(self):
+        self.configure_dual()
+        first = [True]
+
+        def factory(settings):
+            if first and first.pop():
+                return Session(settings, error="mock cable removed")
+            return Session(settings)
+
+        plugin = self.make(factory)
+        plugin.settings["device"] = "/dev/null"  # Simulate a present character device.
+        plugin.start()
+        self.wait(lambda: len(self.transports[0].headers) >= 2)
+        headers = self.transports[0].headers
+        fields = [header.split("|") for header in headers[:2]]
+        self.assertEqual([field[4] for field in fields], ["1", "2"])
+        self.assertEqual(fields[0][1:3], ["bench_a", "bench_a_color_optical_frame"])
+        self.assertEqual(fields[0][5], "host_read")
+        self.assertNotIn(OFFLINE_FRAME, headers)
+        self.assertEqual(self.sessions[0].closed, 1)
+        plugin.stop()
+        plugin.start()
+        self.wait(lambda: len(self.transports) == 2 and self.transports[1].headers)
+        self.assertNotEqual(fields[0][3], self.transports[1].headers[0].split("|")[3])
+
     def test_resource_card_and_auto_stream_has_new_frames_and_independent_topic(self):
         plugin = self.make()
         definition = plugin.get_tools()[0]
@@ -141,6 +193,9 @@ class LiveCameraTests(unittest.TestCase):
         messages = self.transports[0].messages
         self.assertEqual(sum(jpeg == b'live-1' for jpeg, _ in messages), 2)  # One frame per session, never stale replay.
         offline = next(jpeg for jpeg, _ in messages if jpeg.startswith(b'\xff\xd8'))
+        index = next(i for i, (jpeg, _) in enumerate(messages) if jpeg == offline)
+        self.assertEqual(messages[index][1], 0)
+        self.assertEqual(self.transports[0].headers[index], OFFLINE_FRAME)
         self.assertIsNotNone(cv2.imdecode(np.frombuffer(offline, np.uint8), cv2.IMREAD_COLOR))
         self.assertEqual(self.sessions[0].closed, 1)
         self.assertIsNone(plugin.info()['错误原因'])
