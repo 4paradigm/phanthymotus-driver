@@ -111,8 +111,10 @@ class FakeCodec:
         self.encoded_images = []
         self.rectangles = []
         self.labels = []
+        self.decode_calls = 0
 
     def decode(self, data):
+        self.decode_calls += 1
         if data == b"broken":
             raise ValueError("JPEG payload could not be decoded")
         return np.zeros((5, 6, 3), dtype=np.uint8)
@@ -126,6 +128,11 @@ class FakeCodec:
 
     def label(self, _image, text, origin, color):
         self.labels.append((text, origin, color))
+
+
+class LargeDecodedImageCodec(FakeCodec):
+    def decode(self, _data):
+        return np.zeros((4, 4, 3), dtype=np.uint8)
 
 
 def fake_bindings():
@@ -394,6 +401,111 @@ def test_invalid_compressed_message_isolated(data, fmt):
     plugin.stop()
 
 
+def test_compressed_size_limit_drops_frame_before_decode_or_inference():
+    plugin, runtime, codec, _ = make_plugin(max_compressed_bytes=3)
+    assert plugin.start()
+    pubs = publishers(plugin)
+    send(plugin, b"good")
+    wait_for(lambda: plugin.info()["limit_errors"] == 1)
+    assert runtime.predict_calls == 0
+    assert codec.encoded_images == []
+    assert all(not publisher.messages for publisher in pubs.values())
+    assert "max_compressed_bytes" in plugin.info()["last_error"]
+    plugin.stop()
+
+
+def test_decoded_pixel_limit_drops_frame_before_inference():
+    codec = LargeDecodedImageCodec()
+    plugin, runtime, _, _ = make_plugin(codec=codec, max_image_pixels=15)
+    assert plugin.start()
+    pubs = publishers(plugin)
+    send(plugin)
+    wait_for(lambda: plugin.info()["limit_errors"] == 1)
+    assert runtime.predict_calls == 0
+    assert codec.encoded_images == []
+    assert all(not publisher.messages for publisher in pubs.values())
+    assert "max_image_pixels" in plugin.info()["last_error"]
+    plugin.stop()
+
+
+def test_jpeg_header_pixel_limit_drops_frame_before_decode():
+    # SOI + baseline SOF segment declaring a 200x100 RGB image.
+    jpeg_header = (
+        b"\xff\xd8\xff\xc0\x00\x11\x08\x00\x64\x00\xc8\x03"
+        b"\x01\x11\x00\x02\x11\x00\x03\x11\x00"
+    )
+    codec = FakeCodec()
+    plugin, runtime, _, _ = make_plugin(
+        codec=codec, max_image_pixels=10_000)
+    assert plugin.start()
+    pubs = publishers(plugin)
+    send(plugin, jpeg_header)
+    wait_for(lambda: plugin.info()["limit_errors"] == 1)
+    assert codec.decode_calls == 0
+    assert runtime.predict_calls == 0
+    assert all(not publisher.messages for publisher in pubs.values())
+    assert "JPEG header exceeds max_image_pixels" in plugin.info()["last_error"]
+    plugin.stop()
+
+
+def test_instance_limit_drops_result_without_publish():
+    mask = np.zeros((5, 6), dtype=np.uint8)
+    mask[1, 1] = 1
+    results = [
+        RawInstance(47, 0.9, [1, 1, 2, 2], mask.tolist()),
+        RawInstance(47, 0.8, [1, 1, 2, 2], mask.tolist()),
+    ]
+    codec = FakeCodec()
+    plugin, runtime, _, _ = make_plugin(
+        runtime=FakeRuntime(results=results), codec=codec, max_instances=1)
+    assert plugin.start()
+    pubs = publishers(plugin)
+    send(plugin)
+    wait_for(lambda: plugin.info()["limit_errors"] == 1)
+    assert runtime.predict_calls == 1
+    assert codec.encoded_images == []
+    assert all(not publisher.messages for publisher in pubs.values())
+    assert "more than 1 instances" in plugin.info()["last_error"]
+    plugin.stop()
+
+
+def test_rle_and_metadata_limits_drop_result_without_overlay_or_publish():
+    checkerboard = np.indices((5, 6)).sum(axis=0) % 2
+    checkerboard_runtime = FakeRuntime(results=[
+        RawInstance(47, 0.9, [0, 0, 6, 5], checkerboard.tolist())])
+    checkerboard_codec = FakeCodec()
+    plugin, _, _, _ = make_plugin(
+        runtime=checkerboard_runtime, codec=checkerboard_codec,
+        max_total_rle_runs=5)
+    assert plugin.start()
+    pubs = publishers(plugin)
+    send(plugin)
+    wait_for(lambda: plugin.info()["limit_errors"] == 1)
+    assert checkerboard_codec.encoded_images == []
+    assert all(not publisher.messages for publisher in pubs.values())
+    assert "RLE exceeds" in plugin.info()["last_error"]
+    plugin.stop()
+
+    one_pixel = np.zeros((5, 6), dtype=np.uint8)
+    one_pixel[1, 1] = 1
+    many_results = [
+        RawInstance(47, 0.9, [1, 1, 2, 2], one_pixel.tolist())
+        for _ in range(10)
+    ]
+    metadata_codec = FakeCodec()
+    plugin, _, _, _ = make_plugin(
+        runtime=FakeRuntime(results=many_results), codec=metadata_codec,
+        max_instances=10, max_metadata_bytes=1024)
+    assert plugin.start()
+    pubs = publishers(plugin)
+    send(plugin)
+    wait_for(lambda: plugin.info()["limit_errors"] == 1)
+    assert metadata_codec.encoded_images == []
+    assert all(not publisher.messages for publisher in pubs.values())
+    assert "max_metadata_bytes" in plugin.info()["last_error"]
+    plugin.stop()
+
+
 def test_corrupt_jpeg_and_inference_failure_do_not_kill_worker():
     runtime = FakeRuntime(predict_error=RuntimeError("fake inference failure"))
     plugin, _, _, _ = make_plugin(runtime=runtime)
@@ -517,6 +629,11 @@ def test_manifest_config_and_docker_registration_are_safe_by_default():
     cfg = yaml.safe_load((BUMI / "config.yaml").read_text(encoding="utf-8"))
     assert cfg["plugins"]["food_segmentation"]["enabled"] is False
     assert cfg["plugins"]["food_segmentation"]["model_path"] == ""
+    assert cfg["plugins"]["food_segmentation"]["max_compressed_bytes"] == 8388608
+    assert cfg["plugins"]["food_segmentation"]["max_image_pixels"] == 2500000
+    assert cfg["plugins"]["food_segmentation"]["max_instances"] == 50
+    assert cfg["plugins"]["food_segmentation"]["max_total_rle_runs"] == 500000
+    assert cfg["plugins"]["food_segmentation"]["max_metadata_bytes"] == 4194304
     manifest = yaml.safe_load((BUMI / "driver.yaml").read_text(encoding="utf-8"))
     assert {"name": "food_segmentation", "type": "processor"} in manifest["cards"]
     dockerfile = (BUMI / "Dockerfile").read_text(encoding="utf-8")

@@ -20,10 +20,13 @@ import numpy as np
 
 try:  # package import in tests/development
     from .food_segmentation_backend import FoodSegmentationPipeline
-    from .food_segmentation_contract import decode_binary_rle
+    from .food_segmentation_contract import (
+        SegmentationLimitError,
+        decode_binary_rle,
+    )
 except ImportError:  # flat /work layout used by the Bumi Docker image
     from food_segmentation_backend import FoodSegmentationPipeline
-    from food_segmentation_contract import decode_binary_rle
+    from food_segmentation_contract import SegmentationLimitError, decode_binary_rle
 
 
 SCHEMA_VERSION = "food-segmentation/1"
@@ -31,6 +34,11 @@ DEFAULT_MAX_RATE_HZ = 2.0
 DEFAULT_INPUT_TIMEOUT_S = 2.0
 DEFAULT_STOP_TIMEOUT_S = 10.0
 DEFAULT_JPEG_QUALITY = 85
+DEFAULT_MAX_COMPRESSED_BYTES = 8 * 1024 * 1024
+DEFAULT_MAX_IMAGE_PIXELS = 2_500_000
+DEFAULT_MAX_INSTANCES = 50
+DEFAULT_MAX_TOTAL_RLE_RUNS = 500_000
+DEFAULT_MAX_METADATA_BYTES = 4 * 1024 * 1024
 _TOPIC_RE = re.compile(r"^/(?:[A-Za-z_][A-Za-z0-9_]*)(?:/[A-Za-z_][A-Za-z0-9_]*)*$")
 _COLORS = (
     (40, 180, 240), (240, 120, 40), (80, 210, 100),
@@ -49,6 +57,62 @@ def _number(config: dict, name: str, default: float,
             f"food_segmentation.{name} must be in [{minimum:g}, {maximum:g}]"
         )
     return value
+
+
+def _integer(config: dict, name: str, default: int,
+             minimum: int, maximum: int) -> int:
+    value = config.get(name, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"food_segmentation.{name} must be an integer")
+    if not minimum <= value <= maximum:
+        raise ValueError(
+            f"food_segmentation.{name} must be in [{minimum}, {maximum}]"
+        )
+    return value
+
+
+class FrameLimitError(ValueError):
+    """A frame exceeded a configured resource or output limit."""
+
+
+def _jpeg_dimensions(data: bytes) -> tuple[int, int] | None:
+    """Read JPEG SOF dimensions without allocating the decoded image."""
+
+    if len(data) < 4 or data[:2] != b"\xff\xd8":
+        return None
+    offset = 2
+    sof_markers = {
+        0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+        0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
+    }
+    while offset < len(data):
+        while offset < len(data) and data[offset] != 0xFF:
+            offset += 1
+        while offset < len(data) and data[offset] == 0xFF:
+            offset += 1
+        if offset >= len(data):
+            return None
+        marker = data[offset]
+        offset += 1
+        if marker in (0xD9, 0xDA):
+            return None
+        if marker == 0x01 or 0xD0 <= marker <= 0xD7:
+            continue
+        if offset + 2 > len(data):
+            return None
+        segment_length = int.from_bytes(data[offset:offset + 2], "big")
+        if segment_length < 2 or offset + segment_length > len(data):
+            return None
+        if marker in sof_markers:
+            if segment_length < 7:
+                return None
+            height = int.from_bytes(data[offset + 3:offset + 5], "big")
+            width = int.from_bytes(data[offset + 5:offset + 7], "big")
+            if width <= 0 or height <= 0:
+                return None
+            return width, height
+        offset += segment_length
+    return None
 
 
 def _topic(configured: Any, default: str, namespace: str) -> str:
@@ -202,6 +266,20 @@ class FoodSegmentationPlugin:
         if not isinstance(device, str):
             raise ValueError("food_segmentation.device must be a string")
         self._device = device.strip()
+        self._max_compressed_bytes = _integer(
+            self._config, "max_compressed_bytes",
+            DEFAULT_MAX_COMPRESSED_BYTES, 1, 64 * 1024 * 1024)
+        self._max_image_pixels = _integer(
+            self._config, "max_image_pixels",
+            DEFAULT_MAX_IMAGE_PIXELS, 1, 33_554_432)
+        self._max_instances = _integer(
+            self._config, "max_instances", DEFAULT_MAX_INSTANCES, 1, 1000)
+        self._max_total_rle_runs = _integer(
+            self._config, "max_total_rle_runs",
+            DEFAULT_MAX_TOTAL_RLE_RUNS, 1, 10_000_000)
+        self._max_metadata_bytes = _integer(
+            self._config, "max_metadata_bytes",
+            DEFAULT_MAX_METADATA_BYTES, 1024, 64 * 1024 * 1024)
 
         self._lock = threading.RLock()
         self._condition = threading.Condition(self._lock)
@@ -227,6 +305,7 @@ class FoodSegmentationPlugin:
             "decode_errors": 0,
             "inference_errors": 0,
             "publish_errors": 0,
+            "limit_errors": 0,
         }
 
     def get_tool(self) -> dict:
@@ -465,10 +544,32 @@ class FoodSegmentationPlugin:
             fmt = str(getattr(message, "format", "") or "jpeg").lower()
             if "jpeg" not in fmt and "jpg" not in fmt:
                 raise ValueError(f"unsupported CompressedImage format: {fmt!r}")
-            data = bytes(getattr(message, "data", b""))
-            if not data:
+            raw_data = getattr(message, "data", b"")
+            try:
+                compressed_size = len(raw_data)
+            except TypeError as exc:
+                raise ValueError(
+                    "CompressedImage data must be a sized byte sequence") from exc
+            if compressed_size == 0:
                 raise ValueError("CompressedImage JPEG payload is empty")
+            if compressed_size > self._max_compressed_bytes:
+                raise FrameLimitError(
+                    "CompressedImage JPEG payload exceeds max_compressed_bytes "
+                    f"({compressed_size} > {self._max_compressed_bytes})")
+            data = bytes(raw_data)
+            encoded_size = _jpeg_dimensions(data)
+            if (encoded_size is not None
+                    and encoded_size[0] * encoded_size[1] > self._max_image_pixels):
+                raise FrameLimitError(
+                    "JPEG header exceeds max_image_pixels "
+                    f"({encoded_size[0] * encoded_size[1]} > "
+                    f"{self._max_image_pixels})")
             timestamp = self._timestamp(message)
+        except (FrameLimitError, SegmentationLimitError) as exc:
+            with self._lock:
+                self._stats["limit_errors"] += 1
+                self._last_error = str(exc)
+            return
         except Exception as exc:
             with self._lock:
                 self._stats["decode_errors"] += 1
@@ -524,6 +625,16 @@ class FoodSegmentationPlugin:
                 raise ValueError("decoded JPEG must be an HxWx3 color image")
             if image.shape[0] <= 0 or image.shape[1] <= 0:
                 raise ValueError("decoded JPEG dimensions must be positive")
+            pixels = int(image.shape[0]) * int(image.shape[1])
+            if pixels > self._max_image_pixels:
+                raise FrameLimitError(
+                    "decoded JPEG exceeds max_image_pixels "
+                    f"({pixels} > {self._max_image_pixels})")
+        except FrameLimitError as exc:
+            with self._lock:
+                self._stats["limit_errors"] += 1
+                self._last_error = str(exc)
+            return
         except Exception as exc:
             with self._lock:
                 self._stats["decode_errors"] += 1
@@ -539,9 +650,9 @@ class FoodSegmentationPlugin:
                 [width, height],
                 confidence_threshold=self._confidence,
                 mask_threshold=self._mask_threshold,
+                max_instances=self._max_instances,
+                max_total_rle_runs=self._max_total_rle_runs,
             ).process(image)
-            overlay = self._render_overlay(image, result)
-            overlay_jpeg = self._codec.encode(overlay, self._jpeg_quality)
             processing_ms = (time.perf_counter() - started) * 1000.0
             metadata = {
                 "schema_version": SCHEMA_VERSION,
@@ -559,6 +670,18 @@ class FoodSegmentationPlugin:
             }
             metadata_json = json.dumps(
                 metadata, separators=(",", ":"), allow_nan=False)
+            metadata_bytes = len(metadata_json.encode("utf-8"))
+            if metadata_bytes > self._max_metadata_bytes:
+                raise FrameLimitError(
+                    "metadata JSON exceeds max_metadata_bytes "
+                    f"({metadata_bytes} > {self._max_metadata_bytes})")
+            overlay = self._render_overlay(image, result)
+            overlay_jpeg = self._codec.encode(overlay, self._jpeg_quality)
+        except (FrameLimitError, SegmentationLimitError) as exc:
+            with self._lock:
+                self._stats["limit_errors"] += 1
+                self._last_error = str(exc)
+            return
         except Exception as exc:
             with self._lock:
                 self._stats["inference_errors"] += 1
@@ -633,6 +756,11 @@ class FoodSegmentationPlugin:
                 "imgsz": self._imgsz,
                 "device": self._device or None,
                 "jpeg_quality": self._jpeg_quality,
+                "max_compressed_bytes": self._max_compressed_bytes,
+                "max_image_pixels": self._max_image_pixels,
+                "max_instances": self._max_instances,
+                "max_total_rle_runs": self._max_total_rle_runs,
+                "max_metadata_bytes": self._max_metadata_bytes,
                 "input_state": input_state,
                 "last_frame_age_s": frame_age,
                 "last_frame_timestamp": self._last_frame_timestamp,

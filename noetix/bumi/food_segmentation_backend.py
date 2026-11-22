@@ -31,13 +31,19 @@ class FoodSegmentationPipeline:
     """Backend-neutral contract adapter used by fake, Ultralytics and TRT runtimes."""
 
     def __init__(self, runtime: SegmentationRuntime, image_size: Sequence[int],
-                 confidence_threshold: float = 0.25, mask_threshold: float = 0.5):
+                 confidence_threshold: float = 0.25, mask_threshold: float = 0.5,
+                 max_instances: int | None = None,
+                 max_total_rle_runs: int | None = None):
         self.runtime = runtime
         self.image_size = image_size
         self.confidence_threshold = confidence_threshold
         self.mask_threshold = mask_threshold
+        self.max_instances = max_instances
+        self.max_total_rle_runs = max_total_rle_runs
 
     def process(self, image: Any) -> dict[str, Any]:
         raw = self.runtime.predict(image)
         return build_result(raw, self.runtime.names, self.image_size,
-                            self.confidence_threshold, self.mask_threshold)
+                            self.confidence_threshold, self.mask_threshold,
+                            max_instances=self.max_instances,
+                            max_total_rle_runs=self.max_total_rle_runs)

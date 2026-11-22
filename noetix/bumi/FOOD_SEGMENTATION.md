@@ -137,6 +137,11 @@ plugins:
     input_timeout_s: 2
     stop_timeout_s: 10
     jpeg_quality: 85
+    max_compressed_bytes: 8388608
+    max_image_pixels: 2500000
+    max_instances: 50
+    max_total_rle_runs: 500000
+    max_metadata_bytes: 4194304
 ```
 
 An empty `input_topic` selects `/<namespace>/camera/color`. Empty output topics
@@ -163,6 +168,25 @@ Ultralytics is not installed; install it in an isolated environment
 
 The Tool remains discoverable when configured enabled because Ultralytics is
 imported only inside runtime `load()`.
+
+### Resource limits
+
+The Card fails closed on resource-heavy frames instead of publishing a partial
+or geometrically altered Mask:
+
+- `max_compressed_bytes` rejects the DDS JPEG payload before decoding;
+- `max_image_pixels` preflights standard JPEG SOF dimensions before decode and
+  rechecks the decoded image before model inference;
+- `max_instances` bounds backend instances before contract/RLE construction;
+- `max_total_rle_runs` bounds the sum of row-major RLE counts in one frame;
+- `max_metadata_bytes` bounds the UTF-8 JSON before overlay rendering and DDS
+  publication.
+
+An over-limit frame increments `limit_errors`, records `last_error`, and emits
+neither metadata nor overlay. It is not silently truncated, and a bbox is never
+substituted for the Mask. The checked-in limits support common camera frames up
+to roughly 2.5 megapixels; adjust them only after measuring the target DDS and
+Jetson memory budget.
 
 ## Local tests
 

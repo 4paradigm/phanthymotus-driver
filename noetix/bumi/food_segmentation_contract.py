@@ -29,6 +29,10 @@ COCO_FOOD_CLASSES = {
     55: "cake",
 }
 FOOD_CLASS_NAMES = frozenset(COCO_FOOD_CLASSES.values())
+
+
+class SegmentationLimitError(ValueError):
+    """A backend result exceeded a caller-defined resource limit."""
 RLE_ENCODING = "binary-rle-row-major-v1"
 
 
@@ -268,26 +272,45 @@ def build_instance(raw: RawInstance, names: Mapping[int, str] | Sequence[str],
 def build_result(raw_instances: Iterable[RawInstance],
                  names: Mapping[int, str] | Sequence[str], image_size: Sequence[int],
                  confidence_threshold: float = 0.25,
-                 mask_threshold: float = 0.5) -> dict[str, Any]:
+                 mask_threshold: float = 0.5, *,
+                 max_instances: int | None = None,
+                 max_total_rle_runs: int | None = None) -> dict[str, Any]:
     """Build a frame result, isolating malformed instances as reported errors."""
 
     resolve_food_class_ids(names)
     if isinstance(raw_instances, (str, bytes)) or not isinstance(raw_instances, Iterable):
         raise TypeError("raw_instances must be iterable")
+    for name, limit in (("max_instances", max_instances),
+                        ("max_total_rle_runs", max_total_rle_runs)):
+        if limit is not None and (isinstance(limit, bool)
+                                  or not isinstance(limit, int) or limit <= 0):
+            raise ValueError(f"{name} must be a positive integer or None")
     width, height = image_size
     # Validate dimensions even for an empty result.
     validate_bbox([0, 0, width, height], image_size)
     instances, errors = [], []
+    total_rle_runs = 0
     for index, raw in enumerate(raw_instances):
+        if max_instances is not None and index >= max_instances:
+            raise SegmentationLimitError(
+                f"backend returned more than {max_instances} instances")
+        instance = None
         try:
             if not isinstance(raw, RawInstance):
                 raise TypeError("backend item must be RawInstance")
             instance = build_instance(raw, names, image_size, confidence_threshold,
                                       mask_threshold)
-            if instance is not None:
-                instances.append(instance)
         except (TypeError, ValueError) as exc:
             errors.append({"index": index, "error": str(exc)})
+            continue
+        if instance is not None:
+            total_rle_runs += len(instance["mask"]["counts"])
+            if (max_total_rle_runs is not None
+                    and total_rle_runs > max_total_rle_runs):
+                raise SegmentationLimitError(
+                    "frame RLE exceeds the configured run-count limit "
+                    f"({max_total_rle_runs})")
+            instances.append(instance)
     return {
         "image_size": [width, height],
         "instances": instances,
