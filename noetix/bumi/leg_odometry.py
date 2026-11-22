@@ -76,8 +76,7 @@ CONTACT_BLEND_M = 0.004
 LEG_SLIP_SCALE = {'forward': 1.7, 'backward': 1.85, 'left': 4.4, 'right': 5.5}
 DISTANCE_SLIP_SCALE = LEG_SLIP_SCALE['forward']
 
-# The largest plausible body step per sample at ~50 Hz (1.0 m/s). A larger
-# implied step is a contact/kinematics discontinuity, not body motion.
+# The fixed locomotion step limit (1.0 m/s at 50 Hz).
 MAX_STEP_M = 0.02
 # Two implied steps this close are treated as double support and averaged.
 DOUBLE_SUPPORT_M = 0.01
@@ -170,12 +169,22 @@ def foot_position(angles, chain):
 
 
 class LegOdometry:
-    """Integrate body displacement from successive foot positions."""
+    """Integrate body displacement from successive foot positions.
 
-    def __init__(self, slip_scale=None):
+    ``max_step_velocity_m_s`` scales the candidate step limit by elapsed time.
+    The default uses the fixed step limit tuned for locomotion.
+    """
+
+    def __init__(self, slip_scale=None, *, max_step_velocity_m_s=None):
         self.slip_scale = DISTANCE_SLIP_SCALE if slip_scale is None else float(slip_scale)
         if not math.isfinite(self.slip_scale) or self.slip_scale <= 0:
             raise ValueError('leg slip scale must be positive and finite')
+        self._max_step_velocity_m_s = None
+        if max_step_velocity_m_s is not None:
+            max_step_velocity_m_s = float(max_step_velocity_m_s)
+            if not math.isfinite(max_step_velocity_m_s) or max_step_velocity_m_s <= 0:
+                raise ValueError('leg step velocity limit must be positive and finite')
+            self._max_step_velocity_m_s = max_step_velocity_m_s
         self.position = [0.0, 0.0, 0.0]
         self.velocity = [0.0, 0.0, 0.0]
         self.samples = 0
@@ -248,7 +257,10 @@ class LegOdometry:
                 end = _apply(rotation, current)
                 deltas.append([start[i]-end[i] for i in range(3)])
             lengths = [math.hypot(*delta) for delta in deltas]
-            limit = MAX_STEP_M/max(1.0, self.slip_scale)
+            max_step = MAX_STEP_M
+            if self._max_step_velocity_m_s is not None:
+                max_step = self._max_step_velocity_m_s * dt
+            limit = max_step / max(1.0, self.slip_scale)
             plausible = [index for index in (0, 1) if lengths[index] <= limit]
             self.foot_gap = feet[0][0]-feet[1][0]
             both_zero = lengths[0] <= 1e-9 and lengths[1] <= 1e-9

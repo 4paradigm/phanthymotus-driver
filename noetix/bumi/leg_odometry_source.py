@@ -58,7 +58,7 @@ class LegOdometrySource:
         self.frame_id = f'{self.namespace}_leg_odom_{self.session_id}'
         # Existing locomotion retains its own configured slip corrections.
         # Visual and scale correction belong to the generic consumer.
-        self.leg = LegOdometry(slip_scale=1.0)
+        self.leg = LegOdometry(slip_scale=1.0, max_step_velocity_m_s=1.0)
         self._last_stamp_ns = None
         self._last_monotonic_s = None
         self._needs_baseline = False

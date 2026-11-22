@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from noetix.bumi.leg_odometry import DISTANCE_SLIP_SCALE, LegOdometry
+from noetix.bumi.leg_odometry import DISTANCE_SLIP_SCALE, JOINT_INDEX, JOINT_ORDER, LegOdometry
 from noetix.bumi.leg_odometry_source import LegOdometrySource
 
 
@@ -14,8 +14,9 @@ ZERO_GYRO = [0.0, 0.0, 0.0]
 
 
 def joints(pitch=0.0):
-    values = [0.0] * 21
-    values[4] = values[14] = pitch
+    values = [0.0] * len(JOINT_ORDER)
+    values[JOINT_INDEX['l_leg_pitch_joint']] = pitch
+    values[JOINT_INDEX['r_leg_pitch_joint']] = pitch
     return values
 
 
@@ -31,6 +32,15 @@ def walking_source(quaternion=IDENTITY):
     assert read(source, 0.01, quaternion=quaternion,
                 stamp_ns=1_020_000_000, monotonic_s=1.02)
     return source
+
+
+def hip_pitch_displacement(angle):
+    # Both hip-pitch joints rotate the straight leg and sole centre around
+    # the hip. These lever arms are metres from the vendor geometry.
+    lever_x, lever_z = 0.02911801, -0.51897
+    return [lever_x * (1.0 - math.cos(angle)) - lever_z * math.sin(angle),
+            0.0,
+            lever_z * (1.0 - math.cos(angle)) + lever_x * math.sin(angle)]
 
 
 def test_first_read_only_sets_baseline_and_identical_stationary_read_is_valid():
@@ -53,15 +63,30 @@ def test_first_read_only_sets_baseline_and_identical_stationary_read_is_valid():
 def test_raw_leg_displacement_has_no_empirical_slip_multiplier():
     source = walking_source()
     packet = source.sample(1_020_000_000)
-    # Both hip-pitch joints rotate the straight leg and sole centre. These
-    # lever arms are metres from the vendor geometry, independent of an EKF.
-    lever_x, lever_z, angle = 0.02911801, -0.51897, 0.01
-    expected = [lever_x * (1.0 - math.cos(angle)) - lever_z * math.sin(angle),
-                0.0,
-                lever_z * (1.0 - math.cos(angle)) + lever_x * math.sin(angle)]
+    expected = hip_pitch_displacement(0.01)
     assert packet['pose']['position'] == pytest.approx(expected, abs=1e-10)
     assert packet['twist'][:3] == pytest.approx([value / 0.02 for value in expected])
     assert LegOdometry().slip_scale == DISTANCE_SLIP_SCALE == 1.7
+
+
+@pytest.mark.parametrize('interval_ms', [25, 50, 75])
+def test_same_hip_trajectory_retains_displacement_across_sample_intervals(interval_ms):
+    source = LegOdometrySource('robot')
+    assert not read(source)
+    previous_position = [0.0, 0.0, 0.0]
+    duration_ms = 150
+    for elapsed_ms in range(interval_ms, duration_ms + 1, interval_ms):
+        angle = 0.6 * elapsed_ms / 1000
+        stamp_ns = 1_000_000_000 + elapsed_ms * 1_000_000
+        assert read(source, angle, stamp_ns=stamp_ns, monotonic_s=1.0 + elapsed_ms / 1000)
+        packet = source.sample(stamp_ns)
+        expected = hip_pitch_displacement(angle)
+        assert packet['pose']['position'] == pytest.approx(expected, abs=1e-10)
+        assert packet['twist'][:3] == pytest.approx([
+            (current - previous) / (interval_ms / 1000)
+            for current, previous in zip(expected, previous_position)
+        ], abs=1e-10)
+        previous_position = expected
 
 
 @pytest.mark.parametrize(('quaternion', 'world_axes'), [
@@ -153,10 +178,13 @@ def test_reset_makes_a_new_frame_without_reusing_previous_feet():
     assert resumed['pose']['position'] == pytest.approx([0.0, 0.0, 0.0])
 
 
-def test_invalid_stance_does_not_publish_a_measured_zero_speed():
+@pytest.mark.parametrize(('pitch', 'elapsed_ms'), [(0.6, 20), (0.04, 10), (0.19, 75)])
+def test_invalid_stance_does_not_publish_a_measured_zero_speed(pitch, elapsed_ms):
     source = walking_source()
-    assert not read(source, 0.6, stamp_ns=1_040_000_000, monotonic_s=1.04)
-    packet = source.sample(1_040_000_000)
+    # The 10 ms case moves only 1.56 cm, but implies more than 1 m/s.
+    stamp_ns = 1_020_000_000 + elapsed_ms * 1_000_000
+    assert not read(source, pitch, stamp_ns=stamp_ns, monotonic_s=1.02 + elapsed_ms / 1000)
+    packet = source.sample(stamp_ns)
     assert packet['pose'] is None
     assert packet['twist'] == [None] * 6
     assert packet['vendor']['status'] != 'tracking'
