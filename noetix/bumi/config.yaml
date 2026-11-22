@@ -2,6 +2,21 @@ mcp_port: 15704
 ros_namespace: ""   # 留空则自动使用 hostname
 
 plugins:
+  tf_integrity_monitor:
+    enabled: true
+    use_sim_time: false
+    required_frames: [base_link]
+    required_chains: []
+    stale_s: 2.0
+    future_s: 0.25
+    skew_s: 0.5
+    translation_floor: 0.02
+    rotation_floor: 0.1
+    translation_rate: 8.0
+    rotation_rate: 25.0
+    publish_hz: 2.0
+    visual_check: false
+    vision: null
   vision_tf:
     enabled: true
   tf_tree:

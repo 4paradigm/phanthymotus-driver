@@ -140,39 +140,26 @@ ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 
 COPY resource/ /work/resource/
 COPY common/ /work/common/
-COPY main.py   /work/main.py
-COPY device.py /work/device.py
-# Navi support modules are independent from device.py for ROS-free tests.
-COPY loco_servo.py /work/loco_servo.py
-COPY imu_distance_control.py /work/imu_distance_control.py
-COPY leg_odometry.py /work/leg_odometry.py
-COPY camera_specs.py /work/camera_specs.py
-COPY visual_inputs.py /work/visual_inputs.py
-COPY vision_tf.py tf_cards.py calibrate_camera_mount.py /work/
-COPY visual_odometry.py /work/visual_odometry.py
-COPY visual_odometry_contract.py /work/visual_odometry_contract.py
-COPY visual_odometry_probe.py /work/visual_odometry_probe.py
-COPY odom_spec.py /work/odom_spec.py
-COPY sound_direction.py /work/sound_direction.py
-COPY direction_card.py /work/direction_card.py
-COPY config.yaml /work/config.yaml
+# Bundle the Python cards and their configuration in one application layer.
+COPY main.py device.py loco_servo.py imu_distance_control.py leg_odometry.py \
+     camera_specs.py visual_inputs.py tf_integrity.py tf_integrity_monitor.py \
+     vision_tf.py tf_cards.py calibrate_camera_mount.py visual_odometry.py \
+     visual_odometry_contract.py visual_odometry_probe.py odom_spec.py \
+     sound_direction.py direction_card.py config.yaml /work/
 COPY deploy/     /deploy/
 
 # The pinned ARM64 ros-base already ships this executable (layer 049dff30aaed).
 # Reusing it adds 0 compressed or uncompressed package bytes to the TF cards.
 RUN test -x /opt/ros/humble/lib/robot_state_publisher/robot_state_publisher
 
-# Add SDK DDS libs + pybind modules to paths
-ENV LD_LIBRARY_PATH=/work/noetix_sdk_bumi/dds/aarch64/lib:${LD_LIBRARY_PATH}
-ENV PYTHONPATH=/work:/work/noetix_sdk_bumi/build
-ENV PYTHONUNBUFFERED=1
-# rclpy logs bypass the Python stdout guard; keep container logs plain text.
-ENV RCUTILS_COLORIZED_OUTPUT=0
-
-# Vendor HighController/MediaController use CycloneDDS to discover the motion
-# board (192.168.55.102). This driver's ROS 2 bridge to Agent Core uses
-# rmw_fastrtps_cpp and the mounted FASTRTPS_DEFAULT_PROFILES_FILE instead.
-ENV CYCLONEDDS_URI='file:///work/noetix_sdk_bumi/config/dds.xml'
+# Vendor controllers use CycloneDDS. The ROS 2 bridge to Agent Core uses
+# rmw_fastrtps_cpp and the mounted FASTRTPS_DEFAULT_PROFILES_FILE.
+# Keep container logs plain, including rclpy logs outside the stdout guard.
+ENV LD_LIBRARY_PATH=/work/noetix_sdk_bumi/dds/aarch64/lib:${LD_LIBRARY_PATH} \
+    PYTHONPATH=/work:/work/noetix_sdk_bumi/build \
+    PYTHONUNBUFFERED=1 \
+    RCUTILS_COLORIZED_OUTPUT=0 \
+    CYCLONEDDS_URI=file:///work/noetix_sdk_bumi/config/dds.xml
 
 EXPOSE 15704
 

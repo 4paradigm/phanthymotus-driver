@@ -123,6 +123,10 @@ class BumiDeviceBundle:
         plugins_cfg = cfg.get("plugins", {})
         camera_plugin = None
         loco_plugin = None
+        if plugins_cfg.get("tf_integrity_monitor", {}).get("enabled", False):
+            from tf_integrity_monitor import TfIntegrityMonitor
+            self._plugins.append(TfIntegrityMonitor(
+                plugins_cfg["tf_integrity_monitor"], namespace, executor))
         if plugins_cfg.get("vision_tf", {}).get("enabled", False):
             from tf_cards import VisionTfPlugin
             self._plugins.append(VisionTfPlugin(plugins_cfg[VisionTfPlugin.PREFIX], namespace, executor))

@@ -502,3 +502,7 @@ media cards and motion cards keep running.
 
 The output contract, quality states, assumed body-axis calibration, validation
 status and the ROS probe live in [VISUAL_ODOMETRY.md](VISUAL_ODOMETRY.md).
+
+### TF Integrity Monitor
+
+See [configuration and acceptance](TF_INTEGRITY.md) for the read-only TF diagnostic sensor.

@@ -26,9 +26,12 @@ def test_image_installs_the_estimator_and_starts_it_inside_the_bundle():
     assert 'trusted=yes' not in text
     assert '/opt/ros/humble/lib/rtabmap_odom/rgbd_odometry' in text
     assert 'from tf2_ros import StaticTransformBroadcaster' in text
-    assert 'COPY visual_odometry.py /work/visual_odometry.py' in text
-    assert 'COPY visual_odometry_probe.py /work/visual_odometry_probe.py' in text
-    assert 'COPY visual_odometry_contract.py /work/visual_odometry_contract.py' in text
+    # A COPY can place several sources in /work/ with their original filenames.
+    docker_lines = text.replace(chr(92) + chr(10), " ").splitlines()
+    for filename in ("visual_odometry.py", "visual_odometry_probe.py", "visual_odometry_contract.py"):
+        assert any(line.startswith("COPY ") and filename in line.split()[1:-1]
+                   and line.split()[-1] in ("/work/", f"/work/{filename}")
+                   for line in docker_lines)
     assert 'robot-localization' not in text and 'robot_localization' not in text
     assert 'ekf_node' not in text
 
