@@ -212,10 +212,12 @@ def _acp_notify(action_id, status, result, tool="loco"):
 
 class _StateNode:
     _ODOM_INTERVAL = 0.1
+    _CLOSE_WAIT_S = 1.0
 
     def __init__(self, namespace, executor):
         from rclpy.node import Node
         self.node = Node("as2w_state")
+        self._executor = executor
         self.imu = self.node.create_publisher(String, f"/{namespace}/state/imu", _LOW_LAT_QOS or 1)
         self.joints = self.node.create_publisher(String, f"/{namespace}/state/joints", _LOW_LAT_QOS or 1)
         self.joint_state = self.node.create_publisher(String, f"/{namespace}/state/joint_state", _LOW_LAT_QOS or 1)
@@ -261,8 +263,12 @@ class _StateNode:
         self._remote_enabled = True
         self._remote_last_publish_mono = 0.0
         self._stop_event = threading.Event()
+        self._close_lock = threading.Lock()
+        self._close_requested = False
+        self._cleanup_started = False
+        self._cleanup_done = threading.Event()
         self._publisher_thread = threading.Thread(
-            target=self._publish_loop, daemon=True, name="as2w-state-publish")
+            target=self._run_publisher, daemon=True, name="as2w-state-publish")
         # queueLen=1 in the bundled SDK rejects new samples when full; it is
         # not a latest-value queue. LowState is high-rate, so consume it
         # directly and let the callback replace the cached pointer.
@@ -273,19 +279,61 @@ class _StateNode:
         self._publisher_thread.start()
 
     def close(self):
-        card = getattr(self, '_power_card', None)
-        if card is not None:
-            card.detach(self)
-        for subscriber in (self._low, self._bms, self._sport):
+        with self._close_lock:
+            if self._close_requested:
+                return
+            self._close_requested = True
+            self._stop_event.set()
+        worker = self._publisher_thread
+        if worker is threading.current_thread():
+            return  # The worker's finally owns cleanup; never join ourselves.
+        if worker.is_alive():
+            worker.join(timeout=self._CLOSE_WAIT_S)
+        if not worker.is_alive():
+            self._finish_close()
+        # On timeout keep DDS/ROS resources alive. No reaper thread or repeated
+        # wait is needed: the existing worker cleans up after its last publish.
+
+    def _run_publisher(self):
+        try:
+            self._publish_loop()
+        except Exception:
+            _LOG.exception("AS2-W state publisher exited unexpectedly")
+        finally:
+            self._stop_event.set()
+            self._finish_close()
+
+    def _finish_close(self):
+        # Called after the publishing phase, either by its owning worker or by
+        # close() after the worker has exited. Nothing publishes after cleanup.
+        with self._close_lock:
+            if self._cleanup_started:
+                return
+            self._cleanup_started = True
+        try:
+            card = getattr(self, '_power_card', None)
+            if card is not None:
+                try:
+                    card.detach(self)
+                except Exception:
+                    _LOG.exception("AS2-W battery power detach failed")
+            for subscriber in (self._low, self._bms, self._sport):
+                try:
+                    subscriber.Close()
+                except Exception:
+                    _LOG.exception("AS2-W state subscriber close failed")
+            remove_node = getattr(self._executor, 'remove_node', None)
+            if remove_node is not None:
+                try:
+                    remove_node(self.node)
+                except Exception:
+                    _LOG.exception("AS2-W state executor removal failed")
             try:
-                subscriber.Close()
+                self.node.destroy_node()
             except Exception:
-                pass
-        self._stop_event.set()
-        publisher_thread = getattr(self, "_publisher_thread", None)
-        if publisher_thread is not None:
-            publisher_thread.join(timeout=1.0)
-        self.node.destroy_node()
+                _LOG.exception("AS2-W state node destruction failed")
+        finally:
+            self._cleanup_done.set()
 
     def _publish(self, publisher, value):
         message = String()

@@ -311,22 +311,36 @@ class TestPowerCardIntegration(unittest.TestCase):
         d = self.device
 
         class Node:
-            def __init__(self, *args): self.destroyed = False
+            def __init__(self, *args):
+                self.destroyed = False
+                self.destroy_count = 0
+                self.destroyed_event = threading.Event()
+
             def create_publisher(
                     self, *args):
                 return types.SimpleNamespace(publish=lambda m: None)
 
-            def destroy_node(self): self.destroyed = True
+            def destroy_node(self):
+                self.destroy_count += 1
+                self.destroyed = True
+                self.destroyed_event.set()
 
         subscribers = []
+        removed_nodes = []
+        executor = types.SimpleNamespace(
+            add_node=lambda node: None, remove_node=removed_nodes.append)
 
         class Subscriber:
             def __init__(self, *args):
                 self.closed = False
+                self.close_count = 0
                 subscribers.append(self)
 
             def Init(self, callback, *args): self.callback = callback
-            def Close(self): self.closed = True
+
+            def Close(self):
+                self.close_count += 1
+                self.closed = True
         worker = types.SimpleNamespace(
             start=lambda: None, join=lambda **kwargs: None,
             is_alive=lambda: False)
@@ -336,10 +350,11 @@ class TestPowerCardIntegration(unittest.TestCase):
                 d, 'ChannelSubscriber', Subscriber), worker_context:
             plugin = d.StatePlugin(
                 {},
-                'offline', types.SimpleNamespace(add_node=lambda n: None),
+                'offline', executor,
                 battery_power_config={
                     'enabled': power_enabled, 'capacity_wh': 600})
         plugin.test_subscribers = subscribers
+        plugin.test_removed_nodes = removed_nodes
         self.addCleanup(plugin.shutdown)
         return plugin
 
@@ -364,6 +379,142 @@ class TestPowerCardIntegration(unittest.TestCase):
         for sequence in range(1801):
             card.core.update(bms(), sequence, sequence / 10, sequence * 100)
         return card.core.config, card.core.snapshot(180)
+
+    def test_shutdown_defers_cleanup_until_blocked_publication_returns(self):
+        for blocked_stream in ('legacy_battery', 'battery_power'):
+            with self.subTest(stream=blocked_stream):
+                plugin = self.make_plugin(real_worker=True)
+                node, card = plugin._state, plugin._power_card
+                entered = threading.Event()
+                release = threading.Event()
+                returned = threading.Event()
+                blocked_publisher = (node.battery
+                                     if blocked_stream == 'legacy_battery'
+                                     else card.publisher)
+                after_destroy = []
+                close_errors = []
+                original = node._publish
+
+                def publish(publisher, value):
+                    if publisher is blocked_publisher and not release.is_set():
+                        entered.set()
+                        if not release.wait(5):
+                            raise RuntimeError('review test release timed out')
+                    if node.node.destroyed:
+                        after_destroy.append(publisher)
+                    return original(publisher, value)
+
+                def shutdown():
+                    try:
+                        plugin.shutdown()
+                    except Exception as exc:
+                        close_errors.append(exc)
+                    finally:
+                        returned.set()
+
+                closer = threading.Thread(target=shutdown)
+                try:
+                    with patch.object(node, '_publish', side_effect=publish):
+                        node._on_bms(types.SimpleNamespace(**bms()))
+                        self.assertTrue(entered.wait(2))
+                        closer.start()
+                        # Real 1 s join timeout; Event controls release.
+                        self.assertTrue(returned.wait(2.5))
+                        self.assertTrue(node._publisher_thread.is_alive())
+                        self.assertFalse(node.node.destroyed)
+                        self.assertFalse(node._cleanup_done.is_set())
+                        plugin.shutdown()
+                        node.close()
+                        self.assertEqual(0, node.node.destroy_count)
+                        release.set()
+                        self.assertTrue(node._cleanup_done.wait(2))
+                        node._publisher_thread.join(2)
+                        self.assertFalse(node._publisher_thread.is_alive())
+                        self.assertTrue(node.node.destroyed)
+                        self.assertEqual(1, node.node.destroy_count)
+                        self.assertFalse(after_destroy)
+                        self.assertFalse(close_errors)
+                        self.assertTrue(all(
+                            sub.closed for sub in plugin.test_subscribers))
+                        self.assertTrue(all(
+                            sub.close_count == 1
+                            for sub in plugin.test_subscribers))
+                        node.close()
+                        plugin.shutdown()
+                        self.assertEqual(1, node.node.destroy_count)
+                finally:
+                    release.set()
+                    if closer.ident is not None:
+                        closer.join(3)
+                    node._publisher_thread.join(3)
+
+    def test_normal_close_is_idempotent_and_releases_resources(self):
+        plugin = self.make_plugin(real_worker=True)
+        node = plugin._state
+        with patch.object(node._publisher_thread, 'join',
+                          wraps=node._publisher_thread.join) as joined:
+            plugin.shutdown()
+        for call in joined.call_args_list:
+            self.assertEqual({'timeout': node._CLOSE_WAIT_S}, call.kwargs)
+        self.assertTrue(node._cleanup_done.is_set())
+        self.assertFalse(node._publisher_thread.is_alive())
+        self.assertTrue(node.node.destroyed)
+        node.close()
+        plugin.shutdown()
+        self.assertEqual(1, node.node.destroy_count)
+        self.assertEqual([node.node], plugin.test_removed_nodes)
+        self.assertTrue(all(sub.close_count == 1
+                            for sub in plugin.test_subscribers))
+
+    def test_unexpected_worker_exit_cleans_up_once(self):
+        plugin = self.make_plugin(real_worker=True)
+        node = plugin._state
+        with patch.object(node, '_publish_low',
+                          side_effect=RuntimeError('injected worker error')), \
+                patch.object(self.device._LOG, 'exception') as logged:
+            node._on_low(object())
+            self.assertTrue(node._cleanup_done.wait(2))
+            node._publisher_thread.join(2)
+            self.assertEqual(1, logged.call_count)
+        self.assertTrue(node._stop_event.is_set())
+        self.assertFalse(node._publisher_thread.is_alive())
+        self.assertFalse(plugin._power_card.running)
+        self.assertEqual(1, node.node.destroy_count)
+        node.close()
+        plugin.shutdown()
+        self.assertEqual(1, node.node.destroy_count)
+
+    def test_worker_initiated_close_never_joins_itself(self):
+        plugin = self.make_plugin(real_worker=True)
+        node = plugin._state
+        with patch.object(node, '_publish_low',
+                          side_effect=lambda _: node.close()), \
+                patch.object(self.device._LOG, 'exception') as logged:
+            node._on_low(object())
+            self.assertTrue(node._cleanup_done.wait(2))
+            node._publisher_thread.join(2)
+            self.assertFalse(node._publisher_thread.is_alive())
+            self.assertFalse(logged.called)
+        self.assertEqual(1, node.node.destroy_count)
+        self.assertEqual([node.node], plugin.test_removed_nodes)
+        plugin.shutdown()
+        self.assertEqual(1, node.node.destroy_count)
+
+    def test_subscriber_close_error_does_not_skip_remaining_cleanup(self):
+        plugin = self.make_plugin()
+        node = plugin._state
+        with patch.object(node._low, 'Close',
+                          side_effect=RuntimeError(
+                              'injected close error')) as close, \
+                patch.object(self.device._LOG, 'exception') as logged:
+            plugin.shutdown()
+            node.close()
+            self.assertEqual(1, close.call_count)
+            self.assertEqual(1, logged.call_count)
+        self.assertTrue(node._cleanup_done.is_set())
+        self.assertTrue(node._bms.closed)
+        self.assertTrue(node._sport.closed)
+        self.assertEqual(1, node.node.destroy_count)
 
     def test_driver_initialization_publishes_without_mcp_start(self):
         p = self.make_plugin(real_worker=True)
