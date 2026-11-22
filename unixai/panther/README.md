@@ -132,10 +132,8 @@ asynchronous, return `action_id`, report completion, and can be stopped. Arm
 controller state is restored to its pre-command snapshot. Base movement is
 finite-duration. A stop remains pending until its publisher has a matched DDS
 subscriber, then publishes zero velocity for the configured stop interval;
-subscriber loss is never reported as a confirmed stop. Arm `home` retains the
-same per-command delta limit as ordinary moves because its all-zero candidate
-pose has not been independently commissioned. Head `home` uses its configured
-low-speed profile.
+subscriber loss is never reported as a confirmed stop. Head `home` uses its
+configured low-speed profile.
 
 The mounted robot-side CycloneDDS profile is followed by a bundled override
 that sets tracing verbosity to `none` and its output to `/dev/null`, preventing
@@ -161,6 +159,10 @@ the runtime but are not shown in the ordinary canvas form. Each form field
 states the corresponding vendor-URDF range; shared fields show separate
 left/`both` and right ranges where they differ. Every completed target is
 checked against the vendor/live limit intersection before an action is queued.
+`move`, `move_separate`, and `home` accept targets within those limits without
+a separate per-command angle cap. When `duration_s` is omitted, the driver
+estimates duration from the largest joint displacement at the configured
+`speed_deg_s` (20°/s by default), within the configured duration bounds.
 The canvas uses short English semantic fields (`shoulder_rot`, `shoulder_abd`,
 `shoulder_raise`, `elbow_rot`, `elbow_flex`, and `wrist_1` through `wrist_3`).
 Independent-arm fields add an `l_` or `r_` prefix. Their compact descriptions

@@ -275,12 +275,8 @@ def build_plugins(config, namespace, device):
 
         def joint_field(name: str, title: str) -> dict:
             lower, upper = joint_limits.get(name, (None, None))
-            prefix = (f"Range {format_range((lower, upper))}; "
-                      if lower is not None and upper is not None
-                      else "Range unavailable; ")
-            max_delta = enabled["arm_control"].get("max_target_delta_deg", 20.0)
             field = {"type": "number", "title": f"{title} (deg)",
-                     "description": prefix + f"max step {max_delta:g} deg"}
+                     "description": f"Range {format_range((lower, upper))}"}
             if lower is not None and upper is not None:
                 field.update(minimum=lower, maximum=upper)
             return field
@@ -296,14 +292,10 @@ def build_plugins(config, namespace, device):
             left = joint_limits.get(f"joint_la{index}", (None, None))
             right = joint_limits.get(f"joint_ra{index}", (None, None))
             bounds = [value for value in (*left, *right) if value is not None]
-            max_delta = enabled["arm_control"].get("max_target_delta_deg", 20.0)
             field = {
                 "type": "number",
                 "title": f"{ARM_JOINT_TITLES[index]} (deg)",
-                "description": (
-                    f"L/B {format_range(left)}; R {format_range(right)}; "
-                    f"max step {max_delta:g} deg"
-                ),
+                "description": f"L/B {format_range(left)}; R {format_range(right)}",
             }
             if len(bounds) == 4:
                 field.update(minimum=min(bounds), maximum=max(bounds))

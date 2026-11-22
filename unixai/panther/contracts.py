@@ -171,7 +171,7 @@ def validate_joint_target(
     positions,
     limits: dict[str, tuple[float, float]],
     current: dict[str, float],
-    max_delta_rad: Optional[float],
+    *,
     commanded_joint_names=None,
     hold_limit_tolerance_rad: float = 0.0,
 ) -> list[float]:
@@ -184,11 +184,6 @@ def validate_joint_target(
     missing_state = [name for name in joint_names if name not in current]
     if missing_state:
         raise ValueError("fresh joint state is missing: " + ", ".join(missing_state))
-    max_delta = None
-    if max_delta_rad is not None:
-        max_delta = finite_number(max_delta_rad, "max_delta_rad")
-        if max_delta <= 0:
-            raise ValueError("max_delta_rad must be positive")
     commanded = (set(joint_names) if commanded_joint_names is None
                  else set(commanded_joint_names))
     unknown_commanded = commanded.difference(joint_names)
@@ -198,6 +193,7 @@ def validate_joint_target(
     if hold_tolerance < 0:
         raise ValueError("hold_limit_tolerance_rad must not be negative")
     for index, (name, value) in enumerate(zip(joint_names, target)):
+        finite_number(current[name], f"current.{name}")
         lower, upper = limits[name]
         if name not in commanded and not lower <= value <= upper:
             distance = lower - value if value < lower else value - upper
@@ -219,12 +215,6 @@ def validate_joint_target(
             raise ValueError(
                 f"{name} target {math.degrees(value):.2f} deg is outside URDF limit "
                 f"[{math.degrees(lower):.2f}, {math.degrees(upper):.2f}] deg"
-            )
-        delta = abs(value - float(current[name]))
-        if max_delta is not None and delta > max_delta:
-            raise ValueError(
-                f"{name} target delta {math.degrees(delta):.2f} deg exceeds per-command limit "
-                f"{math.degrees(max_delta):.2f} deg"
             )
     return target
 

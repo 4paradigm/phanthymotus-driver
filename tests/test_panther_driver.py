@@ -128,8 +128,7 @@ class PantherDriverTest(unittest.TestCase):
         config = {"plugins": {
             "base_drive": {"enabled": True, "max_linear_mps": 0.5,
                            "max_angular_deg_s": 45.0, "max_duration_s": 10.0},
-            "arm_control": {"enabled": True, "max_duration_s": 20.0,
-                            "max_target_delta_deg": 20.0},
+            "arm_control": {"enabled": True, "max_duration_s": 20.0},
             "gripper": {"enabled": True},
             "lifting": {"enabled": True, "max_position_m": 0.8, "home_position_m": 0.6},
             "head": {"enabled": True, "low_speed_deg_s": 10.0,
@@ -160,12 +159,10 @@ class PantherDriverTest(unittest.TestCase):
         )
         self.assertTrue(arm["properties"]["j0_deg"]["x-ui-hidden"])
         self.assertNotIn("confirm_motion", arm["properties"])
-        self.assertTrue(arm["properties"]["shoulder_raise"]["description"].startswith(
-            "L/B [0.0, 90.0] deg; R [-90.0, 0.0] deg;"
-        ))
-        self.assertTrue(arm["properties"]["l_elbow_flex"]["description"].startswith(
-            "Range [-127.8, 0.0] deg;"
-        ))
+        self.assertEqual(arm["properties"]["shoulder_raise"]["description"],
+                         "L/B [0.0, 90.0] deg; R [-90.0, 0.0] deg")
+        self.assertEqual(arm["properties"]["l_elbow_flex"]["description"],
+                         "Range [-127.8, 0.0] deg")
         self.assertEqual(arm["properties"]["elbow_flex"]["title"],
                          "Elbow Flexion/Extension (deg)")
         self.assertEqual(arm["properties"]["l_shoulder_rot"]["title"],
@@ -283,11 +280,11 @@ class PantherDriverTest(unittest.TestCase):
         )
 
     def test_arm_runtime_builds_mirrored_and_independent_targets(self):
-        def run(arguments, positions=None, model_limits=None):
+        def run(arguments, positions=None, model_limits=None, expected_duration=1.0):
             device = object.__new__(device_module.PantherDevice)
             device._cfg = {"plugins": {"arm_control": {
                 "max_duration_s": 20.0, "min_duration_s": 1.0,
-                "speed_deg_s": 20.0, "max_target_delta_deg": 20.0,
+                "speed_deg_s": 20.0, "home_pose_deg": {"joint_la1": 0.0},
             }}}
             device._lock = threading.RLock()
             device._arm_lock = threading.RLock()
@@ -312,8 +309,9 @@ class PantherDriverTest(unittest.TestCase):
                 completed.set()
 
             device._run_arm = capture
-            result = device.arm({**arguments, "duration_s": 1.0})
+            result = device.arm(arguments)
             self.assertEqual(result["state"], "queued")
+            self.assertAlmostEqual(result["duration_s"], expected_duration)
             self.assertTrue(completed.wait(1.0))
             return captured
 
@@ -341,6 +339,18 @@ class PantherDriverTest(unittest.TestCase):
         )
         self.assertAlmostEqual(math.degrees(partial["left"][0]), 3.0)
         self.assertEqual(partial["left"][2], 0.0)
+
+        # The original rejection was a 40° displacement of joint_la1.
+        large_move = run({"action": "move", "side": "left", "shoulder_abd": 40.0},
+                         model_limits=vendor_limits, expected_duration=2.0)
+        self.assertAlmostEqual(math.degrees(large_move["left"][1]), 40.0)
+        independent = run({"action": "move_separate", "l_shoulder_abd": 40.0, "r_shoulder_abd": -30.0},
+                          model_limits=vendor_limits, expected_duration=2.0)
+        self.assertAlmostEqual(math.degrees(independent["left"][1]), 40.0)
+        self.assertAlmostEqual(math.degrees(independent["right"][1]), -30.0)
+        home = run({"action": "home", "side": "left"}, {"joint_la1": math.radians(40.0)},
+                   model_limits=vendor_limits, expected_duration=2.0)
+        self.assertEqual(home["left"][1], 0.0)
 
     def test_imu_keeps_finite_vectors_when_zero_covariance_has_no_truth_value(self):
         class Covariance:
@@ -446,7 +456,7 @@ class PantherDriverTest(unittest.TestCase):
         device = object.__new__(device_module.PantherDevice)
         device._cfg = {"plugins": {"arm_control": {
             "max_duration_s": 20.0, "min_duration_s": 1.0,
-            "speed_deg_s": 20.0, "max_target_delta_deg": 180.0,
+            "speed_deg_s": 20.0,
         }}}
         device._lock = threading.RLock()
         device._arm_lock = threading.RLock()
@@ -560,12 +570,12 @@ class PantherDriverTest(unittest.TestCase):
 
     def test_joint_target_rejects_missing_limits_instead_of_guessing(self):
         with self.assertRaisesRegex(ValueError, "no limits"):
-            contracts.validate_joint_target(("joint_la0",), [0.0], {}, {"joint_la0": 0.0}, 0.5)
+            contracts.validate_joint_target(("joint_la0",), [0.0], {}, {"joint_la0": 0.0})
 
-    def test_joint_target_rejects_large_per_command_step(self):
-        with self.assertRaisesRegex(ValueError, "per-command limit"):
+    def test_joint_target_rejects_nonfinite_feedback(self):
+        with self.assertRaisesRegex(ValueError, r"current\.joint_la0 must be finite"):
             contracts.validate_joint_target(
-                ("joint_la0",), [0.8], {"joint_la0": (-1.0, 1.0)}, {"joint_la0": 0.0}, 0.35
+                ("joint_la0",), [0.8], {"joint_la0": (-1.0, 1.0)}, {"joint_la0": float("nan")}
             )
 
     def test_partial_arm_target_clamps_small_implicit_hold_limit_error(self):
@@ -577,7 +587,6 @@ class PantherDriverTest(unittest.TestCase):
             [math.radians(3.0), current["joint_la2"]],
             limits,
             current,
-            math.radians(20.0),
             commanded_joint_names={"joint_la0"},
             hold_limit_tolerance_rad=math.radians(0.5),
         )
@@ -590,14 +599,14 @@ class PantherDriverTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "target -0.08 deg"):
             contracts.validate_joint_target(
                 ("joint_la2",), [current["joint_la2"]], limits, current,
-                math.radians(20.0), commanded_joint_names={"joint_la2"},
+                commanded_joint_names={"joint_la2"},
                 hold_limit_tolerance_rad=math.radians(0.5),
             )
         far_current = {"joint_la2": math.radians(-2.0)}
         with self.assertRaisesRegex(ValueError, "calibration or recovery"):
             contracts.validate_joint_target(
                 ("joint_la2",), [far_current["joint_la2"]], limits, far_current,
-                math.radians(20.0), commanded_joint_names=set(),
+                commanded_joint_names=set(),
                 hold_limit_tolerance_rad=math.radians(0.5),
             )
 
@@ -662,14 +671,6 @@ class PantherDriverTest(unittest.TestCase):
             confirmed = device._wait_for_pending_drive_stop(1.0)
         self.assertTrue(confirmed["stop_confirmed"])
         self.assertGreaterEqual(len(publisher.messages), 2)
-
-    def test_arm_home_keeps_the_per_command_delta_gate(self):
-        source = (DRIVER / "device.py").read_text()
-        arm = source.split("    def arm(self, args: dict)", 1)[1].split(
-            "    def _run_arm", 1
-        )[0]
-        self.assertNotIn('step_limit = None if action == "home"', arm)
-        self.assertIn("current, max_delta,", arm)
 
     def test_manifest_lists_expected_cards(self):
         driver_text = (DRIVER / "driver.yaml").read_text()

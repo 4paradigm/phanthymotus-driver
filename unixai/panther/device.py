@@ -1170,7 +1170,6 @@ class PantherDevice:
         if not fresh(received):
             raise RuntimeError("fresh /joint_states is required")
         current = {name: value for name, value in zip(joint_msg.name, joint_msg.position)}
-        max_delta = math.radians(float(cfg["max_target_delta_deg"]))
         hold_limit_tolerance = math.radians(float(cfg.get("hold_limit_tolerance_deg", 0.5)))
         targets: dict[str, list[float]] = {}
 
@@ -1231,14 +1230,11 @@ class PantherDevice:
                     raise ValueError(f"at least one {arm_side} arm joint target is required")
                 values = [updates.get(name, current.get(name)) for name in names]
                 commanded_names = set(updates)
-            # Home is subject to the same per-command delta gate as every
-            # other arm target until the candidate pose is independently
-            # commissioned on hardware.
             effective_limits = intersect_joint_limits(
                 names, self._model_joint_limits, self._joint_limits
             )
             return validate_joint_target(
-                names, values, effective_limits, current, max_delta,
+                names, values, effective_limits, current,
                 commanded_joint_names=commanded_names,
                 hold_limit_tolerance_rad=hold_limit_tolerance,
             )
