@@ -178,9 +178,14 @@ or geometrically altered Mask:
 - `max_image_pixels` preflights standard JPEG SOF dimensions before decode and
   rechecks the decoded image before model inference;
 - `max_instances` bounds backend instances before contract/RLE construction;
-- `max_total_rle_runs` bounds the sum of row-major RLE counts in one frame;
-- `max_metadata_bytes` bounds the UTF-8 JSON before overlay rendering and DDS
-  publication.
+- `max_total_rle_runs` is enforced by the streaming row-major encoder, which
+  stops scanning the Mask before appending an over-budget run;
+- `max_metadata_bytes` is enforced while JSON chunks are encoded, before a
+  complete string, overlay, or DDS sample is constructed.
+
+The Ultralytics adapter also passes the instance cap as `max_det`, rejects a
+backend that returns more detections before converting Mask tensors, and keeps
+accepted Masks as NumPy arrays instead of expanding them into Python lists.
 
 An over-limit frame increments `limit_errors`, records `last_error`, and emits
 neither metadata nor overlay. It is not silently truncated, and a bbox is never

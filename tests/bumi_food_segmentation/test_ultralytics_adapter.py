@@ -73,13 +73,13 @@ def install_fake_ultralytics(monkeypatch, model):
     monkeypatch.setitem(sys.modules, "ultralytics", module)
 
 
-def make_runtime(monkeypatch, tmp_path, result):
+def make_runtime(monkeypatch, tmp_path, result, **load_options):
     model = FakeModel([result])
     install_fake_ultralytics(monkeypatch, model)
     model_path = tmp_path / "yolo11n-seg.pt"
     model_path.write_bytes(b"fake, never parsed by FakeModel")
     runtime = UltralyticsSegmentationRuntime()
-    runtime.load(str(model_path), device="cpu", imgsz=640)
+    runtime.load(str(model_path), device="cpu", imgsz=640, **load_options)
     return runtime, model
 
 
@@ -157,6 +157,7 @@ def test_parse_real_masks_keeps_order_and_same_class_instances(monkeypatch, tmp_
     instances = runtime.predict(np.zeros((6, 8, 3), np.uint8))
     assert [item.class_id for item in instances] == [47, 47, 46]
     assert [sum(map(sum, item.mask)) for item in instances] == [3, 2, 1]
+    assert all(isinstance(item.mask, np.ndarray) for item in instances)
     call = model.calls[0]
     assert call["retina_masks"] is True and call["verbose"] is False
     assert call["device"] == "cpu" and call["imgsz"] == 640
@@ -165,6 +166,18 @@ def test_parse_real_masks_keeps_order_and_same_class_instances(monkeypatch, tmp_
     assert diagnostics["mask_restoration_count"] == 0
     assert diagnostics["detection_count"] == 3
     assert diagnostics["bbox_adjustments"] == [[0, 0, 0, 0]] * 3
+
+
+def test_detection_budget_is_enforced_before_mask_conversion(monkeypatch, tmp_path):
+    masks = FakeMasks(np.zeros((2, 6, 8), dtype=np.float32))
+    result = FakeResult(FakeBoxes(
+        [[1, 1, 2, 2], [3, 3, 4, 4]], [.9, .8], [47, 46]), masks)
+    runtime, model = make_runtime(
+        monkeypatch, tmp_path, result, max_instances=1)
+    with pytest.raises(RuntimeError, match="more than 1 detections"):
+        runtime.predict(np.zeros((6, 8, 3), np.uint8))
+    assert masks.data.detached is False
+    assert model.calls[0]["max_det"] == 1
 
 
 def test_letterbox_mask_is_cropped_then_nearest_resized():

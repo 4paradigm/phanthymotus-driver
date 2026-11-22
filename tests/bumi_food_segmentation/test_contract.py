@@ -6,6 +6,7 @@ from noetix.bumi.food_segmentation_contract import (
     COCO_FOOD_CLASSES,
     RLE_ENCODING,
     RawInstance,
+    SegmentationLimitError,
     binary_mask,
     build_instance,
     build_result,
@@ -115,3 +116,39 @@ def test_malformed_instances_are_isolated_without_losing_valid_ones():
     result = build_result([good, broken, object()], NAMES, [6, 4])
     assert [item["class_name"] for item in result["instances"]] == ["apple"]
     assert [error["index"] for error in result["errors"]] == [1, 2]
+
+
+def test_rle_budget_stops_before_scanning_full_mask():
+    class AlternatingRow:
+        def __init__(self, owner, y):
+            self.owner = owner
+            self.y = y
+
+        def __len__(self):
+            return self.owner.width
+
+        def __getitem__(self, x):
+            self.owner.accesses += 1
+            return (self.y * self.owner.width + x) % 2
+
+    class AlternatingMask:
+        height = 100
+        width = 100
+
+        def __init__(self):
+            self.accesses = 0
+
+        def __len__(self):
+            return self.height
+
+        def __getitem__(self, y):
+            return AlternatingRow(self, y)
+
+    mask = AlternatingMask()
+    with pytest.raises(SegmentationLimitError, match="run-count limit"):
+        build_result(
+            [RawInstance(47, 0.9, [0, 0, 100, 100], mask)],
+            NAMES, [100, 100], max_total_rle_runs=5)
+    # A post-materialization check would touch all 10,000 pixels. The streaming
+    # encoder stops as soon as appending the sixth run would exceed the budget.
+    assert mask.accesses == 7

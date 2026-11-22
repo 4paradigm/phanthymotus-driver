@@ -12,10 +12,14 @@ import numpy as np
 import pytest
 import yaml
 
+import noetix.bumi.food_segmentation as food_segmentation_module
+
 from noetix.bumi.food_segmentation import (
+    FrameLimitError,
     FoodSegmentationPlugin,
     SCHEMA_VERSION,
     _OpenCvCodec,
+    _json_dumps_limited,
 )
 from noetix.bumi.food_segmentation_contract import (
     COCO_FOOD_CLASSES,
@@ -293,7 +297,8 @@ def test_start_is_lazy_idempotent_and_creates_real_dds_shapes():
     assert plugin.start() is True
     assert len(runtime.load_calls) == 1
     assert runtime.load_calls[0] == (
-        "C:/local/yolo11n-seg.pt", {"imgsz": 640, "conf": 0.25})
+        "C:/local/yolo11n-seg.pt",
+        {"imgsz": 640, "conf": 0.25, "max_instances": 50})
     assert executor.nodes == [plugin._node]
     assert plugin._node.subscriptions[0].message_type is FakeCompressedImage
     assert plugin._node.subscriptions[0].callback_group == "mutually_exclusive"
@@ -504,6 +509,30 @@ def test_rle_and_metadata_limits_drop_result_without_overlay_or_publish():
     assert all(not publisher.messages for publisher in pubs.values())
     assert "max_metadata_bytes" in plugin.info()["last_error"]
     plugin.stop()
+
+
+def test_metadata_serializer_stops_at_budget_before_join(monkeypatch):
+    state = {"reached_oversized_chunk": False, "continued_after_limit": False}
+
+    class TrackingEncoder:
+        def __init__(self, **_options):
+            pass
+
+        def iterencode(self, _value):
+            yield "{}"
+            state["reached_oversized_chunk"] = True
+            yield "x" * 20
+            state["continued_after_limit"] = True
+            raise AssertionError("serializer consumed data after exceeding budget")
+
+    monkeypatch.setattr(
+        food_segmentation_module.json, "JSONEncoder", TrackingEncoder)
+    with pytest.raises(FrameLimitError, match="max_metadata_bytes"):
+        _json_dumps_limited({"unused": True}, 10)
+    assert state == {
+        "reached_oversized_chunk": True,
+        "continued_after_limit": False,
+    }
 
 
 def test_corrupt_jpeg_and_inference_failure_do_not_kill_worker():

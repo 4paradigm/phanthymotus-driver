@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from numbers import Real
 from typing import Any, Iterable, Mapping, Sequence
 
 
@@ -33,6 +34,8 @@ FOOD_CLASS_NAMES = frozenset(COCO_FOOD_CLASSES.values())
 
 class SegmentationLimitError(ValueError):
     """A backend result exceeded a caller-defined resource limit."""
+
+
 RLE_ENCODING = "binary-rle-row-major-v1"
 
 
@@ -43,7 +46,7 @@ class RawInstance:
     class_id: int
     confidence: float
     bbox: Sequence[float]
-    mask: Sequence[Sequence[Any]]
+    mask: Any
 
 
 def _model_names(names: Mapping[int, str] | Sequence[str]) -> dict[int, str]:
@@ -174,26 +177,96 @@ def encode_binary_rle(mask: Sequence[Sequence[int]]) -> dict[str, Any]:
     if height == 0 or not isinstance(mask[0], Sequence) or len(mask[0]) == 0:
         raise ValueError("mask must be non-empty")
     width = len(mask[0])
-    flat = []
+    counts = []
+    expected = 0
+    run = 0
     for row in mask:
         if len(row) != width:
             raise ValueError("mask rows must have equal width")
         for value in row:
             if value not in (0, 1, False, True):
                 raise ValueError("RLE input mask must be binary")
-            flat.append(int(bool(value)))
-    counts = []
-    expected = 0
-    run = 0
-    for value in flat:
-        if value == expected:
-            run += 1
-        else:
-            counts.append(run)
-            run = 1
-            expected = value
+            value = int(bool(value))
+            if value == expected:
+                run += 1
+            else:
+                counts.append(run)
+                run = 1
+                expected = value
     counts.append(run)
     return {"encoding": RLE_ENCODING, "size": [height, width], "counts": counts}
+
+
+def _encode_thresholded_mask(
+    mask: Any,
+    image_size: Sequence[int],
+    threshold: float,
+    max_rle_runs: int | None,
+) -> tuple[dict[str, Any], int, list[int]]:
+    """Validate, threshold and RLE-encode without materializing a binary Mask."""
+
+    if not isinstance(threshold, (int, float)) or isinstance(threshold, bool) \
+            or not math.isfinite(float(threshold)):
+        raise ValueError("mask threshold must be finite")
+    width, height = image_size
+    if isinstance(mask, (str, bytes)):
+        raise TypeError("mask must be a two-dimensional sequence")
+    try:
+        mask_height = len(mask)
+    except TypeError as exc:
+        raise TypeError("mask must be a two-dimensional sequence") from exc
+    if mask_height != height:
+        raise ValueError(
+            f"mask height {mask_height} does not match image height {height}")
+
+    counts: list[int] = []
+    expected = 0
+    run = 0
+    area = 0
+    min_x, min_y, max_x, max_y = width, height, -1, -1
+
+    def append_run(value: int) -> None:
+        if max_rle_runs is not None and len(counts) >= max_rle_runs:
+            raise SegmentationLimitError(
+                "frame RLE exceeds the configured run-count limit "
+                f"({max_rle_runs})")
+        counts.append(value)
+
+    for y in range(height):
+        try:
+            row = mask[y]
+            row_width = len(row)
+        except (IndexError, KeyError, TypeError) as exc:
+            raise TypeError("each mask row must be a sequence") from exc
+        if row_width != width:
+            raise ValueError(
+                f"mask width {row_width} does not match image width {width}")
+        for x in range(width):
+            value = row[x]
+            if not isinstance(value, Real):
+                raise TypeError("mask values must be numeric")
+            number = float(value)
+            if not math.isfinite(number):
+                raise ValueError("mask values must be finite")
+            binary = 1 if number >= threshold else 0
+            if binary:
+                area += 1
+                min_x, min_y = min(min_x, x), min(min_y, y)
+                max_x, max_y = max(max_x, x), max(max_y, y)
+            if binary == expected:
+                run += 1
+            else:
+                append_run(run)
+                run = 1
+                expected = binary
+    append_run(run)
+    if area == 0:
+        raise ValueError("instance mask must contain at least one positive pixel")
+    return (
+        {"encoding": RLE_ENCODING, "size": [height, width], "counts": counts},
+        area,
+        [min_x, min_y, max_x + 1, max_y + 1],
+    )
 
 
 def decode_binary_rle(rle: Mapping[str, Any]) -> list[list[int]]:
@@ -228,7 +301,8 @@ def decode_binary_rle(rle: Mapping[str, Any]) -> list[list[int]]:
 
 def build_instance(raw: RawInstance, names: Mapping[int, str] | Sequence[str],
                    image_size: Sequence[int], confidence_threshold: float = 0.25,
-                   mask_threshold: float = 0.5) -> dict[str, Any] | None:
+                   mask_threshold: float = 0.5, *,
+                   max_rle_runs: int | None = None) -> dict[str, Any] | None:
     """Validate one backend instance; return ``None`` when intentionally filtered."""
 
     model_names = _model_names(names)
@@ -251,11 +325,11 @@ def build_instance(raw: RawInstance, names: Mapping[int, str] | Sequence[str],
     if confidence < float(confidence_threshold):
         return None
     bbox = validate_bbox(raw.bbox, image_size)
-    mask = binary_mask(raw.mask, image_size, threshold=mask_threshold)
-    area = sum(sum(row) for row in mask)
-    if area == 0:
-        raise ValueError("instance mask must contain at least one positive pixel")
-    if not bbox_encloses_mask(bbox, mask):
+    rle, area, bounds = _encode_thresholded_mask(
+        raw.mask, image_size, mask_threshold, max_rle_runs)
+    x1, y1, x2, y2 = bbox
+    mx1, my1, mx2, my2 = bounds
+    if not (x1 <= mx1 and y1 <= my1 and x2 >= mx2 and y2 >= my2):
         raise ValueError("bbox does not enclose the positive mask pixels")
     width, height = image_size
     return {
@@ -263,7 +337,7 @@ def build_instance(raw: RawInstance, names: Mapping[int, str] | Sequence[str],
         "class_name": class_name,
         "confidence": confidence,
         "bbox_xyxy": bbox,
-        "mask": encode_binary_rle(mask),
+        "mask": rle,
         "mask_area_px": area,
         "mask_area_ratio": area / (width * height),
     }
@@ -299,7 +373,12 @@ def build_result(raw_instances: Iterable[RawInstance],
             if not isinstance(raw, RawInstance):
                 raise TypeError("backend item must be RawInstance")
             instance = build_instance(raw, names, image_size, confidence_threshold,
-                                      mask_threshold)
+                                      mask_threshold,
+                                      max_rle_runs=(None if max_total_rle_runs is None
+                                                    else max_total_rle_runs
+                                                    - total_rle_runs))
+        except SegmentationLimitError:
+            raise
         except (TypeError, ValueError) as exc:
             errors.append({"index": index, "error": str(exc)})
             continue

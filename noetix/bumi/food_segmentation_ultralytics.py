@@ -146,6 +146,7 @@ class UltralyticsSegmentationRuntime:
         self._names: Mapping[int, str] | Sequence[str] | None = None
         self._model_path: Path | None = None
         self._predict_options: dict[str, Any] = {}
+        self._max_instances: int | None = None
         self._last_diagnostics: dict[str, Any] = {}
 
     @property
@@ -161,6 +162,12 @@ class UltralyticsSegmentationRuntime:
         return dict(self._last_diagnostics)
 
     def load(self, model_path: str, **options: Any) -> None:
+        options = dict(options)
+        max_instances = options.pop("max_instances", None)
+        if max_instances is not None and (
+                isinstance(max_instances, bool)
+                or not isinstance(max_instances, int) or max_instances <= 0):
+            raise ValueError("max_instances must be a positive integer or None")
         path = Path(model_path).expanduser()
         if not path.is_file():
             raise FileNotFoundError(f"segmentation model file does not exist: {path}")
@@ -189,7 +196,10 @@ class UltralyticsSegmentationRuntime:
         self._model = model
         self._names = names
         self._model_path = path
-        self._predict_options = dict(options)
+        self._max_instances = max_instances
+        if max_instances is not None:
+            options["max_det"] = max_instances
+        self._predict_options = options
 
     def predict(self, image: Any) -> list[RawInstance]:
         if self._model is None:
@@ -226,6 +236,9 @@ class UltralyticsSegmentationRuntime:
         count = len(xyxy)
         if len(confidence) != count or len(classes) != count:
             raise RuntimeError("box, confidence and class counts do not match")
+        if self._max_instances is not None and count > self._max_instances:
+            raise RuntimeError(
+                f"model returned more than {self._max_instances} detections")
         if count == 0:
             self._last_diagnostics = {
                 "input_shape": list(input_shape),
@@ -272,7 +285,7 @@ class UltralyticsSegmentationRuntime:
                 class_id=int(class_value),
                 confidence=float(confidence[index]),
                 bbox=bbox,
-                mask=binary.tolist(),
+                mask=binary,
             ))
             detection_diagnostics.append({
                 "class_id": int(class_value),

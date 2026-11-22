@@ -115,6 +115,22 @@ def _jpeg_dimensions(data: bytes) -> tuple[int, int] | None:
     return None
 
 
+def _json_dumps_limited(value: Any, max_bytes: int) -> str:
+    """Serialize JSON incrementally and stop before exceeding the byte budget."""
+
+    encoder = json.JSONEncoder(separators=(",", ":"), allow_nan=False)
+    parts = []
+    total = 0
+    for part in encoder.iterencode(value):
+        total += len(part.encode("utf-8"))
+        if total > max_bytes:
+            raise FrameLimitError(
+                "metadata JSON exceeds max_metadata_bytes "
+                f"({total} > {max_bytes})")
+        parts.append(part)
+    return "".join(parts)
+
+
 def _topic(configured: Any, default: str, namespace: str) -> str:
     value = default if configured in (None, "") else configured
     if not isinstance(value, str):
@@ -355,6 +371,7 @@ class FoodSegmentationPlugin:
         options = {
             "imgsz": self._imgsz,
             "conf": self._confidence,
+            "max_instances": self._max_instances,
         }
         if self._device:
             options["device"] = self._device
@@ -668,13 +685,8 @@ class FoodSegmentationPlugin:
                     "runtime": dict(getattr(runtime, "last_diagnostics", {}) or {}),
                 },
             }
-            metadata_json = json.dumps(
-                metadata, separators=(",", ":"), allow_nan=False)
-            metadata_bytes = len(metadata_json.encode("utf-8"))
-            if metadata_bytes > self._max_metadata_bytes:
-                raise FrameLimitError(
-                    "metadata JSON exceeds max_metadata_bytes "
-                    f"({metadata_bytes} > {self._max_metadata_bytes})")
+            metadata_json = _json_dumps_limited(
+                metadata, self._max_metadata_bytes)
             overlay = self._render_overlay(image, result)
             overlay_jpeg = self._codec.encode(overlay, self._jpeg_quality)
         except (FrameLimitError, SegmentationLimitError) as exc:
