@@ -58,8 +58,9 @@ plugins:
   state: {enabled: true}
   battery_power:
     enabled: true
-    # Confirm installed capacity first; SOH is never applied.
-    capacity_wh: null
+    # Confirmed AS2-W nominal capacity: 648 Wh (15000 mAh).
+    # Change for other batteries; null disables runtime estimates. No SOH scaling.
+    capacity_wh: 648.0
     window_s: 300.0
     min_observation_s: 180.0
     min_coverage: 0.9

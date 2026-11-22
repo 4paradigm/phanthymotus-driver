@@ -22,8 +22,9 @@ def field(msg, name):
 
 @dataclass(frozen=True)
 class PowerConfig:
-    # Set only after installed capacity confirmation.
-    capacity_wh: float | None = None
+    # Confirmed AS2-W nominal capacity; override for other batteries.
+    # Explicit None disables runtime estimates. SOH is never applied.
+    capacity_wh: float | None = 648.0
     window_s: float = 300.0
     min_observation_s: float = 180.0
     min_coverage: float = 0.9

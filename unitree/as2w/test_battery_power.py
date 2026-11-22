@@ -5,9 +5,12 @@ from decimal import Decimal, localcontext
 import os
 from pathlib import Path
 import threading
+import tempfile
 import types
 import unittest
 from unittest.mock import patch
+
+import yaml
 
 from unitree.as2w.battery_power import BatteryPower, PowerConfig, parse_bms
 
@@ -327,6 +330,53 @@ class TestPowerCardIntegration(unittest.TestCase):
                 battery_power_config={'enabled': True, 'capacity_wh': 600})
         self.addCleanup(plugin.shutdown)
         return plugin
+
+    def capacity_config_snapshot(self, override=None):
+        config_path = self.root / 'config.yaml'
+        with tempfile.TemporaryDirectory() as directory:
+            if override is not None:
+                config = yaml.safe_load(
+                    config_path.read_text(encoding='utf-8'))
+                config['plugins']['battery_power'].update(override)
+                config_path = Path(directory) / 'config.yaml'
+                config_path.write_text(
+                    yaml.safe_dump(config), encoding='utf-8')
+            with config_path.open(encoding='utf-8') as stream:
+                with patch.dict(
+                        os.environ, {'CONFIG_PATH': str(config_path)}), \
+                        patch('builtins.open', return_value=stream) as opened:
+                    config = self.main.load_config()
+                    opened.assert_called_once_with(str(config_path))
+        card = self.device._BatteryPowerCard(
+            config['plugins']['battery_power'], 'offline')
+        for sequence in range(1801):
+            card.core.update(bms(), sequence, sequence / 10, sequence * 100)
+        return card.core.config, card.core.snapshot(180)
+
+    def test_default_yaml_capacity_matches_core_default(self):
+        config, snapshot = self.capacity_config_snapshot()
+        self.assertEqual(648.0, config.capacity_wh)
+        self.assertEqual(648.0, PowerConfig().capacity_wh)
+        self.assertEqual('available', snapshot['runtime_status'])
+        self.assertAlmostEqual(648 * .5 / 77.6 * 60,
+                               snapshot['remaining_runtime_minutes'])
+
+    def test_custom_yaml_capacity_overrides_nominal_default(self):
+        config, snapshot = self.capacity_config_snapshot(
+            {'capacity_wh': 324.0})
+        self.assertEqual(324.0, config.capacity_wh)
+        self.assertEqual('available', snapshot['runtime_status'])
+        self.assertAlmostEqual(324 * .5 / 77.6 * 60,
+                               snapshot['remaining_runtime_minutes'])
+
+    def test_explicit_yaml_null_disables_runtime_after_warmup(self):
+        config, snapshot = self.capacity_config_snapshot({'capacity_wh': None})
+        self.assertIsNone(config.capacity_wh)
+        self.assertEqual('capacity_unconfigured', snapshot['runtime_status'])
+        self.assertIsNone(snapshot['remaining_runtime_minutes'])
+        self.assertTrue(snapshot['fresh'])
+        self.assertGreater(snapshot['discharged_energy_wh'], 0)
+        self.assertAlmostEqual(77.6, snapshot['average_power_w'])
 
     def test_lifecycle_registration_other_cards_and_shutdown(self):
         p = self.make_plugin()
@@ -874,7 +924,7 @@ class TestPowerCardIntegration(unittest.TestCase):
                       'Dockerfile').read_text(encoding='utf-8'))
         self.assertIn('name: battery_power, type: sensor',
                       (self.root/'driver.yaml').read_text(encoding='utf-8'))
-        self.assertIn('capacity_wh: null', (self.root /
+        self.assertIn('capacity_wh: 648.0', (self.root /
                       'config.yaml').read_text(encoding='utf-8'))
         self.assertIn('battery_power_config=p.get("battery_power")',
                       (self.root/'main.py').read_text(encoding='utf-8'))
