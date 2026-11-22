@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import time
@@ -252,6 +253,12 @@ def publishers(plugin):
     return {publisher.topic: publisher for publisher in node.publishers}
 
 
+def derived_topics(input_topic="/bumi_test/camera/color"):
+    suffix = hashlib.sha256(input_topic.encode("utf-8")).hexdigest()[:16]
+    base = f"/bumi_test/food_segmentation/i_{suffix}"
+    return f"{base}/metadata", f"{base}/overlay"
+
+
 def send(plugin, data=b"good", fmt="jpeg"):
     plugin._node.subscriptions[0].callback(FakeCompressedImage(data, fmt))
 
@@ -270,9 +277,10 @@ def test_tool_schema_prefix_card_type_and_topics():
         "input_topic"]
     assert tool["topic_in"] == [{
         "topic": "/bumi_test/camera/color", "format": "image/jpeg"}]
+    metadata_topic, overlay_topic = derived_topics()
     assert tool["topic_out"] == [
-        {"topic": "/bumi_test/food_segmentation/metadata", "format": "data/json"},
-        {"topic": "/bumi_test/food_segmentation/overlay", "format": "image/jpeg"},
+        {"topic": metadata_topic, "format": "data/json"},
+        {"topic": overlay_topic, "format": "image/jpeg"},
     ]
 
 
@@ -310,11 +318,26 @@ def test_start_is_lazy_idempotent_and_creates_real_dds_shapes():
 
 def test_canvas_start_can_remap_input_topic_but_not_while_running():
     plugin, runtime, _, _ = make_plugin()
+    canvas_input = "/canvas/camera/jpeg"
+    suffix = hashlib.sha256(canvas_input.encode("utf-8")).hexdigest()[:16]
+    canvas_outputs = [
+        {"topic": f"/bumi_test/food_segmentation/i_{suffix}/metadata",
+         "format": "data/json"},
+        {"topic": f"/bumi_test/food_segmentation/i_{suffix}/overlay",
+         "format": "image/jpeg"},
+    ]
+    inferred = plugin.dispatch("info", {"input_topics": [canvas_input]})
+    assert inferred["state"] == "idle"
+    assert inferred["topic_in"] == [{"topic": canvas_input, "format": "image/jpeg"}]
+    assert inferred["topic_out"] == canvas_outputs
+    assert runtime.load_calls == []
+
     started = plugin.dispatch("start", {"input_topic": "/canvas/camera/jpeg"})
     assert started["ok"] is True
     assert plugin._node.subscriptions[0].topic == "/canvas/camera/jpeg"
     assert started["topic_in"] == [{
         "topic": "/canvas/camera/jpeg", "format": "image/jpeg"}]
+    assert started["topic_out"] == inferred["topic_out"]
     assert plugin.dispatch(
         "start", {"input_topics": ["/canvas/camera/jpeg"]})["ok"] is True
 
@@ -330,6 +353,28 @@ def test_canvas_start_can_remap_input_topic_but_not_while_running():
     assert restarted["topic_in"][0]["topic"] == "/other/camera"
     assert len(runtime.load_calls) == 2  # deliberate unload/reload across stop
     plugin.stop()
+
+
+def test_canvas_info_derives_outputs_before_start_without_side_effects():
+    plugin, runtime, _, executor = make_plugin()
+    input_topic = "/canvas/preflight/camera"
+    suffix = hashlib.sha256(input_topic.encode("utf-8")).hexdigest()[:16]
+
+    result = plugin.dispatch("info", {"input_topics": [input_topic]})
+
+    assert result["state"] == "idle"
+    assert result["runtime_loaded"] is False
+    assert result["topic_in"] == [{"topic": input_topic, "format": "image/jpeg"}]
+    assert result["topic_out"] == [
+        {"topic": f"/bumi_test/food_segmentation/i_{suffix}/metadata",
+         "format": "data/json"},
+        {"topic": f"/bumi_test/food_segmentation/i_{suffix}/overlay",
+         "format": "image/jpeg"},
+    ]
+    assert runtime.load_calls == []
+    assert executor.nodes == []
+    assert plugin.info()["topic_in"] == [{
+        "topic": "/bumi_test/camera/color", "format": "image/jpeg"}]
 
 
 def test_stop_cancels_start_that_is_still_loading_model():
@@ -357,8 +402,9 @@ def test_frame_publishes_contract_json_real_rle_and_overlay():
     pubs = publishers(plugin)
     send(plugin)
     wait_for(lambda: plugin.info()["processed_frames"] == 1)
-    metadata_message = pubs["/bumi_test/food_segmentation/metadata"].messages[0]
-    overlay_message = pubs["/bumi_test/food_segmentation/overlay"].messages[0]
+    metadata_topic, overlay_topic = derived_topics()
+    metadata_message = pubs[metadata_topic].messages[0]
+    overlay_message = pubs[overlay_topic].messages[0]
     payload = json.loads(metadata_message.data)
 
     assert payload["schema_version"] == SCHEMA_VERSION
@@ -386,8 +432,8 @@ def test_empty_detection_is_a_valid_output():
     pubs = publishers(plugin)
     send(plugin)
     wait_for(lambda: plugin.info()["processed_frames"] == 1)
-    payload = json.loads(
-        pubs["/bumi_test/food_segmentation/metadata"].messages[0].data)
+    metadata_topic, _ = derived_topics()
+    payload = json.loads(pubs[metadata_topic].messages[0].data)
     assert payload["processed_instance_count"] == 0
     assert payload["instances"] == []
     assert payload["errors"] == []

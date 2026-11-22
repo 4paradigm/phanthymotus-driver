@@ -57,8 +57,8 @@ plugins:
     enabled: false
     model_path: ""              # Required local path; never downloaded implicitly.
     input_topic: ""             # Empty defaults to /<namespace>/camera/color.
-    metadata_topic: ""          # Empty defaults to /<namespace>/food_segmentation/metadata.
-    overlay_topic: ""           # Empty defaults to /<namespace>/food_segmentation/overlay.
+    metadata_topic: ""          # Empty derives an instance path from the wired input.
+    overlay_topic: ""           # Empty derives an instance path from the wired input.
     confidence_threshold: 0.25
     mask_threshold: 0.5
     imgsz: 640

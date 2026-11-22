@@ -60,13 +60,20 @@ Default topics use the resolved Bumi namespace:
 | Direction | Topic | ROS 2 type | Card format |
 | --- | --- | --- | --- |
 | Input | `/<namespace>/camera/color` | `sensor_msgs/msg/CompressedImage` | `image/jpeg` |
-| Output | `/<namespace>/food_segmentation/metadata` | `std_msgs/msg/String` | `data/json` |
-| Output | `/<namespace>/food_segmentation/overlay` | `sensor_msgs/msg/CompressedImage` | `image/jpeg` |
+| Output | `/<namespace>/food_segmentation/i_<hash>/metadata` | `std_msgs/msg/String` | `data/json` |
+| Output | `/<namespace>/food_segmentation/i_<hash>/overlay` | `sensor_msgs/msg/CompressedImage` | `image/jpeg` |
 
 The input must be a non-empty JPEG that decodes to an `H x W x 3` image. The
 Canvas-resolved `input_topic` passed to the MCP `start` action overrides the
 configured default for that run. A running Card must be stopped before changing
 its input topic.
+
+Before startup, Canvas can call `info` with `input_topic` or one `input_topics`
+entry. The Card derives `<hash>` from the normalized input topic using the first
+16 hexadecimal characters of SHA-256 and returns the same output paths that
+`start` will create, without loading the model or creating a ROS Node. Explicit
+`metadata_topic` or `overlay_topic` configuration overrides derivation for that
+output.
 
 The QoS matches the Bumi camera stream: best effort, volatile, keep-last with
 depth one. The ROS callback only replaces a latest-frame slot; one worker owns
@@ -145,7 +152,8 @@ plugins:
 ```
 
 An empty `input_topic` selects `/<namespace>/camera/color`. Empty output topics
-select their namespace defaults. Topic values may use `{namespace}`.
+derive stable instance paths from the selected input topic. Topic values may
+use `{namespace}`.
 
 For a future approved deployment, mount the checkpoint under the existing
 persistent `/opt/phanthy-motus/data` volume and configure its exact container

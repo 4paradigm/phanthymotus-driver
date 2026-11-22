@@ -8,6 +8,7 @@ Ultralytics, load a model, or download weights.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -245,15 +246,14 @@ class FoodSegmentationPlugin:
         self._codec = image_codec or _OpenCvCodec()
 
         base = f"/{namespace}" if namespace else ""
+        self._base = base
         self._configured_input_topic = _topic(
             self._config.get("input_topic"), f"{base}/camera/color", namespace)
         self._input_topic = self._configured_input_topic
-        self._metadata_topic = _topic(
-            self._config.get("metadata_topic"),
-            f"{base}/food_segmentation/metadata", namespace)
-        self._overlay_topic = _topic(
-            self._config.get("overlay_topic"),
-            f"{base}/food_segmentation/overlay", namespace)
+        self._configured_metadata_topic = self._config.get("metadata_topic")
+        self._configured_overlay_topic = self._config.get("overlay_topic")
+        self._metadata_topic, self._overlay_topic = self._output_topics(
+            self._input_topic)
         if len({self._input_topic, self._metadata_topic, self._overlay_topic}) != 3:
             raise ValueError("food segmentation input and output topics must be distinct")
 
@@ -324,6 +324,31 @@ class FoodSegmentationPlugin:
             "limit_errors": 0,
         }
 
+    def _output_topics(self, input_topic: str) -> tuple[str, str]:
+        suffix = hashlib.sha256(input_topic.encode("utf-8")).hexdigest()[:16]
+        instance = f"{self._base}/food_segmentation/i_{suffix}"
+        metadata = _topic(
+            self._configured_metadata_topic,
+            f"{instance}/metadata", self._namespace)
+        overlay = _topic(
+            self._configured_overlay_topic,
+            f"{instance}/overlay", self._namespace)
+        if len({input_topic, metadata, overlay}) != 3:
+            raise ValueError(
+                "food segmentation input and output topics must be distinct")
+        return metadata, overlay
+
+    def _requested_input_topic(self, args: dict) -> str | None:
+        input_topic = args.get("input_topic")
+        if input_topic:
+            return input_topic
+        input_topics = args.get("input_topics")
+        if input_topics is None:
+            return None
+        if not isinstance(input_topics, list) or len(input_topics) > 1:
+            raise ValueError("food segmentation expects exactly one input topic")
+        return input_topics[0] if input_topics else None
+
     def get_tool(self) -> dict:
         return {
             "name": "food_segmentation",
@@ -381,6 +406,8 @@ class FoodSegmentationPlugin:
         try:
             target_input_topic = _topic(
                 input_topic, self._configured_input_topic, self._namespace)
+            target_metadata_topic, target_overlay_topic = self._output_topics(
+                target_input_topic)
         except (TypeError, ValueError) as exc:
             with self._lock:
                 self._last_error = str(exc)
@@ -423,9 +450,9 @@ class FoodSegmentationPlugin:
             qos = bindings.qos_profile()
             callback_group = bindings.callback_group()
             metadata_publisher = node.create_publisher(
-                bindings.String, self._metadata_topic, qos)
+                bindings.String, target_metadata_topic, qos)
             overlay_publisher = node.create_publisher(
-                bindings.CompressedImage, self._overlay_topic, qos)
+                bindings.CompressedImage, target_overlay_topic, qos)
             subscription = node.create_subscription(
                 bindings.CompressedImage,
                 target_input_topic,
@@ -467,6 +494,8 @@ class FoodSegmentationPlugin:
             else:
                 cancelled = False
                 self._input_topic = target_input_topic
+                self._metadata_topic = target_metadata_topic
+                self._overlay_topic = target_overlay_topic
                 self._bindings = bindings
                 self._runtime = runtime
                 self._node = node
@@ -745,8 +774,16 @@ class FoodSegmentationPlugin:
                 overlay, label, (point1[0], max(15, point1[1] - 5)), color)
         return overlay
 
-    def info(self) -> dict:
+    def info(self, input_topic: str | None = None) -> dict:
+        if input_topic is not None:
+            resolved_input = _topic(
+                input_topic, self._configured_input_topic, self._namespace)
+            metadata_topic, overlay_topic = self._output_topics(resolved_input)
         with self._lock:
+            if input_topic is None:
+                resolved_input = self._input_topic
+                metadata_topic = self._metadata_topic
+                overlay_topic = self._overlay_topic
             if self._last_received_monotonic is None:
                 input_state = "never_received"
                 frame_age = None
@@ -757,10 +794,10 @@ class FoodSegmentationPlugin:
                 "state": self._state,
                 "model_path": self._model_path,
                 "runtime_loaded": self._runtime is not None,
-                "topic_in": [{"topic": self._input_topic, "format": "image/jpeg"}],
+                "topic_in": [{"topic": resolved_input, "format": "image/jpeg"}],
                 "topic_out": [
-                    {"topic": self._metadata_topic, "format": "data/json"},
-                    {"topic": self._overlay_topic, "format": "image/jpeg"},
+                    {"topic": metadata_topic, "format": "data/json"},
+                    {"topic": overlay_topic, "format": "image/jpeg"},
                 ],
                 "max_rate_hz": self._max_rate_hz,
                 "confidence_threshold": self._confidence,
@@ -783,11 +820,7 @@ class FoodSegmentationPlugin:
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         if action == "start":
-            input_topic = args.get("input_topic")
-            if not input_topic:
-                input_topics = args.get("input_topics")
-                if isinstance(input_topics, list) and input_topics:
-                    input_topic = input_topics[0]
+            input_topic = self._requested_input_topic(args)
             ok = self.start(input_topic)
             result = self.info()
             result["ok"] = ok
@@ -798,5 +831,5 @@ class FoodSegmentationPlugin:
             result["ok"] = ok
             return result
         if action == "info":
-            return self.info()
+            return self.info(self._requested_input_topic(args))
         return None
