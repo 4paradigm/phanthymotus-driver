@@ -670,3 +670,31 @@ high/media controllers, so it loads in a data-only deployment.
 
 `start` requires `input_topic`; without it the card honestly reports
 `{"state":"idle","degraded":"no_input_topic"}` instead of claiming `running`.
+
+## `tf_tree` card
+
+Publishes the kinematic tree parsed from `resource/bumi_model.urdf` as ROS 2
+transforms: the 21 revolute joints on `/tf`, driven by the 10 Hz
+`/{ns}/state/joints` sample, and any `fixed` joints on the latched `/tf_static`.
+It computes forward kinematics itself — there is no `robot_state_publisher`
+subprocess and no extra image dependency (`tf2_ros` and `geometry_msgs` are
+already installed for the odometry card). The `fixed` joints declared in the
+URDF — including `camera_mount_joint` and `camera_optical_joint` from the camera
+mount section above — are published on `/tf_static`, which is what connects
+vision targets to the body tree.
+
+Optionally attaches a vision card's `data/json` transform batch (the
+`input_topic` arg of `start`) as additional child frames. Transforms carry the
+sample's own timestamp and expire after `vision_ttl_ms`.
+
+**It drives nothing and is not a pose source.** Its only output topic,
+`/{ns}/tf_tree/status`, is a *health* report (frame counts, publish rate,
+joint-sample age, `degraded` reason). Downstream code that wants "pose of A
+relative to C" must use `tf2_ros` `lookup_transform` on `/tf`; reading `status`
+as a transform is a bug. The card claims no `odom → base_link` edge, so it does
+not conflict with `rgbd_visual_odometry`. It also does not join any trees that
+other cards broadcast separately — a consumer needing that must publish its own
+explicit transform rather than assume two same-physical frame names coincide.
+
+Configuration is under `plugins.tf_tree`: `urdf_path`, `publish_rate_hz`,
+`max_joint_age_s`, `vision_ttl_ms`.

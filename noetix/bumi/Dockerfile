@@ -156,6 +156,8 @@ COPY vision_tf_spec.py /work/vision_tf_spec.py
 COPY vision_tf_card.py /work/vision_tf_card.py
 COPY sound_direction.py /work/sound_direction.py
 COPY direction_card.py /work/direction_card.py
+COPY tf_tree_spec.py /work/tf_tree_spec.py
+COPY tf_tree_card.py /work/tf_tree_card.py
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/
 

@@ -114,3 +114,13 @@ plugins:
     image_width: 640             # [16,4096]
     image_height: 480            # [16,4096]
     publish_rate_hz: 10          # [1,50]
+
+  # 实时 tf 树：把 URDF + 21 个关节角（+可选的视觉变换）发布成 /tf 与 /tf_static。
+  # 只发布坐标系，不驱动任何硬件、不输出位姿给 Agent；下游要算相对位姿请自己订阅 /tf。
+  # 默认开启：它是坐标基础设施，关掉会让所有依赖 frame 的下游失去变换。
+  tf_tree:
+    enabled: true
+    urdf_path: /work/resource/bumi_model.urdf
+    publish_rate_hz: 10        # status 话题频率；/tf 由关节样本到达驱动
+    max_joint_age_s: 0.5       # 超过此时长判定 joints_stale，不再当作新位姿
+    vision_ttl_ms: 500         # 视觉变换自带 stamp 的过期时间

@@ -221,3 +221,55 @@ def test_vision_tf_is_skipped_when_disabled(bundle_module):
 
     assert "vision_tf" not in [t["name"] for t in bundle.get_all_tools()]
 
+
+class FakeTfTreePlugin:
+    def __init__(self, plugin_config, namespace, executor):
+        self.plugin_config = plugin_config
+        self.namespace = namespace
+        self.executor = executor
+
+    def get_tool(self):
+        return {"name": "tf_tree", "type": "processor"}
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, _args):
+        return {"state": action}
+
+
+def test_tf_tree_registers_without_controller_or_camera(bundle_module, monkeypatch):
+    """tf is structural: it must come up even on a build with every other card off.
+
+    Gating it on a controller or on the camera plugin would silently drop the
+    only /tf publisher in the bundle, with no error beyond a missing card.
+    """
+    fake = types.ModuleType("tf_tree_card")
+    fake.TfTreePlugin = FakeTfTreePlugin
+    monkeypatch.setitem(sys.modules, "tf_tree_card", fake)
+
+    config = _config(loco=False, loco_servo=False)
+    config["plugins"]["tf_tree"] = {"enabled": True}
+
+    bundle = bundle_module.BumiDeviceBundle(
+        config, "bumi_test", object(), high_ctrl=None, media_ctrl=None)
+
+    assert [tool["name"] for tool in bundle.get_all_tools()] == ["tf_tree"]
+    assert bundle._plugins[0].namespace == "bumi_test"
+
+
+def test_tf_tree_skipped_when_disabled(bundle_module, monkeypatch):
+    fake = types.ModuleType("tf_tree_card")
+    fake.TfTreePlugin = FakeTfTreePlugin
+    monkeypatch.setitem(sys.modules, "tf_tree_card", fake)
+
+    config = _config(loco=False, loco_servo=False)
+    config["plugins"]["tf_tree"] = {"enabled": False}
+
+    bundle = bundle_module.BumiDeviceBundle(
+        config, "bumi_test", object(), high_ctrl=None, media_ctrl=None)
+
+    assert bundle.get_all_tools() == []

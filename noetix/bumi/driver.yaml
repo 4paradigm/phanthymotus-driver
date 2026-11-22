@@ -32,3 +32,4 @@ cards:
   - { name: rgbd_visual_odometry, type: sensor }
   - { name: vision_capture,    type: actuator }
   - { name: vision_tf,         type: processor }
+  - { name: tf_tree,           type: processor }
