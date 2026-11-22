@@ -23,15 +23,19 @@ def _add_base_visuals(root, lift, joints):
 
     for visual in base.findall("visual"):
         base.remove(visual)
-    # SDK footprint with an approximate bumper height.
+    # Keep the front edge (+X) of the original footprint. Halve the rear
+    # overhang measured from the lift column, without moving the column.
+    x, y, _ = lift.find("origin").get("xyz").split()
+    front_x, original_rear_x = 0.325, -0.325
+    rear_x = (float(x) + original_rear_x) / 2
+    center_x = (front_x + rear_x) / 2
     height = 0.2
     box = ET.SubElement(base, "visual", name="display_base")
-    ET.SubElement(box, "origin", xyz=f"0 0 {height / 2:g}")
-    ET.SubElement(ET.SubElement(box, "geometry"), "box", size="0.65 0.51 0.2")
+    ET.SubElement(box, "origin", xyz=f"{center_x:.9g} 0 {height / 2:g}")
+    ET.SubElement(ET.SubElement(box, "geometry"), "box", size=f"{front_x - rear_x:.9g} 0.51 {height:g}")
 
     # Match the head top at the observed upper position (0.62 m). The rail
     # belongs to the base, while the torso moves on body_joint independently.
-    x, y, _ = lift.find("origin").get("xyz").split()
     top = 0.62 + sum(float(joints[name].find("origin").get("xyz").split()[2])
                      for name in ("body_joint", "joint_head0", "joint_head1", "joint_rgbd"))
     rail = ET.SubElement(base, "visual", name="display_column")
@@ -47,6 +51,13 @@ def render_model(urdf):
     for name, axis in (("joint_head0", "0 0 1"), ("joint_head1", "0 1 0")):
         joint = joints[name]
         joint.find("axis").set("xyz", axis)
+    # The mechanical mounts have lateral offsets that show up as a kink in
+    # the stick figure. Keep both neck pivots and the RGB-D tip on the centerline.
+    # The paired eye mounts already have mirrored offsets.
+    for name in ("joint_head0", "joint_head1", "joint_rgbd"):
+        origin = joints[name].find("origin")
+        x, _, z = origin.get("xyz").split()
+        origin.set("xyz", f"{x} 0 {z}")
     _add_base_visuals(root, joints["body_joint"], joints)
     mimics = {}
     for name, joint in joints.items():

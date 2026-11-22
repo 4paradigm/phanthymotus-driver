@@ -45,8 +45,10 @@ feedback as `1 - position` before expanding the finger linkage.
 These are display-only corrections. `joints` combines `/joint_states` with fresh
 lift and gripper feedback, and `joints info` reports `body_joint` in metres.
 The display model replaces the wheel and lidar branches with a cuboid base
-outline (650 × 510 mm in plan, approximately 200 mm high) and a fixed guide
-column aligned with the head at the observed 0.62 m raised position. The
+outline (approximately 406 × 510 × 200 mm), keeping the front edge and halving
+the rear overhang relative to the fixed guide column. The column is aligned
+with the head at the observed 0.62 m raised position. The neck pivots and
+RGB-D tip are centered in the preview, with mirrored eye mounts. The
 `body_joint` prismatic branch carries the torso, head and arms. Use the Canvas
 renderer from [phanthymotus#413](https://github.com/4paradigm/phanthymotus/pull/413)
 to draw the base primitives and move the upper body along the column from

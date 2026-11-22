@@ -525,12 +525,25 @@ class PantherDriverTest(unittest.TestCase):
         self.assertEqual(model["skeleton_visual_links"], ["base_link"])
         base = ET.fromstring(model["urdf"]).find("link[@name='base_link']")
         self.assertEqual(len(base.findall("visual")), 2)
-        self.assertEqual(base.find("visual[@name='display_base']/geometry/box").get("size"), "0.65 0.51 0.2")
+        box = base.find("visual[@name='display_base']")
+        center_x, center_y, center_z = map(float, box.find("origin").get("xyz").split())
+        length, width, height = map(float, box.find("geometry/box").get("size").split())
+        self.assertEqual((center_y, center_z, width, height), (0.0, 0.1, 0.51, 0.2))
+        self.assertAlmostEqual(center_x + length / 2, 0.325)
+        rear_x = center_x - length / 2
         rail = base.find("visual[@name='display_column']")
-        center = float(rail.find("origin").get("xyz").split()[2])
+        rail_x, _, center = map(float, rail.find("origin").get("xyz").split())
+        self.assertAlmostEqual(rail_x - rear_x, (rail_x + 0.325) / 2)
         half_length = float(rail.find("geometry/cylinder").get("length")) / 2
         self.assertAlmostEqual(center - half_length, 0.2)
         self.assertAlmostEqual(center + half_length, 0.62 + 0.785998)
+        for name in ("joint_head0", "joint_head1", "joint_rgbd"):
+            self.assertEqual(float(joints[name].find("origin").get("xyz").split()[1]), 0.0)
+        for name, axis in (("joint_head0", "0 0 1"), ("joint_head1", "0 1 0")):
+            self.assertEqual(joints[name].find("axis").get("xyz"), axis)
+        left_eye, right_eye = (tuple(map(float, joints[f"joint_{side}_eye"].find("origin").get("xyz").split()))
+                               for side in ("left", "right"))
+        self.assertEqual(left_eye, (right_eye[0], -right_eye[1], right_eye[2]))
 
     def test_skeleton_indices_follow_kinematic_urdf_order(self):
         urdf = """<robot name='p'>
