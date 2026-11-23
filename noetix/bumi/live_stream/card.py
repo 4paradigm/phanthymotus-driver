@@ -60,8 +60,8 @@ class LiveStreamPlugin:
             "type": "actuator",
             "multiInstance": False,
             "description": (
-                "Bumi 直播：支持虎牙和小红书授权 RTMP 地址。"
-                "小红书三方推流页面复制服务器及推流码，本地拼接为完整 URL；"
+                "Bumi 直播：支持小红书、虎牙以及提供 RTMP/RTMPS 推流的其他平台。"
+                "其他平台须先在官方主播后台开通第三方推流，复制服务器地址和推流码；"
                 "在齿轮中填写新推流地址并保存，即授权本场 go_live。"
                 "start 不会公开直播，end_live 结束推流。"
             ),
@@ -72,7 +72,7 @@ class LiveStreamPlugin:
                         "type": "string",
                         "title": "RTMP 完整推流地址（含推流码）",
                         "description": (
-                            "小红书：将服务器地址末尾加 / 再拼接推流码；"
+                            "小红书或其他平台：将官方推流服务器地址与推流码拼接为完整 URL；"
                             "虎牙：直接复制完整 RTMP 地址。"
                             "含敏感密钥，仅在本机齿轮填写，勿发送到聊天。"
                         ),
@@ -152,7 +152,7 @@ class LiveStreamPlugin:
                 platform, url = validate_stream_url(value)
             except ValueError:
                 return {"ok": False, "error_code": "INVALID_STREAM_URL",
-                        "message": "仅支持已验证的虎牙或小红书官方 RTMP 地址"}
+                        "message": "请使用平台提供的公网 RTMP/RTMPS 地址及推流码"}
             with self._lock:
                 signed = self._verify_approval('config', url, args.get('operator_proof'))
                 if not signed and (url != self._url or args.get('authorize_start') is True):
