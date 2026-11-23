@@ -2,7 +2,9 @@
 
 Consumers must provide NumPy (already declared by the Tianyi image).
 """
+from collections import OrderedDict
 import json
+import time
 import uuid
 
 import numpy as np
@@ -90,6 +92,41 @@ class BodyMountSource:
         except Exception:
             pass  # publish() retains the exact lookup failure and diagnostic.
 
+    def _lookup(self, packet):
+        from rclpy.time import Time
+        from rclpy.clock import ClockType
+        stamp = packet['stamp_ns']
+        transform = self.buffer.lookup_transform(packet['parent_frame'], packet['child_frame'],
+            Time(nanoseconds=stamp, clock_type=ClockType.ROS_TIME))
+        return _matrix(transform, packet['parent_frame'], packet['child_frame'], stamp)
+
+    def retry_pending(self):
+        # Called by the image worker, serialized with publish/reset/close.
+        for stamp in sorted(self._pending):
+            deadline, packet = self._pending[stamp]
+            if (time.monotonic() >= deadline or packet['parent_frame'] != self._value(self.body_frame)
+                    or packet['child_frame'] != self._value(self.camera_frame)
+                    or packet['clock_id'] != self._value(self.clock_id)):
+                del self._pending[stamp]
+                continue
+            try:
+                matrix = self._lookup(packet)
+            except Exception as error:
+                if 'extrapolation into the future' in str(error).lower():
+                    # The buffer cannot cover any later capture on this chain yet.
+                    break
+                del self._pending[stamp]
+                continue
+            from std_msgs.msg import String
+            try:
+                self.publisher.publish(String(data=json.dumps(dict(packet, matrix=matrix,
+                    status='available', reason=None), allow_nan=False)))
+            except Exception:
+                continue  # Retry transport only within the original deadline.
+            del self._pending[stamp]
+            if stamp == self._stamp_ns:
+                self._reason = None
+
     def publish(self, stamp_ns):
         if self._closed:
             return False
@@ -113,12 +150,13 @@ class BodyMountSource:
                 packet['matrix'] = self.capture_evidence.lookup(
                     stamp_ns, packet['parent_frame'], packet['child_frame'], packet['clock_id'])
             else:
-                from rclpy.time import Time
-                from rclpy.clock import ClockType
-                capture_time = Time(nanoseconds=stamp_ns, clock_type=ClockType.ROS_TIME)
-                transform = self.buffer.lookup_transform(packet['parent_frame'], packet['child_frame'], capture_time)
-                packet['matrix'] = _matrix(transform, packet['parent_frame'], packet['child_frame'], stamp_ns)
+                packet['matrix'] = self._lookup(packet)
         except Exception as error:
+            if (packet is not None and self.buffer is not None and self.capture_evidence is None and
+                    'extrapolation into the future' in str(error).lower()):
+                self._pending.setdefault(stamp_ns, (time.monotonic() + 2., packet))
+                if len(self._pending) > 128:
+                    self._pending.popitem(last=False)
             self._reason = 'body mount unavailable: ' + str(error)
             if packet is not None:
                 self._reason += ' ({} <- {})'.format(packet['parent_frame'], packet['child_frame'])
@@ -128,11 +166,14 @@ class BodyMountSource:
             if self.publisher is None:
                 return False
             self.publisher.publish(String(data=json.dumps(packet, allow_nan=False)))
+            if self._reason is None:
+                self._pending.pop(stamp_ns, None)
         except Exception as error:
             self._reason = 'body mount publish unavailable: ' + str(error)
         return self._reason is None
 
     def reset(self):
+        self._pending = OrderedDict()
         self.epoch = uuid.uuid4().hex
         self._stamp_ns = None
         self._reason = self._setup_reason or 'waiting for capture-time body-camera TF'
@@ -140,6 +181,7 @@ class BodyMountSource:
     def close(self):
         if self._closed:
             return
+        self._pending.clear()
         self._closed = True
         self._reason = 'body mount source stopped'
         if self.listener is not None:

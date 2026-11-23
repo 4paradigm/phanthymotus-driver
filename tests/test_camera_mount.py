@@ -206,3 +206,39 @@ def test_estimated_capture_preserves_provenance_and_matrix(source):
     assert not mount.buffer.calls
     assert node.messages[-1]['matrix'][2][3] == 1.5
     assert node.messages[-1]['accuracy_validated'] is False
+
+
+def test_late_tf_repairs_only_its_original_capture_once(source):
+    mount, node = source
+    mount.buffer.failure = LookupError('Lookup would require extrapolation into the future.')
+    assert not mount.publish(100)
+    mount.retry_pending()
+    assert len(node.messages) == 1
+    mount.buffer.failure = None
+    mount.retry_pending()
+    mount.retry_pending()
+    assert [(p['stamp_ns'], p['status']) for p in node.messages] == [(100, 'unavailable'), (100, 'available')]
+    assert node.messages[1]['matrix'][0][3] == .25
+
+
+@pytest.mark.parametrize('barrier', ['reset', 'expired', 'frame', 'close', 'wrong_stamp'])
+def test_delayed_mount_cannot_cross_identity_deadline_or_use_wrong_tf(source, monkeypatch, barrier):
+    import time
+    now = [1.]
+    monkeypatch.setattr(time, 'monotonic', lambda: now[0])
+    mount, node = source
+    mount.buffer.failure = LookupError('extrapolation into the future')
+    assert not mount.publish(100)
+    mount.buffer.failure = None
+    if barrier == 'reset':
+        mount.reset()
+    elif barrier == 'expired':
+        now[0] += 3
+    elif barrier == 'frame':
+        mount.camera_frame = 'another_camera'
+    elif barrier == 'close':
+        mount.close()
+    else:
+        mount.buffer.preserve_stamp = True
+    mount.retry_pending()
+    assert [p['status'] for p in node.messages] == ['unavailable']

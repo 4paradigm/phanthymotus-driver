@@ -688,6 +688,8 @@ class RgbdCameraPlugin:
             zlib_compress = zlib.compress
             compression_backend = 'stdlib-zlib'
         while not self.stop_event.is_set():
+            with self.lock:
+                self.body_mount.retry_pending()
             try:
                 item = self.pending.get(timeout=.1)
                 color, depth = item[:2]

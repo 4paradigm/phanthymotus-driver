@@ -554,3 +554,22 @@ def test_card_restart_after_encoding_fault_restores_sibling_outputs(source, monk
     assert set(source.clients) == {'color', 'depth', 'imu'}
     for card in cards:
         card.stop()
+
+
+def test_camera_worker_backfills_old_mount_after_depth_publication(source, monkeypatch):
+    buffer = source.body_mount.buffer
+    lookup = buffer.lookup_transform
+    def late(*args):
+        raise LookupError('extrapolation into the future')
+    monkeypatch.setattr(buffer, 'lookup_transform', late)
+    emit(source)
+    first = [(topic, msg) for topic, msg in source.events if topic.endswith('/body_mount')]
+    assert len(first) == 1 and json.loads(first[0][1].data)['status'] == 'unavailable'
+    assert any(topic.endswith('/depth') for topic, _ in source.events)
+    monkeypatch.setattr(buffer, 'lookup_transform', lookup)
+    source.stop_event.clear()
+    monkeypatch.setattr(m.time, 'time_ns', lambda: STAMP + 160_000_000)
+    emit(source, stamp=STAMP + 60_000_000)
+    mounts = [json.loads(msg.data) for topic, msg in source.events if topic.endswith('/body_mount')]
+    assert [(p['stamp_ns'], p['status']) for p in mounts] == [
+        (STAMP, 'unavailable'), (STAMP, 'available'), (STAMP + 60_000_000, 'available')]
