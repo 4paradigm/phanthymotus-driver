@@ -13,6 +13,9 @@ unixai-panther:
     # separate domain-0 graph.
     - /home/unix_ai/config/cyclonedds.xml:/etc/cyclonedds/panther.xml:ro
     - /run/user/1001/pulse:/run/user/1001/pulse
+    # Vendor PulseAudio uses a random /tmp/pulse-* socket after each boot.
+    - /tmp:/run/panther-host-tmp:ro
+    - /home/unix_ai/map_dir:/home/unix_ai/map_dir
     - ${PANTHER_PULSE_COOKIE_PATH:-/home/unix_ai/.config/pulse/cookie}:/run/panther-pulse-cookie:ro
   environment:
     - PANTHER_ROS_DOMAIN_ID=0
@@ -21,12 +24,12 @@ unixai-panther:
     - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
     - CYCLONEDDS_URI=file:///etc/cyclonedds/panther.xml,file:///work/resource/cyclonedds-muzzle.xml
     - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
-    - PULSE_SERVER=unix:/run/user/1001/pulse/native
+    - PULSE_SERVER=${PANTHER_PULSE_SERVER:-auto}
     - PULSE_COOKIE=/run/panther-pulse-cookie
     - PANTHER_PULSE_UID=${PANTHER_PULSE_UID:-1001}
     - PANTHER_PULSE_GID=${PANTHER_PULSE_GID:-1002}
-    - PANTHER_PULSE_SOURCE=${PANTHER_PULSE_SOURCE:-alsa_input.platform-sound.analog-stereo}
-    - PANTHER_PULSE_SINK=${PANTHER_PULSE_SINK:-alsa_output.platform-sound.analog-stereo}
+    - PANTHER_PULSE_SOURCE=${PANTHER_PULSE_SOURCE:-alsa_input.usb-AISpeech.in_Mic_Arry_8_4169385A3935-00.multichannel-input}
+    - PANTHER_PULSE_SINK=${PANTHER_PULSE_SINK:-alsa_output.usb-C-Media_Electronics_Inc._USB_Audio_Device-00.analog-stereo}
     - PYTHONUNBUFFERED=1
     - RCUTILS_COLORIZED_OUTPUT=0
   logging:
