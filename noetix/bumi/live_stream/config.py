@@ -1,7 +1,9 @@
 """Allowlisted streaming URLs and protected, atomic credential storage."""
 from __future__ import annotations
 
+import ipaddress
 import os
+import re
 import secrets
 import stat
 import tempfile
@@ -10,6 +12,35 @@ from urllib.parse import parse_qs, urlsplit
 
 MAX_URL = 4096
 XIAOHONGSHU_PUSH_HOSTS = frozenset(("live-push.xhscdn.com", "live-push-reg-tx.xhscdn.com"))
+PRIVATE_HOST_SUFFIXES = (".localhost", ".local", ".lan", ".internal", ".test",
+                         ".invalid", ".example", ".onion", ".arpa", ".localdomain")
+
+
+def _valid_public_push_host(host: str) -> bool:
+    """Conservative hostname-only egress guard for operator-approved RTMP URLs.
+
+    This blocks literal IP destinations and private DNS suffixes; a trusted
+    operator must still obtain the address from the official streaming platform.
+    """
+    if not host or len(host) > 253 or host.endswith("."):
+        return False
+    if host == "localhost" or host.endswith(PRIVATE_HOST_SUFFIXES):
+        return False
+    if ".xhscdn.com" in host or ".direct.huya.com" in host:
+        return False  # Existing platforms must use their dedicated validation.
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        return False
+    labels = host.split(".")
+    if len(labels) < 2 or not re.fullmatch(r"[a-z]{2,24}", labels[-1]):
+        return False
+    return all(
+        len(label) <= 63 and re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label)
+        for label in labels
+    )
 
 
 def validate_huya_url(value: object) -> str:
@@ -35,7 +66,7 @@ def validate_huya_url(value: object) -> str:
 
 
 def validate_stream_url(value: object) -> tuple[str, str]:
-    """Identify supported RTMP destinations without allowing arbitrary hosts."""
+    """Accept approved platforms and public-host RTMP destinations only."""
     if not isinstance(value, str):
         raise ValueError("需要完整 RTMP 推流地址")
     url = value.strip()
@@ -46,7 +77,9 @@ def validate_stream_url(value: object) -> tuple[str, str]:
         host = (parts.hostname or "").lower()
         if (parts.scheme not in ("rtmp", "rtmps")
                 or parts.port not in (None, 1935, 443)
-                or parts.username or parts.password or parts.fragment):
+                or parts.username or parts.password or parts.fragment
+                or any(c.isspace() or ord(c) == 127 for c in url)
+                or chr(92) in url):
             raise ValueError
         if host in XIAOHONGSHU_PUSH_HOSTS:
             segments = parts.path.split("/")
@@ -59,9 +92,16 @@ def validate_stream_url(value: object) -> tuple[str, str]:
             return "xiaohongshu", url
         if host == "tx.direct.huya.com" or host.endswith(".direct.huya.com"):
             return "huya", validate_huya_url(url)
+        # Other platforms: a public hostname and a concrete /app/stream-key path
+        # are required. No local, private or IP-literal destinations are accepted.
+        path_parts = parts.path.split("/")
+        if (_valid_public_push_host(host) and len(path_parts) >= 3
+                and path_parts[0] == "" and all(path_parts[1:])
+                and all(part not in (".", "..") for part in path_parts[1:])):
+            return "other", url
     except ValueError:
         pass
-    raise ValueError("只允许已验证的小红书或虎牙官方推流地址") from None
+    raise ValueError("请填写平台提供的公网 RTMP/RTMPS 地址和推流码") from None
 
 
 class HuyaCredentialStore:
