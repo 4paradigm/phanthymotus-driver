@@ -141,11 +141,9 @@ ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 COPY resource/ /work/resource/
 COPY common/ /work/common/
 COPY main.py   /work/main.py
-COPY device.py /work/device.py
+COPY device.py bumi_av_recording.py foot_pose.py foot_pose_state.py /work/
 # Navi support modules are independent from device.py for ROS-free tests.
 COPY loco_servo.py /work/loco_servo.py
-COPY foot_pose.py /work/foot_pose.py
-COPY foot_pose_state.py /work/foot_pose_state.py
 COPY imu_distance_control.py /work/imu_distance_control.py
 COPY leg_odometry.py /work/leg_odometry.py
 COPY camera_specs.py /work/camera_specs.py

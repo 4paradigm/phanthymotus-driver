@@ -136,13 +136,15 @@ class FootPosePlugin:
         self._state = {"state": "idle", "command_sent": False, "pose_confirmed": False, "last_result": None}
 
     def start(self):
-        # The shipped HighController has getters, not a receive callback API.
-        return self.info()
+        # Lifecycle readiness does not arm output or claim a validated pose.
+        # Physical preconditions and preview-only mode remain available in info.
+        return {"state": "ready"}
 
     def get_tools(self):
-        actions = ["info", "status", "config", "read_feet", "check_pose", "reload_assets", "preview", *POSES, "stop"]
+        actions = ["start", "info", "status", "config", "read_feet", "check_pose", "reload_assets", "preview", *POSES, "stop"]
         mapping = {name: {"params": [], "description": LABELS[name] + "；默认仅预览，真实模式需要已验证动作资产。"} for name in POSES}
-        mapping.update({"info": {"params": [], "description": "查询已验证动作、真实执行门槛和缺失条件。"},
+        mapping.update({"start": {"params": [], "description": "启用卡片，不授权或执行脚步动作。"},
+                        "info": {"params": [], "description": "查询已验证动作、真实执行门槛和缺失条件。"},
                         "read_feet": {"params": [], "description": "只读腿部关节，估算机身坐标系中的双脚位置、间距及前后差；不执行动作，不证明着地或平衡。"},
                         "check_pose": {"params": ["pose"], "description": "只读比对已有资产的关节终态；不播放动作，不把缓存匹配当作真机动作完成。"},
                         "reload_assets": {"params": [], "description": "重新载入资产清单，支持逐个姿态接入；同时关闭真实输出授权。"},
@@ -250,7 +252,11 @@ class FootPosePlugin:
             if action == "reload_assets":
                 return self.reload_assets()
             if action == "stop":
-                return self.stop()
+                result = self.stop()
+                # Preserve the truthful physical outcome, including an
+                # unconfirmed stop/retained lease, separately from lifecycle.
+                return {**result, "playback_state": result["state"],
+                        "state": "idle" if result.get("stopped") else "error"}
             if action == "preview":
                 return self.preview(args.get("pose"))
             if action in POSES:

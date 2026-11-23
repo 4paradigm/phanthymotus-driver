@@ -63,6 +63,34 @@ class Loco:
 
 
 class CardTests(unittest.TestCase):
+    def test_lifecycle_markers_do_not_arm_or_confirm_physical_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plugin, _, loco, _ = self.make(directory, assets=False)
+            self.assertEqual(plugin.start(), {"state": "ready"})
+            self.assertEqual(plugin.dispatch("start", {}), {"state": "ready"})
+            self.assertFalse(plugin.info()["physical_execution_ready"])
+            schema = plugin.get_tools()[0]["inputSchema"]
+            self.assertIn("start", schema["properties"]["action"]["enum"])
+            stopped = plugin.dispatch("stop", {})
+            self.assertEqual(stopped["state"], "idle")
+            self.assertEqual(stopped["playback_state"], "stopped")
+            self.assertFalse(stopped["pose_confirmed"])
+            self.assertEqual(loco.calls, [])
+
+    def test_lifecycle_stop_preserves_unconfirmed_outcome_and_ownership(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plugin, high, loco, _ = self.make(directory)
+            plugin._claim()
+            high.mode = 23
+            def failed_stop(_):
+                raise TimeoutError("SDK stop result unknown")
+            loco._do_stop_playback = failed_stop
+            result = plugin.dispatch("stop", {})
+            self.assertEqual(result["state"], "error")
+            self.assertEqual(result["playback_state"], "stop_unconfirmed")
+            self.assertFalse(result["stopped"])
+            self.assertTrue(plugin._owned)
+
     def make(self, directory, *, assets=True, malformed=False, moving=False):
         path = Path(directory) / "assets.json"
         if assets:
@@ -377,7 +405,8 @@ class RegistrationTests(unittest.TestCase):
                                    "foot_pose": {"enabled": True, "assets_file": str(assets)}}}
             bundle = namespace["BumiDeviceBundle"](config, "test", None, High(), None)
             result = bundle.dispatch("foot_pose", {"action": "start"})
-            self.assertFalse(result["physical_execution_ready"])
+            self.assertEqual(result["state"], "ready")
+            self.assertFalse(bundle.dispatch("foot_pose", {"action": "info"})["physical_execution_ready"])
             configured = bundle.dispatch("foot_pose", {"action": "config", "dry_run": False, "confirm": True})
             self.assertTrue(configured["physical_execution_ready"])
             self.assertFalse(bundle._plugins[0].calls)

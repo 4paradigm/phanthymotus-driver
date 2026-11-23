@@ -3145,11 +3145,11 @@ class VisionCapturePlugin:
                                   "description": "开启后录制现有 mic 的声音并合成 AAC 音轨。默认关闭。无音频、断流或仅零 PCM 会明确失败，不降级成无声录像。"},
             }, "required": ["action"], "additionalProperties": False,
                 "x-action-params": {
-                    "start": {"params": [], "description": "检查相机 worker 是否就绪。"},
+                    "start": {"params": [], "description": "启用卡片；拍照与录像操作各自检查设备是否就绪。"},
                     "capture_photo": {"params": [], "description": "拍摄并保存一张当前 RGB 照片。"},
                     "record_video": {"params": ["duration_s", "include_audio"], "description": "按真实时间录制并保存 1–30 秒视频，可选现场声音，默认 5 秒、无声。"},
                     "info": {"params": [], "description": "查看保存目录与相机状态。"},
-                    "stop": {"params": [], "description": "取消当前录像并删除未完成的视频。"},
+                    "stop": {"params": [], "description": "停用卡片并请求取消当前录像；立即返回 idle，清理终态由 ACP/info 报告。"},
                 },
                 "x-completion": {
                     "actions": ["record_video"],
@@ -3161,7 +3161,9 @@ class VisionCapturePlugin:
         return [self.get_tool()]
 
     def start(self):
-        return {"state": "ready" if self._camera_ready() else "error"}
+        # Actuator lifecycle marker. Device readiness belongs to business
+        # actions, not canvas activation (README_dev.md lifecycle contract).
+        return {"state": "ready"}
 
     def stop(self):
         # ``BumiDeviceBundle.stop_all`` calls this during SIGTERM/redeploy. Completing
@@ -3287,7 +3289,7 @@ class VisionCapturePlugin:
                 pass
 
     def _record_video(self, requested, cancel_event, active=None):
-        from common.av_recording import record
+        from bumi_av_recording import record
         if active is None:
             active = {"duration_s": requested, "include_audio": False,
                       "cancel_event": cancel_event, "process": None, "path": None}
@@ -3351,14 +3353,21 @@ class VisionCapturePlugin:
                 "include_audio": include_audio,
                 "requested_duration_s": requested, "message": "Video recording started; completion will be reported asynchronously."}
 
-    def _stop_recording(self):
+    def _stop_recording(self, *, wait=True):
         with self._recording_lock:
             active = self._active_recording
             if not active:
-                return {"state": "idle", "message": "No video recording is in progress"}
+                return {"state": "idle", "cancellation_pending": False,
+                        "message": "No video recording is in progress"}
             active["state"] = "stopping"
             active["cancel_event"].set()
             process = active.get("process")
+        if not wait:
+            # Canvas stop is an immediate lifecycle marker. The worker still
+            # owns the slot until cleanup and the actual ACP terminal result.
+            return {"ok": True, "state": "idle", "recording_state": "stopping",
+                    "cancellation_pending": True, "action_id": active["action_id"],
+                    "message": "Cancellation requested; cleanup completion is reported by ACP/info"}
         self._terminate_encoder(process)
         # Keep the slot until the worker has removed its partial output. A new
         # recording must not race cleanup of a cancelled recording.
@@ -3370,8 +3379,7 @@ class VisionCapturePlugin:
 
     def dispatch(self, action, args):
         if action == "start":
-            return {"state": "ready" if self._camera_ready() else "error",
-                    "message": "" if self._camera_ready() else "Bumi camera worker is unavailable"}
+            return self.start()
         if action == "info":
             return self._info()
         if action == "capture_photo":
@@ -3379,5 +3387,5 @@ class VisionCapturePlugin:
         if action == "record_video":
             return self._start_video_recording(args)
         if action == "stop":
-            return self._stop_recording()
+            return self._stop_recording(wait=False)
         return None

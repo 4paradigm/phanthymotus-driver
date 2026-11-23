@@ -1,7 +1,8 @@
-"""Timestamped JPEG/PCM recording shared by drivers.
+"""Bumi-local timestamped JPEG/PCM recording.
 
 Audio timeline, burst handling and bounded buffering adapted from
-unitree/g1/av_recording.py. No robot SDK or model dependency. Video is sampled
+unitree/g1/av_recording.py. This is private to Bumi, not shared infrastructure.
+No robot SDK or model dependency. Video is sampled
 onto an explicit CFR clock: dropped camera frames are repeated, never played
 faster. Host receive timestamps provide software, not hardware, A/V sync.
 """

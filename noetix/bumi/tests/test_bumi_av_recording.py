@@ -2,6 +2,7 @@
 from __future__ import annotations
 from array import array
 import io
+import importlib.util
 import json
 import math
 import os
@@ -9,18 +10,36 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import types
 import wave
 
 import pytest
 
-from common import av_recording as av
 from test_mic_card import _load_device
+
+_SPEC = importlib.util.spec_from_file_location(
+    "bumi_av_recording", Path(__file__).resolve().parents[1] / "bumi_av_recording.py")
+av = importlib.util.module_from_spec(_SPEC)
+sys.modules[_SPEC.name] = av
+_SPEC.loader.exec_module(av)
 
 
 def pcm(samples, value=1000):
     return int(value).to_bytes(2, "little", signed=True) * samples
+
+
+def test_recorder_is_bumi_local_and_shipped_with_existing_device_copy():
+    root = Path(__file__).resolve().parents[1]
+    assert Path(av.__file__).resolve().parent == root
+    dockerfile = (root / "Dockerfile").read_text(encoding="utf-8")
+    copies = [line.split() for line in dockerfile.splitlines() if line.startswith("COPY device.py ")]
+    assert len(copies) == 1
+    assert "bumi_av_recording.py" in copies[0][1:-1]
+    assert "foot_pose.py" in copies[0][1:-1]
+    assert "foot_pose_state.py" in copies[0][1:-1]
+    assert copies[0][-1] == "/work/"
 
 
 def run_capture(monkeypatch, directory, events, duration=1, include_audio=True, collector=None):
@@ -149,6 +168,54 @@ def test_schema_and_queued_audio_option_are_real(monkeypatch, tmp_path):
     assert plugin._video_topic == "/robot/camera/color"
     assert plugin._audio_topic == "/robot/mic/audio_recording"
     assert plugin.dispatch("record_video", {})["code"] == "RECORD_IN_PROGRESS"
+
+
+def test_actuator_start_is_marker_but_business_action_checks_camera(monkeypatch, tmp_path):
+    plugin, _ = make_plugin(monkeypatch, tmp_path)
+    plugin._worker = None
+    assert plugin.start() == {"state": "ready"}
+    assert plugin.dispatch("start", {}) == {"state": "ready"}
+    assert plugin.dispatch("capture_photo", {})["ok"] is False
+    assert plugin.dispatch("record_video", {})["ok"] is False
+
+
+def test_canvas_stop_returns_idle_without_joining_and_keeps_slot_until_cleanup(monkeypatch, tmp_path):
+    plugin, module = make_plugin(monkeypatch, tmp_path)
+    from unittest.mock import Mock
+    worker, process = Mock(), Mock()
+    active = {"action_id": "pending", "thread": worker, "process": process,
+              "state": "recording", "cancel_event": threading.Event()}
+    plugin._active_recording = active
+    result = plugin.dispatch("stop", {})
+    assert result["state"] == "idle" and result["cancellation_pending"] is True
+    assert result["recording_state"] == "stopping"
+    assert active["cancel_event"].is_set()
+    worker.join.assert_not_called()
+    process.terminate.assert_not_called()
+    assert plugin._active_recording is active
+    assert plugin.dispatch("record_video", {})["code"] == "RECORD_IN_PROGRESS"
+    # Starting a canvas again must never undo the cancellation request.
+    assert plugin.dispatch("start", {})["state"] == "ready"
+    assert active["cancel_event"].is_set()
+    notify = Mock()
+    monkeypatch.setattr(module, "_acp_notify", notify)
+    plugin._finish_recording(active, "cancelled", plugin._cancelled_result())
+    assert plugin._active_recording is None
+    assert plugin._last_recording["status"] == "cancelled"
+    notify.assert_called_once()
+
+
+def test_bundle_shutdown_still_waits_for_recording_cleanup(monkeypatch, tmp_path):
+    plugin, _ = make_plugin(monkeypatch, tmp_path)
+    from unittest.mock import Mock
+    worker, process = Mock(), Mock()
+    process.stdin = None
+    process.poll.return_value = 0
+    worker.is_alive.return_value = False
+    plugin._active_recording = {"action_id": "shutdown", "thread": worker,
+                                "process": process, "cancel_event": threading.Event()}
+    assert plugin.stop()["state"] == "idle"
+    worker.join.assert_called_once_with(timeout=6)
 
 
 def test_bundle_passes_executor_namespace_and_mic_availability(monkeypatch, tmp_path):
@@ -305,7 +372,7 @@ def test_real_ten_second_stopwatch_clock_with_camera_drops(monkeypatch, tmp_path
         end = (index + 1) * .04
         data = values[index * 640:(index + 1) * 640].tobytes()
         events.append((end, end, "audio", data))
-    # Exercise the actual Bumi worker, shared recorder and terminal notification.
+    # Exercise the actual Bumi worker, private recorder and terminal notification.
     plugin, module = make_plugin(monkeypatch, tmp_path)
     from unittest.mock import Mock
     original_collect = av.collect

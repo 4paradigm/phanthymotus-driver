@@ -221,14 +221,17 @@ the new card. State scopes, JSON snapshots, labels and interval logging are no
 longer supported. Historical files under `/opt/phanthy-motus/data/bumi/state-records`
 are left untouched.
 
-- `start`: check whether the camera process is ready (does not take a photo).
+- `start`: immediately return the actuator lifecycle marker `ready`. Camera
+  readiness is checked by the photo/video actions, not canvas activation.
 - `capture_photo`: save one current RGB JPEG.
 - `record_video`: asynchronously save an MP4/H.264 video; `duration_s` is
   an integer from 1 to 30, default 5 seconds. Set `include_audio: true` to
   include microphone AAC audio (default false). Audio capture must be enabled.
 - `info`: return storage directories, camera/frame freshness and active recording.
-- `stop`: cancel recording and remove the incomplete video. This is not
-  “finish early and save”. It does not stop the existing camera sensor card.
+- `stop`: immediately return lifecycle `idle` and request cancellation. If a
+  recording exists, `cancellation_pending=true` means cleanup is still running;
+  ACP/`info.last_recording` reports the terminal result. This does not stop the
+  camera/mic or “finish early and save”. Bundle shutdown separately waits for cleanup.
 
 Bumi reuses its existing 640x480 JPEG topic `/<namespace>/camera/color`.
 A recent cached frame is used for a photo; if none is available or it is older
@@ -265,9 +268,9 @@ A callback delivery failure is logged; it does not delete a successfully saved v
 
 Configuration is under `plugins.vision_capture`: `output_dir`, `fps`
 (output fps, default/max 15), and `max_duration_s` (default/max 30). The existing
-Dockerfile already installs FFmpeg and copies `common/`; rebuild the driver image
-to include `common/av_recording.py` and the updated producer/bundle wiring.
-The shared recorder adapts G1's audio timeline and failure handling; video uses
+Dockerfile already installs FFmpeg; the existing device-source COPY also installs the Bumi-private
+`bumi_av_recording.py`. No base-image, package or model changes are needed.
+The recorder adapts G1's audio timeline and failure handling; video uses
 an explicit CFR clock compatible with FFmpeg 4.4. Synchronization is software,
 not hardware exposure/sample synchronization. See [stopwatch and counting
 acceptance](AV_RECORDING.md) for the exact camera, microphone and download steps.
