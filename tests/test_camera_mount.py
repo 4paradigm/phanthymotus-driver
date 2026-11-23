@@ -242,3 +242,43 @@ def test_delayed_mount_cannot_cross_identity_deadline_or_use_wrong_tf(source, mo
         mount.buffer.preserve_stamp = True
     mount.retry_pending()
     assert [p['status'] for p in node.messages] == ['unavailable']
+
+
+def test_late_tf_offers_previous_measurement_at_its_own_stamp(source):
+    mount, node = source
+    assert mount.publish(100)
+    mount.buffer.failure = LookupError('extrapolation into the future')
+    assert not mount.publish(200)
+    current = node.messages[-1]
+    assert current['status'] == 'unavailable' and 'matrix' not in current
+    assert current['previous_measurement'] == {'stamp_ns': 100, 'matrix': node.messages[0]['matrix']}
+    mount.buffer.failure = None
+    mount.retry_pending()
+    repaired = node.messages[-1]
+    assert repaired['stamp_ns'] == 200 and 'previous_measurement' not in repaired
+    mount.buffer.failure = LookupError('extrapolation into the future')
+    assert not mount.publish(300)
+    assert node.messages[-1]['previous_measurement']['stamp_ns'] == 200
+    mount.reset()
+    assert not mount.publish(400)
+    assert 'previous_measurement' not in node.messages[-1]
+
+
+def test_other_tf_failure_invalidates_previous_measurement(source):
+    mount, node = source
+    assert mount.publish(100)
+    mount.buffer.failure = LookupError('disconnected frames')
+    assert not mount.publish(200)
+    mount.buffer.failure = LookupError('extrapolation into the future')
+    assert not mount.publish(300)
+    assert 'previous_measurement' not in node.messages[-1]
+
+
+def test_frame_change_discards_earlier_tf_even_if_frame_name_returns(source):
+    mount, node = source
+    assert mount.publish(100)
+    mount.buffer.failure = LookupError('extrapolation into the future')
+    for stamp, frame in ((200, 'another_camera'), (300, 'optical')):
+        mount.camera_frame = frame
+        assert not mount.publish(stamp)
+        assert 'previous_measurement' not in node.messages[-1]

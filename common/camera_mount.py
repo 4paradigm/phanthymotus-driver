@@ -119,21 +119,28 @@ class BodyMountSource:
                 continue
             from std_msgs.msg import String
             try:
-                self.publisher.publish(String(data=json.dumps(dict(packet, matrix=matrix,
-                    status='available', reason=None), allow_nan=False)))
+                measured = dict(packet, matrix=matrix, status='available', reason=None)
+                self.publisher.publish(String(data=json.dumps(measured, allow_nan=False)))
+                self._remember_measurement(measured)
             except Exception:
                 continue  # Retry transport only within the original deadline.
             del self._pending[stamp]
             if stamp == self._stamp_ns:
                 self._reason = None
 
+    def _remember_measurement(self, packet):
+        previous = self._last_measurement
+        if previous is None or packet['stamp_ns'] >= previous['stamp_ns']:
+            self._last_measurement = packet
+
     def publish(self, stamp_ns):
         if self._closed:
             return False
-        # A failed lookup publishes a new unavailable packet, never a held matrix.
+        # Keep the requested capture and the last successful measurement distinct.
         self._reason = self._setup_reason
         self._stamp_ns = stamp_ns
         packet = None
+        waiting_for_tf = False
         try:
             packet = self.declaration()
             packet.pop('topic')
@@ -144,6 +151,10 @@ class BodyMountSource:
                 raise ValueError('body frame, actual camera optical frame and capture clock are required')
             if packet['parent_frame'] == packet['child_frame']:
                 raise ValueError('body frame must differ from camera optical frame')
+            if self._last_measurement and any(self._last_measurement[k] != packet[k]
+                    for k in ('parent_frame', 'child_frame', 'clock_id', 'epoch')):
+                self._last_measurement = None
+                self._pending.clear()
             if self._setup_reason:
                 raise RuntimeError(self._setup_reason)
             if self.capture_evidence is not None:
@@ -154,25 +165,34 @@ class BodyMountSource:
         except Exception as error:
             if (packet is not None and self.buffer is not None and self.capture_evidence is None and
                     'extrapolation into the future' in str(error).lower()):
-                self._pending.setdefault(stamp_ns, (time.monotonic() + 2., packet))
+                waiting_for_tf = True
+                self._pending.setdefault(stamp_ns, (time.monotonic() + 2., dict(packet)))
                 if len(self._pending) > 128:
                     self._pending.popitem(last=False)
+            if not waiting_for_tf:
+                self._last_measurement = None
+                self._pending.clear()
             self._reason = 'body mount unavailable: ' + str(error)
             if packet is not None:
                 self._reason += ' ({} <- {})'.format(packet['parent_frame'], packet['child_frame'])
         try:
             packet.update(status='unavailable' if self._reason else 'available', reason=self._reason)
+            previous = self._last_measurement
+            if waiting_for_tf and previous and previous['stamp_ns'] <= stamp_ns:
+                packet['previous_measurement'] = {key: previous[key] for key in ('matrix', 'stamp_ns')}
             from std_msgs.msg import String
             if self.publisher is None:
                 return False
             self.publisher.publish(String(data=json.dumps(packet, allow_nan=False)))
             if self._reason is None:
+                self._remember_measurement(packet)
                 self._pending.pop(stamp_ns, None)
         except Exception as error:
             self._reason = 'body mount publish unavailable: ' + str(error)
         return self._reason is None
 
     def reset(self):
+        self._last_measurement = None
         self._pending = OrderedDict()
         self.epoch = uuid.uuid4().hex
         self._stamp_ns = None
