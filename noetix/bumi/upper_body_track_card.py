@@ -577,6 +577,29 @@ class UpperBodyTrackPlugin:
         self._last_payload = payload
         self._angles_pub.publish(String(data=json.dumps(payload, ensure_ascii=False)))
 
+    def _held_angles(self):
+        """Last filtered angles for every side the bank has ever measured.
+
+        A degraded frame (no person, full occlusion, degenerate projection) has
+        no fresh measurement, but that is not the same as "never measured". The
+        filter's whole purpose is to hold the last pose across a gap; emitting
+        -999 here turns a one-frame dropout into a visible pose discontinuity.
+        A side the bank has never seen stays absent, so -999 still means exactly
+        "no measurement has ever arrived for that arm".
+        """
+        smoothed = self._bank.update(None, time.monotonic())
+        held = {}
+        for side in ("left", "right"):
+            prefix = side[0]
+            if all(f"{prefix}_{axis}" in smoothed
+                   for axis in ("pitch", "roll", "elbow")):
+                held[side] = {
+                    "pitch_deg": smoothed[f"{prefix}_pitch"],
+                    "roll_deg": smoothed[f"{prefix}_roll"],
+                    "elbow_deg": smoothed[f"{prefix}_elbow"],
+                }
+        return held
+
     def _measure(self, persons, width, height, started, frame_age_s):
         """One frame's worth of retargeting, including every reason it may be junk."""
         person = spec.pick_person(persons, self._min_kp_conf)
@@ -588,7 +611,8 @@ class UpperBodyTrackPlugin:
         if person is None:
             return spec.build_angles_payload(
                 tracked=False, person_count=len(persons), target_id=None,
-                angles_by_side=None, clamped_by_side=None, depth_used=False,
+                angles_by_side=self._held_angles(), clamped_by_side=None,
+                depth_used=False,
                 depth_coverage=0.0, focal_px=self._numeric_focal(),
                 latency_ms=(time.monotonic() - started) * 1000.0,
                 frame_age_ms=frame_age_s * 1000.0, reach=None,
@@ -601,7 +625,8 @@ class UpperBodyTrackPlugin:
             return spec.build_angles_payload(
                 tracked=False, person_count=len(persons),
                 target_id=target_id,
-                angles_by_side=None, clamped_by_side=None, depth_used=False,
+                angles_by_side=self._held_angles(), clamped_by_side=None,
+                depth_used=False,
                 depth_coverage=0.0, focal_px=self._numeric_focal(),
                 latency_ms=(time.monotonic() - started) * 1000.0,
                 frame_age_ms=frame_age_s * 1000.0, reach=None,
@@ -645,7 +670,8 @@ class UpperBodyTrackPlugin:
             return spec.build_angles_payload(
                 tracked=False, person_count=len(persons),
                 target_id=target_id,
-                angles_by_side=None, clamped_by_side=None, depth_used=False,
+                angles_by_side=self._held_angles(), clamped_by_side=None,
+                depth_used=False,
                 depth_coverage=coverage, focal_px=focal_px,
                 latency_ms=(time.monotonic() - started) * 1000.0,
                 frame_age_ms=frame_age_s * 1000.0, reach=None,

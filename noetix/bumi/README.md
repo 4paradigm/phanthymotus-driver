@@ -531,7 +531,9 @@ because inference needs an ultralytics/torch runtime and continuous CPU load.
 That runtime is **not in the default image**: Docker layers cannot be switched
 at runtime, so building an image that can run this card requires the build-time
 flag `--build-arg INSTALL_POSE_DEPS=1` (the dependency is pinned in the
-`Dockerfile`). A default build stays free of torch and cannot run the card, so
+`Dockerfile`). With the repository's build script:
+`./build.sh --build-arg INSTALL_POSE_DEPS=1 noetix/bumi`. A default build stays
+free of torch and cannot run the card, so
 turning the plugin on without rebuilding leaves it unloaded — the card's
 `info` reports the import error. To use it, build with that flag, enable the
 plugin, and wire the camera's RGB topic into the card's `start` action via the

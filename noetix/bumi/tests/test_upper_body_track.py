@@ -366,6 +366,68 @@ def test_an_occluded_arm_holds_its_last_angle_in_the_payload(monkeypatch):
     assert second["degraded"] != ""  # the gap is still reported honestly
 
 
+def test_both_arms_occluded_holds_the_last_pose(monkeypatch):
+    """PR #585 review P1: a fully occluded upper body must not read as -999."""
+    import time
+
+    plugin = _bare_plugin(_load_card_module(monkeypatch))
+    good = plugin._measure([_person(_arms_person())], 640, 480, time.monotonic(), 0.0)
+    held = tuple(good[f"{s}_{a}_deg"] for s in ("l", "r")
+                 for a in ("pitch", "roll", "elbow"))
+
+    # Both arms' keypoints below confidence: upper_body_visible fails for both.
+    # _blank_points gives every point confidence 1.0, so lower the six arm joints.
+    occluded = _arms_person()
+    for index in (spec.L_SHOULDER, spec.L_ELBOW, spec.L_WRIST,
+                  spec.R_SHOULDER, spec.R_ELBOW, spec.R_WRIST):
+        occluded[index][2] = 0.0
+    second = plugin._measure([_person(occluded)], 640, 480, time.monotonic(), 0.0)
+
+    assert second["tracked"] is False
+    assert second["degraded"] == "upper_body_occluded"
+    assert tuple(second[f"{s}_{a}_deg"] for s in ("l", "r")
+                 for a in ("pitch", "roll", "elbow")) == held
+
+
+def test_no_person_holds_the_last_pose(monkeypatch):
+    """Same hold contract applies when the person leaves the frame."""
+    import time
+
+    plugin = _bare_plugin(_load_card_module(monkeypatch))
+    good = plugin._measure([_person(_arms_person())], 640, 480, time.monotonic(), 0.0)
+    held = tuple(good[f"{s}_{a}_deg"] for s in ("l", "r")
+                 for a in ("pitch", "roll", "elbow"))
+
+    empty = plugin._measure([], 640, 480, time.monotonic(), 0.0)
+
+    assert empty["tracked"] is False
+    assert empty["degraded"] == "no_person"
+    assert tuple(empty[f"{s}_{a}_deg"] for s in ("l", "r")
+                 for a in ("pitch", "roll", "elbow")) == held
+
+
+def test_degenerate_projection_holds_the_last_pose(monkeypatch):
+    """Third degraded branch: keypoints present but geometry cannot be solved."""
+    import time
+
+    plugin = _bare_plugin(_load_card_module(monkeypatch))
+    good = plugin._measure([_person(_arms_person())], 640, 480, time.monotonic(), 0.0)
+    held = tuple(good[f"{s}_{a}_deg"] for s in ("l", "r")
+                 for a in ("pitch", "roll", "elbow"))
+
+    # Shoulders coincide with elbows: arm_angles raises ValueError for both
+    # arms, so the loop produces no angles_by_side and takes the 3rd return.
+    collapsed = _arms_person()
+    collapsed[spec.L_ELBOW] = list(collapsed[spec.L_SHOULDER])
+    collapsed[spec.R_ELBOW] = list(collapsed[spec.R_SHOULDER])
+    second = plugin._measure([_person(collapsed)], 640, 480, time.monotonic(), 0.0)
+
+    assert second["tracked"] is False
+    assert second["degraded"] == "degenerate_projection"
+    assert tuple(second[f"{s}_{a}_deg"] for s in ("l", "r")
+                 for a in ("pitch", "roll", "elbow")) == held
+
+
 def test_frame_failures_are_throttled(monkeypatch):
     """One corrupt stream is one outage, not a warning per frame."""
     import threading
