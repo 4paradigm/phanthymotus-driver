@@ -1,4 +1,4 @@
-mcp_port: 15747
+mcp_port: 15749
 name: "Leju Kuavo 5-W Driver"
 ros_namespace: ""
 # Optional operator-provided serial; not a robot_version or URDF selector.

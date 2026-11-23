@@ -15,7 +15,7 @@ Kuavo ROS1 Noetic 控制器
   ↕ 官方 ROS1 topics / services
 rosbridge_server（机器人侧，WebSocket :9090）
   ↕ rosbridge v2 JSON 协议
-本驱动（ROS2 Humble 容器，MCP :15747/mcp）
+本驱动（ROS2 Humble 容器，MCP :15749/mcp）
   → ROS2 String / UInt8MultiArray / CompressedImage，domain 42，FastDDS loopback profile
 Agent Core（同一主机，https://localhost:15678）
 ```
@@ -29,9 +29,11 @@ ROS1 没有 DDS domain。本驱动负责 ROS1 → ROS2 消息转换，Agent Core
 ROS2 / Agent Core 与驱动容器需要在同一 Linux 主机；机器人 ROS1 可以在本机或另一台可达主机。
 容器内提供 ROS2 Humble，机器人宿主机无需额外安装 ROS2，也不需要构建 ROS2 版 `kuavo_msgs`。
 ROS1 自定义消息的加载由机器人侧 rosbridge 完成。
-MCP 仅监听 `127.0.0.1:15747`，只接受本机无 `Origin` 的服务端请求，并校验 `Host` 为该端口的
+MCP 仅监听 `127.0.0.1:15749`，只接受本机无 `Origin` 的服务端请求，并校验 `Host` 为该端口的
 `localhost`/`127.0.0.1`；浏览器预检、任意浏览器来源及外部客户端均被拒绝，不返回通配 CORS。
 页面通过 Agent Core 调用驱动，不直接访问运动端口。这是同机进程信任边界，不是本机进程之间的身份鉴权。
+原默认端口15747已由主分支Helios驱动使用；本驱动加载旧配置时将该值映射到15749，
+不改写持久化文件，其他自定义端口保持原值。15748仍是独立宿主机runtime manager端口。
 
 ### 首次部署与自动准备
 
@@ -295,6 +297,10 @@ rosmsg show kuavo_msgs/twoArmHandPoseCmd
 视觉导航接线：`camera_head → vop → navi`（检测结果）、`camera_depth → navi`（米制深度）、`loco_state` 的 `state/odom → navi`，最后 `navi → base_servo`。需要预览叠加时，也可将 `camera_head` 的图像直接连入 navi。**不要把底盘 camera_left/right 的检测框与头部 camera_depth 混用**；它们来自不同镜头，像素位置不对应。底盘RGB如需视觉深度，应从同一路RGB生成 visual_depth。头部相机可转动，当前 navi 不补偿头部姿态，因此导航前须让头部朝正前，导航期间保持不动。
 
 四路相机在 `info/start` 返回 `motus.camera/1` 声明；分辨率取实际JPEG或深度图，内参K/D来自各自ROS CameraInfo，不复制其他型号的FOV。缺少标定时保持 unknown。头部深度只有在 `depth_registration=true`、RGB/深度都使用color optical frame、分辨率和K一致时，才与RGB共享镜头ID并输出有效帧；等待校验时为 loading。VOP沿输入传递镜头ID和分辨率，navi按声明的 `image/depth-zlib` 绑定深度，而非依赖话题名后缀。更新后须重新启动上游和navi，以刷新启动时冻结的声明。
+
+对照[PR519](https://github.com/4paradigm/phanthymotus-driver/pull/519)的空间观测差异和真机只读核对结果见
+[SPATIAL_INPUT_AUDIT.md](SPATIAL_INPUT_AUDIT.md)。已补实时URDF＋实测关节角的动态机身到头部相机外参（厂家模型估计，未做安装标定）；
+相机IMU的计算端口存在也不代表原始gyro/accel一定在输出。融合/建图前应检查实时数据，不能只看服务active或参数enabled。
 
 `base_servo.info.control_interface.footprint` 优先读取真机 `/humanoid_description` 中 `base_link` 的直立圆柱碰撞体，标注 `source: vendor-spec`、`scope: chassis`，附运行时URDF哈希；当前v63模型半径0.37m，因此前/后/半宽均为0.37m，不另加规划器padding。此为厂家底盘模型，非全身实测包络，机器人高度仍为null。模型缺失/不支持时退回厂商costmap多边形加padding并标记estimate；若costmap包络更大则保留更大的估计值。当前现场costmap为±0.34m加0.01m padding。伸臂、头部姿态和实际避障效果须另行验证。
 
@@ -749,7 +755,7 @@ docker build --platform linux/arm64 -t lejurobot-kuavo5-w:dev "$BUILD_CTX"
 通过 Agent Core 安装时使用 `deploy/service.yml`。默认连接 `ws://127.0.0.1:9090`；
 远程 ROS1 可通过部署环境 `KUAVO_ROSBRIDGE_URL=ws://<robot-ip>:9090` 覆盖。
 直接启动 Python 时使用 `ROSBRIDGE_URL`；`CONFIG_PATH` 可指定配置文件，`ros_namespace` 默认使用规范化后的 hostname。
-MCP 端口15747，Agent Core回调默认 `https://localhost:15678`，可通过 `AGENT_CORE_URL` 覆盖。
+MCP 端口15749，Agent Core回调默认 `https://localhost:15678`，可通过 `AGENT_CORE_URL` 覆盖。
 注册请求携带与 `driver.yaml` 一致的 id、名称、URL、`transport: http` 和 `category: driver`。
 当前 Core 的注册匹配仍以 URL/名称为准，不依赖请求 id；显式字段与共享注册工具保持一致。
 本驱动使用局部 topic 命名空间，不修改其他驱动或 Agent Core 的 DDS domain。
@@ -767,9 +773,9 @@ python3 scripts/check_service_yml.py lejurobot/kuavo5-w
 MCP 探测示例（只查询状态）：
 
 ```sh
-curl -s http://localhost:15747/mcp -H 'Content-Type: application/json' \
+curl -s http://localhost:15749/mcp -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
-curl -s http://localhost:15747/mcp -H 'Content-Type: application/json' \
+curl -s http://localhost:15749/mcp -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"base_drive","arguments":{"action":"info"}}}'
 ```
 
@@ -946,8 +952,10 @@ Python/APT dependency is required; rectification uses host OpenCV/NumPy and
 camera-internal transforms use the installed ROS1 SDK TF. The obsolete separate
 depth relay is stopped during upgrade.
 
-These interfaces do **not** supply a calibrated body-to-head-optical mount or
-verified cross-board clock synchronization. The articulated head must remain
+The new `state/extrinsic` output supplies capture-associated model estimates of
+`body_from_camera`. The host relay also joins `base_link` to the SDK depth root
+using runtime URDF kinematics and measured joints. These interfaces do **not**
+supply an installation-calibrated mount or verified cross-board clock synchronization. The articulated head must remain
 forward and stationary for the current navi path. SDK camera-internal IMU
 geometry is distinct from a measured camera-to-robot mounting transform. The
 installed Perception version does not include the PR371 RGB-D fusion backend;
@@ -973,3 +981,10 @@ and the short successful data check does not establish reboot endurance.
 The project remains stopped, whole-body control software paused and base_servo
 disconnected with zero applied commands. Temporary navi/VOP instances were
 stopped; the final image is a local validation build, not a published release.
+
+2026-11-23 stationary follow-up: the new model-mount candidate produced 160/160
+available capture-associated matrices, with successful body-to-optical TF lookup.
+The candidate was reverted after validation; this is not a full live container
+upgrade. Native IMU silence was reproduced even in an independent SDK reader as
+root, then recovered by a camera-only device soft reboot. See the spatial input
+audit for timing, geometry limitations and deployment status.

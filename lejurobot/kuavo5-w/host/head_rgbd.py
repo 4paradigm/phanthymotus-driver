@@ -56,7 +56,9 @@ def main():
     from rgbd_geometry import Geometry, camera_info
     from head_jpeg import encode as jpeg
     from head_depth import encode as depth_zlib
+    from body_mount import BodyMount
     rospy.init_node('motus_head_rgbd')
+    mount = BodyMount()
     pairs, geometry = Pairs(), Geometry()
     pubs = {kind: rospy.Publisher('/camera_head/'+kind+'/image_rect/'+suffix,
             CompressedImage, queue_size=1) for kind, suffix in
@@ -92,6 +94,7 @@ def main():
                 payloads = {'color':jpeg(color,cv2,np,g), 'depth':depth_zlib(depth,g,cv2,np)}
                 # Each retains its original source time, not encoding/receipt time.
                 for kind, source in [('color',color), ('depth',depth)]:
+                    mount.publish(source.header)
                     out = CompressedImage()
                     out.header, out.data = source.header, payloads[kind]
                     out.format = 'jpeg' if kind == 'color' else 'image/depth-zlib'

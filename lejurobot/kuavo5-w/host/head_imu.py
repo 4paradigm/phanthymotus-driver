@@ -60,6 +60,12 @@ def take_samples(gyros, accels):
     return samples
 
 
+def availability(reason, last_success, now):
+    if last_success is None or now-last_success > .5:
+        return 'unavailable', reason or 'native camera gyro/accel stopped or stale'
+    return ('available', None) if reason is None else ('unavailable', reason)
+
+
 def main():
     import rospy
     import tf2_ros
@@ -80,6 +86,7 @@ def main():
             for kind in ('gyro', 'accel')]
     epoch, last, reason, received = uuid.uuid4().hex, 0, 'waiting for native camera gyro/accel', 0
     published_status, status_at = None, 0.
+    last_success = None
     rate = rospy.Rate(200)
     while not rospy.is_shutdown():
         with lock:
@@ -99,13 +106,15 @@ def main():
                 packet = make_packet(gyro, accel, transforms, epoch)
                 publisher.publish(String(data=json.dumps(packet, allow_nan=False)))
                 last, reason, received = ns, None, received+1
+                last_success = time.monotonic()
             except Exception as error:
                 reason = type(error).__name__+': '+str(error)[:250]
         now = time.monotonic()
-        status = dict(state='available' if reason is None else 'unavailable', reason=reason,
+        state, status_reason = availability(reason, last_success, now)
+        status = dict(state=state, reason=status_reason,
                       packets=received, source='orbbec_camera_imu',
-                      fusion=dict(state='available' if reason is None else 'unavailable', reason=reason))
-        signature = (status['state'], reason)
+                      fusion=dict(state=state, reason=status_reason))
+        signature = (state, status_reason)
         if signature != published_status or now-status_at >= 2:
             status_pub.publish(String(data=json.dumps(status)))
             published_status, status_at = signature, now

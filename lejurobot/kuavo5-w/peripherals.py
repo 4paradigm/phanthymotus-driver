@@ -98,6 +98,9 @@ class Peripherals:
         self._running, self._data, self._seen = set(), {}, {}
         self._images, self._last_image_publish = {}, {}
         self._calibrations, self._dimensions = {}, {}
+        self._mount_status, self._mount_at = {}, 0.
+        self._mount_topic = f'/{namespace}/state/camera_head/body_mount'
+        self._mount_pub = node.create_publisher(String, self._mount_topic, latest_qos())
         self._depth_registration, self._footprint = None, None
         self._enabling, self._retry_at, self._camera_error = set(), {}, {}
         # Each camera owns a WebSocket receiver and a latest-frame publisher.
@@ -123,6 +126,7 @@ class Peripherals:
         self._legacy_depth_pub = node.create_publisher(CompressedImage, self._legacy_depth_topic, latest_qos())
         ros1.subscribe('/motus/kuavo5w/battery', 'std_msgs/String', self._on_battery)
         ros1.subscribe('/scan', 'sensor_msgs/LaserScan', self._on_scan, throttle_ms=200)
+        ros1.subscribe('/motus/kuavo5w/body_mount', 'std_msgs/String', self._on_mount)
         for card, topic in INFO_TOPICS.items():
             ros1.subscribe(topic, 'sensor_msgs/CameraInfo',
                            lambda msg, c=card: self._on_camera_info(c, msg), throttle_ms=1000)
@@ -141,6 +145,40 @@ class Peripherals:
         worker = threading.Thread(target=self._metadata_loop, daemon=True, name='camera-geometry')
         self._workers.append(worker)
         worker.start()
+
+    def _on_mount(self, message):
+        try:
+            packet = json.loads(message['data'])
+            if (packet.get('schema') != 'motus.camera_mount/1' or
+                    packet.get('parent_frame') != 'base_link' or
+                    packet.get('child_frame') != 'camera_head_color_optical_frame' or
+                    type(packet.get('stamp_ns')) is not int or packet['stamp_ns'] <= 0):
+                raise ValueError('invalid camera mount provenance')
+            if packet.get('status') == 'available':
+                m = packet.get('matrix')
+                if (not isinstance(m, list) or len(m) != 4 or
+                        any(not isinstance(row, list) or len(row) != 4 or not all(map(number,row)) for row in m)
+                        or any(abs(a-b)>1e-6 for a,b in zip(m[3],[0,0,0,1]))):
+                    raise ValueError('invalid camera mount matrix')
+                # Reject non-rigid matrices rather than trusting a schema label.
+                if any(abs(sum(m[k][i]*m[k][j] for k in range(3))-(1 if i==j else 0))>1e-5
+                       for i in range(3) for j in range(3)):
+                    raise ValueError('nonrigid camera mount rotation')
+                determinant = (m[0][0]*(m[1][1]*m[2][2]-m[1][2]*m[2][1])
+                             - m[0][1]*(m[1][0]*m[2][2]-m[1][2]*m[2][0])
+                             + m[0][2]*(m[1][0]*m[2][1]-m[1][1]*m[2][0]))
+                if abs(determinant-1)>1e-5:
+                    raise ValueError('reflected camera mount rotation')
+            with self._lock:
+                if self._closed:
+                    return
+                self._mount_status, self._mount_at = packet, time.monotonic()
+                if self._running.intersection(('camera_head','camera_depth')):
+                    out = String(); out.data = json.dumps(packet, allow_nan=False)
+                    self._mount_pub.publish(out)
+        except (KeyError, ValueError, TypeError):
+            with self._lock:
+                self._mount_status, self._mount_at = {}, 0.
 
     def _on_camera_info(self, card, message):
         with self._lock:
@@ -198,6 +236,17 @@ class Peripherals:
         if card == 'camera_depth':
             entries.extend(declare(card, self._legacy_depth_topic, DEPTH_FORMAT,
                            self._calibrations.get(card), self._dimensions.get(card), self._depth_aligned()))
+        if card in ('camera_head', 'camera_depth'):
+            available = time.monotonic()-self._mount_at <= 1 and self._mount_status.get('status') == 'available'
+            for entry in entries:
+                entry['vendor']['body_mount'] = dict(schema='motus.camera_mount/1', topic=self._mount_topic,
+                    parent_frame='base_link', child_frame='camera_head_color_optical_frame', mode='dynamic',
+                    length_unit='m', transform_direction='body_from_camera', accuracy_validated=False,
+                    source='runtime_urdf_measured_joints_and_sdk_tf', version='kuavo_v63_model_v1',
+                    epoch=self._mount_status.get('epoch', ''),
+                    status='available' if available else 'unavailable',
+                    reason=None if available else self._mount_status.get('reason') or 'missing_or_stale_model_mount')
+                entry['vendor']['body_mount_status'] = 'available_model_estimate' if available else 'unavailable'
         return entries
 
     def _image_loop(self, card):
@@ -215,6 +264,7 @@ class Peripherals:
         if not connected or generation != self._generation:
             self._data.clear()
             self._seen.clear()
+            self._mount_status, self._mount_at = {}, 0.
             self._images.clear()
             self._last_image_publish.clear()
             self._calibrations.clear()
@@ -358,6 +408,9 @@ class Peripherals:
             if card == 'laser_scan':
                 outputs.insert(0, {'topic': self._points_topic, 'format': 'sensor/pointcloud',
                                    'desc': '原始 laser 平面点云，z=0m'})
+            if card in ('camera_head', 'camera_depth'):
+                outputs.append({'topic': self._mount_topic, 'format': 'state/extrinsic',
+                                'desc': 'Capture-associated articulated body_from_camera; vendor model estimate'})
             tools.append({'name': card, 'type': 'sensor', 'multiInstance': False, 'description': descriptions[card],
                           'inputSchema': {'type': 'object', 'properties': {}}, 'topic_out': outputs})
         return tools

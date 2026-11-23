@@ -93,6 +93,14 @@ class SpatialTelemetryTests(unittest.TestCase):
         accel.header.stamp=stamp(1100000000)
         with self.assertRaises(ValueError):mod.make_packet(gyro,accel,[tr,tr],'e')
 
+    def test_camera_imu_status_expires_when_native_stream_stops(self):
+        spec=importlib.util.spec_from_file_location('head_imu',ROOT/'host/head_imu.py')
+        mod=importlib.util.module_from_spec(spec);spec.loader.exec_module(mod)
+        self.assertEqual(mod.availability(None,10.,10.1),('available',None))
+        self.assertEqual(mod.availability(None,10.,10.6)[0],'unavailable')
+        self.assertEqual(mod.availability('TF missing',10.,10.1),('unavailable','TF missing'))
+        self.assertEqual(mod.availability('waiting',None,100.),('unavailable','waiting'))
+
     def test_camera_imu_drains_delivery_batches_and_waits_for_accel_watermark(self):
         spec=importlib.util.spec_from_file_location('head_imu',ROOT/'host/head_imu.py')
         mod=importlib.util.module_from_spec(spec);spec.loader.exec_module(mod)

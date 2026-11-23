@@ -4,8 +4,8 @@ category: driver
 hardware_provider: lejurobot
 hardware_model: "kuavo5-w"
 image_name: lejurobot-kuavo5-w
-port: 15747
-mcp_url: "http://localhost:15747/mcp"
+port: 15749
+mcp_url: "http://localhost:15749/mcp"
 description: "乐聚 Kuavo 5-W — 轮式底盘、双臂、下肢/躯干、头部和软件暂停控制"
 build_context_extras:
   - ../../common

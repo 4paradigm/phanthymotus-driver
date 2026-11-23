@@ -42,21 +42,21 @@ class McpTests(unittest.TestCase):
             def sendall(self, data):
                 self.output.extend(data)
         connection = Connection()
-        main._handler()(connection, (peer, 12345), types.SimpleNamespace(server_port=15747))
+        main._handler()(connection, (peer, 12345), types.SimpleNamespace(server_port=15749))
         response = bytes(connection.output)
         head, content = response.split(b'\r\n\r\n', 1)
         return int(head.split(b' ')[1]), head, json.loads(content)
 
     def test_http_rejects_browser_remote_and_rebinding_requests_before_dispatch(self):
         cases = [
-            ([('Host', 'localhost:15747'), ('Origin', 'https://attacker.example')], '127.0.0.1', 'POST'),
-            ([('Host', 'localhost:15747'), ('Origin', 'null')], '127.0.0.1', 'POST'),
-            ([('Host', 'localhost:15747'), ('Origin', '')], '127.0.0.1', 'POST'),
-            ([('Host', 'attacker.example:15747')], '127.0.0.1', 'POST'),
-            ([('Host', 'localhost:15747'), ('Host', 'attacker.example')], '127.0.0.1', 'POST'),
+            ([('Host', 'localhost:15749'), ('Origin', 'https://attacker.example')], '127.0.0.1', 'POST'),
+            ([('Host', 'localhost:15749'), ('Origin', 'null')], '127.0.0.1', 'POST'),
+            ([('Host', 'localhost:15749'), ('Origin', '')], '127.0.0.1', 'POST'),
+            ([('Host', 'attacker.example:15749')], '127.0.0.1', 'POST'),
+            ([('Host', 'localhost:15749'), ('Host', 'attacker.example')], '127.0.0.1', 'POST'),
             ([], '127.0.0.1', 'POST'),
-            ([('Host', 'localhost:15747')], '192.168.1.50', 'POST'),
-            ([('Host', '127.0.0.1:15747'), ('Origin', 'https://attacker.example')], '127.0.0.1', 'OPTIONS'),
+            ([('Host', 'localhost:15749')], '192.168.1.50', 'POST'),
+            ([('Host', '127.0.0.1:15749'), ('Origin', 'https://attacker.example')], '127.0.0.1', 'OPTIONS'),
         ]
         bundle = types.SimpleNamespace(dispatch=lambda *a: self.fail('rejected HTTP request dispatched motion'))
         with patch.object(main, '_bundle', bundle):
@@ -69,7 +69,7 @@ class McpTests(unittest.TestCase):
     def test_http_accepts_loopback_core_request_without_browser_origin(self):
         calls = []
         with patch.object(main, '_bundle', types.SimpleNamespace(dispatch=lambda *a: calls.append(a) or {'state': 'ready'})):
-            for host in ('localhost:15747', '127.0.0.1:15747'):
+            for host in ('localhost:15749', '127.0.0.1:15749'):
                 status, head, response = self.http_request([('Host', host)])
                 self.assertEqual(status, 200)
                 self.assertNotIn(b'Access-Control-Allow-Origin', head)
@@ -82,10 +82,10 @@ class McpTests(unittest.TestCase):
         with patch.object(self, 'rpc', return_value=rpc), patch.object(main, 'time', types.SimpleNamespace(monotonic=lambda: clock[0])), patch.object(
                 main, '_bundle', types.SimpleNamespace(dispatch=lambda *args: {'state': 'running'})), patch('builtins.print') as log:
             for _ in range(100):
-                self.assertEqual(self.http_request([('Host', 'localhost:15747')])[0], 200)
+                self.assertEqual(self.http_request([('Host', 'localhost:15749')])[0], 200)
             self.assertEqual(log.call_count, 1)
             clock[0] = 5.
-            self.http_request([('Host', 'localhost:15747')])
+            self.http_request([('Host', 'localhost:15749')])
             self.assertEqual(log.call_count, 2)
             self.assertIn('suppressed=99', log.call_args[0][0])
 
@@ -94,8 +94,8 @@ class McpTests(unittest.TestCase):
         values = iter([{'state': 'running'}, {'state': 'error', 'error': 'test failure'}])
         with patch.object(self, 'rpc', return_value=rpc), patch.object(main, '_bundle',
                 types.SimpleNamespace(dispatch=lambda *args: next(values))), patch('builtins.print') as log:
-            self.http_request([('Host', 'localhost:15747')])
-            status, _, response = self.http_request([('Host', 'localhost:15747')])
+            self.http_request([('Host', 'localhost:15749')])
+            status, _, response = self.http_request([('Host', 'localhost:15749')])
         self.assertEqual(status, 200)
         self.assertTrue(response['result']['isError'])
         self.assertEqual(log.call_count, 2)
@@ -105,7 +105,7 @@ class McpTests(unittest.TestCase):
         states = iter(['ready', 'ready', 'executing', 'executing', 'paused', 'paused'])
         with patch.object(main, '_bundle', types.SimpleNamespace(dispatch=lambda *args: {'state': next(states)})), patch('builtins.print') as log:
             for _ in range(6):
-                self.http_request([('Host', 'localhost:15747')])
+                self.http_request([('Host', 'localhost:15749')])
         self.assertEqual(log.call_count, 3)
         for call, state in zip(log.call_args_list, ('ready', 'executing', 'paused')):
             self.assertIn(f'tool=base_drive state={state}', call[0][0])
@@ -143,9 +143,9 @@ class McpTests(unittest.TestCase):
         handler.path, handler.rfile = path, io.BytesIO(body)
         handler.headers = Message()
         handler.headers['Content-Length'] = str(len(body))
-        handler.headers['Host'] = 'localhost:15747'
+        handler.headers['Host'] = 'localhost:15749'
         handler.client_address = ('127.0.0.1', 12345)
-        handler.server = types.SimpleNamespace(server_port=15747)
+        handler.server = types.SimpleNamespace(server_port=15749)
         replies = []
         handler._reply = lambda status, payload: replies.append((status, payload))
         handler.do_POST()
@@ -195,8 +195,8 @@ class McpTests(unittest.TestCase):
 class DeploymentTests(unittest.TestCase):
     def test_mcp_binds_loopback_only(self):
         with patch.object(main, 'ThreadingHTTPServer') as server:
-            main._mcp_server(15747)
-        self.assertEqual(server.call_args[0][0], ('127.0.0.1', 15747))
+            main._mcp_server(15749)
+        self.assertEqual(server.call_args[0][0], ('127.0.0.1', 15749))
     def test_registration_sends_standard_identity_and_transport(self):
         stopped, requests = threading.Event(), []
         def receive(request, **kwargs):
@@ -204,7 +204,7 @@ class DeploymentTests(unittest.TestCase):
             stopped.set()
             return io.BytesIO(b'{}')
         with patch.object(urllib.request, 'urlopen', side_effect=receive), patch.dict(os.environ, {'AGENT_CORE_URL': 'https://localhost:15678'}):
-            thread = main._register({'name': 'Kuavo test', 'mcp_port': 15747}, stopped)
+            thread = main._register({'name': 'Kuavo test', 'mcp_port': 15749}, stopped)
             try:
                 thread.join(1)
                 self.assertFalse(thread.is_alive())
@@ -216,7 +216,7 @@ class DeploymentTests(unittest.TestCase):
         self.assertEqual(requests[0].full_url, 'https://localhost:15678/api/mcp')
         self.assertEqual(json.loads(requests[0].data), {
             'id': 'lejurobot-kuavo5-w-driver', 'name': 'Kuavo test',
-            'url': 'http://localhost:15747/mcp', 'transport': 'http', 'category': 'driver'})
+            'url': 'http://localhost:15749/mcp', 'transport': 'http', 'category': 'driver'})
         self.assertEqual(main.DRIVER_ID, yaml.safe_load((ROOT / 'driver.yaml').read_text())['id'])
 
     def test_dds_fails_closed_for_missing_or_directory_profile(self):
@@ -288,6 +288,16 @@ class DeploymentTests(unittest.TestCase):
                 path.write_text('sensors: [')
                 with self.assertRaises(yaml.YAMLError):
                     main._load_config()
+
+    def test_legacy_port_migration_preserves_other_settings_and_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'config.yaml'
+            for port, expected in ((15747, 15749), (15770, 15770)):
+                original = yaml.safe_dump({'mcp_port': port, 'motion_enabled': False})
+                path.write_text(original)
+                with patch.dict(os.environ, {'CONFIG_PATH': str(path)}):
+                    self.assertEqual(main._load_config(), {'mcp_port': expected, 'motion_enabled': False})
+                self.assertEqual(path.read_text(), original)
 
     def test_fresh_deployment_seeds_only_designated_config_and_preserves_existing(self):
         with tempfile.TemporaryDirectory() as directory:

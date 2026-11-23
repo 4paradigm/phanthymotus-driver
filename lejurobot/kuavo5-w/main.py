@@ -72,7 +72,13 @@ def _load_config():
             with os.fdopen(descriptor, 'wb') as stream:
                 stream.write((ROOT / 'config.yaml').read_bytes())
     with path.open(encoding="utf-8") as stream:
-        return yaml.safe_load(stream) or {}
+        config = yaml.safe_load(stream) or {}
+    # The original Kuavo default was later allocated to rokae/helios.
+    # Upgrade persisted first-install configs too, without rewriting user files.
+    if config.get('mcp_port') == 15747:
+        config['mcp_port'] = 15749
+        print('[config] legacy Kuavo MCP port 15747 migrated to 15749', flush=True)
+    return config
 
 
 def _rosbridge_url(config):
@@ -108,7 +114,7 @@ def _register(config, stopped):
     context.verify_mode = ssl.CERT_NONE
     url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
     payload = json.dumps({"id": DRIVER_ID, "name": config.get("name", "Leju Kuavo 5-W Driver"),
-        "url": f"http://localhost:{int(config.get('mcp_port', 15747))}/mcp",
+        "url": f"http://localhost:{int(config.get('mcp_port', 15749))}/mcp",
         "transport": "http", "category": "driver"}).encode()
 
     def loop():
@@ -254,7 +260,7 @@ def main():
     try:
         _bundle = KuavoBundle(config, namespace, ros1, node,
                               media_factory=lambda: RosbridgeClient(_rosbridge_url(config)))
-        server = _mcp_server(int(config.get("mcp_port", 15747)))
+        server = _mcp_server(int(config.get("mcp_port", 15749)))
         ros2_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True, name="ros2-domain-42")
         ros2_thread.start()
         ros1.start()

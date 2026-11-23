@@ -227,13 +227,32 @@ class PeripheryTests(unittest.TestCase):
 
     def test_depth_declares_legacy_navi_suffix_even_before_any_source_is_ready(self):
         tool = next(t for t in self.periphery.tools() if t['name']=='camera_depth')
-        self.assertEqual(tool['topic_out'], [{'topic':'/test/state/camera_head/visual_depth',
-                                             'format':'image/depth-zlib'}])
+        self.assertEqual(tool['topic_out'][0], {'topic':'/test/state/camera_head/visual_depth',
+                                               'format':'image/depth-zlib'})
+        self.assertEqual(tool['topic_out'][1]['format'], 'state/extrinsic')
         info = self.periphery.dispatch('camera_depth', 'info')
         self.assertEqual(info['state'], 'idle')
         self.assertEqual(info['topic_out'], tool['topic_out'])
         self.assertEqual([d['topic'] for d in info['camera_info']],
                          ['/test/state/camera_head/visual_depth','/test/state/camera_depth'])
+
+    def test_mount_requires_numeric_rigid_capture_transform_and_active_camera(self):
+        packet = dict(schema='motus.camera_mount/1', parent_frame='base_link',
+                      child_frame='camera_head_color_optical_frame',stamp_ns=123,
+                      status='available', matrix=[[1,0,0,.1],[0,1,0,0],[0,0,1,1.4],[0,0,0,1]])
+        self.periphery._on_mount({'data':json.dumps(packet)})
+        self.assertFalse(self.periphery._mount_pub.messages)
+        self.periphery.dispatch('camera_depth','start')
+        self.periphery._on_mount({'data':json.dumps(packet)})
+        self.assertEqual(json.loads(self.periphery._mount_pub.messages[-1].data), packet)
+        declaration = self.periphery.dispatch('camera_depth','info')['camera_info'][0]['vendor']['body_mount']
+        self.assertEqual(declaration['status'],'available')
+        self.assertFalse(declaration['accuracy_validated'])
+        packet['matrix'][0][0]=2
+        self.periphery._on_mount({'data':json.dumps(packet)})
+        declaration = self.periphery.dispatch('camera_depth','info')['camera_info'][0]['vendor']['body_mount']
+        self.assertEqual(declaration['status'],'unavailable')
+        self.assertEqual(len(self.periphery._mount_pub.messages),1)
 
     def test_depth_alias_preserves_bytes_capture_header_and_lifecycle(self):
         self.periphery.dispatch('camera_depth', 'start')

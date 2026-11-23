@@ -47,7 +47,7 @@ def main():
         shutil.copytree(package, root / 'ros1_messages/kuavo_msgs', dirs_exist_ok=True,
                         ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
     for name in ('rosbridge_loopback.py', 'rosbridge.launch', 'battery_relay.py', 'runtime_manager.py',
-                 'head_camera.launch', 'head_jpeg.py', 'head_depth.py', 'rgbd_geometry.py', 'head_imu.py', 'head_rgbd.py'):
+                 'head_camera.launch', 'head_jpeg.py', 'head_depth.py', 'rgbd_geometry.py', 'head_imu.py', 'head_rgbd.py', 'body_mount.py'):
         shutil.copyfile(Path(__file__).parent / name, root / name)
         (root / name).chmod(0o644)
     config = Path('/opt/phanthy-motus/drivers/lejurobot-kuavo5-w/config.yaml')
