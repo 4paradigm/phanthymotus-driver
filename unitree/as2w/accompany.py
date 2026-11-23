@@ -58,6 +58,12 @@ except ImportError:
 # The remote is considered fresh for the same window device.py uses.
 _REMOTE_FRESH_S = 0.5
 
+# An operator input only counts as exit evidence while it is recent and was
+# seen *after* the mode was confirmed as accompanying. Without both bounds a
+# joystick nudge made before entering accompany mode stays stored forever and
+# becomes a false remote-takeover alert as soon as fsm_name later matches.
+_INPUT_EVIDENCE_TTL_S = 10.0
+
 # Keep the default deadzone aligned with _REMOTE_DEADZONE in device.py, where
 # float32(0.1) is slightly above Python's 0.1 and needs the same tolerance.
 _DEFAULT_DEADZONE = 0.1
@@ -128,6 +134,22 @@ def _peak_axis(axes):
     return max(values) if values else 0.0
 
 
+def _is_post_entry_evidence(last_input, entered_ms, now_ms, ttl_s=_INPUT_EVIDENCE_TTL_S):
+    """True only for a recent operator input seen after the mode was confirmed.
+
+    Both bounds matter. Without the ``entered_ms`` bound a stick nudge from
+    before the operator pressed M is reported forever as a takeover; without
+    the TTL an old input during a long accompany run still looks like a fresh
+    exit trigger. Either way the alert becomes noise and gets ignored.
+    """
+    if not last_input or entered_ms is None:
+        return False
+    at_ms = last_input.get("at_ms")
+    if not isinstance(at_ms, (int, float)):
+        return False
+    return at_ms >= entered_ms and (now_ms - at_ms) <= ttl_s * 1000
+
+
 class AccompanyPlugin:
     """Read-only supervisor for the firmware-owned ISS 3.0 accompany mode."""
 
@@ -153,6 +175,7 @@ class AccompanyPlugin:
         self._fsm_at_ms = None
         self._last_remote_ms = None
         self._last_operator_input = None
+        self._accompany_entered_ms = None
         self._quiet_since_ms = None
         self._pub = None
         self._thread = None
@@ -206,7 +229,12 @@ class AccompanyPlugin:
         if proxy is None:
             return
         try:
-            result = proxy.GetState()
+            # Prefer the isolated, short-deadline channel. A plain proxy that
+            # only exposes GetState (test doubles, older hosts) still works,
+            # but a real RpcProxy never routes an observer through the motion
+            # channel that StopMove depends on.
+            observer = getattr(proxy, "observe_state", None)
+            result = observer() if callable(observer) else proxy.GetState()
         except Exception as exc:
             self._last_error = f"GetState failed: {exc}"
             return
@@ -216,9 +244,18 @@ class AccompanyPlugin:
         if code != 0 or not isinstance(state, dict):
             return
         name = str(state.get("fsm_name", "")).strip().upper()
+        now_ms = int(time.time() * 1000)
         with self._lock:
+            in_accompany = bool(name and name in self._fsm_names)
+            if in_accompany and self._accompany_entered_ms is None:
+                # Anchor the window at the first confirmed transition into
+                # the mode. Inputs seen before this instant are pre-entry and
+                # must never be reported as exit evidence.
+                self._accompany_entered_ms = now_ms
+            elif not in_accompany and name:
+                self._accompany_entered_ms = None
             self._fsm_name = name or None
-            self._fsm_at_ms = int(time.time() * 1000)
+            self._fsm_at_ms = now_ms
 
     # --------------------------------------------------------------- worker
 
@@ -335,9 +372,11 @@ class AccompanyPlugin:
         buttons = snapshot.get("buttons") or {}
         peak = _peak_axis(axes)
         active = bool(snapshot.get("active")) or peak > self._deadzone + _DEADZONE_EPS
+        now_ms = int(time.time() * 1000)
         with self._lock:
             fsm_name = self._fsm_name
             last_input = dict(self._last_operator_input or {}) or None
+            entered_ms = self._accompany_entered_ms
             remote_ms = self._last_remote_ms
 
         result = {
@@ -379,7 +418,7 @@ class AccompanyPlugin:
             result["confidence"] = "confirmed"
             result["mode_source"] = "fsm"
             result["note"] = f"GetState 返回 fsm_name={fsm_name}，命中已登记的伴随态。"
-            if last_input:
+            if _is_post_entry_evidence(last_input, entered_ms, now_ms):
                 result["exit_evidence"] = {
                     "reason": "operator_input_while_accompanying",
                     "at_ms": last_input.get("at_ms"),

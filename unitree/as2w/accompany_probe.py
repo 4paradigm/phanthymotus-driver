@@ -241,6 +241,25 @@ def cmd_modes(args, findings):
     return 0 if code == 0 else 3
 
 
+def watch_snapshot(latest_mode, latest_name, elapsed, code, mode_counts):
+    """Build one time-correlated watch observation.
+
+    ``latest_mode`` must be the *most recent* callback value, never the most
+    frequent one. A short accompany transition after a long baseline is a
+    handful of frames against hundreds, so a cumulative winner (``max(counts)``)
+    would keep pairing the new ``fsm_name`` with the stale baseline mode and
+    write a false ``mode:fsm_name`` mapping into the evidence JSON.
+
+    ``mode_counts`` is kept only for the crop report; it never feeds pairs.
+    """
+    return {
+        "at_s": round(float(elapsed), 3),
+        "mode": latest_mode,
+        "fsm_name": latest_name or None,
+        "code": code,
+    }
+
+
 def cmd_watch(args, findings):
     """Record mode/fsm_name transitions; the human presses M during the window."""
     from unitree_sdk2py.idl.unitree_go.msg.dds_ import SportModeState_  # noqa: WPS433
@@ -250,10 +269,15 @@ def cmd_watch(args, findings):
     pairs = {}
     modes = {}
     names = {}
+    samples = []
+    # The subscriber callback and the poll loop run on different threads.
+    # Guard the latest values so a pair is always built from a coherent read.
+    latest = {"mode": None, "at_s": 0.0}
 
     def on_state(msg):
-        value = int(getattr(msg, "mode", -1))
-        modes[value] = modes.get(value, 0) + 1
+        # Called on the DDS thread: update the freshest mode and its timestamp.
+        latest["mode"] = int(getattr(msg, "mode", -1))
+        latest["at_s"] = time.monotonic()
 
     subscriber = ChannelSubscriber("rt/lf/sportmodestate", SportModeState_)
     subscriber.Init(on_state, 10)
@@ -277,12 +301,19 @@ def cmd_watch(args, findings):
         except Exception as exc:
             print(f"[probe] GetState 失败：{exc}", file=sys.stderr)
         name = str(state_map.get("fsm_name", "") or "").strip().upper()
-        with_mode = max(modes, key=modes.get) if modes else None
+        elapsed = time.monotonic() - started
+        # Snapshot both fields under one lock-free read; mode is a single int
+        # assignment so CPython makes it atomic, and we copy before use.
+        with_mode = latest["mode"]
+        observation = watch_snapshot(with_mode, name, elapsed, code, modes)
+        samples.append(observation)
+        modes[with_mode] = modes.get(with_mode, 0) + 1
         if with_mode != last_mode or name != last_name:
-            elapsed = time.monotonic() - started
             label = mode_name(with_mode) if with_mode is not None else "?"
+            mode_age = elapsed - latest["at_s"]
             print(f"  [{elapsed:6.2f}s] mode={with_mode} ({label})  "
-                  f"fsm_name={name or '(空)'}  code={code}")
+                  f"fsm_name={name or '(空)'}  code={code}  "
+                  f"mode_age={mode_age:.2f}s")
             if with_mode is not None and name:
                 pairs[f"{with_mode}:{name}"] = pairs.get(f"{with_mode}:{name}", 0) + 1
                 names[name] = names.get(name, 0) + 1
@@ -308,6 +339,11 @@ def cmd_watch(args, findings):
         "mode_names": {str(k): mode_name(k) for k in modes},
         "fsm_names": names,
         "pairs": pairs,
+        # Time-correlated observations replace the old cumulative-winner logic
+        # as the authoritative evidence. Each sample pairs the freshest mode
+        # value with the fsm_name read at that instant, so a brief transition
+        # is never paired with the baseline mode that dominated the counts.
+        "samples": samples,
     }
     return 0
 

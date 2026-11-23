@@ -17,10 +17,13 @@ def _serve(commands, results, interface, kind):
     try:
         from unitree_sdk2py.core.channel import ChannelFactoryInitialize
         ChannelFactoryInitialize(0, interface or None)
-        if kind == "sport":
+        if kind in ("sport", "sport_observe"):
             from unitree_sdk2py.as2.sport.sport_client import SportClient
             client = SportClient()
-            client.SetTimeout(5.0)
+            # Observation polls must fail fast. They no longer share the
+            # motion channel's lock, but a dead radio link must still not
+            # leave an observer worker stuck for seconds.
+            client.SetTimeout(5.0 if kind == "sport" else 0.8)
         else:
             from unitree_sdk2py.a2.audio.audio_client import AudioClient
             client = AudioClient()
@@ -124,6 +127,12 @@ class RpcProxy:
         # a separate audio client so they cannot delay either locomotion RPCs
         # or speaker PCM delivery.
         self._audio_led = _RpcChannel(network_interface, "audio_led", 4.0)
+        # Observation polls (accompany's periodic GetState) get their own
+        # worker, lock and 1 s deadline. A stalled observer must never occupy
+        # the motion channel that StopMove and the servo stream depend on: on
+        # a lossy link a 7 s observer timeout would otherwise delay stopping
+        # the chassis by up to 7 s, which is unsafe.
+        self._observe = _RpcChannel(network_interface, "sport_observe", 1.0)
 
     def call(self, method, *args):
         return self._sport.call(method, *args)
@@ -131,9 +140,14 @@ class RpcProxy:
     def __getattr__(self, name):
         return lambda *args: self.call(name, *args)
 
+    def observe_state(self):
+        """GetState on the isolated, short-deadline observation channel."""
+        return self._observe.call("GetState")
+
     def Audio_LedControl(self, red, green, blue):
         return self._audio_led.call("LedControl", red, green, blue)
 
     def stop(self):
         self._audio_led.stop()
+        self._observe.stop()
         self._sport.stop()
