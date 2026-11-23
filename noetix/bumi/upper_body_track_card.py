@@ -51,6 +51,28 @@ _LATEST_QOS = QoSProfile(
 # A depth sample older than this is a different scene, not the same one.
 # Both streams run at 30 fps, so 0.4 s is roughly twelve frames of drift.
 _DEPTH_FRESH_S = 0.4
+# Max |depth_receive_time - rgb_receive_time| for the two frames to count as the
+# same scene. RGB and depth are independent topics; a depth frame may land a
+# little before or after its RGB, so the window is symmetric. Anything further
+# apart is a different capture and must not be reported as `depth_used`.
+_DEPTH_PAIR_S = 0.2
+
+
+def _depth_is_paired(depth_received, rgb_received):
+    """Whether a depth frame and an RGB frame are the same capture.
+
+    Both arguments are receive times on the shared monotonic clock. Using each
+    frame's arrival (not when inference happens to finish) is what makes this
+    robust to slow predict(): a correct pair stays matched however long YOLO
+    takes. The symmetric window tolerates the two async topics landing in
+    either order, while rejecting a fresh depth matched to an old JPEG that is
+    being reprocessed, or a delayed depth matched to a newer RGB frame.
+    """
+    if depth_received is None or rgb_received is None:
+        return False
+    return abs(depth_received - rgb_received) <= _DEPTH_PAIR_S
+
+
 # Width of the depth patch averaged per keypoint. 5x5 at 640x480 is ~1.5 deg of
 # the field of view — small enough to stay on one limb, wide enough to survive
 # single-pixel invalid measurements.
@@ -78,6 +100,11 @@ class _DepthCache:
             self._width = width
             self._height = height
             self._received = time.monotonic()
+
+    def received_at(self):
+        """Receive time of the newest depth frame on the shared monotonic clock."""
+        with self._lock:
+            return self._received if self._data is not None else None
 
     def age_s(self):
         with self._lock:
@@ -232,6 +259,10 @@ class UpperBodyTrackPlugin:
         self._depth_sub = None
         self._worker = None
         self._generation = 0
+        # Immutable per-run token. A slow YOLO predict() can outlive the
+        # 3-second join in teardown; publishing is fenced on this token so a
+        # stopped run can never emit a stale frame after stop() returns.
+        self._run_token = None
         self._stop_event = threading.Event()
         self._frame_lock = threading.Lock()
         self._latest_jpeg = None
@@ -416,8 +447,10 @@ class UpperBodyTrackPlugin:
                 CompressedImage, self._depth_topic, _on_depth, _LATEST_QOS)
 
         self._generation += 1
+        run_token = object()
+        self._run_token = run_token
         self._worker = threading.Thread(
-            target=self._worker_loop, args=(self._generation,),
+            target=self._worker_loop, args=(self._generation, run_token),
             daemon=True, name="upper_body_track")
         self._worker.start()
 
@@ -477,6 +510,11 @@ class UpperBodyTrackPlugin:
         return None
 
     def _teardown(self) -> None:
+        # Fence publication before waiting: an in-flight _process() may be
+        # inside a multi-second predict() and outlive the bounded join below.
+        # Clearing the token makes its publish checks fail, so once stop()
+        # returns no stale frame from this run can reach the output topics.
+        self._run_token = None
         self._stop_event.set()
         worker = self._worker
         self._worker = None
@@ -529,9 +567,11 @@ class UpperBodyTrackPlugin:
 
     # ── Worker ───────────────────────────────────────────────────────────────
 
-    def _worker_loop(self, generation: int) -> None:
+    def _worker_loop(self, generation: int, run_token) -> None:
         interval = 1.0 / self._rate_hz
-        while not self._stop_event.is_set() and generation == self._generation:
+        while (not self._stop_event.is_set()
+               and generation == self._generation
+               and run_token is self._run_token):
             with self._frame_lock:
                 jpeg = self._latest_jpeg
                 received_at = self._latest_jpeg_at
@@ -541,7 +581,7 @@ class UpperBodyTrackPlugin:
 
             started = time.monotonic()
             try:
-                self._process(jpeg, received_at)
+                self._process(jpeg, received_at, run_token)
             except Exception as exc:  # keep the worker alive; a bad frame is not fatal
                 self._frame_failures += 1
                 self._last_error = f"{type(exc).__name__}: {exc}"
@@ -561,7 +601,7 @@ class UpperBodyTrackPlugin:
             if elapsed < interval and self._stop_event.wait(interval - elapsed):
                 break
 
-    def _process(self, jpeg: bytes, received_at: float) -> None:
+    def _process(self, jpeg: bytes, received_at: float, run_token) -> None:
         frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
         if frame is None:
             raise ValueError("JPEG decode returned no frame")
@@ -569,6 +609,10 @@ class UpperBodyTrackPlugin:
 
         started = time.monotonic()
         persons = self._engine.detect(frame)
+        # predict() can take seconds on CPU. stop() may have returned while it
+        # ran; do not publish into a run that has been torn down or replaced.
+        if run_token is not self._run_token or self._stop_event.is_set():
+            return
         self._frames += 1
 
         labeled = {}
@@ -581,8 +625,13 @@ class UpperBodyTrackPlugin:
             ensure_ascii=False)))
 
         payload = self._measure(
-            persons, width, height, started, time.monotonic() - received_at)
+            persons, width, height, started, time.monotonic() - received_at,
+            rgb_received_at=received_at)
         self._last_payload = payload
+        # Re-check: _measure filters a fresh sample and reads depth, both quick,
+        # but a concurrent stop must still not let this frame's angles out.
+        if run_token is not self._run_token or self._stop_event.is_set():
+            return
         self._angles_pub.publish(String(data=json.dumps(payload, ensure_ascii=False)))
 
     def _held_angles(self):
@@ -608,8 +657,15 @@ class UpperBodyTrackPlugin:
                 }
         return held
 
-    def _measure(self, persons, width, height, started, frame_age_s):
-        """One frame's worth of retargeting, including every reason it may be junk."""
+    def _measure(self, persons, width, height, started, frame_age_s,
+                 rgb_received_at=None):
+        """One frame's worth of retargeting, including every reason it may be junk.
+
+        `rgb_received_at` is when this JPEG arrived (monotonic), not when
+        inference finished. Depth is paired against that instant so a slow
+        predict() cannot make a correctly-paired depth look stale, and an old
+        JPEG cannot be matched with a depth frame that arrived long after it.
+        """
         person = spec.pick_person(persons, self._min_kp_conf)
         # Identity, not equality: two people can produce equal dictionaries, and
         # `list.index` would then label the target as whoever matched first.
@@ -641,11 +697,25 @@ class UpperBodyTrackPlugin:
                 **self._signs, degraded="upper_body_occluded")
 
         depth_frame, _, _ = self._depth_cache.decode()
-        depth_fresh = self._depth_cache.age_s()
-        usable_depth = (
-            depth_frame is not None
-            and depth_fresh is not None
-            and depth_fresh <= _DEPTH_FRESH_S)
+        if rgb_received_at is None:
+            # Legacy callers (unit tests without a camera timeline): fall back
+            # to "recently received" as the only signal available.
+            depth_fresh = self._depth_cache.age_s()
+            usable_depth = (
+                depth_frame is not None
+                and depth_fresh is not None
+                and depth_fresh <= _DEPTH_FRESH_S)
+        else:
+            # Pair depth to the RGB frame by their receive times on the same
+            # monotonic clock. Using the frame's arrival (not inference finish)
+            # keeps a slow predict() from rejecting a good pair, and using the
+            # absolute difference rejects a fresh depth matched to an old JPEG
+            # that is being reprocessed. A depth frame arriving slightly after
+            # its RGB is normal for two async topics, hence a symmetric window.
+            depth_received = self._depth_cache.received_at()
+            usable_depth = (
+                depth_frame is not None
+                and _depth_is_paired(depth_received, rgb_received_at))
 
         focal_px = self._resolve_focal(points, depth_frame, usable_depth, width, height)
         scene, coverage = self._scene_points(points, depth_frame, usable_depth, focal_px,

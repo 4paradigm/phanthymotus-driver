@@ -448,11 +448,13 @@ def test_frame_failures_are_throttled(monkeypatch):
             self.n += 1
             return False
 
-    def _fail(_jpeg, _received_at):
+    def _fail(_jpeg, _received_at, _token):
         raise ValueError("bad frame")
 
+    token = object()
     plugin._stop_event = _Event()
     plugin._generation = 0
+    plugin._run_token = token
     plugin._rate_hz = 30.0
     plugin._frame_lock = threading.Lock()
     plugin._latest_jpeg = b"x"
@@ -461,7 +463,7 @@ def test_frame_failures_are_throttled(monkeypatch):
     plugin._process = _fail
     plugin._node = types.SimpleNamespace(get_logger=lambda: types.SimpleNamespace(
         warning=warnings.append, info=infos.append))
-    plugin._worker_loop(0)
+    plugin._worker_loop(0, token)
 
     assert len(warnings) == 2  # first failure and the 100th, not 101
     assert "bad frame" in warnings[0]
@@ -548,3 +550,136 @@ def test_start_subscribes_and_stop_releases_them(monkeypatch):
     plugin.stop()
     plugin.stop()
     assert plugin._color_sub is None
+
+
+def test_stop_during_slow_predict_publishes_nothing(monkeypatch):
+    """PR #585 review P2: a predict() that outlives stop() must not emit a frame.
+
+    Teardown joins with a bounded timeout, so an in-flight YOLO call may finish
+    after stop() returns. The per-run token fences both publishes, ensuring a
+    stopped/restarted run never leaks stale pose or angles onto the topics.
+    """
+    import threading
+    import time
+
+    card = _load_card_module(monkeypatch)
+    plugin = object.__new__(card.UpperBodyTrackPlugin)
+
+    # _process decodes the JPEG before predict; give the stubs a frame that has
+    # a shape so control actually reaches the (blocking) detect call.
+    import types as _types
+
+    class _Frame:
+        shape = (480, 640, 3)
+
+    monkeypatch.setattr(card, "np", _types.SimpleNamespace(
+        uint8=object, frombuffer=lambda *_a, **_k: b"raw"))
+    monkeypatch.setattr(card, "cv2", _types.SimpleNamespace(
+        imdecode=lambda *_a, **_k: _Frame(), IMREAD_COLOR=1))
+
+    detect_entered = threading.Event()
+    release_detect = threading.Event()
+    published = []
+
+    class _SlowEngine:
+        conf = 0.5
+        imgsz = 640
+
+        def detect(self, _frame):
+            detect_entered.set()
+            release_detect.wait(5.0)  # bounded so a failed test cannot hang
+            return []
+
+    class _Pub:
+        def publish(self, _msg):
+            published.append(_msg)
+
+    import types
+    plugin._engine = _SlowEngine()
+    plugin._pose2d_pub = _Pub()
+    plugin._angles_pub = _Pub()
+    plugin._node = types.SimpleNamespace(get_logger=lambda: types.SimpleNamespace(
+        info=lambda *_: None, warning=lambda *_: None))
+    plugin._stop_event = threading.Event()
+    plugin._frame_lock = threading.Lock()
+    plugin._latest_jpeg = b"jpeg"
+    plugin._latest_jpeg_at = time.monotonic()
+    plugin._rate_hz = 10.0
+    plugin._generation = 1
+    plugin._frame_failures = 0
+    plugin._min_kp_conf = 0.4
+    plugin._bank = card.spec.AngleBank()
+    # _measure still needs the rest of its state, but detect returns no persons,
+    # so it takes the `no_person` branch after the fence has already fired.
+    plugin._focal_setting = 460.0
+    plugin._signs = {"pitch_sign": 1.0, "roll_sign": 1.0, "elbow_sign": 1.0}
+    plugin._depth_cache = types.SimpleNamespace(
+        decode=lambda: (None, 0, 0), received_at=lambda: None, age_s=lambda: None)
+    plugin._last_payload = None
+    plugin._last_error = None
+    plugin._last_inference_ms = 0.0
+
+    token = object()
+    plugin._run_token = token
+    plugin._color_sub = None
+    plugin._depth_sub = None
+    plugin._worker = threading.Thread(
+        target=plugin._worker_loop, args=(1, token), daemon=True)
+    worker = plugin._worker
+    worker.start()
+    assert detect_entered.wait(5.0), "worker never reached detect"
+
+    # stop() clears the token before the bounded join; detect is still blocked.
+    plugin._teardown()
+    release_detect.set()
+    worker.join(5.0)
+    assert not worker.is_alive(), "worker did not exit after release"
+
+    # The frame that finished after teardown must not reach either output topic.
+    assert published == []
+
+
+def test_depth_is_paired_to_the_rgb_frame_not_to_inference_time(monkeypatch):
+    """PR #585 review P2: depth freshness must be relative to the RGB frame.
+
+    Pairing on 'now - depth_received' rejects a correct pair after a slow YOLO
+    predict(), and accepts a fresh depth slapped onto an old JPEG being
+    reprocessed. Pairing the two frames' receive times fixes both.
+    """
+    card = _load_card_module(monkeypatch)
+    paired = card._depth_is_paired
+
+    t = 0.0  # exact binary values keep the window edge test deterministic
+    assert paired(t, t) is True                    # same instant
+    assert paired(t + 0.1, t) is True              # depth lands just after RGB
+    assert paired(t - 0.1, t) is True              # depth landed just before RGB
+
+    # A fresh depth with an old JPEG (reprocessing) is a different scene.
+    assert paired(t + 3.0, t) is False             # newer-than-RGB depth
+    assert paired(t - 3.0, t) is False             # older-than-RGB depth
+
+    # Both frames at the edge of the window are still one capture.
+    assert paired(t + card._DEPTH_PAIR_S, t) is True
+    assert paired(t + card._DEPTH_PAIR_S + 0.001, t) is False
+
+    # Missing timestamps never claim a depth match.
+    assert paired(None, t) is False
+    assert paired(t, None) is False
+
+    # Delayed inference: what matters is the two receive times, not when the
+    # result is consumed. t and t+0.05 stay paired even if processed at t+8s.
+    assert paired(t + 0.05, t) is True
+
+
+def test_depth_cache_reports_receive_time_for_pairing(monkeypatch):
+    """The cache exposes the depth frame's own receive clock for the pairing test."""
+    import time
+
+    card = _load_card_module(monkeypatch)
+    cache = card._DepthCache()
+    assert cache.received_at() is None
+    before = time.monotonic()
+    cache.put(b"compressed", 640, 480)
+    after = time.monotonic()
+    received = cache.received_at()
+    assert received is not None and before <= received <= after
