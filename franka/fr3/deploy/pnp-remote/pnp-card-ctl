@@ -1,0 +1,90 @@
+#!/bin/sh
+set -eu
+unit=pnp-fr3-right-teleop.service
+runtime="$HOME/.local/lib/fr3-pnp"
+exec 9>"$runtime/control.lock"
+flock -x 9
+case "${SSH_ORIGINAL_COMMAND:-}" in
+  'pnp-slave-ips')
+    python3 "$runtime/read_vendor_ips.py" ;;
+  'pnp-discover')
+    python3 "$runtime/read_vendor_masters.py" ;;
+  'pnp-package-version')
+    test -f "$runtime/package.sha256" && cat "$runtime/package.sha256" ;;
+  'systemctl --user show pnp-fr3-right-teleop.service -p LoadState -p ActiveState -p SubState -p Result')
+    /usr/bin/systemctl show "$unit" -p LoadState -p ActiveState -p SubState -p Result -p MainPID -p ControlPID
+    python3 "$runtime/run_right.py" --detect
+    if test -f "$runtime/execution.json"; then
+      python3 "$runtime/execution_status.py"
+    fi ;;
+  'pnp-align-right'|'pnp-align-left'|'pnp-align-both')
+    state=$(/usr/bin/systemctl show "$unit" -p ActiveState --value)
+    if test "$state" != inactive && test "$state" != failed; then
+      echo 'Stop the PNP service before starting the vendor sequence' >&2
+      exit 1
+    fi
+    rm -f "$runtime/execution.json" "$runtime/execution-left.json" "$runtime/execution-right.json" "$runtime/requested-playback"
+    printf '%s\n' "${SSH_ORIGINAL_COMMAND#pnp-align-}" > "$runtime/requested-arm"
+    if ! sudo -n /usr/bin/systemctl start "$unit"; then
+      rm -f "$runtime/requested-arm"
+      exit 1
+    fi ;;
+  'pnp-enable-follow'|'pnp-enable-follow-record')
+    test "$(/usr/bin/systemctl show "$unit" -p ActiveState --value)" = active
+    if test "$SSH_ORIGINAL_COMMAND" = pnp-enable-follow-record; then
+      python3 "$runtime/release_follow.py" --record
+    else
+      python3 "$runtime/release_follow.py"
+    fi ;;
+  pnp-play-recording\ *)
+    set -f
+    set -- ${SSH_ORIGINAL_COMMAND#pnp-play-recording }
+    test "$#" -ge 1 && test "$#" -le 2 || exit 1
+    for name in "$@"; do
+      case "$name" in franka-right-*|franka-left-*|fr3-right-*|fr3-left-*) ;; *) exit 1 ;; esac
+    done
+    state=$(/usr/bin/systemctl show "$unit" -p ActiveState --value)
+    case "$state" in inactive|failed) ;; *) exit 1 ;; esac
+    rm -f "$runtime/playback.pause" "$runtime/playback.start" "$runtime/playback.approach" "$runtime/execution.json" "$runtime/requested-arm"
+    printf '%s\n' "$@" > "$runtime/requested-playback"
+    if ! sudo -n /usr/bin/systemctl start "$unit"; then
+      rm -f "$runtime/requested-playback"
+      exit 1
+    fi ;;
+  'pnp-pause-playback'|'pnp-resume-playback')
+    if test "$(/usr/bin/systemctl show "$unit" -p ActiveState --value)" != active; then
+      echo 'There is no active playback session.' >&2
+      exit 1
+    fi
+    python3 -c '
+import json
+import sys
+from pathlib import Path
+
+try:
+    stage = json.loads(Path(sys.argv[1]).read_text()).get("stage", "unknown")
+except FileNotFoundError:
+    stage = "starting"
+if sys.argv[2] == "pnp-pause-playback":
+    if stage != "playback_running":
+        sys.exit(f"Pause requires active playback (current stage: {stage}). "
+                 "Wait for alignment to finish, or use stop_motion to end the session.")
+elif stage != "playback_paused":
+    sys.exit(f"Resume requires a confirmed pause (current stage: {stage}).")
+' "$runtime/execution.json" "$SSH_ORIGINAL_COMMAND"
+    if test "$SSH_ORIGINAL_COMMAND" = pnp-pause-playback; then
+      touch "$runtime/playback.pause"
+    else
+      rm -f "$runtime/playback.pause"
+    fi ;;
+  'pnp-list-recordings')
+    python3 "$runtime/vendor_recordings.py" list ;;
+  pnp-delete-recording\ *)
+    state=$(/usr/bin/systemctl show "$unit" -p ActiveState --value)
+    case "$state" in inactive|failed) ;; *) exit 1 ;; esac
+    python3 "$runtime/vendor_recordings.py" delete "${SSH_ORIGINAL_COMMAND#pnp-delete-recording }" ;;
+  'systemctl --user stop pnp-fr3-right-teleop.service')
+    sudo -n /usr/bin/systemctl stop "$unit"
+    rm -f "$runtime/execution.json" "$runtime/execution-left.json" "$runtime/execution-right.json" ;;
+  *) echo 'Only right-arm service status, start and stop are allowed' >&2; exit 1 ;;
+esac

@@ -6,7 +6,7 @@ hardware_model: fr3
 image_name: franka-fr3
 port: 15723
 mcp_url: "http://localhost:15723/mcp"
-description: "Franka FR3 joint states, bounded joint control, Franka Hand gripper, RealSense streams, calibrated visual pick-and-place, automatic controller configuration and URDF skeleton model; multiple robot IPs share one driver using the official libfranka SDK"
+description: "Franka FR3 joint states, bounded joint control, Franka Hand gripper, RealSense streams, calibrated visual pick-and-place, automatic controller configuration and URDF skeleton model; multiple robot IPs share one driver using the official libfranka SDK; PNP teaching and trajectory recording require a configured PNP workstation service"
 build_context_extras:
   - ../../common
 cards:
@@ -17,3 +17,4 @@ cards:
   - { name: gripper, type: actuator }
   - { name: vision_pick_and_drop, type: actuator }
   - { name: controller_configuration, type: sensor }
+  - { name: teach, type: actuator }

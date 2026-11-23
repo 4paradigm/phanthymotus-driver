@@ -897,4 +897,6 @@ def build_plugins(config, namespace, ros2):
     camera = ExtCameraPlugin(config.get("ext_camera", {}), namespace, ros2)
     pick = PickPlacePlugin(config, sensor._manager, camera, ros2, gripper_manager=gripper._manager,
                            controller_configuration=controller_configuration, acquire_gripper=gripper.acquire_for_vision)
-    return [controller_configuration, sensor, controller, gripper, camera, pick]
+    from franka.fr3.pnp_remote_teleop import PnpRemoteTeleopPlugin
+
+    return [controller_configuration, sensor, controller, gripper, camera, pick, PnpRemoteTeleopPlugin()]

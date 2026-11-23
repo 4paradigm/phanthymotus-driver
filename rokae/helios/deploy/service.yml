@@ -1,0 +1,29 @@
+rokae-helios:
+  image: __IMAGE__
+  container_name: embodied-rokae-helios
+  network_mode: host
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  tmpfs:
+    - /tmp:rw,nosuid,nodev,size=16m
+  volumes:
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+  environment:
+    - ROS_DOMAIN_ID=42
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+    - ROS_LOG_DIR=/tmp/ros-log
+    - PYTHONDONTWRITEBYTECODE=1
+    - PYTHONUNBUFFERED=1
+    - RCUTILS_COLORIZED_OUTPUT=0
+    - AGENT_CORE_URL=${HELIOS_AGENT_CORE_URL:-https://127.0.0.1:15678}
+    - HELIOS_STATE_URL=${HELIOS_STATE_URL:-ws://192.168.0.161:8888/ws}
+    - HELIOS_BATTERY_STATE_URL=${HELIOS_BATTERY_STATE_URL:-ws://192.168.0.100/ws/AGVInfo}
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  stop_grace_period: 15s
+  restart: always

@@ -32,10 +32,10 @@ HEAD_KEEP_OUT = .20  # Skeletal keep-out heuristic, not a collision CAD model.
 
 def tool():
     return {'name':'pose','type':'actuator','multiInstance':False,
-        'description':'TRON2预设轨迹：salute右臂敬礼、wave右臂挥手、welcome双臂欢迎。自检后先确认双臂在原自然下垂home，未到home则自动回位并确认；再将头部回正至pitch0/yaw0并执行轨迹。挥手后右夹爪开合一次；敬礼、欢迎保持1秒，最后回原home。执行前保持静止、空载，区域清空。',
+        'description':'TRON2 preset trajectories: right-arm salute and wave, and dual-arm welcome. The driver confirms or restores the neutral arm pose, centers the head, and runs the trajectory. Wave cycles the right gripper once. Salute and welcome hold for one second before returning home. Start with the robot stationary, unloaded, and the area clear.',
         'inputSchema':{'type':'object','additionalProperties':False,
             'properties':{
-                'pose':{'type':'string','enum':list(LABELS.values()), 'title':'预设动作',
+                'pose':{'type':'string','enum':list(LABELS.values()), 'title':'Preset motion',
                     'oneOf':[{'const':label,'title':label} for label in LABELS.values()]}},
             'required':['pose'], 'x-resource':['arm_l','arm_r','head'],
             'x-completion':{'timeout':ACP_TIMEOUT}}}
@@ -43,10 +43,10 @@ def tool():
 
 def arguments(args):
     if not isinstance(args,dict) or set(args)-{'pose','instance_id','_trace_id'}:
-        raise ValueError('pose只接受预设动作；手臂和速度由动作统一设定')
+        raise ValueError('pose只接受Preset motion；手臂和速度由动作统一设定')
     label=args.get('pose')
     if not isinstance(label,str) or label not in LABELS.values():
-        raise ValueError('请选择有效的预设动作')
+        raise ValueError('请选择有效的Preset motion')
     name=next(key for key,value in LABELS.items() if value==label)
     return name, 'both' if name=='welcome' else 'right'
 
@@ -157,9 +157,9 @@ class Pose:
         sample,current,velocities=arm_feedback(self.reader)
         stamp=(sample.get('data') or {}).get('robot_timestamp')
         if type(stamp) not in (int,float) or not math.isfinite(stamp):
-            raise ValueError('预设动作需要有效的厂家反馈时间戳')
+            raise ValueError('Preset motion需要有效的厂家反馈时间戳')
         if any(v is None or abs(v)>.05 for v in velocities) or len(velocities)!=14:
-            raise ValueError('预设动作要求新鲜、完整且静止的双臂反馈')
+            raise ValueError('Preset motion要求新鲜、完整且静止的双臂反馈')
         status=self.reader.sample('robot_status')
         if not status['available'] or not motion_readiness(status['data'] or {})['ready'] or status['data'].get('motor')!='OK':
             raise ValueError('机器人未处于可用的上层开发状态')
@@ -173,12 +173,12 @@ class Pose:
         packet=skeleton_stream(self.reader.sample('joint_state'))
         head={j['idx']:j for j in packet['joints'] if j['idx']>=14}
         if set(head)!={14,15} or any(j.get('dq') is None or abs(j['dq'])>.05 for j in head.values()):
-            raise ValueError('预设动作要求新鲜且静止的头部反馈')
+            raise ValueError('Preset motion要求新鲜且静止的头部反馈')
         from vendor import HEAD_RAD_LIMITS
         head_start=[head[i]['q'] for i in (14,15)]
         if any(not lo-math.radians(1)<=q<=hi+math.radians(1)
                for q,(lo,hi) in zip(head_start,HEAD_RAD_LIMITS)):
-            raise ValueError('头部反馈超出机械范围，未发送预设动作')
+            raise ValueError('头部反馈超出机械范围，未发送Preset motion')
         # Raise/rotate shoulders with the elbow and wrists unchanged, THEN
         # bend the elbow. Return by extending the elbow before lowering.
         goal=list(LEFT_FRAMES[name]);shoulder=goal[:3]+[0,0,0,0]
@@ -257,7 +257,7 @@ class Pose:
 
     async def execute(self,args):
         arguments(args)  # Reject bad requests before any asynchronous check or task.
-        if self.lock.locked():raise MoveError('正在审核另一条预设动作',False)
+        if self.lock.locked():raise MoveError('正在审核另一条Preset motion',False)
         async with self.lock:
             ticket=self.generation
             ws,serial=self.reader.ws,self.reader.serial

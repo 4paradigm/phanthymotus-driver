@@ -1,0 +1,15 @@
+id: rokae-helios-driver
+name: 珞石 Helios-2.1 状态
+category: driver
+hardware_provider: rokae
+hardware_model: helios-2.1
+image_name: rokae-helios
+port: 15747
+mcp_url: http://localhost:15747/mcp
+description: Read-only 20-axis joints and dual-battery status via the installed iNex and chassis UI streams
+build_context_extras:
+  - ../../common
+cards:
+  - {name: joints, type: sensor}
+  - {name: battery, type: sensor}
+  - {name: model, type: resource}
