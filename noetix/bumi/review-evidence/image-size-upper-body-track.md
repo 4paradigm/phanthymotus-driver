@@ -9,8 +9,10 @@ lines; no torch is added to it.
 ## What was measured, and what was not
 
 This record measures the **download size of the exact pinned ARM64 wheels** that
-`INSTALL_POSE_DEPS=1` installs, read from the PyPI JSON API with pinned versions
-and SHA-256 digests below. It does **not** claim a whole-image `docker inspect`
+`INSTALL_POSE_DEPS=1` installs. The three packages below are pinned by
+`noetix/bumi/pose-requirements.txt` (which the Dockerfile installs with
+`-r`), so a rebuild resolves the same versions; sizes and SHA-256 digests were
+read from the PyPI JSON API. It does **not** claim a whole-image `docker inspect`
 delta: this evidence was prepared on an x86_64 host with no Docker daemon, while
 Bumi runs ARM64, so an end-to-end ARM64 image build could not be performed here.
 Wheel bytes are the dominant and unavoidable part of the growth, but the final

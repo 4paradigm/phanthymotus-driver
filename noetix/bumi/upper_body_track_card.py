@@ -56,6 +56,11 @@ _DEPTH_FRESH_S = 0.4
 # little before or after its RGB, so the window is symmetric. Anything further
 # apart is a different capture and must not be reported as `depth_used`.
 _DEPTH_PAIR_S = 0.2
+# An RGB frame older than this when the worker picks it up is a stalled or
+# disconnected camera, not a scene we should keep republishing. Judged at pick
+# time (before predict), so a slow inference does not make the *next* fresh
+# frame look stale — that frame's clock starts when it arrived.
+_FRAME_FRESH_S = 0.5
 
 
 def _depth_is_paired(depth_received, rgb_received):
@@ -279,6 +284,7 @@ class UpperBodyTrackPlugin:
         # first failure and every hundredth keep visibility; the first good
         # frame announces recovery immediately (same pattern as the odom card).
         self._frame_failures = 0
+        self._stale_frames = 0
         self._last_payload = None
         self._last_inference_ms = 0.0
 
@@ -427,6 +433,7 @@ class UpperBodyTrackPlugin:
         self._depth_topic = str(args.get("depth_topic") or "").strip()
         self._last_error = None
         self._frame_failures = 0
+        self._stale_frames = 0
         self._stop_event = threading.Event()
 
         def _on_color(msg: CompressedImage):
@@ -528,6 +535,14 @@ class UpperBodyTrackPlugin:
                 except Exception:
                     pass
                 setattr(self, attr, None)
+        # Drop every frame from the old run. A new start() creates its worker
+        # before the first new subscription callback can land, so without this
+        # a stop→start (especially to a different input_topic) would publish
+        # the previous run's JPEG/depth as if it were the new camera's scene.
+        with self._frame_lock:
+            self._latest_jpeg = None
+            self._latest_jpeg_at = 0.0
+        self._depth_cache = _DepthCache()
         self._bank.reset()
         self._status = "idle"
 
@@ -578,6 +593,24 @@ class UpperBodyTrackPlugin:
             if jpeg is None:
                 self._stop_event.wait(0.05)
                 continue
+
+            if time.monotonic() - received_at > _FRAME_FRESH_S:
+                # Camera stalled/disconnected: this JPEG is an old scene.
+                # Reprocessing it would pair it with an equally old depth frame
+                # and keep reporting depth_used on a scene that no longer
+                # exists. Skip it (throttled) until a fresh frame arrives.
+                self._stale_frames += 1
+                if self._stale_frames == 1 or self._stale_frames % 100 == 0:
+                    self._node.get_logger().warning(
+                        f"upper_body_track skipping stale frame "
+                        f"({self._stale_frames})")
+                self._stop_event.wait(0.05)
+                continue
+            if self._stale_frames:
+                self._node.get_logger().info(
+                    f"upper_body_track fresh frames resumed after "
+                    f"{self._stale_frames} stale")
+                self._stale_frames = 0
 
             started = time.monotonic()
             try:

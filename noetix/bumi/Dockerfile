@@ -105,14 +105,16 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
 # torch and torchvision, which adds several hundred MB to the image. Docker
 # layers cannot be conditional at runtime, so keeping that cost out of default
 # Bumi images requires a build-time switch: pass --build-arg INSTALL_POSE_DEPS=1
-# to build an image that can run this card. The version is pinned so a rebuild
-# cannot silently swap the inference runtime. The headless opencv above needs
-# no GUI libs; the pose weight is fetched on first run and cached, or
-# `model_path` points at a pre-downloaded copy on an offline robot.
+# to build an image that can run this card. torch, torchvision and ultralytics
+# are pinned in pose-requirements.txt so a rebuild cannot silently swap the
+# runtime or invalidate the recorded ARM64 image-size evidence. The headless
+# opencv above needs no GUI libs; the pose weight is fetched on first run and
+# cached, or `model_path` points at a pre-downloaded copy on an offline robot.
+COPY pose-requirements.txt /work/pose-requirements.txt
 ARG INSTALL_POSE_DEPS=0
 RUN if [ "$INSTALL_POSE_DEPS" = "1" ]; then \
-      pip3 install --no-cache-dir -i ${PYPI_MIRROR} ultralytics==8.4.216 && \
-      python3 -c 'import ultralytics; from ultralytics import YOLO'; \
+      pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r /work/pose-requirements.txt && \
+      python3 -c 'import ultralytics, torch, torchvision; from ultralytics import YOLO'; \
     else \
       echo "upper_body_track pose deps not installed (INSTALL_POSE_DEPS != 1)"; \
     fi

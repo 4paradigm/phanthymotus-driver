@@ -247,10 +247,19 @@ def test_both_modules_reach_the_image():
 
 def test_pose_runtime_is_an_opt_in_pinned_build_arg():
     """A default Bumi image must not silently carry torch for a disabled card."""
-    dockerfile = (Path(__file__).resolve().parent.parent / "Dockerfile").read_text(encoding="utf-8")
+    root = Path(__file__).resolve().parent.parent
+    dockerfile = (root / "Dockerfile").read_text(encoding="utf-8")
+    reqs = (root / "pose-requirements.txt").read_text(encoding="utf-8")
     assert "ARG INSTALL_POSE_DEPS=0" in dockerfile
-    assert 'ultralytics==' in dockerfile
-    assert 'ultralytics &&' not in dockerfile  # no unpinned install remains
+    # The runtime is pinned in a requirements file so the recorded ARM64 size
+    # is reproducible; installing bare `ultralytics` would drift on rebuild.
+    assert "COPY pose-requirements.txt /work/pose-requirements.txt" in dockerfile
+    assert "-r /work/pose-requirements.txt" in dockerfile
+    assert "pip3 install --no-cache-dir -i ${PYPI_MIRROR} ultralytics==" not in dockerfile
+    for pinned in ("torch==2.8.0", "torchvision==0.23.0", "ultralytics==8.4.216"):
+        assert pinned in reqs
+    # torchvision 0.23.0 requires exactly torch 2.8.0; the pinned pair is valid.
+    assert "torch==2.8.0" in reqs and "torchvision==0.23.0" in reqs
 
 
 # ── end-to-end through the card's own `_measure` ──────────────────────────────
@@ -431,6 +440,7 @@ def test_degenerate_projection_holds_the_last_pose(monkeypatch):
 def test_frame_failures_are_throttled(monkeypatch):
     """One corrupt stream is one outage, not a warning per frame."""
     import threading
+    import time
     import types
 
     card = _load_card_module(monkeypatch)
@@ -458,8 +468,9 @@ def test_frame_failures_are_throttled(monkeypatch):
     plugin._rate_hz = 30.0
     plugin._frame_lock = threading.Lock()
     plugin._latest_jpeg = b"x"
-    plugin._latest_jpeg_at = 0.0
+    plugin._latest_jpeg_at = time.monotonic()  # fresh: exercise the failure path
     plugin._frame_failures = 0
+    plugin._stale_frames = 0
     plugin._process = _fail
     plugin._node = types.SimpleNamespace(get_logger=lambda: types.SimpleNamespace(
         warning=warnings.append, info=infos.append))
@@ -607,6 +618,7 @@ def test_stop_during_slow_predict_publishes_nothing(monkeypatch):
     plugin._rate_hz = 10.0
     plugin._generation = 1
     plugin._frame_failures = 0
+    plugin._stale_frames = 0
     plugin._min_kp_conf = 0.4
     plugin._bank = card.spec.AngleBank()
     # _measure still needs the rest of its state, but detect returns no persons,
@@ -683,3 +695,85 @@ def test_depth_cache_reports_receive_time_for_pairing(monkeypatch):
     after = time.monotonic()
     received = cache.received_at()
     assert received is not None and before <= received <= after
+
+
+def test_teardown_drops_frames_from_the_stopped_run(monkeypatch):
+    """PR #585 review P1: stop->start must not publish the prior run's frames."""
+    import threading
+    import types
+
+    card = _load_card_module(monkeypatch)
+    plugin = object.__new__(card.UpperBodyTrackPlugin)
+
+    old_cache = card._DepthCache()
+    old_cache.put(b"old-depth", 640, 480)
+    plugin._depth_cache = old_cache
+    plugin._frame_lock = threading.Lock()
+    plugin._latest_jpeg = b"old-jpeg"
+    plugin._latest_jpeg_at = 12345.0
+    plugin._bank = card.spec.AngleBank()
+    plugin._bank.update({"l_pitch": 12.0, "l_roll": 0.0, "l_elbow": 0.0}, 1.0)
+    plugin._run_token = object()
+    plugin._stop_event = threading.Event()
+    plugin._worker = None
+    plugin._color_sub = None
+    plugin._depth_sub = None
+    plugin._node = types.SimpleNamespace(get_logger=lambda: types.SimpleNamespace(
+        info=lambda *_: None, warning=lambda *_: None))
+
+    plugin._teardown()
+
+    assert plugin._latest_jpeg is None
+    assert plugin._latest_jpeg_at == 0.0
+    assert plugin._depth_cache is not old_cache
+    assert plugin._depth_cache.received_at() is None
+    # The filter's held state is dropped too: a new camera is a new person.
+    assert plugin._bank.update(None, 2.0) == {}
+    assert plugin._run_token is None
+
+
+def test_stale_frame_is_skipped_before_processing(monkeypatch):
+    """PR #585 review P1: an old cached JPEG must not be republished.
+
+    A disconnected camera leaves `_latest_jpeg` unchanged while the worker
+    keeps looping. Judging freshness at pick time drops that frame; a frame
+    that arrived just before this tick is processed normally.
+    """
+    import threading
+    import time
+    import types
+
+    card = _load_card_module(monkeypatch)
+    plugin = object.__new__(card.UpperBodyTrackPlugin)
+    processed = []
+    warnings, infos = [], []
+
+    class _Event:
+        def __init__(self):
+            self.n = 0
+
+        def is_set(self):
+            return self.n >= 3
+
+        def wait(self, _timeout=0):
+            self.n += 1
+            return False
+
+    plugin._stop_event = _Event()
+    plugin._generation = 0
+    token = object()
+    plugin._run_token = token
+    plugin._rate_hz = 10.0
+    plugin._frame_lock = threading.Lock()
+    plugin._latest_jpeg = b"stale"
+    # Arrived well before _FRAME_FRESH_S ago: this is a stalled camera.
+    plugin._latest_jpeg_at = time.monotonic() - card._FRAME_FRESH_S - 5.0
+    plugin._frame_failures = 0
+    plugin._stale_frames = 0
+    plugin._process = lambda *_a: processed.append(_a)
+    plugin._node = types.SimpleNamespace(get_logger=lambda: types.SimpleNamespace(
+        warning=warnings.append, info=infos.append))
+    plugin._worker_loop(0, token)
+
+    assert processed == [], "stale frame must not reach _process"
+    assert warnings and "stale frame" in warnings[0]
