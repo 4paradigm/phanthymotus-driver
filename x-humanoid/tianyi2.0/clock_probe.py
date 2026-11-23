@@ -9,8 +9,19 @@ import sys
 import time
 
 
+def sample_host_clocks(clock):
+    """Bracket the realtime read so scheduling stalls cannot mimic a clock step."""
+    for _ in range(3):
+        begin = clock.monotonic_ns()
+        wall = clock.time_ns()
+        end = clock.monotonic_ns()
+        if end - begin <= 100_000:
+            return wall, (begin + end) // 2
+    raise ValueError('unable to bound host clock sample')
+
+
 def measure(connection, prefix):
-    before, mono = time.time_ns(), time.monotonic_ns()
+    before, mono = sample_host_clocks(time)
     connection.request('GET', prefix + '/api/platform/v1/timestamp')
     requested = time.monotonic_ns()
     response = connection.getresponse()

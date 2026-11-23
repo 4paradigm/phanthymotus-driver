@@ -17,7 +17,7 @@ import uuid
 from urllib.parse import urlsplit
 
 from common.capture_clock import host_clock_reference
-from clock_probe import ClockProbe
+from clock_probe import ClockProbe, sample_host_clocks
 
 TOPIC = 'base/deadreckon_with_gyro_yaw'
 CLOCK_ID = 'host_realtime'
@@ -27,6 +27,10 @@ MAX_AGE_NS = 250_000_000
 
 class ClockObservationRejected(ValueError):
     """A high-latency probe supplies no evidence and cannot refresh the mapping."""
+
+
+class HostClockChanged(ValueError):
+    """A fresh chassis clock observation is needed before mapping this batch."""
 
 
 class ClockMapping:
@@ -40,6 +44,8 @@ class ClockMapping:
         self._wall_minus_mono = None
         self._curves = deque(maxlen=16)
         self._last_source_ns = 0
+        self.epoch = None
+        self.epoch_start_ms = 0
 
     def observe(self, device_ms, before_ns, after_ns, monotonic_ns):
         if (type(device_ms) is not int or device_ms <= 0 or
@@ -48,15 +54,16 @@ class ClockMapping:
         if self._device is not None and device_ms <= self._device:
             raise ValueError('chassis clock reset or did not advance')
         wall_minus_mono = before_ns - monotonic_ns
-        if (self._wall_minus_mono is not None and
-                abs(wall_minus_mono - self._wall_minus_mono) > 2_000_000):
-            raise ValueError('host clock discontinuity')
+        shift = 0 if self._wall_minus_mono is None else wall_minus_mono - self._wall_minus_mono
+        changed = abs(shift) > 2_000_000
         if after_ns - before_ns > 8_000_000:
             raise ClockObservationRejected('clock observation has excessive round trip')
         # The server clock is sampled during the request; allow 1 ms quantization.
         low = before_ns - device_ms * 1_000_000 - 1_000_000
         high = after_ns - device_ms * 1_000_000 + 1_000_000
         if self.offset is None:
+            if changed:
+                raise HostClockChanged('host clock discontinuity')
             if self._bounds is not None:
                 low, high = max(low, self._bounds[0]), min(high, self._bounds[1])
             if low > high:
@@ -72,11 +79,22 @@ class ClockMapping:
             # pending equal-timestamp group awaiting its closing increment).
             anchor = max(source_ns, self._last_source_ns)
             current, start = self._offset_at(source_ns), self._offset_at(anchor)
+            if changed:
+                if not 0 <= monotonic_ns - self._observed <= 2_000_000_000:
+                    raise ValueError('clock observation expired')
+                # The device-to-monotonic relation must survive the wall-clock step.
+                current += shift
+                start += shift
             for offset in (current, start):
                 if low > offset + UNCERTAINTY_NS // 2 or high < offset - UNCERTAINTY_NS // 2:
                     raise ValueError('clock mapping drift exceeds segment budget')
                 if max(abs(offset-low), abs(offset-high)) > UNCERTAINTY_NS // 2:
                     raise ClockObservationRejected('clock observation cannot verify segment budget')
+            if changed:
+                self.epoch = uuid.uuid4().hex
+                self.epoch_start_ms = device_ms
+                self._curves = deque(((a, b + shift, c + shift, d)
+                                      for a, b, c, d in self._curves), maxlen=16)
             target = (low+high)//2
             # At most 1% rate correction: even negative corrections preserve
             # strictly increasing integer-millisecond source timestamps.
@@ -99,7 +117,7 @@ class ClockMapping:
         if monotonic_ns - self._observed > 2_000_000_000 or monotonic_ns < self._observed:
             raise ValueError('clock observation expired')
         if abs(now_ns - monotonic_ns - self._wall_minus_mono) > 2_000_000:
-            raise ValueError('host clock discontinuity')
+            raise HostClockChanged('host clock discontinuity')
         source_ns = source_ms * 1_000_000
         offset = self._offset_at(source_ns)
         stamp = source_ns + offset
@@ -147,9 +165,12 @@ class IncrementalOdometry:
                 raise ValueError('lost segment requires a new subscription')
             if not isinstance(messages, list):
                 raise ValueError('diagnostic batch must be a list')
-            if self._pending:
-                self.clock.map(self._pending[0][0], now_ns, monotonic_ns)
             parsed = list(self._pending)
+            if parsed:
+                mapped, mapping = self.clock.map(parsed[0][0], now_ns, monotonic_ns)
+                if self._pending_epoch != self.clock.epoch:
+                    parsed = [(stamp, mapped, mapping, dx, dy, dyaw)
+                              for stamp, _, _, dx, dy, dyaw in parsed]
             previous = parsed[-1][0] if parsed else self._last
             for message in messages:
                 stamp = message['timestamp']
@@ -166,6 +187,8 @@ class IncrementalOdometry:
                 mapped, mapping = self.clock.map(stamp, now_ns, monotonic_ns)
                 parsed.append((stamp, mapped, mapping, dx, dy, dyaw))
                 previous = stamp
+        except HostClockChanged:
+            raise
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             self.lost(str(exc))
             raise ValueError(str(exc)) from exc
@@ -178,6 +201,7 @@ class IncrementalOdometry:
         # This also handles equal timestamps split across TCP reads. exact_once
         # subscription order is preserved; no increment is deduplicated.
         self._pending = groups.pop() if groups else []
+        self._pending_epoch = self.clock.epoch
         samples = []
         for group in groups:
             stamp, mapped, mapping = group[0][:3]
@@ -197,11 +221,15 @@ class IncrementalOdometry:
                 vy = (-math.sin(origin_yaw)*dx + math.cos(origin_yaw)*dy) / dt
                 twist = [vx, vy, None, None, None, total_yaw / dt]
             self._last, self._pose = stamp, (x, y, yaw)
+            # Integrate through the ambiguous interval, publish only captures
+            # known to belong to the verified new wall-clock epoch.
+            if stamp <= self.clock.epoch_start_ms:
+                continue
             self._state, self._reason = 'tracking', ''
             frame = self.segment + '_odom'
             measurement = {'schema': 'motus.slam_frame/1', 'stamp_ns': mapped,
                            'frame_id': frame, 'clock_id': CLOCK_ID,
-                           'clock_epoch': self.segment, 'source_generation': self.segment,
+                           'clock_epoch': self.clock.epoch or self.segment, 'source_generation': self.segment,
                            'source_clock': 'slamware_uptime_ms', 'source_stamp': stamp,
                            'source_unit': 'ms', 'mapping': mapping}
             samples.append({'schema': 'motus.odom/1', 'stamp_ms': mapped // 1_000_000,
@@ -421,7 +449,12 @@ class OdometrySource:
                                 self._timing['read_ms'] = (read_done - started_read) / 1e6
                                 self._timing['clock_age_ms'] = (
                                     (read_done - clock._observed) / 1e6 if clock._observed is not None else None)
-                        samples = integrator.feed(batch, time.time_ns(), time.monotonic_ns())
+                        try:
+                            samples = integrator.feed(batch, *sample_host_clocks(time))
+                        except HostClockChanged:
+                            # Keep the subscription and retry this exact uncommitted batch.
+                            self._observe(client, clock)
+                            samples = integrator.feed(batch, *sample_host_clocks(time))
                         if samples:
                             # Integrate ALL deltas, publish the newest source time at card Hz.
                             received = time.monotonic()

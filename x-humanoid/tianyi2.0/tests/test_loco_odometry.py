@@ -598,3 +598,118 @@ def test_unfinished_slew_can_reverse_without_rewriting_or_extending_expiry():
     assert stamps[-1]-1800_000_000>pivot[1]['offset_ns']
     with pytest.raises(ValueError,match='expired'):
         clock.map(4000,EPOCH+4_015_000_000,4_015_000_000)
+
+
+@pytest.mark.parametrize('wall_step_ns', [0, 3_000_000])
+def test_preempted_clock_probe_preserves_only_continuous_host_time(monkeypatch, wall_step_ns):
+    from types import SimpleNamespace
+
+    m = module()
+    import clock_probe
+    clock = ready_clock(m)
+    odom = m.IncrementalOdometry(clock)
+    segment = odom.segment
+    mono = 1_100_000_000
+    interrupted = False
+    def wall():
+        nonlocal mono, interrupted
+        sampled = EPOCH + mono + wall_step_ns
+        if not interrupted:
+            mono += 3_050_000
+            interrupted = True
+        return sampled
+
+    monkeypatch.setattr(clock_probe, 'time', SimpleNamespace(
+        time_ns=wall, monotonic_ns=lambda: mono))
+    connection = SimpleNamespace(request=lambda *args: None, getresponse=lambda: SimpleNamespace(
+        status=200, read=lambda cap: str(mono // 1_000_000).encode()))
+    result = clock_probe.measure(connection, '')
+    args = [result[k] for k in ('device_ms', 'before_ns', 'after_ns', 'monotonic_ns')]
+    clock.observe(*args)
+    stamps = [delta(1105), delta(1115, x=.02), delta(1125)]
+    samples = odom.feed(stamps, EPOCH + mono + wall_step_ns + 30_000_000, mono + 30_000_000)
+    quality = samples[-1]['vendor']['motus_slam']
+    assert quality['segment_id'] == segment
+    assert (quality['measurement']['clock_epoch'] != segment) == bool(wall_step_ns)
+    assert samples[-1]['pose']['position'] == pytest.approx([.02, 0, 0])
+
+
+@pytest.mark.parametrize('step', [300_000_000, -300_000_000])
+def test_clock_step_preserves_pose_and_pending_displacements(step):
+    m = module()
+    clock = ready_clock(m)
+    odom = m.IncrementalOdometry(clock)
+    old = odom.feed([delta(1050), delta(1060, x=.1), delta(1070, x=.02)],
+                    EPOCH + 1_080_000_000, 1_080_000_000)[-1]
+    assert old['pose']['position'][0] == pytest.approx(.1)
+    batch = [delta(1070, x=.03), delta(1080, x=.04), delta(1090)]
+    mono = 1_100_000_000
+    now = EPOCH + mono + step
+    with pytest.raises(m.HostClockChanged):
+        odom.feed(batch, now, mono)
+    clock.observe(1100, now, now + 2_000_000, mono)
+    samples = odom.feed(batch, now, mono)
+    assert samples == []
+    samples = odom.feed([delta(1110, x=.05), delta(1120)],
+                        now + 25_000_000, mono + 25_000_000)
+    assert [s['pose']['position'][0] for s in samples] == pytest.approx([.24])
+    assert samples[-1]['pose']['frame_id'] == old['pose']['frame_id']
+    assert samples[0]['vendor']['motus_slam']['measurement']['stamp_ns'] == EPOCH + 1_111_000_000 + step
+    with pytest.raises(ValueError, match='gap'):
+        odom.feed([delta(1230)], now, mono)
+
+def test_worker_switches_clock_while_draining_same_subscription(monkeypatch):
+    from types import SimpleNamespace
+
+    m = module()
+    mono = 1_000_000_000
+    shift = 0
+    subscriptions = []
+    published = []
+    monkeypatch.setattr(m, 'time', SimpleNamespace(
+        monotonic=lambda: mono / 1e9, monotonic_ns=lambda: mono,
+        time_ns=lambda: EPOCH + mono + shift))
+
+    class Stop:
+        def is_set(self):
+            return mono >= 2_000_000_000
+
+        def wait(self, seconds):
+            nonlocal mono
+            mono += round(seconds * 1e9)
+            return self.is_set()
+
+    class Client:
+        def __init__(self, url):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def subscribe(self):
+            subscriptions.append(mono)
+
+        def observe(self, clock):
+            now = EPOCH + mono + shift
+            clock.observe(mono // 1_000_000, now, now + 2_000_000, mono)
+
+        def read(self):
+            nonlocal shift
+            if mono >= 1_300_000_000:
+                shift = -300_000_000
+            return [delta(mono // 1_000_000, x=.02)]
+
+    monkeypatch.setattr(m, 'DiagnosticClient', Client)
+    source = m.OdometrySource('http://offline', 20, published.append)
+    source._stop = Stop()
+    source._run()
+    assert len(subscriptions) == 1
+    assert len({s['pose']['frame_id'] for s in published}) == 1
+    assert len({s['vendor']['motus_slam']['measurement']['clock_epoch'] for s in published}) == 2
+    for s in published:
+        elapsed_ms = s['vendor']['source_stamp_ms'] - subscriptions[0] // 1_000_000
+        assert s['pose']['position'][0] == pytest.approx(.02 * elapsed_ms / 50)
+    assert published[-1]['vendor']['source_stamp_ms'] >= 1850
