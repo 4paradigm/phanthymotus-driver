@@ -66,14 +66,14 @@ change the previous movement result.
 
 ## 可选：夹爪离桌距离
 
-`piper_table_clearance` 是默认关闭的只读 sensor，基于现有末端姿态、夹爪开度
-和经验证的桌面/工具标定，以 5 Hz 输出夹爪模型最低点到桌面的有符号法向间隙。
-缺少标定或反馈过期时输出不可用，不连接 CAN、不使能、不执行运动或避碰。
+随附配置启用 `piper_table_clearance` 只读 sensor，内置原厂 100 mm 夹爪模型，
+基于 can0 的现有关节和开度反馈，以 5 Hz 输出“夹爪离桌距离（估算）”。
+假设桌面水平且与模型安装平面重合；`verified=false`，不作为实测标定结果。
+反馈失效时清空距离，不连接 CAN、不使能、不执行运动或避碰。
 配置和现场验收见 [TABLE_CLEARANCE.md](TABLE_CLEARANCE.md)。
 
-可显式选择 `model_estimate` 模式，加载部署侧从官方 URDF/碰撞网格导出的
-模型 profile，复用关节角度和开度计算未标定的高度估算；该模式保持
-`verified=false`，输出 `state=estimated`，不提供经过验证的保守间隙。
+内置模型已随镜像打包，无需下载、填写路径或额外挂载；仍支持外部模型 profile
+和 `calibrated` 模式。估算输出 `state=estimated`，不提供经过验证的保守间隙。
 
 ## Build and packaging
 

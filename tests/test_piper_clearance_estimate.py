@@ -113,3 +113,47 @@ def test_estimated_build_plugins_uses_shared_sdk_without_commands(tmp_path):
         assert driver.arm.calls==[]
     finally:
         card.stop();runtime.driver=None;DriverBundle(plugins).stop_all()
+
+
+def test_shipped_config_includes_working_official_model_without_site_files(tmp_path):
+    from pathlib import Path
+    import yaml
+    from agilex.piper.device import build_plugins
+    from common.vendor_runtime import DriverBundle
+    from test_piper_intent import IntentDriver
+    root=Path(__file__).resolve().parents[1]/'agilex/piper'
+    cfg=yaml.safe_load((root/'config.yaml').read_text(encoding='utf-8'))
+    cfg['data_dir']=str(tmp_path/'data')
+    assert cfg['table_clearance']['enabled'] is True
+    assert cfg['table_clearance']['estimate_profile_path']=='builtin:piper_100mm'
+    assert cfg['table_clearance']['verified'] is False
+    plugins=build_plugins(cfg,'shipped_default',None)
+    runtime,background=plugins[:2];background.auto_connect=False
+    driver=IntentDriver();runtime.driver=driver
+    driver.arm.raw=(25344,38,-1131,10879,18161,-48470)
+    driver.arm.width=99.7
+    card=plugins[-1]
+    try:
+        card.start();card.tick(card.generation)
+        result=card.info()['result']
+        assert result['state']=='estimated'
+        assert result['clearance_mm']==pytest.approx(112.0788112340331,abs=1e-8)
+        assert result['calibration_verified'] is False
+        assert result['model_commit']=='680fa925cd00db7e2628563d2edc5540963045de'
+        assert result['model_sha256']=='549be81f8571e355f9f671fff2559a0a90b76b3eaaece6b769dc9a288a15d0a7'
+        assert (root/'resource/clearance/LICENSE.agx_arm_urdf').is_file()
+        assert driver.arm.calls==[]
+        json.dumps(result,allow_nan=False)
+    finally:
+        card.stop();runtime.driver=None;DriverBundle(plugins).stop_all()
+
+
+def test_modified_bundled_profile_rejected(monkeypatch):
+    from pathlib import Path
+    original=Path.read_bytes
+    def tampered(path):
+        data=original(path)
+        return data+b' ' if path.name=='piper_100mm.json' else data
+    monkeypatch.setattr(Path,'read_bytes',tampered)
+    with pytest.raises(ValueError,match='bundled_estimate_profile_hash_mismatch'):
+        load_profile('builtin:piper_100mm')

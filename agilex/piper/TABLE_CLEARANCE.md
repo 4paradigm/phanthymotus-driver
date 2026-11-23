@@ -1,9 +1,47 @@
 # PiPER 夹爪离桌距离
 
+## Canvas 可视化配置和输出
+
+卡片右上角“实例配置”齿轮提供机械臂 CAN 接口、显示名称、是否使用实测标定的下拉项。
+当前为单实例卡片：一张卡一次监测一个接口。can0/can1 在本工位分别对应左右从臂，
+其他工位需核对接线。选项保存在 Core 的卡片配置中，通过标准 config 操作应用；
+停止或重启卡片仍可恢复，不需要修改镜像或配置文件。
+
+- 不标定：选择“使用内置模型估算”，填写桌面相对安装面的高度（默认0）。
+- 使用实测标定：选择“使用实测标定参数”，填写平面、几何、开合轴、开度范围、
+  坐标系、误差余量及记录编号。数组使用 JSON 输入框。只有物理核验后才能确认 verified。
+- 选择标定模式并不自动完成标定；未确认时清空距离。切换 CAN 接口会撤销旧标定确认，
+  清空旧距离，避免把左臂标定应用到右臂。无效参数在更改前拒绝，原有有效配置保持运行。
+
+当所选接口等于现有 runtime 接口时复用其反馈；另一个接口只创建本卡独立的
+SocketCAN 接收器，使用 CAN_RAW_FILTER，只调用 recv、不发送 CAN 帧、不操作运动控制卡。
+停止后释放接收器。另一个接口不存在、帧未到、过期或非宽度模式时不输出距离。
+不支持同时双臂合并距离；不要将 CAN 接口等同于固定的物理左右标识。
+
+生命周期顶层 state=running/idle 表示卡片是否运行；内层 result.state=estimated/ok/
+unavailable/idle 表示测量结果状态。两者含义独立。
+
+“查看数据流”首先显示中文“读数”：机械臂、接口、模式、数据状态、间隙、开度、
+最近部件、反馈龄、状态说明以及“未启用自动防碰桌”。原机器字段保留，新增“字段说明”
+为每个机器字段解释含义和单位；部件标识也给出中文对应。
+
+配置仅属于这张测距卡，不改变 Arm control 的 can_interface。Core 的齿轮配置表单在
+项目停止时编辑；不需要开启智能控制来查看已启动的测距数据。模型已内置，不增加新依赖。
+
+卡片操作菜单提供“开始测距（仅监测）／暂停测距”，通过独立执行按钮操作，
+不需要启动整个智能控制项目。暂停会发布最后一帧 idle，并清空距离，避免面板将历史
+估算值误作实时值。停止项目后若需单独查看本卡，请重新执行“开始测距”。
+标定参数集中在 Advanced settings（高级设置）；部分旧 Core 不支持条件隐藏，
+因此高级字段即使在估算模式可展开，也不会参与估算或把 verified 改为 true。
+查看数据流时将面板内部滚动到顶部，首先查看中文“读数”和实时更新时间。
+
+2026-11-23：生命周期、配置、模型估算、标定、控制及部署回归合计 **122 passed**。
+Canvas schema 和 config/start/stop 协议已验证；浏览器界面呈现需以现场观察为准。
+
 ## 模型估算模式（可选）
 
-默认仍为下文的 `calibrated` 模式。若已有与安装工具匹配的官方模型，可在部署侧
-提供从 URDF 关节链和碰撞网格凸包导出的本地 JSON profile，显式启用模型估算：
+随附配置已启用内置模型估算，原厂 100 mm 夹爪、can0、桌面与模型安装平面重合的
+现场无需下载模型、填写文件路径或增加挂载。默认配置为：
 
 ```yaml
 table_clearance:
@@ -11,14 +49,19 @@ table_clearance:
   mode: model_estimate
   verified: false
   can_interface: can0
-  estimate_profile_path: /opt/piper-models/gripper-profile.json
+  estimate_profile_path: builtin:piper_100mm
   table_z_mm: 0
 ```
 
-路径是**容器内**的绝对路径，部署时需将 profile 单文件只读挂载到该路径。
-此例的 `table_z_mm: 0` 表示假设桌面与模型 world 的安装平面重合；必须按安装情况选取。
-软件不会自动下载模型或自动确认安装关系。模型数据不随本 PR 打包；没有 profile
-的部署应保留默认 calibrated 模式，不能直接使用此例启动。
+`builtin:piper_100mm` 解析为包内 resource/clearance/piper_100mm.json，并校验固定
+SHA-256。现有 Dockerfile 已 COPY resource/，无需添加依赖或构建下载步骤。
+资源目录保留来源记录、源文件哈希及 MIT 许可。新增模型 JSON 为 67,334 字节；
+连同许可和说明会带来少量资源字节增长，未测量最终镜像层大小。
+`table_z_mm: 0` 是桌面与模型安装平面重合的假设，不是自动检测或已完成实测标定。
+不同工具、底座高度或 CAN 接口仍需选择匹配配置，不能将默认模型套用于不匹配硬件。
+
+仍支持外部 profile：将 estimate_profile_path 换成容器内绝对路径，并由部署侧只读挂载。
+外部模型模式和下文 calibrated 模式用于其他安装情况；默认用户无需这些额外步骤。
 
 profile 的 `schema` 为 `piper.gripper_estimate/1`，包括 `root=world`、`source`、
 `commit`、按父节点先行排序的 `joints`、`vertices_m`、`joint_bounds_deg` 和
@@ -40,24 +83,32 @@ estimated 状态，不能按 calibrated 模式的 state=ok 使用。
 得到相同的 112.0788112340331 mm。此核对只证明计算复现一致，不是真机精度标定。
 
 验证命令增加 `tests/test_piper_clearance_estimate.py`。2026-11-23 本次源码验证结果
-记录在提交操作前的测试输出中；本轮未部署新增估算模式，未验证画布数值显示。
+记录在提交操作前的测试输出中。2026-11-23 内置模型版本回归合计 **116 passed**；
+覆盖随附配置直接注册卡片并产生估算、固定模型校验和篡改拒绝。
+
+2026-11-23 现场软件验证：使用独立命名的本地 AMD64 源码叠加测试镜像运行内置配置，
+MCP 返回 state=estimated，真实反馈开度为 51.7 mm，模型估算间隙为约 155.7851 mm。
+独立 DDS 订阅收到 10 帧，约 5.0009 Hz；motion_enabled=false。
+这验证了配置、真实反馈读取与发布链路，不是量尺测量或距离精度验收。
+此次是已有 AMD64 依赖镜像上的本地源码/资源叠加，不代表上游完整构建或云端 ARM64
+镜像已在 AMD64 工位机原生运行。画布浏览器内的数值呈现尚未在本轮观察确认。
 
 ## 标定模式
 
-`piper_table_clearance` 是默认关闭的只读 sensor，以 5 Hz 发布 `data/json`
+`piper_table_clearance` 是只读 sensor，以 5 Hz 发布 `data/json`
 到 `/{namespace}/piper/state/table_clearance`（ROS `std_msgs/String`）。
 支持 MCP `start/stop/info`；只读取已有 runtime 缓存，不创建 CAN 连接、不发送控制指令。
 Stop 释放本卡 timer/publisher，不影响现有控制和监控。`info` 不刷新硬件反馈。
 下游须检查 state、timestamp 和 feedback_time，不得沿用历史有效值。
 
-启用方式：在部署配置中将 `table_clearance.enabled` 改为 true，重新初始化驱动。
+若需要使用实测标定模式，将 mode 改为 calibrated，并保持 enabled=true，重新初始化驱动。
 verified 保持 false 时会持续输出不可用；完成以下物理标定后才能设为 true。
-配置仅在初始化时读取，默认不在工具列表中注册。每个实例对应一个现有机械臂 runtime。
+配置仅在初始化时读取。每个实例对应一个现有机械臂 runtime。
 
 
 该卡根据实测几何计算模型距离，不从图像自动识别夹爪或拟合桌面。
 两主两从中，每个实例只绑定其现有 runtime 的一条反馈源，不推测四臂对应关系。
-当前现场未提供经过验证的桌面平面和夹爪几何，因此默认输出
+标定模式在未提供经过验证的桌面平面和夹爪几何时输出
 `unavailable/calibration_unverified`，不会填写任何猜测尺寸。
 
 启用后先保持 `verified: false`，以下字段必须按该机械臂/工具实测填写：

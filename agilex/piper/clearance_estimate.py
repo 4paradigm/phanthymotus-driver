@@ -10,12 +10,20 @@ from pathlib import Path
 
 import numpy as np
 
+BUNDLED_PROFILE = 'builtin:piper_100mm'
+BUNDLED_SHA256 = '549be81f8571e355f9f671fff2559a0a90b76b3eaaece6b769dc9a288a15d0a7'
+
 
 def load_profile(path):
+    bundled = str(path) == BUNDLED_PROFILE
+    if bundled:
+        path = Path(__file__).resolve().parent / 'resource' / 'clearance' / 'piper_100mm.json'
     path = Path(path)
     if not path.is_absolute() or path.stat().st_size > 2 * 1024 * 1024:
         raise ValueError('模型 profile 必须为不超过 2 MiB 的本地绝对路径')
     raw = path.read_bytes()
+    if bundled and hashlib.sha256(raw).hexdigest() != BUNDLED_SHA256:
+        raise ValueError('bundled_estimate_profile_hash_mismatch')
     profile = json.loads(raw)
     if profile.get('schema') != 'piper.gripper_estimate/1':
         raise ValueError('unsupported_estimate_profile')

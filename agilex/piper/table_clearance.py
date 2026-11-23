@@ -1,6 +1,7 @@
 """Calibrated passive gripper-to-table measurements; no hardware commands."""
 from copy import deepcopy
 import math
+import json
 import threading
 import time
 import numpy as np
@@ -32,6 +33,7 @@ def section(config, key, defaults):
 
 
 CLEARANCE_DEFAULTS = dict(enabled=False, calibration_id='', verified=False, can_interface='',
+    arm_label='',
     mode='calibrated', estimate_profile_path='', table_z_mm=None,
     base_frame='', plane_base_mm=None, body_vertices_mm=[],
     left_finger_vertices_mm=[], right_finger_vertices_mm=[], opening_axis=None,
@@ -44,7 +46,7 @@ def clearance_settings(config):
         raise ValueError('mode 必须为 calibrated 或 model_estimate')
     if type(cfg['verified']) is not bool:
         raise ValueError('table_clearance.verified 必须为布尔值')
-    for key in ('calibration_id', 'base_frame', 'can_interface'):
+    for key in ('calibration_id', 'base_frame', 'can_interface', 'arm_label'):
         if not isinstance(cfg[key], str) or len(cfg[key]) > 128:
             raise ValueError(f'{key} 必须为不超过 128 字符的文本')
     if cfg['mode'] == 'model_estimate':
@@ -132,13 +134,18 @@ def table_distance(snapshot, cfg, now):
 
 class TableClearance:
     def __init__(self, read_snapshot, config, namespace, ros2=None, *, clock=time.time,
-                 monotonic=time.monotonic, publisher_factory=_RosPublisher):
+                 monotonic=time.monotonic, publisher_factory=_RosPublisher, source_factory=None):
         self.cfg = clearance_settings(config)
         self.estimate_model = None
         if self.cfg['mode'] == 'model_estimate':
             from agilex.piper.clearance_estimate import load_profile
             self.estimate_model = load_profile(self.cfg['estimate_profile_path'])
         self.read_snapshot, self.namespace, self.ros2 = read_snapshot, namespace.strip('/'), ros2
+        from agilex.piper.clearance_feedback import PassiveFeedback
+        self.runtime_interface = config.get('can_interface','can0')
+        self.source_factory = source_factory or PassiveFeedback
+        self.source = (self.source_factory(self.cfg['can_interface'])
+                       if self.cfg['can_interface'] and self.cfg['can_interface'] != self.runtime_interface else None)
         self.clock, self.monotonic, self.factory = clock, monotonic, publisher_factory
         self.lock, self.lifecycle = threading.RLock(), threading.RLock()
         self.running, self.generation, self.transport = False, 0, None
@@ -151,10 +158,18 @@ class TableClearance:
         definition = tool('piper_table_clearance', 'sensor',
             '持续输出经标定夹爪模型最低点到桌面的有符号法向间隙（毫米）。'
             '复用已有反馈；缺少标定或反馈失效则不可用。仅供观测，不执行控制或避碰。',
-            {'type': 'object', 'properties': {}, 'additionalProperties': False}, topic_out=self.topics())
+            {'type': 'object', 'properties': {'action': {'type':'string',
+                'enum':['begin_measurement','pause_measurement'],'default':'begin_measurement',
+                'oneOf':[{'const':'begin_measurement','title':'开始测距（仅监测）'},
+                         {'const':'pause_measurement','title':'暂停测距'}]}},
+             'additionalProperties': False,'x-manual-execution':True,
+             'x-action-params':{'begin_measurement':{'params':[],'description':'启动本卡只读距离数据发布'},
+                                'pause_measurement':{'params':[],'description':'暂停本卡发布，不操作电机'}}}, topic_out=self.topics())
         if self.estimate_model is not None:
             definition['description'] = '按部署的夹爪模型、关节角度和开度估算离桌高度；未完成实测标定，不执行避碰。'
         definition['title'] = '夹爪离桌距离（估算）' if self.estimate_model is not None else '夹爪离桌距离'
+        from agilex.piper.clearance_ui import schema
+        definition['configSchema'] = schema(self.cfg)
         return [definition]
 
     def unavailable(self, reason):
@@ -163,7 +178,8 @@ class TableClearance:
 
     def current(self):
         if not self.running:
-            return dict(state='idle')
+            return dict(state='idle',clearance_mm=None,lowest_point_base_mm=None,
+                        conservative_clearance_mm=None,reason='measurement_stopped')
         if self.result is None:
             return self.unavailable('waiting_for_feedback')
         stamp = self.result.get('feedback_time')
@@ -175,8 +191,9 @@ class TableClearance:
 
     def info(self):
         with self.lock:
-            return dict(running=self.running, publishing=self.transport is not None,
-                        result=self.current(), config=deepcopy(self.cfg), topic_out=self.topics())
+            from agilex.piper.clearance_display import annotate
+            return dict(state='running' if self.running else 'idle',running=self.running, publishing=self.transport is not None,
+                        result=annotate(self.current(),self.cfg,self.clock()), config=deepcopy(self.cfg), topic_out=self.topics())
 
     def start(self):
         with self.lifecycle, self.lock:
@@ -185,9 +202,14 @@ class TableClearance:
             self.generation += 1
             gen = self.generation
             self.result = self.received = None
-            if self.ros2 is not None:
-                self.transport = self.factory(self.ros2, self.namespace + '/table_clearance',
-                    self.topics(), .2, lambda: self.tick(gen))
+            try:
+                if self.source is not None:self.source.start()
+                if self.ros2 is not None:
+                    self.transport = self.factory(self.ros2, self.namespace + '/table_clearance',
+                        self.topics(), .2, lambda: self.tick(gen))
+            except BaseException:
+                if self.source is not None:self.source.close()
+                raise
             self.running = True
             return self.info()
 
@@ -199,7 +221,15 @@ class TableClearance:
                 transport, self.transport = self.transport, None
                 self.result = self.received = None
             if transport is not None:
-                transport.close()
+                try:
+                    from agilex.piper.clearance_display import annotate
+                    transport.publish('data/json',annotate(dict(self.current(),timestamp=self.clock(),
+                        advisory_only=True),self.cfg,self.clock()))
+                except Exception:
+                    pass
+                finally:
+                    transport.close()
+            if self.source is not None:self.source.close()
             return self.info()
 
     def tick(self, gen):
@@ -207,7 +237,8 @@ class TableClearance:
             if not self.running or gen != self.generation:
                 return
             try:
-                snapshot = self.read_snapshot() if self.cfg['verified'] or self.estimate_model else {}
+                reader = self.source.snapshot if self.source is not None else self.read_snapshot
+                snapshot = reader() if self.cfg['verified'] or self.estimate_model else {}
                 if self.estimate_model is not None:
                     from agilex.piper.clearance_estimate import estimate
                     self.result = estimate(snapshot, self.cfg, self.clock(), self.estimate_model)
@@ -217,6 +248,8 @@ class TableClearance:
             except Exception:
                 self.result, self.received = self.unavailable('invalid_feedback'), None
             result = dict(self.current(), timestamp=self.clock(), advisory_only=True)
+            from agilex.piper.clearance_display import annotate
+            result = annotate(result,self.cfg,self.clock())
             if self.transport is not None:
                 try:
                     self.transport.publish('data/json', result)
@@ -224,12 +257,46 @@ class TableClearance:
                     self.result, self.received = self.unavailable('publish_failed'), None
 
     def dispatch(self, action, args):
+        action={'begin_measurement':'start','pause_measurement':'stop'}.get(action,action)
+        if action == 'config':return self.configure(args)
+        if action == 'start' and set(args) & set(CLEARANCE_DEFAULTS):
+            self.configure(args)
+            return self.start()
         allowed = {'_tool_name', 'instance_id'}
         if args.get('input_topic') == '':
             allowed.add('input_topic')
         if set(args) - allowed or action not in {'start', 'stop', 'info', 'piper_table_clearance'}:
             raise ValueError('夹爪离桌距离仅接受 start、stop、info')
         return self.info() if action == 'piper_table_clearance' else getattr(self, action)()
+
+    def configure(self,args):
+        with self.lifecycle:
+            allowed=set(CLEARANCE_DEFAULTS)-{'enabled'}
+            meta={'_tool_name','instance_id'}
+            if args.get('input_topic')=='':meta.add('input_topic')
+            if set(args)-allowed-meta:raise ValueError('未知测距配置参数')
+            updates={k:v for k,v in args.items() if k in allowed}
+            for key in ['plane_base_mm','body_vertices_mm','left_finger_vertices_mm',
+                        'right_finger_vertices_mm','opening_axis','opening_range_mm']:
+                if isinstance(updates.get(key),str):updates[key]=json.loads(updates[key])
+            if updates.get('mode')=='model_estimate':updates['verified']=False
+            if updates.get('can_interface',self.cfg['can_interface'])!=self.cfg['can_interface']:
+                updates['verified']=False
+                updates['calibration_id']=''
+                if updates.get('arm_label',self.cfg['arm_label'])==self.cfg['arm_label']:
+                    updates['arm_label']='机械臂 '+updates['can_interface']
+            cfg=clearance_settings({'table_clearance':{**self.cfg,**updates}})
+            if cfg['can_interface'] not in {'can0','can1'}:raise ValueError('请选择 can0 或 can1')
+            model=None
+            if cfg['mode']=='model_estimate':
+                from agilex.piper.clearance_estimate import load_profile
+                model=load_profile(cfg['estimate_profile_path'])
+            if cfg==self.cfg:return self.info()
+            source=(self.source_factory(cfg['can_interface']) if cfg['can_interface']!=self.runtime_interface else None)
+            running=self.running
+            self.stop()
+            with self.lock:self.cfg,self.estimate_model,self.source=cfg,model,source
+            return self.start() if running else self.info()
 
 
 def add_table_clearance(plugins, config, namespace, ros2):
