@@ -125,14 +125,9 @@ the actual integer `offset_ns` for each capture. The arithmetic remains
 `source_ms * 1e6 + offset_ns == stamp_ns`; the declared bound stays 50 ms, and
 accepted probe intervals must remain inside the existing 25 ms verification
 envelope. Invalid probes do not alter the ramp or refresh its two-second TTL.
-The companion Perception PR #371/#395 `continuous_pose_clock` implementation
-accepts verified v2 chassis slews in the same segment only when every mapping
-field except `offset_ns` is unchanged and the offset change stays within 1% of
-elapsed source time. Changed clock identity, evidence or mapping version still
-requires a new segment. Use a Perception revision containing that implementation
-and the independent `pose.stamp_ms` decoder change described below; an older
-revision is not compatible. No fixed-offset rollback is required. This change
-has not been deployed over an active mapping session.
+These clock checks govern the Tianyi producer. PR #371 accepts numeric pose
+timestamps across changes in the reported clock offset.
+
 `info().slam_odometry.timing` separates request/header/body time, total probe
 time, increment-read time and publication time. `last_loss` preserves the
 pre-failure timings across recovery. This instrumentation is not an accuracy
@@ -153,19 +148,19 @@ The message uses the existing `motus.odom/1` JSON format, not ROS
 `nav_msgs/Odometry`. `pose.frame_id` identifies a unique odometry segment and
 `child_frame_id` is `base_link`; `frame = "body"` describes the twist.
 
-Connect `state/odom` to the SLAM card's odometry input. The pose includes the
-`motus_slam/1` quality metadata and source-time mapping accepted by its decoder.
-Deploy the companion Perception PR #371/#395 decoder/validator revision with
-this driver: it reads explicit `pose.stamp_ms`, falling back to top-level
-`stamp_ms` only for legacy packets without an independent pose timestamp. It
-checks exact `quality.stamp_ns` and diagnostic measurement evidence against the
-pose time. Older decoders reject a split-time packet through their existing
-precise-time mismatch check, rather than treating REST receipt as pose time.
-Repeated REST updates retain the same pose timestamp and do not refresh the
-SLAM consumer's diagnostic ingress age.
-The point cloud must independently have a verified clock relationship and a
-measured transform to the chassis reference; this adapter does not invent a
-camera mount transform or mark the native cloud's unknown timing as verified.
+Connect `state/odom` to the SLAM card's odometry input. Tianyi supplies the full
+`motus_slam/1` capability declaration and source-time diagnostics. PR #371's
+ordinary pose decoder reads `pose.stamp_ms`, falling back to top-level
+`stamp_ms` when the pose has no independent timestamp. It accepts numeric poses
+without clock evidence or a capability declaration; a missing declaration
+appears in the card diagnostics. Repeated REST updates retain the diagnostic
+pose timestamp.
+
+For static input without a mount, PR #371 assumes the cloud coordinates already
+match the pose child. Check the physical clock relationship and camera mount
+before using a raw Orbbec cloud with chassis odometry. An explicitly dynamic
+mount needs a numeric transform for the cloud.
+
 Timestamp rollback, reordered increments, gaps over 100 ms, data older
 than 250 ms, disconnects, or failed clock checks publish `lost` with null pose
 and strict `vendor.motus_slam` loss metadata; independently healthy REST twist
@@ -1202,7 +1197,7 @@ dynamic mounting needs an actual numeric matrix. The RGB-D camera-reference
 route uses its paired depth-derived cloud and camera pose.
 
 Current PR371 accepts source/read/receipt integer timestamps and descriptive
-metadata under its [format-only policy](https://github.com/Nidhogg2002/phanthymotus/blob/feat/pointcloud-slam-offline-eval/perception/docs/spatial-inputs.md).
+metadata as covered by the [numeric input tests](https://github.com/4paradigm/phanthymotus/blob/8d38150c2d3be9e7074b5aa9b8b67f806daaf888/perception/tests/test_pointcloud_slam_numeric_input.py).
 Older capture-identity and freshness requirements described in historical
 validation notes are not current consumer admission requirements.
 
