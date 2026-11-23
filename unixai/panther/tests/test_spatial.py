@@ -416,6 +416,21 @@ class AudioDiscoveryTest(unittest.TestCase):
         self.assertEqual(result['server'], 'unix:/run/panther-host-tmp/pulse-new/native')
         self.assertEqual(config['server'], 'auto')  # Repeat discovery on the next start.
 
+    @patch.object(audio, '_pulse_user', return_value={})
+    @patch.object(audio.glob, 'glob', return_value=['/run/panther-host-tmp/pulse-new/native'])
+    @patch.object(audio.subprocess, 'run')
+    def test_auto_skips_reachable_server_without_the_requested_sink(self, run, *_):
+        run.side_effect = [
+            SimpleNamespace(returncode=0, stderr=''),
+            SimpleNamespace(returncode=0, stdout='0 onboard module-alsa-card.c', stderr=''),
+            SimpleNamespace(returncode=0, stderr=''),
+            SimpleNamespace(returncode=0, stdout='1 usb_speaker module-alsa-card.c', stderr=''),
+        ]
+        result = audio._resolve_pulse(
+            {'server': 'auto', 'uid': 1001, 'gid': 1002, 'device': 'usb_speaker'}, 'speaker')
+        self.assertEqual(result['server'], 'unix:/run/panther-host-tmp/pulse-new/native')
+        self.assertEqual(run.call_args.args[0], ['pactl', 'list', 'short', 'sinks'])
+
 
 
 class StoreCompatibilityTest(unittest.TestCase):

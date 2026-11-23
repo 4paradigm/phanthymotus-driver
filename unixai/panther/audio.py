@@ -68,7 +68,7 @@ def _pulse_user(config: dict) -> dict[str, int]:
     return _pulse_identity(config)
 
 
-def _resolve_pulse(config: dict) -> dict:
+def _resolve_pulse(config: dict, mode=None) -> dict:
     """Discover a live host server on every start; vendor sockets change on reboot."""
     resolved = dict(config)
     server = config["server"]
@@ -87,6 +87,20 @@ def _resolve_pulse(config: dict) -> dict:
             failures.append(candidate + ": connection timed out")
             continue
         if probe.returncode == 0:
+            if mode is not None:
+                collection = "sources" if mode == "mic" else "sinks"
+                try:
+                    devices = subprocess.run(
+                        ["pactl", "list", "short", collection], env=env, timeout=2,
+                        capture_output=True, text=True, **_pulse_user(config))
+                except subprocess.TimeoutExpired:
+                    failures.append(candidate + ": device listing timed out")
+                    continue
+                names = [row.split()[1] for row in devices.stdout.splitlines()
+                         if len(row.split()) >= 2]
+                if devices.returncode != 0 or config["device"] not in names:
+                    failures.append(candidate + ": configured " + collection + " device missing")
+                    continue
             resolved["server"] = candidate
             return resolved
         failures.append(probe.stderr.strip()[-120:])
@@ -252,7 +266,7 @@ def _worker(mode, topic, config, commands, replies):
                 state.update(error="", frames=0, dropped=0, last_frame=0.0, input_topic=input_topic)
                 stop_event.clear()
                 try:
-                    resolved = _resolve_pulse(config)
+                    resolved = _resolve_pulse(config, mode)
                     os.environ["PULSE_SERVER"] = resolved["server"]
                     process = subprocess.Popen(
                         _pulse_command(mode, config["device"]),
