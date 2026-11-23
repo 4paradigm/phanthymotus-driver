@@ -53,13 +53,9 @@ class FakeLocoPlugin:
 
     def start(self):
         self.started = True
-        if self.walking_mode is not None:
-            self.walking_mode.start()
 
     def stop(self):
         self.stopped = True
-        if self.walking_mode is not None:
-            self.walking_mode.stop()
 
     def dispatch(self, action, _args):
         return {"state": action}
@@ -253,17 +249,17 @@ def test_packaged_defaults_advertise_walking_mode_without_contacting_robot(
     assert tools["loco_relative_move"]["inputSchema"]["x-completion"] == {
         "actions": ["rotate", "move"], "timeout": 120}
     assert bundle._plugins[0]._walking_mode is bundle._walking_mode
-    assert bundle.dispatch("walking_mode", {"action": "info"})["command_sent"] is False
+    for name in ("loco", "loco_relative_move"):
+        assert bundle.dispatch(name, {"action": "start"}) == {"state": "ready"}
     # Existing shutdown braking is independent of declaration/startup checks.
     monkeypatch.setattr(bundle._plugins[0], "_stop_move", lambda: {"state": "stopped"})
     bundle.stop_all()
-    assert bundle._walking_mode._stopped is True
     driver = yaml.safe_load((BUMI / "driver.yaml").read_text(encoding="utf-8"))
     assert "walking_mode" not in [card["name"] for card in driver["cards"]]
 
 
 @pytest.mark.parametrize("model", ["lower_body", "whole_body"])
-def test_walking_mode_dispatch_accepts_a_request_without_action(bundle_module, model, monkeypatch):
+def test_removed_standalone_tool_rejects_calls(bundle_module, model, monkeypatch):
     bundle = bundle_module.BumiDeviceBundle(
         {"plugins": {"loco": {"enabled": True}, "walking_mode": {"enabled": True}}},
         "bumi_test", object(), FakeHighCtrl(), None)
@@ -272,12 +268,13 @@ def test_walking_mode_dispatch_accepts_a_request_without_action(bundle_module, m
     switcher = bundle._walking_mode
     assert switcher._loco is loco
     assert loco.walking_mode is switcher
-    monkeypatch.setattr(switcher, "_switch", lambda requested: {
-        "state": "test_dispatch", "requested_walking_model": requested})
+    def unexpected_switch(_model):
+        raise AssertionError("a removed tool must not switch the robot")
+
+    monkeypatch.setattr(switcher, "_switch", unexpected_switch)
     assert [tool["name"] for tool in bundle.get_all_tools()] == ["loco"]
     result = bundle.dispatch("walking_mode", {"walking_model": model})
-    assert result["state"] == "test_dispatch"
-    assert result["requested_walking_model"] == model
+    assert result is None
     bundle.stop_all()
 
 
@@ -512,6 +509,113 @@ def test_mode_acceptance_waits_for_the_entire_brake(locomotion_bundle, monkeypat
     assert not request.is_alive()
     assert results[0]["state"] == "completed"
     assert events == ["brake_start", "brake_end", "mode_write"]
+
+
+@pytest.mark.parametrize("tool_name", ["loco", "loco_relative_move"])
+@pytest.mark.parametrize("stop_action", ["stop", "stop_move", "shutdown"])
+def test_stop_allows_a_later_switch_from_either_card(
+        locomotion_bundle, monkeypatch, tool_name, stop_action):
+    bundle = locomotion_bundle
+    loco, = bundle._plugins
+    entered, release = threading.Event(), threading.Event()
+    original = bundle._walking_mode._switch
+    results = []
+
+    def switch(model):
+        entered.set()
+        assert release.wait(timeout=2)
+        return original(model)
+
+    monkeypatch.setattr(bundle._walking_mode, "_switch", switch)
+    monkeypatch.setattr(loco._high_ctrl, "publish_cmd", lambda *_args: None)
+    request = threading.Thread(target=lambda: results.append(bundle.dispatch(
+        tool_name, {"action": "walking_mode", "walking_model": "whole_body"})))
+    request.start()
+    try:
+        assert entered.wait(timeout=2)
+        if stop_action == "shutdown":
+            bundle.stop_all()
+        else:
+            assert bundle.dispatch(tool_name, {"action": stop_action})["state"] in ("idle", "stopped")
+    finally:
+        release.set()
+        request.join(timeout=2)
+    assert not request.is_alive()
+    assert results[0]["code"] == "cancelled"
+    calls = []
+
+    def complete(model):
+        assert not bundle._walking_mode._cancel.is_set()
+        calls.append(model)
+        return {"state": "completed", "walking_model": model}
+
+    monkeypatch.setattr(bundle._walking_mode, "_switch", complete)
+    for name in ("loco", "loco_relative_move"):
+        result = bundle.dispatch(name, {"action": "walking_mode", "walking_model": "lower_body"})
+        assert result["state"] == "completed"
+        assert result["walking_model"] == "lower_body"
+    assert calls == ["lower_body", "lower_body"]
+
+
+def test_slow_command_write_bounds_the_real_stop_move_wait(locomotion_bundle, monkeypatch):
+    import walking_mode_client
+
+    bundle = locomotion_bundle
+    loco, = bundle._plugins
+    bundle._walking_mode._query_timeout = 15.0
+    writing, finished = threading.Event(), threading.Event()
+    events, results = [], []
+
+    class Socket:
+        incoming = walking_mode_client.encode_packet({"cmd": "status", "data": {"status": 2}})
+
+        def settimeout(self, timeout):
+            self.timeout = timeout
+
+        def sendall(self, data):
+            if json.loads(data[16:-4])["cmd"] == "run":
+                assert self.timeout <= 0.1
+                writing.set()
+                finished.wait(timeout=self.timeout)
+                events.append("write_timeout")
+                raise TimeoutError("command write timed out")
+
+        def recv(self, size):
+            data, self.incoming = self.incoming[:size], self.incoming[size:]
+            return data
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(walking_mode_client.socket, "create_connection", lambda *_args: Socket())
+    monkeypatch.setattr(loco._high_ctrl, "get_mode", lambda: 2, raising=False)
+    monkeypatch.setattr(loco._high_ctrl, "get_joint_state", lambda: [
+        types.SimpleNamespace(vel=0.0) for _ in range(21)], raising=False)
+    monkeypatch.setattr(loco._high_ctrl, "publish_cmd", lambda *_args: events.append("brake"))
+    request = threading.Thread(target=lambda: results.append(bundle.dispatch(
+        "loco", {"action": "walking_mode", "walking_model": "whole_body"})))
+
+    def stop():
+        bundle.dispatch("loco_relative_move", {"action": "stop_move"})
+        finished.set()
+
+    stopper = threading.Thread(target=stop)
+    request.start()
+    try:
+        assert writing.wait(timeout=2)
+        stopper.start()
+        assert finished.wait(timeout=0.5)
+    finally:
+        finished.set()
+        request.join(timeout=2)
+        if stopper.ident is not None:
+            stopper.join(timeout=2)
+    assert not request.is_alive()
+    assert not stopper.is_alive()
+    assert events == ["write_timeout", "brake"]
+    assert results[0]["command_may_have_been_sent"] is True
+    assert results[0]["mode_verified"] is False
+    assert not loco.is_moving()
 
 
 def test_mcp_discovers_both_actions_and_executes_each_mode(locomotion_bundle_module, monkeypatch):

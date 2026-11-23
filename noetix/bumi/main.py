@@ -247,10 +247,6 @@ class BumiDeviceBundle:
         return tools
 
     def dispatch(self, tool_name: str, args: dict) -> dict | None:
-        # Saved skills can still call the former standalone tool. New tool
-        # discovery exposes mode selection through the two locomotion cards.
-        if tool_name == "walking_mode" and self._walking_mode is not None:
-            return self._walking_mode.dispatch(args.pop("action", tool_name), args)
         for p in self._plugins:
             plugin_tools = p.get_tools() if hasattr(p, 'get_tools') else [p.get_tool()]
             for tool_def in plugin_tools:

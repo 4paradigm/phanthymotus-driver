@@ -371,142 +371,27 @@ navi 流水线时仍保留 `dry_run: true`，用于核对视觉控制方向。�
 ## 运动卡片中的行走模式切换
 
 在 `loco` 或 `loco_relative_move` 的 `ACTION` 中选择 `walking_mode`，
-即可显示 `walking_model` 下拉框，选项为 `lower_body`（仅腿部行走）与
-`whole_body`（全身行走）。该字段仅属于模式切换动作。已有动作继续使用各自的
-速度、距离、角度参数和原有执行逻辑。
-`loco.move` 及 `loco_relative_move` 的 `move`、`rotate` 均接受反馈状态 2、3，
-速度命令沿用 `ControlCmd.DEFAULT` 并保留所选模式。
-相对移动需要同时填写 `x_m`、`y_m`，直行时将 `y_m` 填为 0。
+再选择 `walking_model` 的 `lower_body`（仅腿部）或 `whole_body`（全身）。
 
 ```json
-{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"loco","arguments":{"action":"walking_mode","walking_model":"lower_body"}}}
+{"name":"loco","arguments":{"action":"walking_mode","walking_model":"whole_body"}}
 ```
 
-同样的请求可将 `name` 改为 `loco_relative_move`。两张卡片共用一个独立的
-模式切换后端和底盘预留。模式切换调用等待校验结束，直接向本次请求返回
-`action=walking_mode` 及完成、取消或错误结果，沿用发现、查询和校验的超时配置。
-模式切换请求只向后端传递 `walking_model`。原有 `loco_relative_move` 的
-`rotate`、`move` 继续使用各自的异步 ACP 协议。
-两张卡片的 `stop_move` 均可取消模式切换并刹停，取消与整个刹停过程共用
-模式写入锁。写入已经开始时，停止请求等待该次写入结束再刹停。
+`loco.move` 和 `loco_relative_move` 的移动、旋转均支持两种模式。
+相对移动需要同时填写 `x_m`、`y_m`，直行时 `y_m` 填 0。
+切换前须平稳站立并停止移动，已有底盘动作或非行走状态会拒绝切换。
+切换只发送一次，经服务端与 SDK 反馈确认后同步返回最终结果。
+两张卡片的 `stop_move` 均可取消本次切换，后续请求可直接通过任一卡片发起。
 
-**默认配置启用两张卡片中的模式切换动作。**
-新镜像部署并启动后，只要 SDK 控制器初始化成功、`loco` 已启用且驱动在线，
-两张卡片均可发现该动作。模式切换后端在注册、启动时只初始化本地状态，
-执行时才连接 App 接口。保留原配置项 `plugins.walking_mode.enabled`，
-设为 `false` 并重启驱动即可关闭两张卡片中的该动作。
-旧镜像及通过 `CONFIG_PATH` 指定的自定义配置沿用各自的配置。
-已保存的 skill 仍可用原工具名 `walking_mode` 及 `walking_model` 参数同步调用，
-该兼容入口沿用原协议。新工具目录统一展示两张运动卡片。
-当前 SDK 没有已核验的步态选择入口，因此本卡复用官方 App 的 TCP 命令，
-SDK 只用于读取现有控制器的反馈，不实例化另一个 `HighController`。
-
-执行时先预留 `loco` 的底盘，已有移动、转向或身体动作则拒绝切换；
-处于使能、准备、保护等非行走模式时同样拒绝，不会自动使能或起身。
-App 与 SDK 必须先报告一致的 2/3 模式；已处于目标模式则直接返回，不重发命令。
-实际切换前暂停 `loco_servo`，检查全部 21 个关节速度均低于 `0.15 rad/s`，
-并再次检查模式未变化。发送一次 `walk` 或 `run` 后，连续两次确认 App 与
-SDK 的反馈均为目标代码，校验结果包含 `state=completed`、`mode_verified=true`。
-超时、保护或断连不会自动重试、回退或恢复流式移动；发送中断时会保留
-`command_may_have_been_sent`，避免误报指令肯定未到达。
-
-默认在 UDP 9090 被动接收 `discovery_source_ip` 指定的运动板广播，
-取其 `perception_ip` 连接 TCP 8888；不发送扫描报文，也不把实验机器 IP 写进代码。
-UDP 不可用时可在部署配置中指定 `app_host`。驱动容器需要能访问该地址。
-`loco`、`loco_relative_move` 共用状态 2/3 的运动检查，保护状态及其他非行走状态会返回错误。
-`loco_servo` 的流式速度门槛为状态 2。
-
-2026-11-11 核对了本仓库附带的 SDK 3.1.0 头文件、Python 绑定和示例，
-并对照了厂家的公开文档与当前 SDK 源码：
-
-- [厂家 HighController 文档](https://web.noetixrobotics.com/docs/#3-highcontroller常用接口及参数表)
-  仅声明 `WALK` 为走路模式，`RUN` 为当前不可用的预留命令，`index` 为示教索引。
-- [厂家 HighController 头文件](https://github.com/Noetix-Robotics/noetix_sdk_bumi/blob/main/include/highcontroller.h)
-  公开 `publish_cmd` 和状态订阅，没有分别设置两种行走模式的接口。
-- [厂家 ControlCmd 定义](https://github.com/Noetix-Robotics/noetix_sdk_bumi/blob/main/include/common.h)
-  与本仓库的枚举一样，未列出 lower-body / whole-body 选择项。
-
-这些资料不能确定两种模式对应的 DDS 调用，也不能证明目标固件没有该能力。
-本卡没有向 SDK 发送 `WALK` / `RUN`，也没有用 `WALK` 的 `index=0/1`
-选择步态。2026-11-13 的分支基线为官方 driver 主分支
-`18211f9902549ce931867a3622cbb96d4c79183b`。
-
-2026-11-11 用户提供了 NOETIX Run 连接实机后的控制页照片，明确显示独立的
-“行走”和“全身行走”入口。因此，App 入口存在已获确认，当前缺口是它们与 SDK
-命令的准确对应关系，不能据公开文档未列出就判断机器人不支持。
-
-进一步只读检查了[厂家下载页](https://app-api.noetixrobotics.com/)提供的
-`noetix-installer-3.1.2.apk`（SHA-256：
-`dc3f035c6bf7a2a99d73dd3fcb41be461673f890f24d256352e9b9440c3eee17`）。
-其中有 `walk_mode_*`、`bumi_run_*` 图标资源，以及 `walkMode`、`runMode`、
-`RobotCommandSender` 等内部名称。继续解析包内 Flutter 3.6.1 的 AOT 快照后，
-已核对两种命令对象的初始化和序列化逻辑：
-
-| 选择需求 | App Wi-Fi JSON | App 蓝牙 JSON |
-| --- | --- | --- |
-| `lower_body`，App 的“行走” | `{"cmd":"walk"}` | `{"cmd":18,"data":[1]}` |
-| `whole_body`，Bumi 的“全身行走”使用内部 run 分支 | `{"cmd":"run"}` | `{"cmd":18,"data":[2]}` |
-
-定位依据为 `WifiCommand.walkMode`（`0x604138`）、`WifiCommand.runMode`
-（`0x626fc8`）、`BleCommand.walkMode`（`0x6040d0`）、`BleCommand.runMode`
-（`0x626f60`），以及两者的 `toJson` 和 `ControlRobotController.updateModeList`
-（`0x626a50`）；显示名称由 `ModeType.title`（`0x61d52c`）区分机型。
-这些是上述特定安装包的代码地址，不是稳定协议版本号。
-
-关键限制是：同一 App 的 `BumiRobotStatusType` 将 `walk` 的状态值定义为 2，
-将 `run` 的状态值定义为 3，并在后者附带“DDS无法触发”的说明。
-因此，App 的 `cmd="run"` 不能直接视为 DDS SDK 的 `ControlCmd.RUN`（枚举值 4）。
-这些静态结果证明 App 的编码方法，不能把它们直接塞入 DDS。
-
-继续检查同一 APK 的 `classes3.dex`，`WifiService.connect` 使用设备发现消息中的
-`perception_ip:8888`；`MessageContent.parse` 与 `ProtocolUtils.buildPacket`
-将 UTF-8 JSON 封为：8 字节 magic `be ba fe ca ef be ad de`、4 字节正文长度、
-4 字节消息类型（JSON 为 0）、正文、4 字节重复正文长度；整数均为小端。
-`get_status` 是查询命令，响应为 `{"cmd":"status","data":{"status":2}}`。
-上述方法在该 DEX 中的 code offset 分别为 `0x345974`、`0x348228`、`0x346924`；
-这些偏移仅用于定位该安装包。
-
-现场只读监听收到运动板 `192.168.55.102` 的 UDP 广播，其中包含网络地址。
-在 Windows 端使用上述封包发送一次 `get_status`，已收到合法的
-`status=2` 响应，连接随后关闭；没有发送 `walk` 或 `run`。这验证了查询协议，
-尚未验证命令会切换当前实机或多客户端之间的控制权处理。
-
-2026-11-11 用户提供了在 App 中反复手动切换时的实机 `motion_state` 日志，
-并确认期间一直在主动往返点击。20:50:22—20:50:33 共 23 条记录，
-状态码 2 出现 13 次，状态码 3 出现 10 次，共有 10 次双向变化，
-最后回到 2；所有记录均为 `fresh=true`、`protection=false`。
-例如 20:50:22 为 2、20:50:23 进入 3、20:50:24 返回 2。
-结合 App 的状态定义，该实机的“行走”与“全身行走”可分别通过反馈码 2、3
-区分。驱动保留 2 的既有名称 `walking`，为 3 补上 `whole_body_walking`，
-避免显示 `unknown`。这次观察没有验证 SDK 切换命令，也不能把反馈码 3
-当作 `publish_cmd` 的 action；SDK 命令枚举 3 实际为 `CHEER`。
-
-厂家 SDK 当前提交 `20750fda734da0ef4c2fe28226b0d506a1f32273` 的 x86 静态库中，
-`publish_cmd` 直接把枚举写入 DDS action，只在保存与播放示教时写入 index；
-因此给 `WALK` 设置不同的 index 无法用该接口选步态。
-上述 2026-11-11 日志中的切换由用户在 App 中手动完成。
-
-2026-11-17 用户确认现有独立卡片的执行效果，并提供全身行走切换成功的截图，
-结果包含 `walking_model=whole_body`、App/SDK 状态码 3、
-`command_sent=true`、`mode_verified=true`。
-本次集成复用同一套切换协议和反馈校验。两张运动卡片的新入口已进行离线验证，
-部署新镜像后的画布交互和实机切换需继续验证。
-
-后续实测反馈切换后机器人持续前后摇动。只读检查确认驱动运行于
-`release.261117.3944b9d`，`loco_servo` 当时为 idle、空跑开启、发布计数为 0。
-Agent Core 日志记录了手动切换的 ACP 完成通知唤醒决策核心，随后出现全身模式的
-再次调用。因此两张卡片中的模式切换改为同步返回最终结果，完成通知留在本次
-请求中。此调整用于消除已观察到的决策触发链，实际摇动的消除效果需实机复测。
-
-在仓库根目录运行离线验证。
-
-```powershell
-python -X utf8 -m pytest tests/test_bumi_walking_mode.py tests/test_bumi_walking_mode_client.py tests/test_bumi_motion_state.py tests/test_bumi_bundle.py tests/test_bumi_loco_servo.py noetix/bumi/tests/test_loco_destination.py -q
-```
-
-上述测试覆盖两张卡片的参数分组与 MCP HTTP 调用、旧入口兼容、启用依赖、
-底盘预留、并发与取消、停止/写入串行化、调用结果隔离、静止检查、双路反馈、断连/超时/保护处理、
-TCP 分帧、`motion_state` 状态区分，以及原有旋转和目标移动的回归验证。
+`plugins.loco.enabled` 和 `plugins.walking_mode.enabled` 默认均为 `true`。
+`plugins.walking_mode.app_host` 可指定机器人模式服务的 IPv4 地址，跳过 UDP 发现。
+留空时按 `discovery_source_ip` 监听 UDP 9090，端口无法共享时需指定 `app_host`。
+发现、查询和确认超时分别由 `discovery_timeout_s`、`query_timeout_s`、
+`verify_timeout_s` 控制，默认 3、1、4 秒。整次网络等待最多 20 秒，
+调用方超时应长于此值，Agent Core 的 actuator 默认调用超时为 60 秒。
+命令写入单独限制为 100 毫秒，停止请求等待当前写入结束后刹停。
+超时、保护或断连会返回错误，发送中断时保留 `command_may_have_been_sent`。
+该功能依赖机器人模式服务的网络可达性及固件支持。
 
 ## Direct action cards
 

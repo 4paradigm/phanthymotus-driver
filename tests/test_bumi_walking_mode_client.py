@@ -1,9 +1,11 @@
 """Golden App frames and fragmented, malformed and missing TCP responses."""
 
 import importlib.util
+import errno
 import json
 import struct
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -19,9 +21,11 @@ class Socket:
         self.incoming = incoming
         self.outgoing = []
         self.closed = False
+        self.timeouts = []
 
     def settimeout(self, timeout):
         assert timeout > 0
+        self.timeouts.append(timeout)
 
     def sendall(self, data):
         self.outgoing.append(data)
@@ -102,6 +106,75 @@ def test_unknown_model_sends_nothing(monkeypatch):
     assert sock.outgoing == []
 
 
+def test_command_timeout_is_shorter_than_status_timeout(monkeypatch):
+    incoming = MODULE.encode_packet({"cmd": "status", "data": {"status": 2}})
+    sock, client = connection(monkeypatch, incoming)
+    client.timeout = 5.0
+    with client:
+        client.set_walking_model("whole_body")
+        assert sock.timeouts == [0.1]
+        assert client.get_status() == 2
+        assert sock.timeouts[1] == 5.0
+
+
+def test_request_deadline_caps_connect_and_command_write(monkeypatch):
+    now = [0.0]
+    sock = Socket()
+    connect_timeouts = []
+    monkeypatch.setattr(MODULE, "time", SimpleNamespace(monotonic=lambda: now[0]))
+
+    def connect(address, timeout):
+        connect_timeouts.append(timeout)
+        return sock
+
+    monkeypatch.setattr(MODULE.socket, "create_connection", connect)
+    with MODULE.WalkingModeClient("127.0.0.1", timeout=15.0, deadline=2.0) as client:
+        assert connect_timeouts == [2.0]
+        now[0] = 1.95
+        client.set_walking_model("whole_body")
+        assert sock.timeouts == [pytest.approx(0.05)]
+        now[0] = 2.0
+        with pytest.raises(TimeoutError):
+            client.set_walking_model("lower_body")
+        assert sock.outgoing == [MODULE.encode_packet({"cmd": "run"})]
+    assert sock.closed
+
+
+def test_status_send_and_read_share_one_query_budget(monkeypatch):
+    now = [0.0]
+    sock, client = connection(monkeypatch, b"")
+    monkeypatch.setattr(MODULE, "time", SimpleNamespace(monotonic=lambda: now[0]))
+
+    def send(data):
+        sock.outgoing.append(data)
+        now[0] += 1.0
+
+    monkeypatch.setattr(sock, "sendall", send)
+    monkeypatch.setattr(sock, "recv", lambda _size: pytest.fail("query budget exhausted during send"))
+    with client, pytest.raises(TimeoutError):
+        client.get_status()
+    assert sock.closed
+    assert sock.timeouts == [1.0]
+
+
+def test_status_read_is_capped_by_the_request_deadline(monkeypatch):
+    now = [0.0]
+    sock = Socket()
+    monkeypatch.setattr(MODULE, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    monkeypatch.setattr(MODULE.socket, "create_connection", lambda *_args: sock)
+
+    def recv(_size):
+        now[0] += sock.timeouts[-1]
+        raise TimeoutError("status timed out")
+
+    monkeypatch.setattr(sock, "recv", recv)
+    with MODULE.WalkingModeClient("127.0.0.1", timeout=15, deadline=2) as client:
+        with pytest.raises(TimeoutError):
+            client.get_status()
+    assert now[0] == 2.0
+    assert sock.timeouts == [2.0, 2.0]
+
+
 def test_discovery_accepts_only_the_configured_motion_board(monkeypatch):
     expected_source = "192.168.55.102"
 
@@ -119,7 +192,12 @@ def test_discovery_accepts_only_the_configured_motion_board(monkeypatch):
         def __exit__(self, *_args):
             pass
 
+        def setsockopt(self, level, option, value):
+            assert (level, option, value) == (MODULE.socket.SOL_SOCKET, MODULE.socket.SO_REUSEADDR, 1)
+            self.reuse = True
+
         def bind(self, address):
+            assert self.reuse
             assert address == ("0.0.0.0", 9090)
 
         def settimeout(self, _timeout):
@@ -130,3 +208,22 @@ def test_discovery_accepts_only_the_configured_motion_board(monkeypatch):
 
     monkeypatch.setattr(MODULE.socket, "socket", lambda *_args: Receiver())
     assert MODULE.discover_host(expected_source, 1.0) == "192.0.2.22"
+
+
+def test_exclusive_discovery_port_reports_the_explicit_host_fallback(monkeypatch):
+    class Receiver:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+        def setsockopt(self, *_args):
+            pass
+
+        def bind(self, _address):
+            raise OSError(errno.EADDRINUSE, "Address already in use")
+
+    monkeypatch.setattr(MODULE.socket, "socket", lambda *_args: Receiver())
+    with pytest.raises(MODULE.AppProtocolError, match="plugins.walking_mode.app_host"):
+        MODULE.discover_host("192.168.55.102", 1.0)

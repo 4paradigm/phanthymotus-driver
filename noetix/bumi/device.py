@@ -681,8 +681,7 @@ class LocoPlugin:
         }
 
     def start(self) -> None:
-        if self._walking_mode is not None:
-            self._walking_mode.start()
+        pass  # The standalone distance worker reads the SDK IMU and joint states directly.
 
     def stop(self) -> None:
         # BumiDeviceBundle.stop_all calls this during SIGTERM/redeploy. The
@@ -691,8 +690,6 @@ class LocoPlugin:
         # completes the ACP action before Agent Core is left holding a
         # pending action (mirrors VisionCapturePlugin.stop).
         self._stop_move()
-        if self._walking_mode is not None:
-            self._walking_mode.stop()
         self._wait_for_rotate_idle()
 
     def _wait_for_rotate_idle(self, timeout_s: float = 6.0) -> bool:
