@@ -47,6 +47,10 @@ class BatteryTest(unittest.TestCase):
             bundle.start_all()
             definition, = bundle.get_all_tools()
             self.assertEqual((definition["name"], definition["type"]), ("battery", "sensor"))
+            with self.subTest("plugin prefix"):
+                self.assertEqual(BatteryCard.PREFIX, definition["name"])
+            with self.subTest("unknown action"):
+                self.assertIsNone(call("unsupported"))
             self.assertEqual(set(definition["inputSchema"]["properties"]["action"]["enum"]),
                              {"info", "start", "stop"})
             self.assertEqual(definition["topic_out"], [{"topic": "/test_q1/battery", "format": "data/json"}])

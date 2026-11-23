@@ -12,8 +12,10 @@ from robot import read_robot
 
 
 class BatteryCard:
+    PREFIX = "battery"
+
     def __init__(self, namespace, ros, robot_domain):
-        self.topic = f"/{namespace}/battery"
+        self.topic = f"/{namespace}/{self.PREFIX}"
         self.output = [{"topic": self.topic, "format": "data/json"}]
         self.node = Node("primebot_q1_battery", context=ros.ctx_core)
         self.publisher = self.node.create_publisher(String, self.topic, 5)
@@ -29,7 +31,7 @@ class BatteryCard:
         self.timer = None
 
     def get_tool(self):
-        return tool("battery", "sensor", "启元 Q1 电池：SOC、电压、电流、功率、温度、剩余容量与循环次数",
+        return tool(self.PREFIX, "sensor", "启元 Q1 电池：SOC、电压、电流、功率、温度、剩余容量与循环次数",
                     action_schema({"info": ([], "状态与数据话题"), "start": ([], "开始输出"),
                                    "stop": ([], "暂停输出")}, {}),
                     topic_out=self.output)
@@ -82,7 +84,7 @@ class BatteryCard:
                 self.active = True
             elif action == "stop":
                 self.active = False
-            elif action not in ("info", "battery"):
-                raise ValueError(f"Unknown battery action: {action}")
+            elif action not in ("info", self.PREFIX):
+                return None
             return {"state": "running" if self.active else "idle", "topic_out": self.output,
                     "data": self.snapshot()}
