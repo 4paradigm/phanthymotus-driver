@@ -73,6 +73,47 @@ def test_rejects_invalid_or_impostor_xiaohongshu_urls(url):
         validate_stream_url(url)
 
 
+
+def test_other_platform_valid_public_rtmp_and_rtmps():
+    for url in (
+        "rtmp://rtmp.youtube.com/live2/FAKE_STREAM_KEY",
+        "rtmps://rtmp.youtube.com:443/live2/FAKE_STREAM_KEY",
+    ):
+        assert validate_stream_url(url) == ("other", url)
+
+
+@pytest.mark.parametrize("host", [
+    "localhost", "localhost.local", "127.0.0.1", "10.0.0.8",
+    "192.168.3.22", "169.254.169.254", "[::1]", "robot.internal",
+    "push.test", "live-push.xhscdn.com.evil.com",
+    "fake-live-push.xhscdn.com", "tx.direct.huya.com",
+])
+def test_other_platform_rejects_private_and_impostor_hosts(host):
+    with pytest.raises(ValueError):
+        validate_stream_url(f"rtmp://{host}/live/key")
+
+
+@pytest.mark.parametrize("url", [
+    "http://rtmp.youtube.com/live2/key",
+    "rtmp://rtmp.youtube.com/live2/",
+    "rtmp://rtmp.youtube.com/live2",
+    "rtmp://rtmp.youtube.com:4444/live2/key",
+    "rtmp://username:password@rtmp.youtube.com/live2/key",
+    "rtmp://rtmp.youtube.com/live2/key#fragment",
+    "rtmp://rtmp.youtube.com/live2/key\\nforged",
+])
+def test_other_platform_rejects_missing_key_and_unsafe_urls(url):
+    with pytest.raises(ValueError):
+        validate_stream_url(url)
+
+
+def test_other_platform_private_store_roundtrip(tmp_path):
+    url = "rtmp://rtmp.youtube.com/live2/FAKE_STREAM_KEY"
+    store = HuyaCredentialStore(tmp_path / "private" / "url")
+    store.save(url)
+    assert store.read() == url
+
+
 def test_xiaohongshu_store_is_private_and_restored(tmp_path):
     store = HuyaCredentialStore(tmp_path / "private" / "rtmp")
     store.save(XHS_URL)
