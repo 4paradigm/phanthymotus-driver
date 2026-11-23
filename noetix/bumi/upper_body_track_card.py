@@ -133,8 +133,16 @@ class _PoseEngine:
     def load(self):
         if self._model is not None:
             return
-        from ultralytics import YOLO
-        self._model = YOLO(self.model_path)
+        try:
+            from ultralytics import YOLO
+            self._model = YOLO(self.model_path)
+        except Exception as exc:
+            # `info` exposes model.error so an operator can tell "runtime not
+            # installed / weights unreadable" from "no person in frame"; leave
+            # this populated even though detect() re-raises into the worker's
+            # throttled last_error path.
+            self._error = f"{type(exc).__name__}: {exc}"
+            raise
         self._error = None
 
     def detect(self, bgr):

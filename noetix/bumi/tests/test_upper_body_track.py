@@ -466,3 +466,85 @@ def test_frame_failures_are_throttled(monkeypatch):
     assert len(warnings) == 2  # first failure and the 100th, not 101
     assert "bad frame" in warnings[0]
     assert "100" in warnings[1]
+
+
+def test_start_subscribes_and_stop_releases_them(monkeypatch):
+    """The canvas contract: dispatch start builds subscriptions, stop tears them down.
+
+    This exercises the real plugin constructor, dispatch and teardown paths with
+    only a ROS stub — no hardware, model download or GPU. `start`/`stop` on the
+    bundle are lifecycle hooks that must not begin inference until the canvas
+    resolves the camera topic in dispatch("start").
+    """
+    import types
+
+    card = _load_card_module(monkeypatch)
+
+    class _FakeNode:
+        def __init__(self, *_args, **_kwargs):
+            self.subs = []
+            self.destroyed = []
+            self._logger = types.SimpleNamespace(
+                info=lambda *_: None, warning=lambda *_: None)
+
+        def create_publisher(self, *_args, **_kwargs):
+            return types.SimpleNamespace(publish=lambda *_: None)
+
+        def create_subscription(self, _msg_type, topic, _cb, _qos):
+            sub = types.SimpleNamespace(topic=topic)
+            self.subs.append(sub)
+            return sub
+
+        def destroy_subscription(self, sub):
+            self.destroyed.append(sub.topic)
+            if sub in self.subs:
+                self.subs.remove(sub)
+
+        def get_logger(self):
+            return self._logger
+
+    monkeypatch.setattr(card, "Node", _FakeNode)
+    executor = types.SimpleNamespace(add_node=lambda *_: None)
+
+    plugin = card.UpperBodyTrackPlugin({}, "bumi", executor)
+    node = plugin._node
+    # Constructing and bundle-starting must not subscribe: the camera topic is
+    # supplied by the canvas only at dispatch("start").
+    plugin.start()
+    assert node.subs == []
+    assert plugin.dispatch("info", {})["state"] == "idle"
+
+    result = plugin.dispatch("start", {"input_topic": "/camera/color/image_raw/compressed"})
+    assert result["state"] == "running"
+    assert [s.topic for s in node.subs] == ["/camera/color/image_raw/compressed"]
+    info = plugin.dispatch("info", {})
+    assert info["state"] == "running"
+    assert info["topic_in"][0]["topic"] == "/camera/color/image_raw/compressed"
+
+    # A depth topic adds a second subscription; both are released on stop.
+    result = plugin.dispatch("start", {
+        "input_topic": "/camera/color/image_raw/compressed",
+        "depth_topic": "/camera/depth/image_raw/compressed",
+    })
+    assert [s.topic for s in node.subs] == [
+        "/camera/color/image_raw/compressed",
+        "/camera/depth/image_raw/compressed",
+    ]
+    assert len(result["topic_in"]) == 2
+
+    assert plugin.dispatch("stop", {}) == {"state": "idle"}
+    # First color sub was replaced by the second start; stop releases the
+    # current color and depth subs. All three releases are accounted for.
+    assert node.destroyed == [
+        "/camera/color/image_raw/compressed",
+        "/camera/color/image_raw/compressed",
+        "/camera/depth/image_raw/compressed",
+    ]
+    assert plugin._color_sub is None and plugin._depth_sub is None
+    assert plugin.dispatch("info", {})["state"] == "idle"
+
+    # The bundle stop hook reaches the same teardown, and is safe twice.
+    plugin.dispatch("start", {"input_topic": "/camera/color/image_raw/compressed"})
+    plugin.stop()
+    plugin.stop()
+    assert plugin._color_sub is None

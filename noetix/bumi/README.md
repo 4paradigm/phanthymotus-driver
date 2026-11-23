@@ -533,10 +533,19 @@ at runtime, so building an image that can run this card requires the build-time
 flag `--build-arg INSTALL_POSE_DEPS=1` (the dependency is pinned in the
 `Dockerfile`). With the repository's build script:
 `./build.sh --build-arg INSTALL_POSE_DEPS=1 noetix/bumi`. A default build stays
-free of torch and cannot run the card, so
-turning the plugin on without rebuilding leaves it unloaded — the card's
-`info` reports the import error. To use it, build with that flag, enable the
-plugin, and wire the camera's RGB topic into the card's `start` action via the
-canvas; depth is optional — without it the card falls back to a flat-plane
-assumption and says so in `degraded`. The sign of each axis can be corrected
-per robot in `config.yaml` or overridden at `start` without rebuilding.
+free of torch and cannot run the card. The card module itself still loads —
+`ultralytics` is imported lazily on the first frame, not at load time — so
+enabling the plugin on a default image is not fatal, but inference raises on
+that first frame and the import error then shows up in `info` as `model.error`
+and `last_error`. There is no point enabling it without rebuilding. To use it,
+build with that flag, enable the plugin, and wire the camera's RGB topic into
+the card's `start` action via the canvas; depth is optional — without it the
+card falls back to a flat-plane assumption and says so in `degraded`. The sign
+of each axis can be corrected per robot in `config.yaml` or overridden at
+`start` without rebuilding.
+
+The [pose-dependency size record](review-evidence/image-size-upper-body-track.md)
+documents the pinned ARM64 wheels behind the enabled image's growth (about
+101 MiB across torch, torchvision and ultralytics; the default image is
+unchanged), why the ARM64 torch wheel is already the smallest official build,
+and the commands to measure the full-image delta on an ARM64 builder.
