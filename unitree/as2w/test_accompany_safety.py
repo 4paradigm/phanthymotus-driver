@@ -11,6 +11,7 @@ turns exactly one named test red:
 * Low    — the driver catalogue description must advertise the new card.
 """
 import importlib.util
+import queue
 import sys
 import threading
 import time
@@ -118,6 +119,93 @@ class RpcChannelIsolationTests(unittest.TestCase):
         self.assertEqual(0, result["stop"])
         self.assertLess(elapsed, 1.0,
                         f"stop took {elapsed:.2f}s behind an outstanding poll")
+
+
+class GetStateContractTests(unittest.TestCase):
+    """High finding: both sport workers must pass a mutable state_map.
+
+    ``SportClient.GetState(state_map)`` mutates the dict it receives. Calling
+    it bare raises TypeError, which ``_RpcChannel.call`` converts into the
+    ``(3104, {})`` fallback — the observer then never learns an FSM name.
+    These tests run the real ``_serve`` loop with a fake SDK enforcing the
+    signature, instead of mocking away the call convention.
+    """
+
+    @staticmethod
+    def _fake_modules(client_class):
+        channel = types.ModuleType("unitree_sdk2py.core.channel")
+        channel.ChannelFactoryInitialize = lambda *a, **k: None
+        client_module = types.ModuleType(
+            "unitree_sdk2py.as2.sport.sport_client")
+        client_module.SportClient = client_class
+        return {
+            "unitree_sdk2py": types.ModuleType("unitree_sdk2py"),
+            "unitree_sdk2py.core": types.ModuleType("unitree_sdk2py.core"),
+            "unitree_sdk2py.core.channel": channel,
+            "unitree_sdk2py.as2": types.ModuleType("unitree_sdk2py.as2"),
+            "unitree_sdk2py.as2.sport": types.ModuleType(
+                "unitree_sdk2py.as2.sport"),
+            "unitree_sdk2py.as2.sport.sport_client": client_module,
+        }
+
+    def _run_getstate(self, kind):
+        rpc = _load("as2w_rpc_contract_under_test", ROOT / "rpc_proxy.py")
+        commands = queue.Queue()
+        results = queue.Queue()
+        commands.put((1, "GetState", ()))
+        commands.put(None)
+        calls = []
+
+        class FakeSportClient:
+            def __init__(self):
+                pass
+
+            def SetTimeout(self, seconds):
+                pass
+
+            def Init(self):
+                pass
+
+            def GetState(self, state_map):  # exact SDK signature
+                calls.append(dict(state_map))
+                state_map["fsm_name"] = "AI_ACCOMPANY"
+                return 0
+
+        modules = self._fake_modules(FakeSportClient)
+        originals = {name: sys.modules.get(name) for name in modules}
+        sys.modules.update(modules)
+        try:
+            worker = threading.Thread(
+                target=rpc._serve, args=(commands, results, "eth0", kind),
+                daemon=True)
+            worker.start()
+            ready = results.get(timeout=3.0)
+            self.assertTrue(ready.get("ready"), ready)
+            outcome = results.get(timeout=3.0)
+            worker.join(timeout=3.0)
+        finally:
+            for name, original in originals.items():
+                if original is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = original
+        return outcome, calls
+
+    def test_motion_worker_passes_a_state_map(self):
+        outcome, calls = self._run_getstate("sport")
+        self.assertNotIn("error", outcome, outcome)
+        self.assertEqual(0, outcome["result"][0])
+        self.assertEqual("AI_ACCOMPANY", outcome["result"][1]["fsm_name"])
+        self.assertEqual(1, len(calls))
+
+    def test_observer_worker_passes_a_state_map(self):
+        """The regression: sport_observe must not call GetState with no args."""
+        outcome, calls = self._run_getstate("sport_observe")
+        self.assertNotIn("error", outcome,
+                         f"observer GetState failed: {outcome.get('error')}")
+        self.assertEqual(0, outcome["result"][0])
+        self.assertEqual("AI_ACCOMPANY", outcome["result"][1]["fsm_name"])
+        self.assertEqual(1, len(calls))
 
 
 class OperatorInputFreshnessTests(unittest.TestCase):

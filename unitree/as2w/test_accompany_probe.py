@@ -6,7 +6,10 @@ if it ever stops refusing, an unarmed run would push unknown api ids at the
 firmware.
 """
 
+import contextlib
+import io
 import sys
+import types
 import unittest
 from pathlib import Path
 
@@ -100,6 +103,94 @@ class FsmNameTest(unittest.TestCase):
 
     def test_empty_name_is_not_new(self):
         self.assertFalse(probe.is_new_fsm_name(""))
+
+
+class WatchReportTest(unittest.TestCase):
+    def test_no_frame_bucket_renders_without_crashing(self):
+        """A degraded link yields mode=None; the report must still be written."""
+        lines = probe.watch_mode_lines({None: 5})
+        self.assertEqual(1, len(lines))
+        self.assertIn("?", lines[0])
+        self.assertIn("5", lines[0])
+
+    def test_none_and_real_modes_sort_without_comparing_types(self):
+        lines = probe.watch_mode_lines({3: 2, None: 5, 17: 1})
+        self.assertEqual(3, len(lines))
+        self.assertIn("?", lines[0], "the no-frame bucket sorts first")
+        self.assertIn("帧数 2", " ".join(lines))
+
+
+class WatchDegradedLinkTest(unittest.TestCase):
+    def test_watch_finishes_without_any_mode_callback(self):
+        """No DDS frame must still produce evidence JSON, not a TypeError."""
+        channel = types.ModuleType("unitree_sdk2py.core.channel")
+
+        class FakeSubscriber:
+            def __init__(self, topic, msg_type):
+                self.topic = topic
+
+            def Init(self, callback, queue_depth):
+                # Deliberately never fire callback: simulate a dead DDS link.
+                pass
+
+        channel.ChannelSubscriber = FakeSubscriber
+        dds = types.ModuleType("unitree_sdk2py.idl.unitree_go.msg.dds_")
+        dds.SportModeState_ = type("SportModeState_", (), {})
+        client_module = types.ModuleType(
+            "unitree_sdk2py.as2.sport.sport_client")
+
+        class FakeSportClient:
+            def SetTimeout(self, seconds):
+                pass
+
+            def Init(self):
+                pass
+
+            def GetState(self, state_map):  # exact SDK signature
+                state_map["fsm_name"] = "AI_ACCOMPANY"
+                return 0
+
+        client_module.SportClient = FakeSportClient
+        modules = {
+            "unitree_sdk2py": types.ModuleType("unitree_sdk2py"),
+            "unitree_sdk2py.idl": types.ModuleType("unitree_sdk2py.idl"),
+            "unitree_sdk2py.idl.unitree_go": types.ModuleType(
+                "unitree_sdk2py.idl.unitree_go"),
+            "unitree_sdk2py.idl.unitree_go.msg": types.ModuleType(
+                "unitree_sdk2py.idl.unitree_go.msg"),
+            "unitree_sdk2py.idl.unitree_go.msg.dds_": dds,
+            "unitree_sdk2py.core": types.ModuleType("unitree_sdk2py.core"),
+            "unitree_sdk2py.core.channel": channel,
+            "unitree_sdk2py.as2": types.ModuleType("unitree_sdk2py.as2"),
+            "unitree_sdk2py.as2.sport": types.ModuleType(
+                "unitree_sdk2py.as2.sport"),
+            "unitree_sdk2py.as2.sport.sport_client": client_module,
+        }
+        originals = {name: sys.modules.get(name) for name in modules}
+        sys.modules.update(modules)
+        try:
+            args = types.SimpleNamespace(watch=0.3)
+            findings = {}
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = probe.cmd_watch(args, findings)
+        finally:
+            for name, original in originals.items():
+                if original is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = original
+
+        self.assertEqual(0, code)
+        self.assertIn("?", output.getvalue())
+        self.assertIn("None", findings["watch"]["modes"])
+        # With no mode frame, pairs/names stay empty by design; the FSM name
+        # still lives in the time-correlated samples, which is the evidence.
+        samples = findings["watch"]["samples"]
+        self.assertTrue(samples)
+        self.assertEqual({"AI_ACCOMPANY"},
+                         {sample["fsm_name"] for sample in samples})
+        self.assertTrue(all(sample["mode"] is None for sample in samples))
 
 
 class ArmedGuardTest(unittest.TestCase):

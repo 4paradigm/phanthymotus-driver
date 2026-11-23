@@ -38,6 +38,7 @@ import argparse
 import json
 import re
 import sys
+import threading
 import time
 
 # ---------------------------------------------------------------- constants
@@ -260,6 +261,22 @@ def watch_snapshot(latest_mode, latest_name, elapsed, code, mode_counts):
     }
 
 
+def watch_mode_lines(modes):
+    """Render the mode tally even when no DDS frame ever arrived.
+
+    ``latest["mode"]`` starts as ``None`` on a degraded link. ``None`` cannot
+    be compared with ``int`` in ``sorted()`` and does not support ``<3``
+    formatting, so the original report crashed before writing the evidence
+    JSON it was meant to diagnose the outage with.
+    """
+    lines = []
+    for value in sorted(modes, key=lambda v: (v is not None, v or 0)):
+        shown = "?" if value is None else str(value)
+        name = "(no frame)" if value is None else mode_name(value)
+        lines.append(f"  mode={shown:<3} {name:<20} 帧数 {modes[value]}")
+    return lines
+
+
 def cmd_watch(args, findings):
     """Record mode/fsm_name transitions; the human presses M during the window."""
     from unitree_sdk2py.idl.unitree_go.msg.dds_ import SportModeState_  # noqa: WPS433
@@ -271,13 +288,16 @@ def cmd_watch(args, findings):
     names = {}
     samples = []
     # The subscriber callback and the poll loop run on different threads.
-    # Guard the latest values so a pair is always built from a coherent read.
+    # Snapshot mode and timestamp together: a fresh mode with an old stamp
+    # would produce a misleading mode_age in the evidence.
     latest = {"mode": None, "at_s": 0.0}
+    latest_lock = threading.Lock()
 
     def on_state(msg):
-        # Called on the DDS thread: update the freshest mode and its timestamp.
-        latest["mode"] = int(getattr(msg, "mode", -1))
-        latest["at_s"] = time.monotonic()
+        # Called on the DDS thread: mode and timestamp must move together.
+        with latest_lock:
+            latest["mode"] = int(getattr(msg, "mode", -1))
+            latest["at_s"] = time.monotonic()
 
     subscriber = ChannelSubscriber("rt/lf/sportmodestate", SportModeState_)
     subscriber.Init(on_state, 10)
@@ -302,15 +322,16 @@ def cmd_watch(args, findings):
             print(f"[probe] GetState 失败：{exc}", file=sys.stderr)
         name = str(state_map.get("fsm_name", "") or "").strip().upper()
         elapsed = time.monotonic() - started
-        # Snapshot both fields under one lock-free read; mode is a single int
-        # assignment so CPython makes it atomic, and we copy before use.
-        with_mode = latest["mode"]
+        # Snapshot both fields under one lock so the row is coherent.
+        with latest_lock:
+            with_mode = latest["mode"]
+            mode_at_s = latest["at_s"]
         observation = watch_snapshot(with_mode, name, elapsed, code, modes)
         samples.append(observation)
         modes[with_mode] = modes.get(with_mode, 0) + 1
         if with_mode != last_mode or name != last_name:
             label = mode_name(with_mode) if with_mode is not None else "?"
-            mode_age = elapsed - latest["at_s"]
+            mode_age = elapsed - mode_at_s
             print(f"  [{elapsed:6.2f}s] mode={with_mode} ({label})  "
                   f"fsm_name={name or '(空)'}  code={code}  "
                   f"mode_age={mode_age:.2f}s")
@@ -321,8 +342,8 @@ def cmd_watch(args, findings):
         time.sleep(0.25)
 
     print("[probe] -------- 本次观测到 --------")
-    for value in sorted(modes):
-        print(f"  mode={value:<3} {mode_name(value):<20} 帧数 {modes[value]}")
+    for line in watch_mode_lines(modes):
+        print(line)
     for name in sorted(names):
         flag = "  <== 本仓库从未见过" if is_new_fsm_name(name) else ""
         print(f"  fsm_name={name}{flag}")

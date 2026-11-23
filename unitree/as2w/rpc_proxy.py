@@ -40,7 +40,11 @@ def _serve(commands, results, interface, kind):
             return
         request_id, method, args = command
         try:
-            if kind == "sport" and method == "GetState":
+            # SportClient.GetState requires a mutable state_map. Both sport
+            # workers use that client: motion and the isolated observer. A
+            # bare getattr call raises TypeError on the observer and silently
+            # returns (3104, {}), so the card can never confirm an FSM name.
+            if method == "GetState" and kind in ("sport", "sport_observe"):
                 state = {}
                 code = client.GetState(state)
                 result = (code, state)
