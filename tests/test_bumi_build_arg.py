@@ -55,6 +55,22 @@ class BuildArgForwardingTests(unittest.TestCase):
         self.assertIn('build-arg', result.stdout + result.stderr)
         self.assertEqual(commands, '')
 
+    def test_build_sh_keeps_its_executable_bit(self):
+        """The documented `./build.sh ...` form must stay runnable.
+
+        The blob tests above call `bash build.sh`, which works even when the
+        executable bit is lost — as happened when a Git-data-API push wrote the
+        blob with mode 100644. Assert the committed mode directly so that
+        user-facing regression cannot slip through again.
+        """
+        result = subprocess.run(
+            ['git', 'ls-files', '-s', 'build.sh'],
+            text=True, capture_output=True, cwd=str(ROOT))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # git ls-files -s prints: <mode> <sha> <stage>\t<path>
+        self.assertTrue(result.stdout.startswith('100755 '),
+                        f"build.sh must be executable (100755), got: {result.stdout!r}")
+
 
 if __name__ == '__main__':
     unittest.main()
