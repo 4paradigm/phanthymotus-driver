@@ -20,6 +20,7 @@ Each driver is a standalone [MCP](https://modelcontextprotocol.io) HTTP server t
 | `dji/M300` | DJI Matrice 300 RTK | 15702 | Flight control, telemetry, perception, HMS, aircraft info |
 | `dji/mavic3e` | DJI Mavic 3E/3T | 15702 | Flight control, camera (wide/zoom/IR), gimbal, waypoint missions, perception, IR thermometry |
 | `dji/mavic4e` | DJI Mavic 4E/4T | 15703 | Flight control, camera, gimbal, waypoint missions, telemetry, perception |
+| [`primebot/q1`](primebot/q1/README.md) | PrimeBot Q1 Explorer | 15748 | Battery SOC, voltage, current, power and cycle count |
 | `engineai/t800` | EngineAI T800 Development Edition | 15708 | ROS2/Native SDK, full state, dance/gesture sequences, virtual gamepad, locomotion and low-level joint control |
 | `noetix/bumi` | Noetix Bumi-EDU Humanoid | 15704 | Mic, speaker, locomotion, RealSense camera, state monitoring |
 | `x-humanoid/tianyi2.0` | X-humanoid Tianyi 2.0 Pro Bundle | 15707 | 35DOF (wheeled chassis + dual arms + dexterous hands + head + navigation) |
