@@ -13,8 +13,8 @@ cards:
   - { name: joint_states, type: sensor }
   - { name: model, type: resource }
   - { name: joint_control, type: actuator }
+  - { name: teach, type: actuator }
   - { name: ext_camera, type: sensor }
   - { name: gripper, type: actuator }
   - { name: vision_pick_and_drop, type: actuator }
   - { name: controller_configuration, type: sensor }
-  - { name: teach, type: actuator }

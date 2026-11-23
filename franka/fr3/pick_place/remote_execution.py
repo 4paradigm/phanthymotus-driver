@@ -4,11 +4,10 @@ import time
 
 import numpy as np
 from scipy.interpolate import BPoly
-from scipy.optimize import brentq
 from scipy.spatial.transform import Rotation
 
 from .execution import OBSERVATION_TOLERANCE_DEG, PickExecution
-from .hand_collision import check_descent_curve, check_path_table, frame, table_clearance, vertices
+from .hand_collision import check_table, check_descent_curve, check_path_table, frame, table_clearance, vertices
 from .kinematics import Kinematics
 
 
@@ -30,7 +29,6 @@ class RemoteExecution(PickExecution):
         self.hand_points = vertices(frame(profile, state['F_T_EE']))
         self.q = list(state['q'])
         self.goals = {}
-        self.descent = None
         self.visible_surface = (np.asarray(scene['visible_surface_base_mm']) / 1000
                                 if scene and scene.get('visible_surface_base_mm') else None)
         actual = np.asarray(state['O_T_EE']).reshape(4, 4, order='F')
@@ -59,8 +57,6 @@ class RemoteExecution(PickExecution):
         self.check()
         started = time.monotonic()
         self.goals[stage] = (target, dict(cartesian=cartesian, joint=joint, use_ik=use_ik))
-        if stage == 'descend':
-            self.descent = None
         if use_ik:
             target_joints = self.arm.solve_ik(self.flange_pose(target), self.q)
         elif joint:
@@ -69,19 +65,7 @@ class RemoteExecution(PickExecution):
             target_joints = None
 
         if stage in ('approach', 'move_to_observation', 'return_to_observation') and target_joints is not None:
-            candidates = []
-            failure = None
-            for _ in range(3):
-                self.check()
-                plan = self.arm.plan_joint(target_joints, self.q)
-                if plan.get('code') != 1 or not plan.get('succeeded') or not plan.get('points'):
-                    failure = RuntimeError(f'MoveIt failed to plan {stage} (code={plan.get("code")})')
-                    continue
-                positions = np.asarray([point['positions'] for point in plan['points']], dtype=float)
-                if positions.ndim != 2 or positions.shape[1] != 7 or not np.isfinite(positions).all():
-                    failure = ValueError(f'Invalid MoveIt joint positions during {stage}')
-                    continue
-                candidates.append((float(np.abs(np.diff(positions, axis=0)).sum()), plan))
+            candidates, failure = self.joint_candidates(stage, target_joints)
             for _, plan in sorted(candidates, key=lambda candidate: candidate[0]):
                 try:
                     return self.prepare_trajectory(stage, target, plan, cartesian, joint, started)
@@ -100,7 +84,30 @@ class RemoteExecution(PickExecution):
             raise ValueError(f'Missing planning mode for {stage}')
         return self.prepare_trajectory(stage, target, plan, cartesian, joint, started)
 
-    def prepare_trajectory(self, stage, target, plan, cartesian, joint, started):
+    def joint_candidates(self, stage, target_joints):
+        candidates = []
+        failure = None
+        for _ in range(3):
+            self.check()
+            plan = self.arm.plan_joint(target_joints, self.q)
+            if plan.get('code') != 1 or not plan.get('succeeded') or not plan.get('points'):
+                failure = RuntimeError(f'MoveIt failed to plan {stage} (code={plan.get("code")})')
+                continue
+            positions = np.asarray([point['positions'] for point in plan['points']], dtype=float)
+            if positions.ndim != 2 or positions.shape[1] != 7 or not np.isfinite(positions).all():
+                failure = ValueError(f'Invalid MoveIt joint positions during {stage}')
+                continue
+            candidates.append((float(np.abs(np.diff(positions, axis=0)).sum()), plan))
+        return candidates, failure
+
+    def approach_candidates(self, target):
+        joints = self.arm.solve_ik(self.flange_pose(target), self.q)
+        candidates, failure = self.joint_candidates('approach', joints)
+        if not candidates:
+            raise failure
+        return candidates
+
+    def prepare_trajectory(self, stage, target, plan, cartesian, joint, started=None):
         if (plan.get('code') != 1 or not plan.get('points')
                 or (cartesian and plan.get('fraction') != 1.)
                 or (not cartesian and not plan.get('succeeded'))):
@@ -120,36 +127,8 @@ class RemoteExecution(PickExecution):
         times = np.array([sample['time_ns'] for sample in samples], dtype=float) / 1e9
         if times[0] != 0 or not np.all(np.diff(times) > 0):
             raise RuntimeError('MoveIt returned invalid trajectory timing')
-        plane = self.scene or self.profile.get('table_plane')
-        if not plane and (self.scene or self.profile.get('tool_frame')):
-            raise ValueError('Calibrated table plane is required for remote motion')
-        if plane:
-            table = np.asarray(plane.get('table_point_base_mm', plane.get('point_base_mm'))) / 1000
-            normal = np.asarray(plane.get('table_normal_base', plane.get('normal_base')))
-            if (table.shape != (3,) or normal.shape != (3,) or not np.isfinite(table).all()
-                    or not np.isclose(np.linalg.norm(normal), 1., atol=.001)):
-                raise ValueError('Invalid table plane')
-        if stage in ('descend', 'miss_retreat'):
-            if not plane:
-                raise ValueError('A table plane is required to verify descent clearance')
-            allowance = self.profile.get('descent_clearance_allowance_mm', 0)
-            if type(allowance) not in (int, float) or not math.isfinite(allowance) or allowance < 0:
-                raise ValueError('Invalid descent clearance allowance')
-            # Apply the measured allowance to collision checking only.
-            descent_planes = [(table + normal * (allowance / 1000), normal)]
-            clearance_mm = self.profile.get('descent_min_clearance_mm', 5)
-            if type(clearance_mm) not in (int, float) or not math.isfinite(clearance_mm) or clearance_mm < 1:
-                raise ValueError('Invalid descent minimum clearance')
-            minimum_gap = clearance_mm / 1000
-            fixed = self.profile.get('table_plane')
-            if fixed and fixed is not plane:
-                fixed_table = np.asarray(fixed['point_base_mm']) / 1000
-                fixed_normal = np.asarray(fixed['normal_base'])
-                if (fixed_table.shape != (3,) or fixed_normal.shape != (3,)
-                        or not np.isfinite(fixed_table).all()
-                        or not np.isclose(np.linalg.norm(fixed_normal), 1., atol=.001)):
-                    raise ValueError('Invalid calibrated table plane')
-                descent_planes.append((fixed_table, fixed_normal))
+        if stage in ('descend', 'miss_retreat', 'place_descend'):
+            descent_planes, minimum_gap = self.descent_limits()
         # Make every segment quintic, with a stationary start and end, so
         # controller interpolation is continuous through acceleration.
         for sample in samples:
@@ -186,25 +165,29 @@ class RemoteExecution(PickExecution):
             sample['time_ns'] = round(sample['time_ns'] * factor)
             sample['velocities'] = [v / factor for v in sample['velocities']]
             sample['accelerations'] = [v / factor**2 for v in sample['accelerations']]
-        if stage in ('descend', 'miss_retreat'):
+        if stage in ('descend', 'miss_retreat', 'place_descend'):
             plan['descent_planes'] = descent_planes
             plan['descent_min_gap_m'] = minimum_gap
         plan['segments'] = [(end * factor, controls) for end, controls in segments]
-        if stage == 'descend':
-            self.descent = plan
         self.validate_path(stage, plan, sample_scale=factor)
+        rpc_timing = f"rpc_s={planned-started:.3f} " if started is not None else ""
         print(f"[fr3 timing] action={self.active.get('action_id')} stage={stage} "
-              f"rpc_s={planned-started:.3f} checks_s={time.monotonic()-planned:.3f} "
+              f"{rpc_timing}checks_s={time.monotonic()-planned:.3f} "
               f"speed_deg_s={math.degrees(speed):.2f} nominal_s={times[-1]:.3f} "
               f"retimed_s={times[-1]*factor:.3f} limiting={limiting} factor={factor:.2f}", flush=True)
         self.q = positions[-1].tolist()
         return stage, plan
 
-    def validate_path(self, stage, plan, *, sample_scale=1., descent_target=None):
+    def validate_path(self, stage, plan, *, sample_scale=1.):
         plane = self.scene or self.profile.get('table_plane')
         if plane:
             table = np.asarray(plane.get('table_point_base_mm', plane.get('point_base_mm'))) / 1000
             normal = np.asarray(plane.get('table_normal_base', plane.get('normal_base')))
+            if (table.shape != (3,) or normal.shape != (3,) or not np.isfinite(table).all()
+                    or not np.isclose(np.linalg.norm(normal), 1., atol=.001)):
+                raise ValueError('Invalid table plane')
+        elif self.profile.get('tool_frame'):
+            raise ValueError('Calibrated table plane is required for remote motion')
         minimum = math.inf
         start = 0.
         for stop, controls in plan['segments']:
@@ -216,6 +199,7 @@ class RemoteExecution(PickExecution):
                     minimum_gap=plan['descent_min_gap_m']))
             interval = np.linspace(start, stop, max(8, int(np.ceil((stop - start) / (.01 * sample_scale))) + 1))
             for q in curve(interval):
+                self.check()
                 if np.any(q < self.model.low) or np.any(q > self.model.high):
                     j = np.flatnonzero((q < self.model.low) | (q > self.model.high))[0]
                     lo, hi, actual = map(math.degrees, (self.model.low[j], self.model.high[j], q[j]))
@@ -224,12 +208,6 @@ class RemoteExecution(PickExecution):
                     raise ValueError(f'Arm self-collision clearance violated during {stage}')
                 if plane:
                     check_path_table(self.model, q, self.hand_points, table, normal, stage, self.profile)
-                if descent_target is not None:
-                    offset = self.model.pose(q)[:3, 3] - descent_target[:3, 3]
-                    axis = descent_target[:3, 2]
-                    down = offset @ axis
-                    if down > .0001 or np.linalg.norm(offset - down * axis) > .001:
-                        raise ValueError('Shortened descent deviates from the vertical path to its stop')
                 if self.visible_surface is not None and stage in ('approach', 'descend'):
                     ee = self.model.pose(q)
                     local = (self.visible_surface - ee[:3, 3]) @ ee[:3, :3]
@@ -240,70 +218,39 @@ class RemoteExecution(PickExecution):
         if 'descent_planes' in plan:
             plan['descent_gap_bound_mm'] = minimum * 1000
 
-    def shorten_descent(self, target):
-        # Preserve the timed prefix and replace only the end with a continuous stop.
-        self.check()
-        original = self.descent
-        if original is None:
-            raise ValueError('No original descent to shorten')
-        segments = original['segments']
-        axis, position = target[:3, 2], target[:3, 3]
+    def descent_limits(self):
+        plane = self.scene or self.profile.get('table_plane')
+        if not plane:
+            raise ValueError('A table plane is required to verify descent clearance')
+        table = np.asarray(plane.get('table_point_base_mm', plane.get('point_base_mm'))) / 1000
+        normal = np.asarray(plane.get('table_normal_base', plane.get('normal_base')))
+        if (table.shape != (3,) or normal.shape != (3,) or not np.isfinite(table).all()
+                or not np.isclose(np.linalg.norm(normal), 1., atol=.001)):
+            raise ValueError('Invalid table plane')
+        allowance = self.profile.get('descent_clearance_allowance_mm', 0)
+        if type(allowance) not in (int, float) or not math.isfinite(allowance) or allowance < 0:
+            raise ValueError('Invalid descent clearance allowance')
+        # Apply the measured allowance to collision checking only.
+        descent_planes = [(table + normal * (allowance / 1000), normal)]
+        clearance_mm = self.profile.get('descent_min_clearance_mm', 5)
+        if type(clearance_mm) not in (int, float) or not math.isfinite(clearance_mm) or clearance_mm < 1:
+            raise ValueError('Invalid descent minimum clearance')
+        minimum_gap = clearance_mm / 1000
+        fixed = self.profile.get('table_plane')
+        if fixed and fixed is not plane:
+            fixed_table = np.asarray(fixed['point_base_mm']) / 1000
+            fixed_normal = np.asarray(fixed['normal_base'])
+            if (fixed_table.shape != (3,) or fixed_normal.shape != (3,)
+                    or not np.isfinite(fixed_table).all()
+                    or not np.isclose(np.linalg.norm(fixed_normal), 1., atol=.001)):
+                raise ValueError('Invalid calibrated table plane')
+            descent_planes.append((fixed_table, fixed_normal))
+        return descent_planes, minimum_gap
 
-        def depth(q):
-            return (self.model.pose(q)[:3, 3] - position) @ axis
-
-        curves = []
-        start = 0.
-        for stop, controls in segments:
-            self.check()
-            curve = BPoly(np.asarray(controls)[:, None, :], [start, stop])
-            curves.append(curve)
-            # Find the first crossing, including one inside a spline segment.
-            times = np.linspace(start, stop, 9)
-            for left, right in zip(times, times[1:]):
-                if depth(curve(left)) < 0 <= depth(curve(right)):
-                    cut = brentq(lambda t: depth(curve(t)), left, right)
-                    break
-            else:
-                start = stop
-                continue
-            break
-        else:
-            raise ValueError('Original descent does not reach the shallower target')
-
-        q = curve(cut)
-        if np.linalg.norm(self.model.pose(q)[:3, 3] - position) > .0005:
-            raise ValueError('Original descent does not pass near the shallower target')
-
-        speed = math.radians(self.options['speed_deg_s'])
-        names = original['joint_names']
-        order = [names.index(f'fr3_joint{i}') for i in range(1, 8)]
-        goal = q[np.argsort(order)].tolist()
-        failure = ValueError('Cannot stop at the shallower target within motion limits')
-        for i in range(len(curves)-1, max(-1, len(curves)-7), -1):
-            self.check()
-            prefix = curves[i]
-            begin = prefix.x[0]
-            initial = [prefix(begin), prefix.derivative()(begin), prefix.derivative(2)(begin)]
-            for scale in (1., .75, 1.25, 1.5, 2.):
-                end = begin + (cut - begin) * scale
-                if not begin + .001 <= end <= 359.:
-                    continue
-                tail = BPoly.from_derivatives([begin, end], [initial, [q, np.zeros(7), np.zeros(7)]])
-                if any(np.max(np.abs(tail.derivative(n).c)) > limit
-                       for n, limit in enumerate((speed, JOINT_ACCELERATION_LIMIT, JOINT_JERK_LIMIT), 1)):
-                    continue
-                points = original['points'][:i + 1] + [
-                    dict(time_ns=round(end * 1e9), positions=goal, velocities=[0.] * 7, accelerations=[0.] * 7)]
-                plan = dict(original, points=points, segments=segments[:i] + [(end, tail.c[:, 0].tolist())])
-                try:
-                    self.validate_path('descend', plan, descent_target=target)
-                except ValueError as exc:
-                    failure = exc
-                    continue
-                self.q = q.tolist()
-                return 'descend', plan
-        raise failure
+    def check_descent_target(self, target, stage):
+        planes, minimum_gap = self.descent_limits()
+        for table, normal in planes:
+            check_table(target, self.hand_points, table, normal, stage, minimum_gap=minimum_gap)
 
     def move_remote(self, step):
         self.check()
@@ -347,12 +294,12 @@ class RemoteExecution(PickExecution):
                 if not math.isfinite(gap) or gap < minimum_gap:
                     raise RuntimeError(f'Measured hand clearance {gap*1000:.2f} mm below {minimum_gap*1000:g} mm during {stage}')
 
-            if stage in ('descend', 'miss_retreat'):
+            if stage in ('descend', 'miss_retreat', 'place_descend'):
                 check_live_descent(self.fresh(self.arm))
             command = local.move_timed(self.active['owner'], trajectory['segments'],
                                        math.radians(self.options['speed_deg_s']), tolerance, duration + 8)
             self.wait(self.arm, command, duration + 10, 'command_id',
-                      arm_feedback=check_live_descent if stage in ('descend', 'miss_retreat') else None)
+                      arm_feedback=check_live_descent if stage in ('descend', 'miss_retreat', 'place_descend') else None)
             target = np.asarray(trajectory['points'][-1]['positions'])[order]
             deadline = time.monotonic() + 5
             while True:
@@ -372,7 +319,7 @@ class RemoteExecution(PickExecution):
                         f'max speed={math.degrees(speed):.3f} deg/s (limit=0.573 deg/s)'
                     )
                 self.active['cancel'].wait(.05)
-            if stage in ('descend', 'miss_retreat'):
+            if stage in ('descend', 'miss_retreat', 'place_descend'):
                 check_live_descent(sample)
             self.arm_commands += 1
         self.active['last_completed_stage'] = stage

@@ -259,11 +259,11 @@ class NativeSessionTest(NativeProcessCase):
         self.assertEqual(self.terminal(item)["status"], "cancelled")
         self.assertEqual(item[0].wait(timeout=4), 0)
 
-    def test_broken_input_channel_aborts_control(self):
+    def test_oversized_command_aborts_control(self):
         item = self.start()
         self.move(item, target=0.2)
         self.wait_for(item, lambda r: r.get("status") == "running")
-        self.send(item, "X" * 4097)
+        self.send(item, "X" * (512 * 1024 + 1))
         self.assertEqual(self.terminal(item)["status"], "failed")
         item[0].wait(timeout=4)
 

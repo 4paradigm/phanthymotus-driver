@@ -399,6 +399,14 @@ class RobotSession:
         with self._lock:
             if self._stop.is_set() or self._connection_broken:
                 return False
+            received_ns = time.monotonic_ns()
+            captured, published = record.get("captured_ns"), record.get("published_ns")
+            if type(captured) is int and type(published) is int and 0 < captured <= published <= received_ns:
+                previous = (self._sample or {}).get("captured_ns")
+                sample.update(captured_ns=captured,
+                              capture_gap_ms=None if previous is None else round((captured - previous) / 1e6, 1),
+                              capture_to_publish_ms=round((published - captured) / 1e6, 1),
+                              publish_to_python_ms=round((received_ns - published) / 1e6, 1))
             self._sample, self._received = sample, time.monotonic()
             self._state, self._error = "connected", None
         return True

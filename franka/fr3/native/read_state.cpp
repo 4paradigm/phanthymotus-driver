@@ -137,6 +137,7 @@ class RobotLock {
 struct Sample {
   fr3::Joints q{}, q_d{}, dq{}, tau{};
   int mode = 0;
+  Clock::time_point captured{};
   std::array<double, 16> O_T_EE{};
   std::array<double, 16> F_T_EE{};
 };
@@ -198,7 +199,7 @@ class Session {
   void sample(const franka::RobotState& state) {
     const auto now = Clock::now();
     if (now < next_sample_) return;
-    samples_.push({state.q, state.q_d, state.dq, state.tau_J, static_cast<int>(state.robot_mode), state.O_T_EE, state.F_T_EE});
+    samples_.push({state.q, state.q_d, state.dq, state.tau_J, static_cast<int>(state.robot_mode), now, state.O_T_EE, state.F_T_EE});
     next_sample_ = now + std::chrono::microseconds(33333);
   }
 
@@ -233,7 +234,12 @@ class Session {
           write_array(std::cout, "O_T_EE", current.O_T_EE);
           std::cout << ',';
           write_array(std::cout, "F_T_EE", current.F_T_EE);
-          std::cout << ",\"robot_mode\":" << current.mode
+          const auto ns = [](Clock::time_point t) {
+            return std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count();
+          };
+          std::cout << ",\"captured_ns\":" << ns(current.captured)
+                    << ",\"published_ns\":" << ns(Clock::now())
+                    << ",\"robot_mode\":" << current.mode
                     << ",\"capabilities\":[\"joint_position\"],";
           write_realtime(std::cout, rt_);
           std::cout << "}\n";

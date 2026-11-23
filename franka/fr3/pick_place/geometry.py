@@ -55,7 +55,4 @@ def locate(observation, position, handeye):
     ee=transform(np.asarray(meta['O_T_EE']).reshape(4,4,order='F'),'O_T_EE')
     extr=transform(handeye['EE_T_camera'],'EE_T_camera')
     base=(ee@extr@np.r_[point,1])[:3]
-    return dict(observation_id=meta['observation_id'],pixel=[x,y],depth_mm=z*1000,
-                camera_xyz_mm=(point*1000).tolist(),base_xyz_mm=(base*1000).tolist(),
-                depth_spread_mm=int(np.ptp(valid)),handeye_accepted=handeye.get('accepted') is True,
-                target_semantics='visible_surface_not_grasp_centre')
+    return dict(pixel=[x, y], depth_mm=z * 1000, base_xyz_mm=(base * 1000).tolist())

@@ -55,11 +55,12 @@ def destination(observation, scene, handeye, options):
     return delta
 
 
-def moveit_targets(observation, pick, scene, handeye, options):
+def moveit_targets(observation, pick, scene, handeye, options, *, delta=None):
     """Build SDK-frame targets for remote planning without solving local IK."""
     approach, grasp, lift = np.asarray(pick['poses'], dtype=float)
     normal = np.asarray(scene['table_normal_base'], dtype=float)
-    delta = destination(observation, scene, handeye, options)
+    if delta is None:
+        delta = destination(observation, scene, handeye, options)
     initial = grasp[:3, :3]
     final = rotation(-normal, math.radians(options['rotation_deg'])) @ initial
     pad = pick['sdk_to_pad_offset_mm'] / 1000

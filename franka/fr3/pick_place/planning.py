@@ -19,19 +19,6 @@ def rigid(r, p):
     return result
 
 
-def segment_distance(a, b, c, d):
-    u, v = b-a, d-c
-    matrix = np.column_stack((u, -v))
-    s, t = np.linalg.lstsq(matrix, c-a, rcond=None)[0]
-    distances = []
-    if 0 <= s <= 1 and 0 <= t <= 1:
-        distances.append(np.linalg.norm(a-c+s*u-t*v))
-    for p, start, direction in ((a,c,v), (b,c,v), (c,a,u), (d,a,u)):
-        f = np.clip((p-start)@direction/max(direction@direction, 1e-15), 0, 1)
-        distances.append(np.linalg.norm(p-start-f*direction))
-    return min(distances)
-
-
 def grasp_targets(observation, scene, profile, *, extra_retreat_mm=0, only_yaw=None):
     diameter_mm = scene['diameter_mm']
     if type(diameter_mm) not in (int, float) or not 0 < diameter_mm < 79.4:

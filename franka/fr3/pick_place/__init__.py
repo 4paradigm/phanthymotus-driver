@@ -559,11 +559,14 @@ class PickPlacePlugin:
         from .hand_collision import TableClearanceError
         from .planning import grasp_targets
         from .scene import estimate
-        from .transfer import moveit_targets
+        from .transfer import destination, moveit_targets
         status, result, executor, hand = 'error', {}, None, None
         try:
+            started = time.monotonic()
             hand = self.acquire_hand(active)
+            hand_ready = time.monotonic()
             with self.controller(active) as arm:
+                controller_ready = time.monotonic()
                 active['session'] = arm
                 if not active['observation']:
                     active['stage'] = 'auto_observe'
@@ -589,6 +592,11 @@ class PickPlacePlugin:
                 opening = min(executor.fresh(hand)['max_width'], .08)
                 errors = []
                 deadline = time.monotonic() + 120
+                print(f'[fr3 planning start] action={active["action_id"]} '
+                      f'hand_s={hand_ready-started:.3f} controller_s={controller_ready-hand_ready:.3f} '
+                      f'observation_and_target_s={time.monotonic()-controller_ready:.3f}', flush=True)
+                executor.planning_deadline = deadline
+                delta = destination(photo, scene, profile['handeye'], active['transfer'])
                 ranked = []
                 for pick in candidates:
                     executor.check()
@@ -598,36 +606,52 @@ class PickPlacePlugin:
                     try:
                         if not 0 < pick['grasp_width_mm'] / 1000 < opening:
                             raise ValueError('Target does not fit the calibrated opening')
-                        targets = moveit_targets(photo, pick, scene, profile['handeye'], active['transfer'])
-                        approach = executor.prepare('approach', targets['approach'], use_ik=True)
-                        points = approach[1]['points'] if approach[1] else []
-                        travel = float(np.abs(np.diff([p['positions'] for p in points], axis=0)).sum()) if points else 0.
-                        ranked.append((travel, pick, targets, approach, list(executor.q)))
+                        targets = moveit_targets(photo, pick, scene, profile['handeye'], active['transfer'], delta=delta)
+                        descents = []
+                        for retreat_mm in range(6):
+                            executor.check()
+                            try:
+                                candidate, goals = pick, targets
+                                if retreat_mm:
+                                    candidate = grasp_targets(photo, scene, profile, extra_retreat_mm=retreat_mm,
+                                                              only_yaw=pick['yaw_deg'])[0]
+                                    goals = moveit_targets(photo, candidate, scene, profile['handeye'], active['transfer'], delta=delta)
+                                width = candidate['grasp_width_mm'] / 1000
+                                if not 0 < width < opening:
+                                    raise ValueError('Target does not fit the calibrated opening')
+                                executor.check_descent_target(goals['descent'], 'descend')
+                            except (RuntimeError, ValueError) as exc:
+                                errors.append(f'{pick["yaw_deg"]:.1f} deg (+{retreat_mm} mm): {exc}')
+                                continue
+                            descents.append((retreat_mm, candidate, goals, width))
+                        if descents:
+                            requested = time.monotonic()
+                            approaches = executor.approach_candidates(targets['approach'])
+                            print(f'[fr3 approach planning] action={active["action_id"]} '
+                                  f'yaw_deg={pick["yaw_deg"]:.1f} rpc_s={time.monotonic()-requested:.3f}',
+                                  flush=True)
+                            ranked.extend((travel, pick, targets, plan, descents)
+                                          for travel, plan in approaches)
                     except (RuntimeError, ValueError, TimeoutError) as exc:
+                        executor.check()
                         errors.append(f'{pick["yaw_deg"]:.1f} deg approach: {exc}')
 
-                for _, pick, targets, approach, approach_end in sorted(ranked, key=lambda item: item[0]):
-                    if time.monotonic() >= deadline:
-                        break
+                for _, pick, targets, plan, descents in sorted(ranked, key=lambda item: item[0]):
+                    executor.check()
+                    executor.q = list(live['q'])
+                    try:
+                        approach = executor.prepare_trajectory('approach', targets['approach'], plan,
+                                                               False, False)
+                    except (RuntimeError, ValueError) as exc:
+                        errors.append(f'{pick["yaw_deg"]:.1f} deg approach check: {exc}')
+                        continue
+                    approach_end = list(executor.q)
                     descent = None
-                    for retreat_mm in range(6):
+                    for retreat_mm, candidate, goals, width in descents:
                         executor.check()
-                        if time.monotonic() >= deadline:
-                            break
                         executor.q = list(approach_end)
                         try:
-                            candidate, goals = pick, targets
-                            if retreat_mm:
-                                candidate = grasp_targets(photo, scene, profile, extra_retreat_mm=retreat_mm,
-                                                          only_yaw=pick['yaw_deg'])[0]
-                                goals = moveit_targets(photo, candidate, scene, profile['handeye'], active['transfer'])
-                            width = candidate['grasp_width_mm'] / 1000
-                            if not 0 < width < opening:
-                                raise ValueError('Target does not fit the calibrated opening')
-                            if retreat_mm:
-                                descent = executor.shorten_descent(goals['descent'])
-                            else:
-                                descent = executor.prepare('descend', [goals['descent']], cartesian=True)
+                            descent = executor.prepare('descend', [goals['descent']], cartesian=True)
                         except (RuntimeError, ValueError) as exc:
                             errors.append(f'{pick["yaw_deg"]:.1f} deg (+{retreat_mm} mm): {exc}')
                             if not retreat_mm and not isinstance(exc, TableClearanceError):
@@ -638,8 +662,24 @@ class PickPlacePlugin:
                         continue
                     try:
                         lift = executor.prepare('lift', [goals['lift']], cartesian=True)
-                        carry = executor.prepare('move_to_place', goals['carry'], cartesian=True)
-                        place_lift = executor.prepare('place_lift', [goals['place_lift']], cartesian=True)
+                        carry = executor.prepare('move_to_place', goals['carry'][:-1], cartesian=True)
+                        land = goals['carry'][-1]
+                        normal = np.asarray(scene['table_normal_base'])
+                        carry_end = list(executor.q)
+                        for place_retreat_mm in range(6):
+                            executor.q = list(carry_end)
+                            landing = land.copy()
+                            landing[:3, 3] += normal * (place_retreat_mm / 1000)
+                            try:
+                                executor.check_descent_target(landing, 'place_descend')
+                                place_descent = executor.prepare('place_descend', [landing], cartesian=True)
+                                break
+                            except TableClearanceError:
+                                if place_retreat_mm == 5:
+                                    raise
+                        release_lift = goals['place_lift'].copy()
+                        release_lift[:3, 3] += normal * (place_retreat_mm / 1000)
+                        place_lift = executor.prepare('place_lift', [release_lift], cartesian=True)
                         home = executor.prepare('return_to_observation',
                                                 list(map(math.radians, active['target'])), joint=True)
                     except (RuntimeError, ValueError) as exc:
@@ -649,12 +689,17 @@ class PickPlacePlugin:
                     pick, targets = candidate, goals
                     break
                 else:
-                    raise RuntimeError('No complete MoveIt plan: ' + '; '.join(errors))
+                    reason = 'MoveIt candidate planning deadline' if time.monotonic() >= deadline else 'No complete MoveIt plan'
+                    raise RuntimeError(reason + ': ' + '; '.join(errors))
                 if time.monotonic() >= deadline:
                     raise RuntimeError('MoveIt candidate planning deadline: ' + '; '.join(errors))
                 if retreat_mm:
                     print(f"[fr3 descent retreat] action={active['action_id']} retreat_mm={retreat_mm} "
                           f"minimum_clearance_bound_mm={descent[1]['descent_gap_bound_mm']:.3f}", flush=True)
+                executor.planning_deadline = None
+                if place_retreat_mm:
+                    print(f'[fr3 place retreat] action={active["action_id"]} retreat_mm={place_retreat_mm}',
+                          flush=True)
                 active['grasp_retreat_mm'] = retreat_mm
                 executor.open_hand('pick_open')
                 executor.move_remote(approach)
@@ -686,6 +731,7 @@ class PickPlacePlugin:
                 if not executor.fresh(hand)['is_grasped']:
                     raise RuntimeError('Grasp feedback lost during lift')
                 executor.move_remote(carry)
+                executor.move_remote(place_descent)
                 executor.open_hand('place_open')
                 active.update(holding_object_possible=False, release_completed=True, transfer_completed=True)
                 executor.move_remote(place_lift)

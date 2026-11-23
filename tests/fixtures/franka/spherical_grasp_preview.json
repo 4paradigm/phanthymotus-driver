@@ -89,35 +89,12 @@
           0.0,
           1.0
         ]
-      ],
-      "training_samples": 22,
-      "holdout_samples": 5,
-      "holdout_board_position_error_mm": [
-        3.6826077746473547,
-        4.425246596175185,
-        0.7935473947610658,
-        1.6868488535245054,
-        3.3172297555687296
-      ],
-      "holdout_board_rotation_error_deg": [
-        0.09395874264857151,
-        0.2421754855197456,
-        0.0442038647135542,
-        0.17146574684640617,
-        0.09464626612068783
-      ],
-      "accepted": false,
-      "note": "Candidate only; independent physical validation required"
+      ]
     },
     "table_normal_base": [
       -0.7073603555290829,
       -0.7068520859984078,
       -0.0012066256537300152
-    ],
-    "table_point_base_mm": [
-      742.2706682839408,
-      216.82545881584394,
-      -157.22524704002785
     ]
   }
 }
