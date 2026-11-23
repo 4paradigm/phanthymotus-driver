@@ -130,8 +130,6 @@ def _get_default_cmd():
     return _get_control_cmd("DEFAULT")
 
 _WORKMODE_NAMES = {
-    # App status definitions and the 2026-11-11 hardware log agree on 2/3.
-    # These are feedback codes, not ControlCmd values (RUN is command 4).
     0: "enabled", 1: "ready", 2: "walking", 3: "whole_body_walking", 5: "dance",
     8: "greet", 9: "shake", 10: "cheer", 11: "start_teach",
     12: "end_teach", 14: "save_teach_1", 23: "play_teach",
@@ -716,7 +714,6 @@ class LocoPlugin:
         if action == "config" and args.get('_tool_name') == 'loco_relative_move':
             return self._apply_distance_config(args)
         if action == "start":
-            self.start()
             return {"state": "ready"}
         if action == "stop":
             # The streaming card goes first. Stopping the chassis and leaving a
@@ -1027,8 +1024,7 @@ class LocoPlugin:
                     "movement requires workmode=2 (walking) or 3 (whole_body_walking). "
                     "Current mode is "
                     f"{mode} ({_WORKMODE_NAMES.get(mode, 'unknown')}). "
-                    "Select lower_body or whole_body using action=walking_mode, "
-                    "or use switch_mode switch=walk for lower-body walking."
+                    "Select lower_body or whole_body using action=walking_mode."
                 ),
             }
         return None

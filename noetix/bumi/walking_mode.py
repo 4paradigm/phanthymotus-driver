@@ -31,8 +31,7 @@ class WalkingModePlugin:
 
     PREFIX = "walking_mode"
 
-    def __init__(self, plugin_config: dict, namespace: str, executor, high_ctrl,
-                 loco_plugin=None):
+    def __init__(self, plugin_config: dict, high_ctrl, loco_plugin):
         self._high_ctrl = high_ctrl
         self._loco = loco_plugin
         self._host = plugin_config.get("app_host") or None
@@ -84,8 +83,6 @@ class WalkingModePlugin:
                 "command_sent": False,
                 "error": "walking_model 必须为 lower_body 或 whole_body。",
             }
-        if self._loco is None:
-            return self._error("missing_arbitration", model, "行走模式切换需要启用 loco。")
         # Only the active request is cancelled. A later request can be made
         # through either locomotion card without a separate start action.
         with self._state_lock:

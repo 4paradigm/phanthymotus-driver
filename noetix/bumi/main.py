@@ -120,7 +120,6 @@ def _disable_vendor_video_capture_service(cfg: dict) -> None:
 class BumiDeviceBundle:
     def __init__(self, cfg: dict, namespace: str, executor, high_ctrl, media_ctrl):
         self._plugins: list = []
-        self._walking_mode = None
         plugins_cfg = cfg.get("plugins", {})
         camera_plugin = None
         loco_plugin = None
@@ -152,10 +151,8 @@ class BumiDeviceBundle:
         if (plugins_cfg.get("walking_mode", {}).get("enabled", False)
                 and high_ctrl is not None and loco_plugin is not None):
             from walking_mode import WalkingModePlugin
-            self._walking_mode = WalkingModePlugin(
-                plugins_cfg["walking_mode"], namespace, executor, high_ctrl,
-                loco_plugin=loco_plugin)
-            loco_plugin.attach_walking_mode(self._walking_mode)
+            loco_plugin.attach_walking_mode(WalkingModePlugin(
+                plugins_cfg["walking_mode"], high_ctrl, loco_plugin))
             print("[bundle] Walking mode loaded into loco and loco_relative_move (App TCP)")
 
         if (plugins_cfg.get("loco_servo", {}).get("enabled", False)
