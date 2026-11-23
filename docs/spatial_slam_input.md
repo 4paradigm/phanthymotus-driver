@@ -1,31 +1,39 @@
 # Spatial SLAM Input Contract (v1)
 
-This is the **cross-robot** contract for the generic Perception
-`pointcloud_slam` card. The contract is based on observable sensor facts, not
-robot names. The normative ROS-free checks are in
-[`common/spatial_slam.py`](../common/spatial_slam.py); the separately deployed
-Perception image mirrors those checks in
-`perception/plugins/pointcloud_slam_contract.py`.
+Drivers that advertise the optional `motus_slam/1` pose profile use the
+[producer validators](../common/spatial_slam.py) for the declarations and
+evidence described below. Producers own the physical alignment of poses and
+clouds and should publish only clock and calibration claims they can support.
 
-This contract specifies the **producer's assertions**. Passing structural
-validation does not prove geometric calibration or timing synchronization.
-Producers must never invent a transform, pose, clock proof, or capability just
-to make an input pass.
+## Minimum input for Perception PR #371
+
+The ordinary point-cloud mapping path reads a `motus.odom/1` object with a
+numeric `pose`: three finite position values in meters and four finite xyzw
+quaternion components with nonzero norm. The decoder normalizes the quaternion.
+It uses the integer `pose.stamp_ms` if present, otherwise the integer top-level
+`stamp_ms`. Covariance can be omitted or null; when supplied it has 36 finite
+entries. Missing `info().odom_interface.slam_pose` produces a diagnostic.
+The ordinary decoder accepts samples without frame names or `vendor.motus_slam`,
+including its status, segment and clock fields. Publish `pose: null` when
+there is no usable pose; a loss label alone leaves a numeric pose usable.
+
+See the [consumer pose decoder](https://github.com/4paradigm/phanthymotus/blob/8d38150c2d3be9e7074b5aa9b8b67f806daaf888/perception/plugins/pointcloud_slam_odom.py)
+and [numeric input tests](https://github.com/4paradigm/phanthymotus/blob/8d38150c2d3be9e7074b5aa9b8b67f806daaf888/perception/tests/test_pointcloud_slam_numeric_input.py).
 
 ## Wire types and capability
 
-Exactly two connected native ROS 2 topics are used by the current card:
+The pose and cloud connections use these ROS 2 wire types:
 
 | Port format | ROS message | Contents |
 | --- | --- | --- |
-| `state/odom` | `std_msgs/msg/String` | JSON `motus.odom/1` with `vendor.motus_slam` |
+| `state/odom` | `std_msgs/msg/String` | JSON `motus.odom/1` (profile metadata in `vendor.motus_slam` is optional for PR #371) |
 | `sensor/pointcloud2` | `sensor_msgs/msg/PointCloud2` | Original metric XYZ scan or depth cloud |
 
 `sensor/pointcloud` is an `UInt8MultiArray` **dashboard rendering format**,
 not a native PointCloud2 input; `sensor_msgs/msg/LaserScan` requires a
 separate adapter. Do not relabel a visualization packet as PointCloud2.
 
-A state card that actually supports SLAM announces, in `info()`:
+A state card implementing the full driver profile announces, in `info()`:
 
 ```json
 {
@@ -44,7 +52,7 @@ A state card that actually supports SLAM announces, in `info()`:
 pose-only sensor. An ordinary `motus.odom/1` sample, a valid velocity, or a
 `pose_drift` hint alone does **not** imply the SLAM pose capability.
 
-For each tracking reading, `motus.odom/1` must carry positive integer
+For each tracking reading in the full driver profile, `motus.odom/1` must carry positive integer
 `stamp_ms` (the measurement's time in a documented clock), `units.length=m`,
 `pose.position` (finite 3-vector, meters), normalized xyzw quaternion,
 `pose.frame_id`, `pose.child_frame_id`, covariance (36 finite row-major
@@ -200,39 +208,19 @@ The check reproduces normalized time exactly:
 stamp_ns = int(source_stamp * (1_000_000 if source_unit == 'ms' else 1)) + offset_ns
 ```
 
-The current SLAM parser uses the tuple
-`(clock_id, clock_epoch, source_generation)` to guard against stale or
-restarted streams. Cloud headers, odometry measurements, sidecar
-timestamps, hash, frame IDs and segment state are cross-checked before
-admission. An unverified mapping, new generation, lost tracking or conflicting
-mount must not be silently promoted to valid SLAM input.
+The driver validator can check these provenance claims. PR #371 can consume a
+static cloud before, after, or without the sidecar. The pose and cloud still
+need timestamps that allow pairing. The producer is responsible for their
+physical timing and coordinate relationship.
 
-## Core main (topic-only) compatibility
+## Runtime geometry in PR #371
 
-Agent Core's current `main` project-start path forwards `input_topics` and
-some camera optics, but **not** the complete
-`input_metadata`/`odom_interfaces` declarations. A connected graph therefore
-uses the Perception card's *legacy-Core runtime discovery* unless a caller
-explicitly supplies the strict contract:
-
-1. Discover native publisher types from the two ROS topic names.
-2. On `start_mapping`, observe a fresh tracking `motus.odom/1` sample and
-   PointCloud2 capture stamp / frame (default 5-second probe).
-3. Require overlapping measurement timestamps (default `max_gap_ms=200`);
-   resolve the actual frame, odometry child frame and clock label.
-4. Accept a producer mount only if calibrated; otherwise require a compatible
-   manually configured 4×4 `child_from_cloud` matrix. Fail closed when
-   frames/time/mount are inconsistent.
-5. Report `input_provenance` in `info()` and the map revision metadata.
-   The fallback reports `timestamp_overlap_only_not_independent_clock_proof`.
-
-**This fallback is not a verified clock-sync protocol.** It must not be used to
-assert that independent LiDAR and odometry clocks are synchronized.
-
-The SLAM card's backend and input contracts are platform-wide; no
-`robot: Bumi|G1|Tianyi` selector is needed. The current card retains one
-fixed `sensor/mapping` visualization output. RTAB-Map's native database is
-the stored map for future localization/navigation, not that preview packet.
+When producer declarations are missing, runtime discovery can resolve geometry
+from the connected samples. For ordinary static input, an absent mount means
+the cloud is assumed to be in pose-child coordinates. Different frame labels
+alone do not block that calculation. A dynamic mount needs a numeric transform
+for the cloud. See [geometry resolution](https://github.com/4paradigm/phanthymotus/blob/8d38150c2d3be9e7074b5aa9b8b67f806daaf888/perception/plugins/pointcloud_slam_config.py)
+and the numeric input tests above.
 
 ## Driver author checklist
 

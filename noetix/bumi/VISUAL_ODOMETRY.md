@@ -174,7 +174,8 @@ The camera-IMU RSUSB build path and its modules have been removed.
 ## Generic pointcloud SLAM input evidence
 
 The visual-odometry `motus.odom/1` stream retains its existing status and pose
-ports. Each sample now carries `vendor.motus_slam.source_id`,
+ports. PR #371 accepts the numeric pose without a full driver-profile
+capability declaration or per-sample `stamp_source` and `clock_id`. Each sample carries `vendor.motus_slam.source_id`,
 `clock_mapping`, `clock_verified=false`, and, once the optical frame is known,
 `vendor.motus_slam.extrinsic`. This describes the same `base -> optical`
 mount used to launch RTAB-Map. The shipping preset retains `assumed: true` and

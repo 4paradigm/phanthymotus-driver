@@ -2061,9 +2061,9 @@ from velocity or substitute zero for unknown covariance.
 [Spatial SLAM Input Contract](docs/spatial_slam_input.md) specifies
 `motus.slam_input/1`, `motus.slam_frame/1`, native PointCloud2 wire
 types, coordinate transforms, time proofs, input declaration fields, and
-Core-main fallback behavior. Use the ROS-free
-`common/spatial_slam.py` validators in driver tests; publishing a bare
-`state/odom` or display `sensor/pointcloud` packet is not enough.
+PR #371 runtime geometry. Use the ROS-free `common/spatial_slam.py`
+validators to test a driver's full profile. The consumer's minimum numeric
+pose requirements are listed separately in the same document.
 
 ### Implementing it in a new driver
 
