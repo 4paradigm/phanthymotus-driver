@@ -18,12 +18,12 @@ import tempfile
 FILES = {'config.yaml', 'host/install.py', 'host/install_controller.py',
          'host/controller_boot.py', 'host/install_speaker.py', 'host/speaker_relay.py',
          'host/rosbridge_loopback.py', 'host/rosbridge.launch', 'host/runtime_manager.py',
-         'host/battery_relay.py', 'host/head_camera.launch', 'host/head_jpeg.py', 'host/head_depth.py', 'host/rgbd_geometry.py', 'host/head_imu.py', 'host/head_rgbd.py'}
+         'host/battery_relay.py', 'host/head_camera.launch', 'host/head_jpeg.py', 'host/head_depth.py', 'host/rgbd_geometry.py', 'host/head_imu.py', 'host/head_rgbd.py', 'host/body_mount.py'}
 ROOTS = {'host': Path('/opt/phanthy-motus/kuavo5w-host'),
          'controller': Path('/opt/phanthy-motus/kuavo5w-controller'),
          'chassis': Path('/opt/phanthy-motus/kuavo5w-speaker')}
 OWNED = {'host': ('rosbridge_loopback.py', 'rosbridge.launch', 'runtime_manager.py',
-                 'battery_relay.py', 'head_camera.launch', 'head_jpeg.py', 'head_depth.py', 'rgbd_geometry.py', 'head_imu.py', 'head_rgbd.py'),
+                 'battery_relay.py', 'head_camera.launch', 'head_jpeg.py', 'head_depth.py', 'rgbd_geometry.py', 'head_imu.py', 'head_rgbd.py', 'body_mount.py'),
          'controller': ('controller_boot.py',), 'chassis': ('speaker_relay.py',)}
 UNIT_DIR = Path('/etc/systemd/system')
 CONTROLLER_RUNTIME = Path('/run/kuavo5w-controller')
@@ -232,7 +232,7 @@ def install(request):
             changed = True
     units = {'host': ('kuavo5w-runtime-manager.service', 'kuavo5w-rosbridge.service',
                      'kuavo5w-battery-relay.service', 'kuavo5w-head-camera.service',
-                     'kuavo5w-head-jpeg-relay.service', 'kuavo5w-head-depth-relay.service'),
+                     'kuavo5w-head-jpeg-relay.service', 'kuavo5w-head-imu-relay.service'),
              'controller': ('kuavo5w-controller.service',), 'chassis': ('kuavo5w-speaker.service',)}[role]
     if not all((UNIT_DIR / unit).is_file() for unit in units):
         changed = True

@@ -127,6 +127,9 @@ class BootstrapTests(unittest.TestCase):
         host_request = transport.run.call_args_list[1].args[2]
         self.assertEqual(host_request['messages'], messages)
         self.assertEqual(set(host_request['files']), set(bootstrap.FILES))
+        for call in transport.run.call_args_list:
+            self.assertEqual(set(call.args[2]['files']), remote.FILES)
+        self.assertIn('body_mount.py', remote.OWNED['host'])
         self.assertEqual(manager.snapshot()['state'], 'ready')
         self.assertNotIn('fixture', json.dumps(manager.snapshot()))
 
@@ -320,7 +323,7 @@ class RemoteTests(unittest.TestCase):
                     for name in remote.OWNED['host']:
                         (root / name).write_bytes((stage / name).read_bytes())
                     remote.write_messages(root / 'ros1_messages', messages)
-                    for name in ('runtime-manager', 'rosbridge', 'battery-relay', 'head-camera', 'head-jpeg-relay', 'head-depth-relay'):
+                    for name in ('runtime-manager', 'rosbridge', 'battery-relay', 'head-camera', 'head-jpeg-relay', 'head-imu-relay'):
                         (units / ('kuavo5w-' + name + '.service')).write_text('fixture unit')
                 return types.SimpleNamespace(stdout=b'active\n', returncode=0)
             with patch.dict(remote.ROOTS, roots), patch.object(remote, 'UNIT_DIR', units), \
@@ -337,6 +340,16 @@ class RemoteTests(unittest.TestCase):
                 installed.write_text('wrong MD5 fixture')
                 self.assertTrue(remote.install(request)['changed'])
                 self.assertEqual(installed.read_text(), 'controller wire fixture')
+                mount = roots['host'] / 'body_mount.py'
+                mount.unlink()
+                self.assertTrue(remote.install(request)['changed'])
+                self.assertEqual(mount.read_text(), 'host/body_mount.py')
+                self.assertFalse(remote.install(request)['changed'])
+                imu_unit = units / 'kuavo5w-head-imu-relay.service'
+                imu_unit.unlink()
+                self.assertTrue(remote.install(request)['changed'])
+                self.assertTrue(imu_unit.is_file())
+                self.assertFalse(remote.install(request)['changed'])
 
     def test_fresh_install_repeat_and_deleted_helper_repair(self):
         with tempfile.TemporaryDirectory() as directory:
