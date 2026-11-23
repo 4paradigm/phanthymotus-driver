@@ -319,8 +319,12 @@ class ToolInventoryTests(unittest.TestCase):
         bridge = (DEVICE_DIR / "domain_bridge.py").read_text(encoding="utf-8")
         relay = (DEVICE_DIR / "jazzy_relay.sh").read_text(encoding="utf-8")
         discovery = "10.42.10.10:11811;10.42.10.12:11811"
-        self.assertNotIn("ROS_DISCOVERY_SERVER=", service)
-        self.assertIn('os.environ["ROS_DISCOVERY_SERVER"] = DISCOVERY_SERVERS', main)
+        environment = yaml.safe_load(service)["agibot-a3"]["environment"]
+        configured = [item for item in environment if item.startswith("ROS_DISCOVERY_SERVER=")]
+        self.assertEqual(configured, [f"ROS_DISCOVERY_SERVER={discovery}"])
+        for address in discovery.split(";"):
+            self.assertNotIn(address, main)
+            self.assertNotIn(address, relay)
         module = ast.parse(bridge)
         for function_name in ("_run", "_run_subscription"):
             function = next(node for node in module.body
@@ -344,7 +348,6 @@ class ToolInventoryTests(unittest.TestCase):
             self.assertEqual(len(pop_lines), 1, function_name)
             self.assertEqual(len(init_lines), 1, function_name)
             self.assertLess(pop_lines[0], init_lines[0], function_name)
-        self.assertIn(f'export ROS_DISCOVERY_SERVER="{discovery}"', relay)
 
     def test_relay_start_failure_is_fatal_when_cameras_use_host_relay(self):
         dockerfile = (DEVICE_DIR / "Dockerfile").read_text(encoding="utf-8")
