@@ -138,7 +138,7 @@ class PickPlacePlugin:
                                    'on_interrupt_all': {'action': 'cancel'}}})
         definition = tool(self.PREFIX, 'actuator',
             'Pick and place with the FR3 wrist camera. Connect RGB, depth and object detections. '
-            'The first confirmed motion may home the hand. Remove any held object before starting.',
+            'The hand homes before each requested or automatic pre-grasp observation. Remove any held object before starting.',
             schema, topic_in=[dict(format=fmt, desc=desc, **({'topic': self.inputs.topics[i]} if self.inputs.topics else {}))
                               for i, fmt, desc in ((1, 'image/depth-zlib', 'Depth image'),
                                   (0, 'image/jpeg', 'RGB image'), (2, 'data/json', 'VOP objects'))])
@@ -420,8 +420,9 @@ class PickPlacePlugin:
                     raise RuntimeError('Visual action cancelled')
                 if time.monotonic() >= deadline:
                     raise TimeoutError('Hand connection timed out')
-            if not self.hand_initialized:
-                self.initialize_hand(active, hand)
+            before_observation = active.get('observation') is None
+            if before_observation or not self.hand_initialized:
+                self.initialize_hand(active, hand, force=before_observation)
                 with self.lock:
                     if active['cancel'].is_set():
                         raise RuntimeError('Visual action cancelled')
@@ -431,10 +432,10 @@ class PickPlacePlugin:
             self.gripper_manager.release(self.address, active['owner'])
             raise
 
-    def initialize_hand(self, active, hand):
+    def initialize_hand(self, active, hand, *, force=False):
         executor = PickExecution(active, None, hand, active['config'])
         sample = executor.fresh(hand)
-        if not sample['is_grasped'] and sample['max_width'] > 0:
+        if not force and not sample['is_grasped'] and sample['max_width'] > 0:
             return
         stage = active['stage']
         active['stage'] = 'hand_homing'

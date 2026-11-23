@@ -139,12 +139,12 @@ def grasp_targets(observation, scene, profile, *, extra_retreat_mm=0, only_yaw=N
         sdk_grasp = grasp + shift - pad_offset*goal_r[:,2]
         hover = sdk_grasp - (.15 - extra_retreat_mm/1000) * goal_r[:, 2]
         corrected_grasp = sdk_grasp + horizontal + vertical
-        ends = [hover + horizontal, corrected_grasp, corrected_grasp + .01 * normal]
+        ends = [hover + horizontal + vertical, corrected_grasp, corrected_grasp + .01 * normal]
         candidates.append(dict(
             yaw_deg=yaw, observation_id=metadata['observation_id'],
             poses=[rigid(goal_r, point).tolist() for point in ends],
             grasp_width_mm=grasp_width,
-            placement_reference=sdk_grasp.tolist(),
+            placement_reference=(sdk_grasp + vertical).tolist(),
             sdk_to_pad_offset_mm=pad_offset*1000,
         ))
     if not candidates:

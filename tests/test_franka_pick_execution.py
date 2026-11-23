@@ -25,6 +25,7 @@ class PickExecutionTests(unittest.TestCase):
         self.hand = self.card.gripper_manager.acquire.return_value
         self.hand.snapshot.return_value = dict(connected=True, control_ready=True, data_age_ms=1,
                                                    is_grasped=False, max_width=.08)
+        self.hand.motion.side_effect = self.finish_homing
         self.arm = Mock()
         self.card.controller = Mock(side_effect=self.started)
 
@@ -38,20 +39,17 @@ class PickExecutionTests(unittest.TestCase):
                     dq=[0.] * 7, O_T_EE=np.eye(4).flatten(order='F').tolist(),
                     F_T_EE=np.eye(4).flatten(order='F').tolist())
 
-    def test_first_confirmed_observe_homes_when_hand_reports_grasped(self):
-        self.hand.snapshot.return_value['is_grasped'] = True
+    def finish_homing(self, _):
+        self.hand.snapshot.return_value.update(is_grasped=False, sdk_received_ns=time.monotonic_ns())
+        return dict(status='succeeded')
+
+    def test_each_confirmed_observe_homes_even_when_hand_is_already_calibrated(self):
         self.arm.snapshot.side_effect = self.state
-
-        def finish(_):
-            self.hand.snapshot.return_value.update(is_grasped=False, sdk_received_ns=time.monotonic_ns())
-            return dict(status='succeeded')
-
-        self.hand.motion.side_effect = finish
         for _ in range(2):
             reply = self.card.dispatch('observe', dict(confirm_motion=True))
             self.assertEqual(reply['state'], 'completed', reply)
-        self.hand.command.assert_called_once()
-        self.assertEqual(self.hand.command.call_args.args[1], 'homing')
+        self.assertEqual(self.hand.command.call_count, 2)
+        self.assertTrue(all(call.args[1] == 'homing' for call in self.hand.command.call_args_list))
 
     def test_homing_does_not_release_a_possible_load_from_a_failed_transfer(self):
         self.hand.snapshot.return_value['is_grasped'] = True
@@ -60,12 +58,6 @@ class PickExecutionTests(unittest.TestCase):
             reply = self.card.dispatch('observe', dict(confirm_motion=True))
             self.assertEqual(reply['state'], 'error', reply)
             self.assertTrue(reply['result']['holding_object_possible'])
-        self.hand.command.assert_not_called()
-
-    def test_healthy_hand_needs_no_homing(self):
-        self.arm.snapshot.side_effect = self.state
-        reply = self.card.dispatch('observe', dict(confirm_motion=True))
-        self.assertEqual(reply['state'], 'completed', reply)
         self.hand.command.assert_not_called()
 
     def test_observe_uses_controller_and_returns_synchronously(self):

@@ -110,7 +110,7 @@ class GraspTargetTests(unittest.TestCase):
             np.testing.assert_allclose(tail.derivative(degree)(end), 0., atol=1e-9)
 
 
-    def test_pick_offset_preserves_hover_height_and_placement_reference(self):
+    def test_vertical_offset_raises_all_grasp_and_placement_targets(self):
         from franka.fr3.pick_place.geometry import transform
         from franka.fr3.pick_place.transfer import image_table_axes
 
@@ -121,6 +121,18 @@ class GraspTargetTests(unittest.TestCase):
         normal = np.asarray(self.scene['table_normal_base'])
         horizontal = image_table_axes(camera, normal)[:, 1] * -.002
         delta = np.asarray(corrected['poses'])[:, :3, 3] - np.asarray(original['poses'])[:, :3, 3]
-        np.testing.assert_allclose(delta[0], horizontal)
-        np.testing.assert_allclose(delta[1], horizontal + normal * .003)
-        np.testing.assert_allclose(corrected['placement_reference'], np.asarray(original['poses'][1])[:3, 3])
+        np.testing.assert_allclose(delta, np.tile(horizontal + normal * .003, (3, 1)))
+        np.testing.assert_allclose(corrected['placement_reference'],
+                                   np.asarray(original['poses'][1])[:3, 3] + normal * .003)
+
+        from franka.fr3.pick_place.transfer import moveit_targets
+        scene = dict(self.scene, table_point_base_mm=self.scene['centre_base_mm'])
+        options = dict(displacement_mm=[20, 0], rotation_deg=0)
+        old_targets, new_targets = (
+            moveit_targets(self.observation, pick, scene, self.profile['handeye'], options)
+            for pick in (original, corrected)
+        )
+        for name in ('approach', 'descent', 'lift', 'carry', 'place_lift'):
+            before = np.asarray(old_targets[name]).reshape(-1, 4, 4)
+            after = np.asarray(new_targets[name]).reshape(-1, 4, 4)
+            np.testing.assert_allclose((after[:, :3, 3] - before[:, :3, 3]) @ normal, .003)
