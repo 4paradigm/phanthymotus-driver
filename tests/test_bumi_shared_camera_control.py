@@ -155,7 +155,7 @@ def test_body_imu_stop_ack_waits_for_publish_and_restart_rejects_queued_reads(ca
     state.on_publish=publish
     def spin(node):
         if state.iterations==1:
-            body=node.subscriptions['/robot/state/imu']
+            body=state.send_imu
             body(NS(data=json.dumps(reading(10_030_000_000))))
             workers[0].join(1.)
             assert not workers[0].is_alive()

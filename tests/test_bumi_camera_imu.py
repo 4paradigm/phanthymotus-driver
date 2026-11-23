@@ -2,6 +2,7 @@
 import importlib.util
 import json
 import sys
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -25,14 +26,25 @@ def test_capture_uses_body_imu_without_discovering_or_enabling_camera_motion(cap
     sdk.pipeline_wrapper=lambda pipeline:probes.append(pipeline)
     monkeypatch.setenv('BUMI_BODY_IMU_MOUNT',json.dumps(mount))
     state.frame_limit=2
-    def spin(node):
-        if state.iterations==1:
-            node.subscriptions['/robot/state/imu'](NS(data=json.dumps(reading(10_030_000_000))))
-    state.on_spin=spin
+    imu_threads = []
+    def published(topic, _):
+        if topic == '/robot/state/imu_calibrated':
+            imu_threads.append(threading.current_thread())
+
+    state.on_publish = published
+
+    def frame_boundary():
+        if state.iterations == 2:
+            state.send_imu(NS(data=json.dumps(reading(10_030_000_000))))
+
+    state.before_frame = frame_boundary
     device._camera_subprocess('robot')
     packet=json.loads(state.published['/robot/state/imu_calibrated'][0].data)
     assert not {'source_id','epoch','stamp_source','clock_id','translation_source'} & packet.keys()
     assert packet['camera_frame_id']=='robot_rgb_optical'
+    assert '/robot/state/imu' not in state.node.subscriptions
+    assert len(imu_threads) == 1 and imu_threads[0] is not threading.current_thread()
+    assert state.imu_node.destroyed and not imu_threads[0].is_alive()
     assert packet['angular_velocity']==[1.,2.,3.]
     assert packet['camera_from_gyro_translation']==[0.,0.,0.]
     assert packet['camera_from_accel_translation']==[0.,0.,0.]

@@ -2348,6 +2348,7 @@ def _camera_subprocess(namespace: str):
 
     import rclpy as _rclpy
     from rclpy.node import Node as _Node
+    from rclpy.executors import SingleThreadedExecutor
     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
     from std_msgs.msg import String as _String
     from body_imu import BodyImuSource
@@ -2418,7 +2419,14 @@ def _camera_subprocess(namespace: str):
         msg.data = json.dumps(packet, allow_nan=False)
         if 'imu' in enabled_cards:
             imu_pub.publish(msg)
+    imu_reference = 'waiting for RGB-D wall-clock mapping'
     def body_reference():
+        reference = imu_reference
+        if isinstance(reference, str):
+            raise ValueError(reference)
+        return reference
+
+    def camera_reference():
         if rgbd_inputs is None or rgbd_inputs.clocks[0].offset is None:
             raise ValueError('waiting for RGB-D wall-clock mapping')
         if rgbd_inputs._clock_error:
@@ -2436,7 +2444,6 @@ def _camera_subprocess(namespace: str):
                     publish_imu(packet)
             except (ValueError, TypeError) as error:
                 imu.unavailable(error)
-    node.create_subscription(_String, f'/{namespace}/state/imu', body_reading, _QOS)
     try:
         pipeline.start(config)
         capture = pipeline
@@ -2543,7 +2550,13 @@ def _camera_subprocess(namespace: str):
     last_imu_report = 0.
     t_start = _time.monotonic()
     acknowledge_control()
+    imu_node = _Node('bumi_camera_imu_rx', enable_rosout=False, start_parameter_services=False)
+    imu_node.create_subscription(_String, f'/{namespace}/state/imu', body_reading, _QOS)
+    imu_executor = SingleThreadedExecutor()
+    imu_executor.add_node(imu_node)
+    imu_thread = threading.Thread(target=imu_executor.spin, name='bumi_camera_imu_rx')
     try:
+        imu_thread.start()
         while True:
             # The camera node owns the raw_enabled subscription. This is a
             # separate process from the bundle executor, so it must service its
@@ -2572,6 +2585,10 @@ def _camera_subprocess(namespace: str):
                     rgbd_inputs.publish(source_frames)
                 except Exception as exc:
                     rgbd_inputs.unavailable(exc)
+                try:
+                    imu_reference = camera_reference()
+                except ValueError as exc:
+                    imu_reference = str(exc)
 
             if _time.monotonic() - last_imu_report >= .2:
                 print('[camera_subprocess] IMU ' + json.dumps(dict(imu.status(_time.time_ns()), activation=control['activations']['imu']), allow_nan=False), flush=True)
@@ -2587,6 +2604,10 @@ def _camera_subprocess(namespace: str):
     except Exception as e:
         print(f"[camera_subprocess] error: {e}", flush=True)
     finally:
+        imu_executor.shutdown()
+        if imu_thread.ident is not None:
+            imu_thread.join()
+        imu_node.destroy_node()
         if rgbd_inputs is not None:
             close = getattr(rgbd_inputs, 'close', None)
             if close is not None:

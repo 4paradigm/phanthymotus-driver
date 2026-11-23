@@ -183,6 +183,8 @@ def test_capture_owner_does_not_publish_native_color_on_calibrated_source_failur
     device, state = capture
     calls = []
     class BrokenSource:
+        clocks = (NS(offset=None),)
+
         def __init__(self, node, namespace, pipeline, qos, **kwargs):
             calls.append(('init', namespace, pipeline))
         def set_enabled(self, cards): pass
@@ -253,6 +255,8 @@ def test_capture_failure_after_recovery_clears_source_readiness(capture, monkeyp
     state.frame_limit = 4
     calls = []
     class IntermittentSource:
+        clocks = (NS(offset=None),)
+
         def __init__(self, *args, **kwargs):
             self.count = 0
         def set_enabled(self, cards): pass

@@ -5,6 +5,8 @@ pipeline and must never be able to stop JPEG/Z16 media production. Only the
 hardware, codec, ROS and child-process boundaries are replaced here.
 """
 from array import array
+from concurrent.futures import Future
+from queue import Queue
 import importlib.util
 import json
 import sys
@@ -175,9 +177,16 @@ def capture(monkeypatch):
     qos.QoSProfile = lambda **kwargs: NS(**kwargs)
 
     class Node:
-        def __init__(self, name):
-            state.node = self
+        def __init__(self, name, **kwargs):
+            if name == 'bumi_camera_imu_rx':
+                state.imu_node = self
+            else:
+                state.node = self
             self.subscriptions = {}
+            self.destroyed = False
+
+        def destroy_node(self):
+            self.destroyed = True
 
         def create_publisher(self, cls, topic, qos):
             state.publisher_topics.append(topic)
@@ -200,6 +209,32 @@ def capture(monkeypatch):
                                      nanoseconds=1_000_000_002))
 
     monkeypatch.setattr(sys.modules['rclpy.node'], 'Node', Node)
+    imu_jobs = Queue()
+
+    class ImuExecutor:
+        def add_node(self, node):
+            self.node = node
+
+        def spin(self):
+            while (job := imu_jobs.get()) is not None:
+                message, result = job
+                try:
+                    self.node.subscriptions['/robot/state/imu'](message)
+                except Exception as error:
+                    result.set_exception(error)
+                else:
+                    result.set_result(None)
+
+        def shutdown(self):
+            imu_jobs.put(None)
+
+    def send_imu(message):
+        result = Future()
+        imu_jobs.put((message, result))
+        return result.result(timeout=1.)
+
+    state.send_imu = send_imu
+    monkeypatch.setitem(sys.modules, 'rclpy.executors', NS(SingleThreadedExecutor=ImuExecutor))
     rclpy = sys.modules['rclpy']
     rclpy.init = lambda: None
 
