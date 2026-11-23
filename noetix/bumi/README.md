@@ -221,19 +221,28 @@ the new card. State scopes, JSON snapshots, labels and interval logging are no
 longer supported. Historical files under `/opt/phanthy-motus/data/bumi/state-records`
 are left untouched.
 
-- `start`: check whether the camera process is ready (does not take a photo).
+- `start`: immediately return the actuator lifecycle marker `ready`. Camera
+  readiness is checked by the photo/video actions, not canvas activation.
 - `capture_photo`: save one current RGB JPEG.
-- `record_video`: asynchronously save an RGB MP4/H.264 video; `duration_s` is
-  an integer from 1 to 30, default 5 seconds.
+- `record_video`: asynchronously save an MP4/H.264 video; `duration_s` is
+  an integer from 1 to 30, default 5 seconds. Set `include_audio: true` to
+  include microphone AAC audio (default false). Audio capture must be enabled.
 - `info`: return storage directories, camera/frame freshness and active recording.
-- `stop`: cancel recording and remove the incomplete video. This is not
-  “finish early and save”. It does not stop the existing camera sensor card.
+- `stop`: immediately return lifecycle `idle` and request cancellation. If a
+  recording exists, `cancellation_pending=true` means cleanup is still running;
+  ACP/`info.last_recording` reports the terminal result. This does not stop the
+  camera/mic or “finish early and save”. Bundle shutdown separately waits for cleanup.
 
 Bumi reuses its existing 640x480 JPEG topic `/<namespace>/camera/color`.
 A recent cached frame is used for a photo; if none is available or it is older
 than 3 seconds, capture waits for a fresh frame (up to 5 seconds per wait).
-Recording requests a strictly later frame sequence for each encoded frame.
-No second RealSense pipeline, depth capture, audio or state JSON is added.
+Recording subscribes to the existing timestamped JPEG producer. It maps source
+timestamps onto the output frame clock, repeating missing frames instead of
+accelerating playback. A camera gap over one second fails the recording.
+Optional audio uses `/<namespace>/mic/audio_recording`, published by the existing
+mic process with host chunk-end stamps. No second SDK capture client is opened.
+The original mic topic keeps its SDK timestamp contract; SDK audio at a different
+sample rate is resampled to the declared 16 kHz instead of changing playback speed.
 
 Default persistent output:
 
@@ -254,13 +263,17 @@ Photo failure returns `CAPTURE_FAILED` without creating a JSON sidecar.
 Video requests return `state=queued` and an `action_id`; completion/failure/
 cancellation is sent to `AGENT_CORE_URL/api/acp/complete` (default Agent Core
 URL: `https://localhost:15678`), matching Q5's ACP contract. Only one video
-recording may run at a time. A callback delivery failure is logged; it does not
-delete a successfully saved video.
+recording may run at a time. `info.last_recording` retains its terminal result.
+A callback delivery failure is logged; it does not delete a successfully saved video.
 
 Configuration is under `plugins.vision_capture`: `output_dir`, `fps`
-(default/max 15), and `max_duration_s` (default/max 30). Rebuild the driver
-image to install the new FFmpeg dependency. All runtime implementation remains
-in `device.py`; no extra runtime Python file is required.
+(output fps, default/max 15), and `max_duration_s` (default/max 30). The existing
+Dockerfile already installs FFmpeg; the existing device-source COPY also installs the Bumi-private
+`bumi_av_recording.py`. No base-image, package or model changes are needed.
+The recorder adapts G1's audio timeline and failure handling; video uses
+an explicit CFR clock compatible with FFmpeg 4.4. Synchronization is software,
+not hardware exposure/sample synchronization. See [stopwatch and counting
+acceptance](AV_RECORDING.md) for the exact camera, microphone and download steps.
 
 ## New cards
 
@@ -500,3 +513,17 @@ media cards and motion cards keep running.
 
 The output contract, quality states, assumed body-axis calibration, validation
 status and the ROS probe live in [VISUAL_ODOMETRY.md](VISUAL_ODOMETRY.md).
+
+## Foot-pose prototype and scene Skills
+
+`foot_pose` reads leg-joint snapshots, estimates body-frame foot positions and
+separation, compares saved pose signatures, and reloads individual assets.
+The geometry calculator also runs offline without ROS or the SDK. Motion requests
+default to preview-only: no verified leg-motion assets or source-reception
+freshness adapter are shipped.
+See [FOOT_POSE.md](FOOT_POSE.md) for its execution boundary and checks.
+
+The [scene Skill sources](skills/README.md) include doorway greeting with wave
+and welcome speech, station photo records, and an offline foot-RPS rules draft.
+Skills are installed separately into Agent Core; building this driver does not
+install or start them. [PORTING.md](PORTING.md) records the migration scope.

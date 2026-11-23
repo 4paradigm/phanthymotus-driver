@@ -72,11 +72,12 @@ def _load_device(monkeypatch):
     return module, String
 
 
-@pytest.mark.parametrize('timestamps, expected_stamp', [
-    ((1_700_000_000_000_000, 1_700_000_000_020_000), (1_700_000_000, 0)),
-    ((1_700_000_000_000_000_000, 1_700_000_000_020_000_000), (0, 0)),
+@pytest.mark.parametrize('timestamps, expected_stamp, source_rate', [
+    ((1_700_000_000_000_000, 1_700_000_000_020_000), (1_700_000_000, 0), 16000),
+    ((1_700_000_000_000_000_000, 1_700_000_000_020_000_000), (0, 0), 16000),
+    ((1_700_000_000_000_000, 1_700_000_000_020_000), (1_700_000_000, 0), 48000),
 ])
-def test_mic_publishes_mono_audio_from_sdk_frames(monkeypatch, timestamps, expected_stamp):
+def test_mic_publishes_mono_audio_from_sdk_frames(monkeypatch, timestamps, expected_stamp, source_rate):
     module, String = _load_device(monkeypatch)
     monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
     published = {}
@@ -100,8 +101,8 @@ def test_mic_publishes_mono_audio_from_sdk_frames(monkeypatch, timestamps, expec
         except StopIteration:
             raise Done()
         return types.SimpleNamespace(timestamp_us=timestamp_us,
-                                     channels=8, sample_rate=16000,
-                                     audio_data=[10] * (320 * 8))
+                                     channels=8, sample_rate=source_rate,
+                                     audio_data=[10] * (round(source_rate * .02) * 8))
 
     monkeypatch.setattr(sys.modules["rclpy"], "init", lambda: None, raising=False)
     monkeypatch.setattr(sys.modules["rclpy.node"], "Node", Node)
@@ -123,3 +124,11 @@ def test_mic_publishes_mono_audio_from_sdk_frames(monkeypatch, timestamps, expec
     assert audio[0].format == "pcm_16k_16bit_mono"
     assert audio[0].data == (500).to_bytes(2, "little", signed=True) * 640
     assert (audio[0].header.stamp.sec, audio[0].header.stamp.nanosec) == expected_stamp
+    recording = published["/robot/mic/audio_recording"]
+    assert len(recording) == 1
+    assert recording[0].format == "audio/pcm-16k"
+    assert recording[0].data == audio[0].data
+    # The timed recording stream remains usable even when SDK stamps are invalid.
+    stamp = recording[0].header.stamp
+    import time
+    assert abs(time.time() - (stamp.sec + stamp.nanosec / 1e9)) < 1
