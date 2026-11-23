@@ -527,9 +527,14 @@ arms is a separate card, because on Bumi that must take over all 21 motors
 (`LowController.set_joint` rejects any other length) and hold its own balance.
 
 The card is **disabled by default** (`plugins.upper_body_track.enabled: false`)
-because enabling it adds an ultralytics/torch image layer and continuous CPU
-load. To use it, enable the plugin and wire the camera's RGB topic into the
-card's `start` action via the canvas; depth is optional — without it the card
-falls back to a flat-plane assumption and says so in `degraded`. The sign of
-each axis can be corrected per robot in `config.yaml` or overridden at `start`
-without rebuilding the image.
+because inference needs an ultralytics/torch runtime and continuous CPU load.
+That runtime is **not in the default image**: Docker layers cannot be switched
+at runtime, so building an image that can run this card requires the build-time
+flag `--build-arg INSTALL_POSE_DEPS=1` (the dependency is pinned in the
+`Dockerfile`). A default build stays free of torch and cannot run the card, so
+turning the plugin on without rebuilding leaves it unloaded — the card's
+`info` reports the import error. To use it, build with that flag, enable the
+plugin, and wire the camera's RGB topic into the card's `start` action via the
+canvas; depth is optional — without it the card falls back to a flat-plane
+assumption and says so in `degraded`. The sign of each axis can be corrected
+per robot in `config.yaml` or overridden at `start` without rebuilding.

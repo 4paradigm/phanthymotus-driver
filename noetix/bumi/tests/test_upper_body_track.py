@@ -243,3 +243,164 @@ def test_both_modules_reach_the_image():
     dockerfile = (Path(__file__).resolve().parent.parent / "Dockerfile").read_text(encoding="utf-8")
     for name in ("upper_body_track_spec.py", "upper_body_track_card.py"):
         assert f"COPY {name} /work/{name}" in dockerfile
+
+
+def test_pose_runtime_is_an_opt_in_pinned_build_arg():
+    """A default Bumi image must not silently carry torch for a disabled card."""
+    dockerfile = (Path(__file__).resolve().parent.parent / "Dockerfile").read_text(encoding="utf-8")
+    assert "ARG INSTALL_POSE_DEPS=0" in dockerfile
+    assert 'ultralytics==' in dockerfile
+    assert 'ultralytics &&' not in dockerfile  # no unpinned install remains
+
+
+# ── end-to-end through the card's own `_measure` ──────────────────────────────
+
+def _load_card_module(monkeypatch):
+    """Import the card with its ROS/OpenCV/numpy dependencies stubbed out.
+
+    `_measure` — where the payload is actually assembled — is a pure function
+    of keypoints plus the AngleBank. The spec tests above cannot see a held
+    angle being dropped at that layer, so this stub lets the regression run on
+    a laptop without ROS, cv2 or numpy installed.
+    """
+    import importlib.util
+    import sys
+    import types
+
+    cv2 = types.ModuleType("cv2")
+    cv2.imdecode = lambda *a, **k: None
+    cv2.IMREAD_COLOR = 1
+    np = types.ModuleType("numpy")
+    np.uint8 = object
+    np.uint16 = object
+    np.frombuffer = lambda *a, **k: None
+    # pytest.approx consults numpy if it is importable, so the stub must answer
+    # its scalar check or the assertion itself errors before comparing.
+    # (pytest.approx needs more numpy internals than are worth faking here;
+    #  the assertions below use plain float comparison instead.)
+    rclpy = types.ModuleType("rclpy")
+    node_mod = types.ModuleType("rclpy.node")
+    node_mod.Node = object
+    qos_mod = types.ModuleType("rclpy.qos")
+    qos_mod.QoSProfile = lambda **kw: None
+    qos_mod.ReliabilityPolicy = types.SimpleNamespace(BEST_EFFORT=1)
+    qos_mod.HistoryPolicy = types.SimpleNamespace(KEEP_LAST=1)
+    qos_mod.DurabilityPolicy = types.SimpleNamespace(VOLATILE=1)
+    sensor_msgs = types.ModuleType("sensor_msgs")
+    sensor_msg = types.ModuleType("sensor_msgs.msg")
+    sensor_msg.CompressedImage = object
+    std_msgs = types.ModuleType("std_msgs")
+    std_msg = types.ModuleType("std_msgs.msg")
+    std_msg.String = lambda data="": types.SimpleNamespace(data=data)
+    for name, module in (
+        ("cv2", cv2), ("numpy", np), ("rclpy", rclpy),
+        ("rclpy.node", node_mod), ("rclpy.qos", qos_mod),
+        ("sensor_msgs", sensor_msgs), ("sensor_msgs.msg", sensor_msg),
+        ("std_msgs", std_msgs), ("std_msgs.msg", std_msg),
+    ):
+        monkeypatch.setitem(sys.modules, name, module)
+
+    path = Path(__file__).resolve().parent.parent / "upper_body_track_card.py"
+    loader = importlib.util.spec_from_file_location("ubt_card_under_test", path)
+    module = importlib.util.module_from_spec(loader)
+    loader.loader.exec_module(module)
+    return module
+
+
+def _bare_plugin(module):
+    """A plugin with only the state `_measure` actually reads."""
+    import types
+
+    plugin = object.__new__(module.UpperBodyTrackPlugin)
+    plugin._min_kp_conf = 0.4
+    plugin._focal_setting = 460.0
+    plugin._signs = {"pitch_sign": 1.0, "roll_sign": 1.0, "elbow_sign": 1.0}
+    plugin._bank = spec.AngleBank()
+    plugin._depth_cache = types.SimpleNamespace(
+        decode=lambda: (None, None, None), age_s=lambda: None)
+    return plugin
+
+
+def _arms_person():
+    """Keypoints with both arms visible on a flat plane (no depth needed)."""
+    points = _blank_points()
+    # Person's LEFT arm drives the robot's right — this is the one we occlude.
+    points[spec.L_SHOULDER] = [360.0, 200.0, 0.9]
+    points[spec.L_ELBOW] = [400.0, 200.0, 0.9]
+    points[spec.L_WRIST] = [440.0, 200.0, 0.9]
+    # Person's RIGHT arm drives the robot's left.
+    points[spec.R_SHOULDER] = [280.0, 200.0, 0.9]
+    points[spec.R_ELBOW] = [240.0, 200.0, 0.9]
+    points[spec.R_WRIST] = [200.0, 200.0, 0.9]
+    points[spec.L_HIP] = [350.0, 400.0, 0.9]
+    points[spec.R_HIP] = [290.0, 400.0, 0.9]
+    return points
+
+
+def test_an_occluded_arm_holds_its_last_angle_in_the_payload(monkeypatch):
+    """Regression: a blink of missing keypoints must not read as 'not measured'.
+
+    The bank still holds the last filtered angle, but the payload used to be
+    built only from sides visible *this* frame, so an occluded arm emitted
+    -999 — a discontinuity exactly when the filter should be holding.
+    """
+    import time
+
+    card = _load_card_module(monkeypatch)
+    plugin = _bare_plugin(card)
+
+    first = plugin._measure([_person(_arms_person())], 640, 480, time.monotonic(), 0.0)
+    assert first["tracked"] is True
+    assert first["l_pitch_deg"] != -999.0
+    assert first["r_pitch_deg"] != -999.0
+    held = (first["r_pitch_deg"], first["r_roll_deg"], first["r_elbow_deg"])
+
+    occluded = _arms_person()
+    occluded[spec.L_WRIST] = [440.0, 200.0, 0.0]  # robot-right loses its wrist
+    second = plugin._measure([_person(occluded)], 640, 480, time.monotonic(), 0.0)
+
+    assert abs(second["r_pitch_deg"] - held[0]) < 1e-6
+    assert abs(second["r_roll_deg"] - held[1]) < 1e-6
+    assert abs(second["r_elbow_deg"] - held[2]) < 1e-6
+    assert second["r_pitch_deg"] != -999.0
+    assert second["degraded"] != ""  # the gap is still reported honestly
+
+
+def test_frame_failures_are_throttled(monkeypatch):
+    """One corrupt stream is one outage, not a warning per frame."""
+    import threading
+    import types
+
+    card = _load_card_module(monkeypatch)
+    plugin = object.__new__(card.UpperBodyTrackPlugin)
+    warnings, infos = [], []
+
+    class _Event:
+        def __init__(self):
+            self.n = 0
+
+        def is_set(self):
+            return self.n >= 101
+
+        def wait(self, _timeout=0):
+            self.n += 1
+            return False
+
+    def _fail(_jpeg, _received_at):
+        raise ValueError("bad frame")
+
+    plugin._stop_event = _Event()
+    plugin._generation = 0
+    plugin._rate_hz = 30.0
+    plugin._frame_lock = threading.Lock()
+    plugin._latest_jpeg = b"x"
+    plugin._latest_jpeg_at = 0.0
+    plugin._frame_failures = 0
+    plugin._process = _fail
+    plugin._node = types.SimpleNamespace(get_logger=lambda: types.SimpleNamespace(
+        warning=warnings.append, info=infos.append))
+    plugin._worker_loop(0)
+
+    assert len(warnings) == 2  # first failure and the 100th, not 101
+    assert "bad frame" in warnings[0]
+    assert "100" in warnings[1]

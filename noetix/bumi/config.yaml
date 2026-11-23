@@ -96,7 +96,7 @@ plugins:
   # 只读上半身动作镜像：吃相机画面（可选深度），发布 2D 关键点和重定向后的
   # 6 个手臂关节角。不下发任何关节命令，不驱动手臂。
   upper_body_track:
-    enabled: false   # 默认关闭：开启会多一层 ultralytics/torch 并持续占 CPU
+    enabled: false   # 默认关闭：需先用 --build-arg INSTALL_POSE_DEPS=1 构建含 ultralytics/torch 的镜像，并持续占 CPU
     # YOLO11-pose 权重。n=nano 最快；首次运行自动下载，离线机器人请预下载后填绝对路径。
     model_path: yolo11n-pose.pt
     device: cpu

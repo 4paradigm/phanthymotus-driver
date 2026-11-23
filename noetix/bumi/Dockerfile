@@ -101,14 +101,21 @@ RUN apt-get update && \
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     pyyaml netifaces numpy opencv-python-headless pyrealsense2 pybind11
 
-# `upper_body_track` card: YOLO11-pose inference. ultralytics pulls torch and
-# torchvision (CPU-only wheels on ARM64 via PyPI); the headless opencv above
-# needs no GUI libs. The pose weight is fetched on first run and cached, or
-# `model_path` points at a pre-downloaded copy on an offline robot. The card
-# ships disabled in config.yaml — this layer costs image size, so it is paid
-# only when the card is actually enabled.
-RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} ultralytics && \
-    python3 -c 'import ultralytics; from ultralytics import YOLO'
+# `upper_body_track` card: optional YOLO11-pose inference. ultralytics pulls
+# torch and torchvision, which adds several hundred MB to the image. Docker
+# layers cannot be conditional at runtime, so keeping that cost out of default
+# Bumi images requires a build-time switch: pass --build-arg INSTALL_POSE_DEPS=1
+# to build an image that can run this card. The version is pinned so a rebuild
+# cannot silently swap the inference runtime. The headless opencv above needs
+# no GUI libs; the pose weight is fetched on first run and cached, or
+# `model_path` points at a pre-downloaded copy on an offline robot.
+ARG INSTALL_POSE_DEPS=0
+RUN if [ "$INSTALL_POSE_DEPS" = "1" ]; then \
+      pip3 install --no-cache-dir -i ${PYPI_MIRROR} ultralytics==8.4.216 && \
+      python3 -c 'import ultralytics; from ultralytics import YOLO'; \
+    else \
+      echo "upper_body_track pose deps not installed (INSTALL_POSE_DEPS != 1)"; \
+    fi
 
 # The bundle image must be able to start the estimator child and this card's
 # Python imports; fail the build here rather than on a robot. Docker's default

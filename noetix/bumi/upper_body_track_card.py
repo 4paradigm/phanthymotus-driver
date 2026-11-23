@@ -236,6 +236,10 @@ class UpperBodyTrackPlugin:
         self._status = "idle"
         self._frames = 0
         self._last_error = None
+        # One corrupt stream is one outage, not ten warnings a second. The
+        # first failure and every hundredth keep visibility; the first good
+        # frame announces recovery immediately (same pattern as the odom card).
+        self._frame_failures = 0
         self._last_payload = None
         self._last_inference_ms = 0.0
 
@@ -383,6 +387,7 @@ class UpperBodyTrackPlugin:
         self._input_topic = input_topic
         self._depth_topic = str(args.get("depth_topic") or "").strip()
         self._last_error = None
+        self._frame_failures = 0
         self._stop_event = threading.Event()
 
         def _on_color(msg: CompressedImage):
@@ -530,9 +535,18 @@ class UpperBodyTrackPlugin:
             try:
                 self._process(jpeg, received_at)
             except Exception as exc:  # keep the worker alive; a bad frame is not fatal
+                self._frame_failures += 1
                 self._last_error = f"{type(exc).__name__}: {exc}"
-                self._node.get_logger().warning(
-                    f"upper_body_track frame failed: {self._last_error}")
+                if self._frame_failures == 1 or self._frame_failures % 100 == 0:
+                    self._node.get_logger().warning(
+                        f"upper_body_track frame failed ({self._frame_failures}): "
+                        f"{self._last_error}")
+            else:
+                if self._frame_failures:
+                    self._node.get_logger().info(
+                        f"upper_body_track frame recovered after "
+                        f"{self._frame_failures} failures")
+                    self._frame_failures = 0
             self._last_inference_ms = (time.monotonic() - started) * 1000.0
 
             elapsed = time.monotonic() - started
@@ -640,11 +654,20 @@ class UpperBodyTrackPlugin:
         smoothed = self._bank.update(angles_by_side, time.monotonic())
         angles_out = {}
         for side in ("left", "right"):
-            if side in angles_by_side:
+            prefix = side[0]
+            # Emit the held value for every side the bank has ever seen, not
+            # just the sides measured in this frame. When an arm is occluded
+            # `angles_by_side` drops it but the bank still holds its last
+            # filtered angle; sending -999 for that side would turn a brief
+            # occlusion into a pose discontinuity — the exact failure this
+            # filter exists to prevent. A side never seen at all is still
+            # omitted, and the reader sees -999 = "never measured".
+            if all(f"{prefix}_{axis}" in smoothed
+                   for axis in ("pitch", "roll", "elbow")):
                 angles_out[side] = {
-                    "pitch_deg": smoothed.get(f"{side[0]}_pitch", angles_by_side[side]["pitch_deg"]),
-                    "roll_deg": smoothed.get(f"{side[0]}_roll", angles_by_side[side]["roll_deg"]),
-                    "elbow_deg": smoothed.get(f"{side[0]}_elbow", angles_by_side[side]["elbow_deg"]),
+                    "pitch_deg": smoothed[f"{prefix}_pitch"],
+                    "roll_deg": smoothed[f"{prefix}_roll"],
+                    "elbow_deg": smoothed[f"{prefix}_elbow"],
                 }
 
         reach = None
