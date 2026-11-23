@@ -1027,7 +1027,8 @@ class LocoPlugin:
                     "movement requires workmode=2 (walking) or 3 (whole_body_walking). "
                     "Current mode is "
                     f"{mode} ({_WORKMODE_NAMES.get(mode, 'unknown')}). "
-                    "Select lower_body or whole_body using action=walking_mode."
+                    "Select lower_body or whole_body using action=walking_mode, "
+                    "or use switch_mode switch=walk for lower-body walking."
                 ),
             }
         return None
