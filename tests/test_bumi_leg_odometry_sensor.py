@@ -199,3 +199,161 @@ def test_bundle_loads_leg_sensor_with_no_camera_or_visual_card(sensor, monkeypat
         {'plugins': {'leg_odometry': {'enabled': True}}}, 'robot', executor, Controller(), None)
     assert [tool['name'] for tool in bundle.get_all_tools()] == ['leg_odometry']
     assert bundle.dispatch('leg_odometry', {'action': 'info'})['state'] == 'idle'
+
+
+@pytest.fixture
+def stream(sensor, monkeypatch):
+    module, executor = sensor()
+    controller = Controller()
+    plugin = module.LegOdometryPlugin({}, 'robot', executor, controller)
+    plugin.active = True
+    clock = [1.]
+    monkeypatch.setattr(module.time, 'monotonic', lambda: clock[0])
+
+    def read(ms, monotonic_s=None):
+        plugin.node.now_ns = round(ms * 1_000_000)
+        clock[0] = ms / 1000 if monotonic_s is None else monotonic_s
+        plugin._sample_once()
+
+    def publish():
+        plugin.node.tick()
+        return json.loads(plugin.node.published[plugin.topic][-1].data)
+
+    return NS(plugin=plugin, controller=controller, read=read, publish=publish)
+
+
+def test_sdk_recovery_requires_a_new_read_even_after_a_fault(stream):
+    stream.read(1000)
+    stream.read(1025)
+    assert stream.publish()['pose'] is not None
+    stream.controller.error = RuntimeError('sample unavailable')
+    stream.read(1050)
+    assert stream.publish()['twist'] == [None] * 6
+    stream.controller.error = None
+    stream.controller.frozen = True
+    stream.read(1075)
+    cached = stream.publish()
+    assert cached['stamp_ms'] == 1025
+    assert cached['twist'] == [None] * 6
+    assert not cached.get('reset')
+    stream.controller.frozen = False
+    stream.read(1100)
+    measured = stream.publish()
+    assert measured['stamp_ms'] == 1100
+    assert measured['pose'] is None
+    assert measured['twist'] == [None, None, None, 0., 0., .1]
+    assert measured.get('reset') is True
+
+
+def test_gap_reset_reaches_first_measured_publication_when_timer_skips_baseline(stream):
+    stream.read(1000)
+    stream.read(1025)
+    first = stream.publish()
+    assert first.get('reset') is True
+    stream.read(1200)
+    stream.plugin.node.now_ns += 250_000_001
+    stale = stream.publish()
+    assert stale['twist'] == [None] * 6
+    assert not stale.get('reset')
+    stream.read(1225)
+    for _ in range(2):
+        assert stream.plugin.info()['estimate']['pose'] is not None
+    measured = stream.publish()
+    assert measured['pose']['frame_id'] != first['pose']['frame_id']
+    assert measured.get('reset') is True
+    assert stream.publish() == measured
+    stream.read(1250)
+    assert not stream.publish().get('reset')
+
+
+def test_rollback_reset_waits_for_a_strictly_newer_wire_measurement(stream):
+    stream.read(1000)
+    stream.read(1025)
+    assert stream.publish()['stamp_ms'] == 1025
+    stream.read(1075)  # Observed, but never published.
+    for ms in (1015, 1025, 1025.5):
+        stream.read(ms)
+        withheld = stream.publish()
+        assert withheld['pose'] is None and withheld['twist'] == [None] * 6
+        assert not withheld.get('reset')
+    stream.read(1050)
+    recovered = stream.publish()
+    assert recovered['pose'] is not None
+    assert recovered['stamp_ms'] == 1050
+    assert recovered.get('reset') is True
+    assert stream.publish() == recovered
+
+
+def test_foot_rebase_keeps_uninterrupted_gyro_on_wire(stream, monkeypatch):
+    from noetix.bumi.leg_odometry import JOINT_INDEX
+
+    joints = [0.] * 21
+    monkeypatch.setattr(stream.controller, 'get_joint_state', lambda: joints)
+    stream.read(1000)
+    stream.read(1025)
+    first = stream.publish()
+    for side in ('l', 'r'):
+        joints[JOINT_INDEX[f'{side}_leg_pitch_joint']] = .6
+    for ms in (1050, 1075, 1100, 1125, 1150):
+        stream.read(ms)
+        partial = stream.publish()
+        assert partial['twist'] == [None, None, None, 0., 0., .1]
+        assert partial['pose'] is None
+        assert not partial.get('reset')
+    stream.read(1175)
+    after = stream.publish()
+    assert after['pose']['frame_id'] != first['pose']['frame_id']
+    assert not after.get('reset')
+
+
+def test_explicit_restart_accepts_the_first_read_and_marks_a_new_epoch(stream, monkeypatch):
+    stream.read(1000)
+    stream.read(1025)
+    assert stream.publish()['pose'] is not None
+    stream.plugin.stop()
+    stream.controller.frozen = True
+    # Drive acquisition by hand so timer/worker ordering is deterministic.
+    monkeypatch.setattr(stream.plugin, '_sample_loop', lambda event: None)
+    assert stream.plugin.start()
+    try:
+        stream.read(1050)
+        resumed = stream.publish()
+        assert resumed['stamp_ms'] == 1050
+        assert resumed['twist'] == [None, None, None, 0., 0., .1]
+        assert resumed.get('reset') is True
+    finally:
+        stream.plugin.stop()
+
+
+@pytest.mark.parametrize(('stamp_ms', 'monotonic_s', 'reset'), [
+    (1125, 1.125, False),                 # Exactly 100 ms on both clocks
+    (1125.000001, 1.125, True),           # One nanosecond over on ROS time
+    (1125, 1.125000001, True),            # One nanosecond over on monotonic time
+    (1050, 1.025, True),                  # Monotonic time stopped
+])
+def test_acquisition_reset_uses_the_bound_on_either_clock(stream, stamp_ms, monotonic_s, reset):
+    stream.read(1000)
+    stream.read(1025)
+    stream.publish()
+    stream.read(stamp_ms, monotonic_s)
+    sample = stream.publish()
+    assert sample['twist'][3:] == [0., 0., .1]
+    assert (sample.get('reset') is True) is reset
+
+
+def test_failed_odometry_publish_leaves_epoch_pending(stream, monkeypatch):
+    stream.read(1000)
+    stream.publish()
+    stream.read(1200)
+
+    def fail(message):
+        raise RuntimeError('publish failed')
+
+    with monkeypatch.context() as patch:
+        patch.setattr(stream.plugin.pub, 'publish', fail)
+        with pytest.raises(RuntimeError, match='publish failed'):
+            stream.publish()
+    stream.read(1225)
+    recovered = stream.publish()
+    assert recovered['pose'] is not None
+    assert recovered.get('reset') is True

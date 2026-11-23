@@ -403,3 +403,41 @@ def test_clear_stance_height_reduces_ambiguity_when_velocity_evidence_is_equal()
         return leg.support_ambiguity
 
     assert ambiguity(-.43) < ambiguity(-.48)
+
+
+@pytest.mark.parametrize(('stamp_ms', 'monotonic_s', 'fault'), [
+    (1000, 1., False),   # Cold start
+    (1531, 1.531, False),  # 506 ms since the previous read
+    (1050, 1.050, True),
+    (1015, 1.050, False),  # ROS clock reversal
+    (1050, 1.015, False),  # Monotonic clock reversal
+])
+def test_fresh_gyro_survives_acquisition_baseline(stamp_ms, monotonic_s, fault):
+    source = LegOdometrySource('robot')
+    if stamp_ms != 1000:
+        read(source)
+        read(source, stamp_ns=1_025_000_000, monotonic_s=1.025)
+    if fault:
+        source.invalidate('SDK fault')
+        assert source.sample(1_030_000_000)['twist'] == [None] * 6
+    stamp_ns = stamp_ms * 1_000_000
+    assert not read(source, .4, stamp_ns=stamp_ns, monotonic_s=monotonic_s,
+                    angular_velocity=[.1, -.2, .75])
+    packet = source.sample(stamp_ns)
+    assert packet['twist'] == [None, None, None, .1, -.2, .75]
+    assert packet['pose'] is None
+    assert packet['stamp_ms'] == stamp_ms
+    assert source.sample(stamp_ns - 1)['twist'] == [None] * 6
+    assert source.sample(stamp_ns + 250_000_001)['twist'] == [None] * 6
+
+
+def test_sparse_506_ms_reads_report_rates_without_accumulating_distance():
+    source = LegOdometrySource('robot')
+    for i, rate in enumerate((.25, -.75, .5, 0.)):
+        ms = 1000 + 506 * i
+        assert not read(source, pitch=i * .01, stamp_ns=ms * 1_000_000,
+                        monotonic_s=ms / 1000, angular_velocity=[0., 0., rate])
+        sample = source.sample(ms * 1_000_000)
+        assert sample['pose'] is None
+        assert sample['twist'] == [None, None, None, 0., 0., rate]
+        assert sample['stamp_ms'] == ms

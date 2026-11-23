@@ -57,8 +57,24 @@ class LegOdometrySource:
             raise ValueError('leg odometry child_frame_id must be nonempty')
         self.reset()
 
+    @property
+    def acquisition_epoch(self):
+        """Identity shared by consecutive valid reads on both clocks."""
+        return self._acquisition_epoch
+
+    @property
+    def last_stamp_ns(self):
+        return self._last_stamp_ns
+
     def reset(self):
-        """New independent reference frame; never retain a previous foot step."""
+        """Start a new acquisition epoch and independent foot reference frame."""
+        self._last_stamp_ns = None
+        self._last_monotonic_s = None
+        self._needs_baseline = False
+        self._reset_feet()
+        self._acquisition_epoch = self.session_id
+
+    def _reset_feet(self):
         self.session_id = uuid.uuid4().hex
         self.frame_id = f'{self.namespace}_leg_odom_{self.session_id}'
         # Existing locomotion retains its own configured slip corrections.
@@ -67,9 +83,6 @@ class LegOdometrySource:
                                contact_confidence=True)
         self._baseline_stamp_ns = None
         self._baseline_monotonic_s = None
-        self._last_stamp_ns = None
-        self._last_monotonic_s = None
-        self._needs_baseline = False
         self._pose = None
         self._twist = None
         self._status = 'initializing'
@@ -107,15 +120,21 @@ class LegOdometrySource:
             self.invalidate(str(exc))
             raise ValueError(str(exc)) from exc
 
-        # Require read chronology as well as a short span from the last usable
-        # foot endpoint. Rejected feet never move that endpoint forward.
-        discontinuity = self._baseline_stamp_ns is not None and (
+        # A break between SDK reads cuts both gyro and foot continuity. Failed
+        # support steps can instead expire just the foot reference frame.
+        max_interval_ns = int(MAX_INTERVAL_S * 1e9)
+        read_gap = self._last_stamp_ns is not None and (
             monotonic_s <= self._last_monotonic_s or stamp_ns <= self._last_stamp_ns
-            or interval_too_long(self._baseline_monotonic_s, monotonic_s)
-            or stamp_ns - self._baseline_stamp_ns > int(MAX_INTERVAL_S * 1e9)
+            or interval_too_long(self._last_monotonic_s, monotonic_s)
+            or stamp_ns - self._last_stamp_ns > max_interval_ns
         )
-        if self._needs_baseline or discontinuity:
+        if self._needs_baseline or read_gap:
             self.reset()
+        elif self._baseline_stamp_ns is not None and (
+            interval_too_long(self._baseline_monotonic_s, monotonic_s)
+            or stamp_ns - self._baseline_stamp_ns > max_interval_ns
+        ):
+            self._reset_feet()
         previous_mono = self._baseline_monotonic_s
         recovering = self._last_stamp_ns != self._baseline_stamp_ns
         previous_position = list(self.leg.position)
@@ -138,6 +157,7 @@ class LegOdometrySource:
         self._baseline_stamp_ns = stamp_ns
         self._baseline_monotonic_s = monotonic_s
         if previous_mono is None:
+            self._twist = [None, None, None, *angular]
             self._reason = 'establishing leg baseline'
             return False
 

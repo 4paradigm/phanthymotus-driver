@@ -42,6 +42,9 @@ class LegOdometryPlugin:
         self.errors = 0
         self.last_error = None
         self._last_signature = None
+        self._published_epoch = None
+        self._published_read_ns = None
+        self._published_reset = False
         self.timer = self.node.create_timer(PUBLISH_INTERVAL_S, self._publish)
         executor.add_node(self.node)
 
@@ -126,7 +129,6 @@ class LegOdometryPlugin:
                     return
                 self.errors += 1
                 self.last_error = str(error)
-                self._last_signature = None
                 self.source.invalidate(self.last_error)
                 if self.errors == 1 or self.errors % 100 == 0:
                     print(f'[leg_odometry] SDK sample failed ({self.errors}): {error}', flush=True)
@@ -145,7 +147,26 @@ class LegOdometryPlugin:
             if not self.active and not force:
                 return
             sample = self.source.sample(self.node.get_clock().now().nanoseconds)
+            epoch = self.source.acquisition_epoch
+            read_ns = self.source.last_stamp_ns
+            measured = any(value is not None for value in sample['twist'])
+            if measured:
+                repeat = epoch == self._published_epoch and read_ns == self._published_read_ns
+                if (not repeat and self._published_read_ns is not None and
+                        sample['stamp_ms'] <= self._published_read_ns // 1_000_000):
+                    # Wire stamps are milliseconds. A rolled-back or colliding
+                    # read cannot replace a measurement at the published stamp.
+                    sample['pose'] = None
+                    sample['twist'] = [None] * 6
+                    sample['vendor'].update(status='lost', reason='waiting for a newer read timestamp')
+                    measured = False
+                elif epoch != self._published_epoch or (repeat and self._published_reset):
+                    sample['reset'] = True
             self.pub.publish(self.String(data=json.dumps(sample, allow_nan=False)))
+            if measured:
+                self._published_epoch = epoch
+                self._published_read_ns = read_ns
+                self._published_reset = sample.get('reset') is True
             status = dict(sample['vendor'],
                           position_m=(sample.get('pose') or {}).get('position'),
                           last_error=self.last_error, error_count=self.errors)
