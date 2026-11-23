@@ -191,6 +191,16 @@ class BumiDeviceBundle:
                     high_ctrl=high_ctrl))
                 print("[bundle] VisualOdometryPlugin loaded")
 
+        if plugins_cfg.get("upper_body_track", {}).get("enabled", False):
+            # Not gated on the camera plugin: this card is handed its input topic
+            # by the canvas, so a build where the camera card is off can still
+            # subscribe to whatever stream the operator wires in. It commands no
+            # joint, so there is nothing here to gate on a controller either.
+            from upper_body_track_card import UpperBodyTrackPlugin
+            self._plugins.append(UpperBodyTrackPlugin(
+                plugins_cfg["upper_body_track"], namespace, executor))
+            print("[bundle] UpperBodyTrackPlugin loaded")
+
         if plugins_cfg.get("motion_state", {}).get("enabled", False) and high_ctrl is not None:
             from device import MotionStatePlugin
             motion_state_plugin = MotionStatePlugin(

@@ -93,3 +93,25 @@ plugins:
     output_dir: /opt/phanthy-motus/data/vision_capture
     fps: 15
     max_duration_s: 30
+  # 只读上半身动作镜像：吃相机画面（可选深度），发布 2D 关键点和重定向后的
+  # 6 个手臂关节角。不下发任何关节命令，不驱动手臂。
+  upper_body_track:
+    enabled: false   # 默认关闭：开启会多一层 ultralytics/torch 并持续占 CPU
+    # YOLO11-pose 权重。n=nano 最快；首次运行自动下载，离线机器人请预下载后填绝对路径。
+    model_path: yolo11n-pose.pt
+    device: cpu
+    conf: 0.5                 # 人体检测置信度
+    imgsz: 640
+    rate_hz: 10               # 处理上限；相机 30fps，只取最新帧
+    min_keypoint_conf: 0.4    # 低于此值的关节点不参与重定向
+    # 相机焦距（像素）。auto = 用肩宽 0.38m 与实测深度反推；焦距错了不会整体
+    # 旋转，而是把"前后"分量按比例缩放，所以值得实测一次。
+    focal_px: 460
+    # 每轴符号：由镜像安装的关节限位推导得出（左臂 roll -8~111、右臂 -111~8）。
+    # 真机首次核对若方向相反，改成 -1；也可在卡片 start 时临时覆盖，不必重建镜像。
+    pitch_sign: 1.0
+    roll_sign: 1.0
+    elbow_sign: 1.0
+    # 1€ 滤波：慢动作重平滑、快挥手不留滞后。min_cutoff 越小越平滑。
+    filter_min_cutoff: 1.0
+    filter_beta: 0.02

@@ -170,3 +170,58 @@ def test_existing_bumi_plugin_loading_is_unchanged(bundle_module):
     assert [tool["name"] for tool in bundle.get_all_tools()] == [
         "loco", "loco_servo", "speaker"]
 
+
+class FakeUpperBodyTrackPlugin:
+    def __init__(self, plugin_config, namespace, executor):
+        self.plugin_config = plugin_config
+        self.namespace = namespace
+        self.executor = executor
+
+    def get_tool(self):
+        return {"name": "upper_body_track", "type": "processor"}
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, _args):
+        return {"state": action}
+
+
+def test_upper_body_track_registers_without_any_controller(bundle_module, monkeypatch):
+    """A vision card that only publishes must not be gated on a controller.
+
+    It is also deliberately not gated on the camera plugin: the canvas hands it
+    the input topic, so a build with the camera card off can still subscribe to
+    a stream the operator wired in. A missing guard here has no symptom beyond
+    a card that silently never appears.
+    """
+    fake = types.ModuleType("upper_body_track_card")
+    fake.UpperBodyTrackPlugin = FakeUpperBodyTrackPlugin
+    monkeypatch.setitem(sys.modules, "upper_body_track_card", fake)
+
+    config = _config(loco=False, loco_servo=False)
+    config["plugins"]["upper_body_track"] = {"enabled": True}
+
+    bundle = bundle_module.BumiDeviceBundle(
+        config, "bumi_test", object(), high_ctrl=None, media_ctrl=None)
+
+    assert [tool["name"] for tool in bundle.get_all_tools()] == ["upper_body_track"]
+    assert bundle._plugins[0].namespace == "bumi_test"
+
+
+def test_upper_body_track_is_skipped_when_disabled(bundle_module, monkeypatch):
+    fake = types.ModuleType("upper_body_track_card")
+    fake.UpperBodyTrackPlugin = FakeUpperBodyTrackPlugin
+    monkeypatch.setitem(sys.modules, "upper_body_track_card", fake)
+
+    config = _config(loco=False, loco_servo=False)
+    config["plugins"]["upper_body_track"] = {"enabled": False}
+
+    bundle = bundle_module.BumiDeviceBundle(
+        config, "bumi_test", object(), high_ctrl=None, media_ctrl=None)
+
+    assert bundle.get_all_tools() == []
+

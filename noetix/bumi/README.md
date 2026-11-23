@@ -500,3 +500,36 @@ media cards and motion cards keep running.
 
 The output contract, quality states, assumed body-axis calibration, validation
 status and the ROS probe live in [VISUAL_ODOMETRY.md](VISUAL_ODOMETRY.md).
+
+## Upper-body motion tracking (`upper_body_track`)
+
+A read-only processor card that answers one question: is a person's upper body
+in view, and where would that person's arms land on **this** robot? It consumes
+the RGB stream (and the depth stream registered to it, when wired), runs
+YOLO11-pose on a worker thread, and publishes two topics:
+
+| Topic | Format | Content |
+| --- | --- | --- |
+| `/NS/upper_body_track/pose2d` | `sensor/pose2d` | COCO-17 keypoints in pixels for the dashboard to draw the skeleton |
+| `/NS/upper_body_track/angles` | `data/json` | the six retargeted arm joint angles plus confidence/quality flags |
+
+The six angles are left/right shoulder pitch, shoulder roll and elbow flexion,
+derived from **bone directions** (not copied hand positions — the robot's
+shoulder-to-wrist reach is ~312 mm against a human's ~550-600 mm). The person's
+right arm maps to the robot's left and vice versa, because they face each other.
+Each angle is clamped to the robot's mechanical limits and smoothed with a 1€
+filter; the payload reports `tracked`, `target_id`, per-axis `*_clamped` flags,
+`degraded` reasons and `*_deg: -999` for "not measured". Humeral rotation (palm
+orientation) is not observable from 2D keypoints and is reported as zero.
+
+**It commands nothing.** There is no joint-command call in the card: driving the
+arms is a separate card, because on Bumi that must take over all 21 motors
+(`LowController.set_joint` rejects any other length) and hold its own balance.
+
+The card is **disabled by default** (`plugins.upper_body_track.enabled: false`)
+because enabling it adds an ultralytics/torch image layer and continuous CPU
+load. To use it, enable the plugin and wire the camera's RGB topic into the
+card's `start` action via the canvas; depth is optional — without it the card
+falls back to a flat-plane assumption and says so in `degraded`. The sign of
+each axis can be corrected per robot in `config.yaml` or overridden at `start`
+without rebuilding the image.

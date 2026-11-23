@@ -101,6 +101,15 @@ RUN apt-get update && \
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     pyyaml netifaces numpy opencv-python-headless pyrealsense2 pybind11
 
+# `upper_body_track` card: YOLO11-pose inference. ultralytics pulls torch and
+# torchvision (CPU-only wheels on ARM64 via PyPI); the headless opencv above
+# needs no GUI libs. The pose weight is fetched on first run and cached, or
+# `model_path` points at a pre-downloaded copy on an offline robot. The card
+# ships disabled in config.yaml — this layer costs image size, so it is paid
+# only when the card is actually enabled.
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} ultralytics && \
+    python3 -c 'import ultralytics; from ultralytics import YOLO'
+
 # The bundle image must be able to start the estimator child and this card's
 # Python imports; fail the build here rather than on a robot. Docker's default
 # shell is /bin/sh (dash), where `source` does not exist — use bash explicitly
@@ -154,6 +163,8 @@ COPY visual_odometry_probe.py /work/visual_odometry_probe.py
 COPY odom_spec.py /work/odom_spec.py
 COPY sound_direction.py /work/sound_direction.py
 COPY direction_card.py /work/direction_card.py
+COPY upper_body_track_spec.py /work/upper_body_track_spec.py
+COPY upper_body_track_card.py /work/upper_body_track_card.py
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/
 
