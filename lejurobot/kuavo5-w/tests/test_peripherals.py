@@ -126,6 +126,23 @@ class PeripheryTests(unittest.TestCase):
         self.assertTrue(all(call[:3] == ('/camera_left/set_camera_enabled',
                             'std_srvs/SetBool', {'data': True}) for call in self.ros.services))
 
+    def test_camera_age_exposes_upstream_delay_without_rewriting_timestamp(self):
+        self.periphery.dispatch('camera_left', 'start')
+        payload = {'data': base64.b64encode(b'\xff\xd8test\xff\xd9').decode(),
+                   'header': {'stamp': {'secs': 100, 'nsecs': 250_000_000}}}
+        with patch.object(peripherals_module.time, 'time', return_value=100.75):
+            self.periphery._on_image('camera_left', payload, 1)
+        self.assertEqual(self.periphery.snapshot('camera_left')['source_age_at_receive_ms'], 500.)
+        self.periphery.tick()
+        stamp = self.periphery._image_pubs['camera_left'].messages[-1].header.stamp
+        self.assertEqual((stamp.sec, stamp.nanosec), (100, 250_000_000))
+
+    def test_head_relay_does_not_add_second_rosbridge_throttle(self):
+        with patch.object(self.ros, 'subscribe') as subscribe:
+            for card, throttle in [('camera_head', 0), ('camera_depth', 0), ('camera_left', 100)]:
+                self.periphery._subscribe_camera(card)
+                self.assertEqual(subscribe.call_args.kwargs['throttle_ms'], throttle)
+
     def test_camera_reconnect_rebinds_and_only_invokes_camera_enable(self):
         with patch.object(peripherals_module.threading, 'Thread') as thread:
             self.periphery.dispatch('camera_left', 'start')

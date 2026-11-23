@@ -289,6 +289,12 @@ class Peripherals:
                 self._data[card] = {'valid': True, 'bytes': len(payload),
                                     'encoding': '16UC1-zlib' if card == 'camera_depth' else 'jpeg',
                                     'source_topic': CAMERAS[card][0]}
+                stamp = self._images[card][1]
+                if stamp['sec']:
+                    # Same-host SDK system timestamps; an observed age, not a
+                    # verified capture clock mapping or a safety freshness gate.
+                    self._data[card]['source_age_at_receive_ms'] = round(
+                        (time.time() - stamp['sec'] - stamp['nanosec'] / 1e9) * 1000, 2)
                 if card == 'camera_depth':
                     self._data[card].update(width=640, height=480, unit='mm', invalid_value=0, aligned_to_rgb=True)
                 self._seen[card] = time.monotonic()
@@ -433,7 +439,10 @@ class Peripherals:
         generation = client.connection[1]
         self._media_generations[card] = client.connection
         client.subscribe(CAMERAS[card][0], 'sensor_msgs/CompressedImage',
-            lambda msg, c=card, g=generation: self._on_image(c, msg, g), throttle_ms=100)
+            # Head relays already cap output at 10 Hz. A second rosbridge
+            # throttle can hold a frame until its timer; forward immediately.
+            lambda msg, c=card, g=generation: self._on_image(c, msg, g),
+            throttle_ms=0 if card in ('camera_head', 'camera_depth') else 100)
 
     def _publish_image(self, card):
         with self._lock:

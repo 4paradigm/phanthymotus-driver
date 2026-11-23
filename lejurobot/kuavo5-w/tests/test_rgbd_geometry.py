@@ -49,6 +49,18 @@ class RgbdGeometryTests(unittest.TestCase):
                 count+=1
         self.assertEqual(count,25)
 
+    def test_pair_wakeup_keeps_only_newest_pending_pair(self):
+        pairs=relay.Pairs()
+        self.assertFalse(pairs.ready.is_set())
+        for ns in (1_000_000_000,1_100_000_000,1_200_000_000):
+            c,d=self.frame(ns),self.frame(ns+12_000_000)
+            pairs.receive('color',c)
+            pairs.receive('depth',d)
+        self.assertTrue(pairs.ready.is_set())
+        self.assertEqual(pairs.take(),(c,d))
+        self.assertFalse(pairs.ready.is_set())
+        self.assertIsNone(pairs.take())
+
     def test_geometry_refuses_different_optical_frames_or_distorted_depth(self):
         color,depth=self.info(),self.info();depth.header.frame_id='native_depth'
         with self.assertRaises(ValueError):geometry.make_geometry(color,depth,None,None)

@@ -201,6 +201,11 @@ FastDDS/std_msgs/sensor_msgs以及新增openssh-client/sshpass仅在基础镜像
 以 latest-only 方式将头部原始 RGB 转 JPEG。按现场授权，头部共用RGBD进程开启深度及深度激光，RGB/深度均为640×480@15Hz源流。
 `host/head_depth.py` 保留原始header，将已由厂商驱动换算为毫米的16UC1图像转换为小端无损zlib；不使用PNG/RVL compressedDepth格式，不增加镜像依赖。
 RGB和深度卡共享物理相机进程，启动任一头部卡可能同时打开两路源流；只有处于运行状态的卡输出DDS数据。
+
+头部中继按源时间戳配对后唤醒编码线程，以最多10Hz输出最新帧；头部两路不再叠加rosbridge的100ms限速。
+`info.feedback.source_age_at_receive_ms`显示源时间戳到驱动接收的观察帧龄，
+`publish_delay_ms`只表示接收后到DDS发布的耗时；前者依赖SDK时间戳，不代表已验证的采集时钟映射。
+两者均不包含Core转发、网络和浏览器显示延迟。厂商原始深度的滞后不会被重写时间戳掩盖。
 WebSocket 使用 CPython 严格 UTF-8 解码和 JSON 校验，避免纯 Python 逐字节校验造成积压，不放宽非法编码检查。
 安装器自动检测 `/home/<user>/kuavo_data_pilot` 或指定 `--head-workspace`，仅在找到已构建 Orbbec 驱动时安装固定头部服务。
 底盘源时间戳为0，无法据此测得端到端延迟；卡片 info 中 publish_delay_ms 仅是驱动接收至 DDS 发布耗时。

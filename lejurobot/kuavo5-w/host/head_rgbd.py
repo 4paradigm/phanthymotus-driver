@@ -2,6 +2,7 @@
 """One bounded, capture-paired rectification owner for both public image cards."""
 from collections import deque
 import threading
+import time
 
 
 def capture_ns(message):
@@ -11,6 +12,7 @@ def capture_ns(message):
 class Pairs:
     def __init__(self):
         self.lock = threading.Lock()
+        self.ready = threading.Event()
         # Registered depth arrives several frames after RGB on the host even
         # when their capture times agree. Retain a bounded second at 15 Hz;
         # a four-frame queue discarded RGB before its depth partner arrived.
@@ -33,6 +35,7 @@ class Pairs:
                 delta = capture_ns(color)-capture_ns(depth)
                 if abs(delta) <= 50_000_000:
                     self.latest = colors.popleft(), depths.popleft()
+                    self.ready.set()
                 elif delta < 0:
                     colors.popleft()
                 else:
@@ -41,6 +44,7 @@ class Pairs:
     def take(self):
         with self.lock:
             pair, self.latest = self.latest, None
+            self.ready.clear()
             return pair
 
 
@@ -66,10 +70,20 @@ def main():
         subs.append(rospy.Subscriber('/camera_head/'+kind+'/image_raw', Image,
             lambda msg,k=kind:pairs.receive(k,msg), queue_size=2,
             buff_size=3_000_000, tcp_nodelay=True))
-    rate = rospy.Rate(10)
+    # Wake on a matched frame instead of adding up to 100 ms polling delay.
+    # Keep the existing 10 Hz budget and take the newest pair AFTER rate limiting.
+    next_publish = 0.
     while not rospy.is_shutdown():
+        if not pairs.ready.wait(.2):
+            continue
+        remaining = next_publish - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
+        if rospy.is_shutdown():
+            break
         pair = pairs.take()
         if pair is not None:
+            next_publish = time.monotonic() + .1
             try:
                 color, depth = pair
                 g = geometry.get(cv2,np)
@@ -85,7 +99,6 @@ def main():
                     pubs[kind].publish(out)
             except Exception as error:
                 rospy.logwarn_throttle(10, 'head RGB-D pair rejected: %s: %s',type(error).__name__,str(error)[:180])
-        rate.sleep()
 
 
 if __name__ == '__main__':
