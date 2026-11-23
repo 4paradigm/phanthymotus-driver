@@ -33,7 +33,7 @@ def section(config, key, defaults):
 
 
 CLEARANCE_DEFAULTS = dict(enabled=False, calibration_id='', verified=False, can_interface='',
-    arm_label='',
+    arm_label='', calibration_can_interface='',
     mode='calibrated', estimate_profile_path='', table_z_mm=None,
     base_frame='', plane_base_mm=None, body_vertices_mm=[],
     left_finger_vertices_mm=[], right_finger_vertices_mm=[], opening_axis=None,
@@ -46,7 +46,7 @@ def clearance_settings(config):
         raise ValueError('mode 必须为 calibrated 或 model_estimate')
     if type(cfg['verified']) is not bool:
         raise ValueError('table_clearance.verified 必须为布尔值')
-    for key in ('calibration_id', 'base_frame', 'can_interface', 'arm_label'):
+    for key in ('calibration_id', 'base_frame', 'can_interface', 'arm_label', 'calibration_can_interface'):
         if not isinstance(cfg[key], str) or len(cfg[key]) > 128:
             raise ValueError(f'{key} 必须为不超过 128 字符的文本')
     if cfg['mode'] == 'model_estimate':
@@ -58,6 +58,8 @@ def clearance_settings(config):
         return cfg
     if not cfg['verified']:
         return cfg
+    if cfg['calibration_can_interface'] != cfg['can_interface']:
+        raise ValueError('实测标定绑定的 CAN 接口必须与测距来源一致；请重新核验该臂标定')
     if not all(cfg[k].strip() for k in ('calibration_id', 'base_frame', 'can_interface')):
         raise ValueError('验证后的标定必须提供 calibration_id、base_frame 和 can_interface')
     plane = vector(cfg['plane_base_mm'], 4)
@@ -90,6 +92,8 @@ def table_distance(snapshot, cfg, now):
                conservative_clearance_mm=None)
     if not cfg['verified']:
         return dict(bad, reason='calibration_unverified')
+    if cfg['calibration_can_interface'] != cfg['can_interface']:
+        return dict(bad, reason='calibration_interface_mismatch')
     if snapshot.get('connected') is not True:
         return dict(bad, reason='disconnected')
     if snapshot.get('can_interface') != cfg['can_interface']:
@@ -128,7 +132,8 @@ def table_distance(snapshot, cfg, now):
         conservative_clearance_mm=conservative,
         lowest_point_base_mm=points[index].tolist(), feedback_time=min(stamps),
         opening_mm=width, unit='mm', quantity='signed_plane_normal_distance',
-        calibration_id=cfg['calibration_id'], base_frame=cfg['base_frame'],
+        calibration_id=cfg['calibration_id'], calibration_can_interface=cfg['calibration_can_interface'],
+        base_frame=cfg['base_frame'],
         uncertainty_mm=cfg['uncertainty_mm'], model='calibrated_convex_hulls')
 
 
@@ -143,6 +148,7 @@ class TableClearance:
         self.read_snapshot, self.namespace, self.ros2 = read_snapshot, namespace.strip('/'), ros2
         from agilex.piper.clearance_feedback import PassiveFeedback
         self.runtime_interface = config.get('can_interface','can0')
+        self.runtime_available = None
         self.source_factory = source_factory or PassiveFeedback
         self.source = (self.source_factory(self.cfg['can_interface'])
                        if self.cfg['can_interface'] and self.cfg['can_interface'] != self.runtime_interface else None)
@@ -204,6 +210,7 @@ class TableClearance:
             self.result = self.received = None
             try:
                 if self.source is not None:self.source.start()
+                self._ensure_feedback_source()
                 if self.ros2 is not None:
                     self.transport = self.factory(self.ros2, self.namespace + '/table_clearance',
                         self.topics(), .2, lambda: self.tick(gen))
@@ -237,6 +244,7 @@ class TableClearance:
             if not self.running or gen != self.generation:
                 return
             try:
+                self._ensure_feedback_source()
                 reader = self.source.snapshot if self.source is not None else self.read_snapshot
                 snapshot = reader() if self.cfg['verified'] or self.estimate_model else {}
                 if self.estimate_model is not None:
@@ -268,6 +276,20 @@ class TableClearance:
         if set(args) - allowed or action not in {'start', 'stop', 'info', 'piper_table_clearance'}:
             raise ValueError('夹爪离桌距离仅接受 start、stop、info')
         return self.info() if action == 'piper_table_clearance' else getattr(self, action)()
+
+    def _ensure_feedback_source(self):
+        # A stopped project closes the shared runtime. Resume only a receive-only
+        # socket, never runtime.start(), connected(), mode changes or enabling.
+        if (self.source is None and self.runtime_available is not None
+                and (self.cfg['verified'] or self.estimate_model is not None)
+                and not self.runtime_available() and self.cfg['can_interface'] in {'can0','can1'}):
+            source=self.source_factory(self.cfg['can_interface'])
+            try:
+                source.start()
+            except BaseException:
+                source.close()
+                raise
+            self.source=source
 
     def configure(self,args):
         with self.lifecycle:
@@ -303,4 +325,7 @@ def add_table_clearance(plugins, config, namespace, ros2):
     cfg = clearance_settings(config)
     if not cfg['enabled']:
         return plugins
-    return [*plugins, TableClearance(plugins[0].read_monitor_snapshot, config, namespace, ros2)]
+    runtime=plugins[0]
+    card=TableClearance(runtime.read_monitor_snapshot, config, namespace, ros2)
+    card.runtime_available=lambda:runtime.driver is not None and not runtime.closed
+    return [*plugins,card]

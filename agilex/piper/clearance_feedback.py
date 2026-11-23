@@ -54,11 +54,13 @@ class PassiveFeedback:
         if not all(required): return result
         ages = [self.monotonic()-p[2] for p in required]
         if min(ages) < 0 or max(ages) > .5 or max(ages)-min(ages) > .1: return result
-        if required[-1][0][7] != 0:
-            return dict(result, reason='gripper_not_width_mode')
+        # Pinned SDK 0x2A8: bytes 0..3 stroke, 4..5 effort, 6 status,
+        # byte 7 RESERVED. It is not a documented gripper mode field.
         q = [v*.001 for p in required[:3] for v in struct.unpack('>ii', p[0])]
         result.update(fresh=True, joints_deg=q, feedback_time=min(p[1] for p in required[:3]),
             gripper=dict(width_mm=struct.unpack('>i', required[-1][0][:4])[0]*.001,
+                         effort_nm=struct.unpack('>h',required[-1][0][4:6])[0]*.001,
+                         status_code=required[-1][0][6],
                          feedback_time=required[-1][1]))
         pose = [parts.get(i) for i in (0x2A2,0x2A3,0x2A4)]
         if all(pose) and all(0 <= self.monotonic()-p[2] <= .5 for p in pose):

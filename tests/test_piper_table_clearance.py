@@ -10,6 +10,7 @@ from agilex.piper.table_clearance import (TableClearance, add_table_clearance,
 def calibrated(**changes):
     box = list(map(list, product([-1., 1.], repeat=3)))
     cfg = dict(enabled=True, verified=True, calibration_id='synthetic-only',
+        calibration_can_interface='can0',
         can_interface='can0', base_frame='sdk_base', plane_base_mm=[0, 0, 1, 0],
         body_vertices_mm=box, left_finger_vertices_mm=box,
         right_finger_vertices_mm=box, opening_axis=[0, 1, 0],

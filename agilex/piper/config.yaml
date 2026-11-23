@@ -34,6 +34,7 @@ table_clearance:
   table_z_mm: 0
   verified: false
   calibration_id: ""
+  calibration_can_interface: ""
   can_interface: "can0"
   arm_label: "左侧从臂（can0，请核对接线）"
   base_frame: ""

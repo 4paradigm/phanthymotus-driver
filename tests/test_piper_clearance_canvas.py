@@ -117,3 +117,76 @@ def test_passive_feedback_filtered_receive_only_and_staleness():
     clock.tick+=.6
     assert source.snapshot()['fresh'] is False
     assert 'gripper' not in source.snapshot()
+
+
+def test_saved_config_replay_cannot_restore_another_arms_calibration():
+    card=TableClearance(snapshot,{'table_clearance':calibrated()},'test',
+        clock=lambda:100.,source_factory=Source)
+    saved=calibrated();saved.pop('enabled');saved['can_interface']='can1'
+    card.configure(saved)
+    assert card.cfg['verified'] is False
+    # Core persists the user's original form and may replay it on Start/reconnect.
+    for _ in range(2):
+        with pytest.raises(ValueError,match='CAN 接口必须与测距来源一致'):
+            card.configure(saved)
+        assert card.cfg['verified'] is False
+        assert card.cfg['calibration_can_interface']=='can0'
+    # Explicitly providing a matching per-arm calibration is still supported.
+    card.configure({**saved,'calibration_can_interface':'can1','calibration_id':'arm1-measured'})
+    assert card.cfg['verified'] is True
+    card.stop()
+
+
+def test_saved_cross_arm_calibration_rejected_on_initialization():
+    bad=calibrated();bad['can_interface']='can1'
+    with pytest.raises(ValueError,match='CAN 接口必须与测距来源一致'):
+        TableClearance(snapshot,{'table_clearance':bad},'test')
+
+
+def test_manual_measurement_resumes_after_whole_project_stop_without_sdk_reconnect(tmp_path):
+    import time
+    from agilex.piper.device import build_plugins
+    from common.vendor_runtime import DriverBundle
+    from test_piper_intent import IntentDriver
+    cfg={'data_dir':str(tmp_path),'table_clearance':dict(enabled=True,mode='model_estimate',
+        estimate_profile_path='builtin:piper_100mm',table_z_mm=0,can_interface='can0')}
+    plugins=build_plugins(cfg,'resume_test',None)
+    runtime,monitor=plugins[:2];monitor.auto_connect=False
+    def forbid(*args,**kwargs):pytest.fail('A measurement must not reconnect the control SDK')
+    runtime.factory=forbid
+    driver=IntentDriver();runtime.driver=driver;driver.arm.raw=(0,0,0,0,0,0)
+    sdk=driver.arm
+    card,bundle=plugins[-1],DriverBundle(plugins)
+    class Fallback(Source):
+        def snapshot(self):
+            now=time.time()
+            return dict(snapshot(can_interface=self.interface),joints_deg=[0.]*6,feedback_time=now,
+                        gripper=dict(width_mm=20.,feedback_time=now))
+    card.source_factory=Fallback
+    try:
+        card.start();card.tick(card.generation)
+        assert card.info()['result']['state']=='estimated'
+        bundle.stop_all()
+        assert runtime.closed and runtime.driver is None
+        assert card.dispatch('begin_measurement',{})['state']=='running'
+        card.tick(card.generation)
+        assert card.info()['result']['state']=='estimated'
+        assert card.source.interface=='can0' and card.source.started
+        assert runtime.closed and runtime.driver is None and sdk.calls==[]
+        source=card.source
+        card.stop();assert source.closed
+    finally:bundle.stop_all()
+
+
+def test_reserved_gripper_byte_does_not_define_mode_and_status_is_byte_six():
+    source=PassiveFeedback('can1',clock=lambda:100.,monotonic=lambda:10.)
+    for ident in (0x2A5,0x2A6,0x2A7):
+        source.accept_packet(struct.pack('=IB3x8s',ident,8,struct.pack('>ii',1000,2000)))
+    for reserved in (0,1,255):
+        data=struct.pack('>ihBB',51700,47,0xC0,reserved)
+        source.accept_packet(struct.pack('=IB3x8s',0x2A8,8,data))
+        result=source.snapshot()
+        assert result['fresh'] is True
+        assert result['gripper']['width_mm']==51.7
+        assert result['gripper']['effort_nm']==.047
+        assert result['gripper']['status_code']==0xC0

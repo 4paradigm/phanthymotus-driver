@@ -18,6 +18,7 @@ def schema(cfg):
     fields = {
         'verified':('boolean','我已完成该臂、桌面及夹爪几何的实测核验'),
         'calibration_id':('string','标定记录编号'), 'base_frame':('string','SDK基坐标系名称'),
+        'calibration_can_interface':('string','该份实测标定对应的 CAN 接口（必须与来源一致）'),
         'plane_base_mm':('array','实测桌面平面 [nx,ny,nz,d_mm]（朝上单位法线）'),
         'body_vertices_mm':('array','固定夹爪本体凸包顶点 [x,y,z]（mm）'),
         'left_finger_vertices_mm':('array','零开度左指凸包顶点 [x,y,z]（mm）'),
@@ -31,6 +32,8 @@ def schema(cfg):
             description='仅在实测标定模式生效。估算模式不会使用这些核验参数。',
             **{'x-show-when':{'mode':'calibrated'}})
         if kind=='array':props[key]['items']={}
+    props['calibration_can_interface']['oneOf']=[dict(const='can0',title='can0 的实测标定'),
+                                                dict(const='can1',title='can1 的实测标定')]
     for key,prop in props.items():
         prop['scope']='instance'
         if cfg.get(key) is not None:prop['default']=deepcopy(cfg[key])

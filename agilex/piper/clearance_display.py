@@ -15,6 +15,7 @@ FIELDS = {
     'collision_protection_active':'是否执行碰撞拦截；本卡始终不执行',
     'depth_used':'是否使用相机深度；本卡没有使用', 'advisory_only':'仅供观察，不作为安全联锁',
     'calibration_id':'实测标定记录编号', 'uncertainty_mm':'输入的实测总误差余量，毫米',
+    'calibration_can_interface':'这份实测标定绑定的 CAN 接口，必须与测距来源一致',
     'model':'计算方法标识', 'quantity':'测量量：有符号桌面法向间隙',
     'can_interface':'当前测距来源 CAN 接口', 'arm_label':'用户配置的机械臂名称（不是自动识别）',
     'measurement_mode':'所选的模型估算或实测标定模式',
@@ -42,6 +43,7 @@ def annotate(result, cfg, now):
         'opening_out_of_model_range':'开度超出模型范围','invalid_feedback':'反馈读取失败或格式无效',
         'estimate_source_unavailable':'所选机械臂来源不可用','disconnected':'机械臂反馈未连接',
         'calibration_arm_mismatch':'标定接口与反馈接口不匹配','nonfinite_geometry':'几何计算超出有限数值范围',
+        'calibration_interface_mismatch':'实测标定绑定的接口与测距来源不匹配',
         'publish_failed':'数据发布失败','pose_gripper_time_skew':'位姿与开度反馈时间不一致',
         'joint_gripper_time_skew':'关节与开度反馈时间不一致','opening_outside_calibrated_range':'开度超出标定范围'}
     display['状态说明']=reasons.get(result.get('reason'),result.get('reason') or '有效')
