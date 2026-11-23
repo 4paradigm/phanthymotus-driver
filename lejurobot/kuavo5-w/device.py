@@ -559,7 +559,8 @@ class _KuavoPlugin:
                 'position': [math.degrees(v) for v in target], 'velocity': [], 'effort': []}),
             joint_target=(offset, target), joint_card=card, preflight=validate)
 
-    def _async_reach(self, key, publish, allowed_modes=None, joint_target=None, joint_card=None, preflight=None):
+    def _async_reach(self, key, publish, allowed_modes=None, joint_target=None, joint_card=None, preflight=None,
+                     completion_details=None):
         modes = allowed_modes or self.ALLOWED_MODES
         joint_card = joint_card or self.PREFIX
         validate = preflight or (None if joint_target is None else
@@ -620,7 +621,8 @@ class _KuavoPlugin:
                             self.tracker.finish(self.CHANNEL, aid, self.PREFIX, "completed", {
                                 "completion_basis": "measured_joint_convergence" if joint_target is not None else "vendor_reach_time_estimate",
                                 "estimated_duration_s": duration,
-                                "measured_convergence": joint_target is not None})
+                                "measured_convergence": joint_target is not None,
+                                **(completion_details() if completion_details else {})})
                             return
                 except Exception as exc:
                     self.bundle.pause(_safe_log(str(exc)), status="error", expected=(self.CHANNEL, aid))
@@ -1031,7 +1033,7 @@ class LowerBodyPlugin(_KuavoPlugin):
                 **fields,
                 "height": {"type": "number", "description": "动态可达范围见get_height，单位m；waist_yaw_link原点相对base_link的Z坐标，非头顶离地高度"},
                 "positions": _array_schema(4, "四个下肢关节目标角度，度")}, {
-                'get_height': ([], '动态可达范围与当前高度，单位m；保持当前躯干x/俯仰和腰偏航，基于实时URDF和关节限位'),
+                'get_height': ([], '动态可达范围、当前腰部高度及头顶高度估计，单位m，相对base_link；头顶取实时URDF碰撞包络，非实测离地高度'),
                 'set_height': (['height'], '动态可达范围见get_height，单位m；协调膝、腿、腰垂直升降，保持当前躯干x/俯仰和腰偏航'),
                 'set': (list(self.FIELDS), '按名称设置部分/全部下肢关节绝对角度，度；至少填写一个'),
                 'zero': ([], '四个下肢关节归零，包含腰部；需现场核验限位'),
@@ -1044,14 +1046,24 @@ class LowerBodyPlugin(_KuavoPlugin):
         if self.PREFIX == 'leg' and action == 'set_height':
             height = _number(args.get('height'), 'height')
             target, torso = [0.] * 4, {}
+            current_height = {}
             def validate():
                 candidate, pose = self.bundle.sensors.height_target(height, with_pose=True)
+                current_height.update(self.bundle.sensors.height_state())
                 target[:] = candidate
                 torso.update(pose)
                 return self.bundle.sensors.validate_joint_target('leg', target)
-            return self._async_reach('torso_reach_time',
+            result = self._async_reach('torso_reach_time',
                 lambda: self.bundle.twist('/cmd_lb_torso_pose', **torso),
-                joint_target=(0, target), joint_card='leg', preflight=validate)
+                joint_target=(0, target), joint_card='leg', preflight=validate,
+                completion_details=lambda: {**self.bundle.sensors.height_state(),
+                                            'height_sample_phase': 'after_measured_convergence',
+                                            'requested_height_m': height})
+            return {**result, **current_height, 'requested_height_m': height,
+                    'height_sample_phase': 'before_motion',
+                    'target_head_top_height_m': (current_height['head_top_height_m']
+                        + height-current_height['height_m']
+                        if current_height.get('head_top_height_m') is not None else None)}
         if self.PREFIX == 'leg' and action in ('set', 'zero'):
             updates = {i: 0. if action == 'zero' else math.radians(_number(args[field], field))
                        for field, (i, _) in self.FIELDS.items() if action == 'zero' or field in args}

@@ -2168,6 +2168,33 @@ class CardRevisionTests(unittest.TestCase):
         self.ros.raw(q=[.2,-.4,.2,0.]+[0.]*16)
         self.assertNotEqual(self.call('leg', 'get_height')['reachable_height_intervals_m'], intervals)
 
+    def test_height_head_top_uses_live_envelope_and_current_pose(self):
+        self.vendor_model()
+        model = self.ros.params['humanoid_description'].replace(
+            '<link name="zhead_1_link">', '<link name="zhead_1_link"><collision>'
+            '<origin xyz="0.03 0 0.09"/><geometry><sphere radius="0.1"/></geometry></collision>')
+        self.ros.params['humanoid_description'] = model
+        self.bundle.sensors.discover();self.ros.raw()
+        status = self.call('leg', 'get_height')
+        self.assertAlmostEqual(status['head_top_height_m'], .96901+.43935+.09+.1)
+        self.assertTrue(status['head_top_is_estimate'])
+        self.assertEqual(status['head_top_frame_id'], 'base_link')
+        result = self.call('leg', 'set_height', height=1.02)
+        self.assertEqual(result['state'], 'executing')
+        self.assertAlmostEqual(result['head_top_height_m'], status['head_top_height_m'])
+        self.assertAlmostEqual(result['target_head_top_height_m'], 1.02+.43935+.19)
+        self.assertEqual(result['height_sample_phase'], 'before_motion')
+        self.ros.raw(q=[.1,-.2,.2,.3]+[0.]*14+[.4,0.])
+        tilted = self.call('leg', 'get_height')
+        self.assertAlmostEqual(tilted['head_top_height_m'], tilted['height_m']
+            -math.sin(.1)*math.cos(.7)*.03+math.cos(.1)*(.43935+.09)+.1)
+
+    def test_height_missing_head_geometry_returns_unknown_not_nominal_height(self):
+        self.vendor_model()
+        status = self.call('leg', 'get_height')
+        self.assertIsNone(status['head_top_height_m'])
+        self.assertIn('unavailable', status['head_top_reason'])
+
     def test_height_interval_endpoints_and_interior_match_fk_and_joint_limits(self):
         self.vendor_model()
         for q in ([0.,0.,0.,0.], [.2,-.4,.2,.1], [.7,-1.2,.5,0.]):

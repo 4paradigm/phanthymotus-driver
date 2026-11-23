@@ -427,6 +427,54 @@ class KuavoSensors:
     def height_state(self):
         return self._height_plan(None)[2]
 
+    def _head_top_state(self, root, torso_z, torso_pitch, waist_yaw):
+        """Highest head collision sphere, not a measured scalp/ground height.
+
+        The vendor's visual head is an external STL; do not substitute its
+        frame origin or a fixed nominal body height for physical geometry.
+        """
+        result = {'head_top_height_m': None, 'head_top_frame_id': 'base_link',
+                  'head_top_basis': 'live_urdf_head_collision_envelope_estimate',
+                  'head_top_is_estimate': True}
+        try:
+            joints = {j.get('name'): j for j in root.findall('joint')}
+            link = root.find("link[@name='zhead_1_link']")
+            head = joints['zhead_1_joint']
+            if (head.find('parent').get('link') != 'waist_yaw_link'
+                    or head.find('child').get('link') != 'zhead_1_link'
+                    or vector([float(v) for v in head.find('axis').get('xyz').split()], 3) != [0., 0., 1.]):
+                raise ValueError('unsupported head chain')
+            def xyz(element):
+                origin = element.find('origin')
+                if origin is None:
+                    return [0., 0., 0.]
+                if any(abs(v) > 1e-8 for v in vector([float(v) for v in origin.get('rpy', '0 0 0').split()], 3)):
+                    raise ValueError('unsupported rotated head origin')
+                return vector([float(v) for v in origin.get('xyz', '0 0 0').split()], 3)
+            offset = xyz(head)
+            yaw = waist_yaw + self.joint_positions()[0][18]
+            tops = []
+            for collision in link.findall('collision'):
+                sphere = collision.find('geometry/sphere')
+                if sphere is None:
+                    raise ValueError('unsupported head collision')
+                radius = float(sphere.get('radius'))
+                if not math.isfinite(radius) or radius <= 0:
+                    raise ValueError('invalid head radius')
+                cx, cy, cz = xyz(collision)
+                # torso R_y(pitch) R_z(waist), then head R_z(yaw).
+                local_x = (math.cos(waist_yaw)*offset[0]-math.sin(waist_yaw)*offset[1]
+                           + math.cos(yaw)*cx-math.sin(yaw)*cy)
+                tops.append(torso_z-math.sin(torso_pitch)*local_x
+                            + math.cos(torso_pitch)*(offset[2]+cz)+radius)
+            if not tops:
+                raise ValueError('missing head collision geometry')
+            result['head_top_height_m'] = max(tops)
+            result['head_top_geometry_frame'] = 'zhead_1_link'
+        except (KeyError, AttributeError, ValueError, TypeError, IndexError):
+            result['head_top_reason'] = 'live_head_collision_geometry_unavailable_or_unsupported'
+        return result
+
     def _height_plan(self, height):
         """Planar 3-joint IK from the validated live wheel-arm chain.
 
@@ -536,6 +584,7 @@ class KuavoSensors:
                       'reachable_height_intervals_m': intervals,
                       'basis': 'live_urdf_and_joint_limits_at_current_x_pitch_yaw',
                       'meaning': 'torso_frame_origin_z_relative_to_base_link_not_total_robot_height'}
+            status.update(self._head_top_state(ET.fromstring(self._urdf), current, pitch, q[3]))
             if height is None:
                 return None, None, status
             candidates = solutions(height)
