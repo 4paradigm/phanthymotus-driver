@@ -27,6 +27,9 @@ intent_control:
   point_to_point_acceptance: null
 table_clearance:
   enabled: false
+  mode: calibrated
+  estimate_profile_path: ""
+  table_z_mm: null
   verified: false
   calibration_id: ""
   can_interface: ""

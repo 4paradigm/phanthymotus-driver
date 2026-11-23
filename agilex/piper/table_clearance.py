@@ -32,6 +32,7 @@ def section(config, key, defaults):
 
 
 CLEARANCE_DEFAULTS = dict(enabled=False, calibration_id='', verified=False, can_interface='',
+    mode='calibrated', estimate_profile_path='', table_z_mm=None,
     base_frame='', plane_base_mm=None, body_vertices_mm=[],
     left_finger_vertices_mm=[], right_finger_vertices_mm=[], opening_axis=None,
     opening_range_mm=None, uncertainty_mm=None)
@@ -39,11 +40,20 @@ CLEARANCE_DEFAULTS = dict(enabled=False, calibration_id='', verified=False, can_
 
 def clearance_settings(config):
     cfg = section(config, 'table_clearance', CLEARANCE_DEFAULTS)
+    if cfg['mode'] not in {'calibrated', 'model_estimate'}:
+        raise ValueError('mode 必须为 calibrated 或 model_estimate')
     if type(cfg['verified']) is not bool:
         raise ValueError('table_clearance.verified 必须为布尔值')
     for key in ('calibration_id', 'base_frame', 'can_interface'):
         if not isinstance(cfg[key], str) or len(cfg[key]) > 128:
             raise ValueError(f'{key} 必须为不超过 128 字符的文本')
+    if cfg['mode'] == 'model_estimate':
+        if cfg['verified'] or not cfg['can_interface'].strip():
+            raise ValueError('估算模式必须保留 verified=false，且显式绑定 can_interface')
+        if (not isinstance(cfg['estimate_profile_path'], str) or not cfg['estimate_profile_path']
+                or not finite(cfg['table_z_mm'])):
+            raise ValueError('估算模式需要本地模型 profile 和显式 table_z_mm')
+        return cfg
     if not cfg['verified']:
         return cfg
     if not all(cfg[k].strip() for k in ('calibration_id', 'base_frame', 'can_interface')):
@@ -124,6 +134,10 @@ class TableClearance:
     def __init__(self, read_snapshot, config, namespace, ros2=None, *, clock=time.time,
                  monotonic=time.monotonic, publisher_factory=_RosPublisher):
         self.cfg = clearance_settings(config)
+        self.estimate_model = None
+        if self.cfg['mode'] == 'model_estimate':
+            from agilex.piper.clearance_estimate import load_profile
+            self.estimate_model = load_profile(self.cfg['estimate_profile_path'])
         self.read_snapshot, self.namespace, self.ros2 = read_snapshot, namespace.strip('/'), ros2
         self.clock, self.monotonic, self.factory = clock, monotonic, publisher_factory
         self.lock, self.lifecycle = threading.RLock(), threading.RLock()
@@ -138,7 +152,9 @@ class TableClearance:
             '持续输出经标定夹爪模型最低点到桌面的有符号法向间隙（毫米）。'
             '复用已有反馈；缺少标定或反馈失效则不可用。仅供观测，不执行控制或避碰。',
             {'type': 'object', 'properties': {}, 'additionalProperties': False}, topic_out=self.topics())
-        definition['title'] = '夹爪离桌距离'
+        if self.estimate_model is not None:
+            definition['description'] = '按部署的夹爪模型、关节角度和开度估算离桌高度；未完成实测标定，不执行避碰。'
+        definition['title'] = '夹爪离桌距离（估算）' if self.estimate_model is not None else '夹爪离桌距离'
         return [definition]
 
     def unavailable(self, reason):
@@ -151,7 +167,7 @@ class TableClearance:
         if self.result is None:
             return self.unavailable('waiting_for_feedback')
         stamp = self.result.get('feedback_time')
-        if self.result['state'] == 'ok' and (self.received is None
+        if self.result['state'] in {'ok', 'estimated'} and (self.received is None
                 or not 0 <= self.monotonic() - self.received <= .5
                 or not finite(stamp) or not 0 <= self.clock() - stamp <= .5):
             return self.unavailable('feedback_expired')
@@ -191,8 +207,12 @@ class TableClearance:
             if not self.running or gen != self.generation:
                 return
             try:
-                snapshot = self.read_snapshot() if self.cfg['verified'] else {}
-                self.result = table_distance(snapshot, self.cfg, self.clock())
+                snapshot = self.read_snapshot() if self.cfg['verified'] or self.estimate_model else {}
+                if self.estimate_model is not None:
+                    from agilex.piper.clearance_estimate import estimate
+                    self.result = estimate(snapshot, self.cfg, self.clock(), self.estimate_model)
+                else:
+                    self.result = table_distance(snapshot, self.cfg, self.clock())
                 self.received = self.monotonic()
             except Exception:
                 self.result, self.received = self.unavailable('invalid_feedback'), None

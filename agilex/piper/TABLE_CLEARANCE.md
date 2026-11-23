@@ -1,5 +1,49 @@
 # PiPER 夹爪离桌距离
 
+## 模型估算模式（可选）
+
+默认仍为下文的 `calibrated` 模式。若已有与安装工具匹配的官方模型，可在部署侧
+提供从 URDF 关节链和碰撞网格凸包导出的本地 JSON profile，显式启用模型估算：
+
+```yaml
+table_clearance:
+  enabled: true
+  mode: model_estimate
+  verified: false
+  can_interface: can0
+  estimate_profile_path: /opt/piper-models/gripper-profile.json
+  table_z_mm: 0
+```
+
+路径是**容器内**的绝对路径，部署时需将 profile 单文件只读挂载到该路径。
+此例的 `table_z_mm: 0` 表示假设桌面与模型 world 的安装平面重合；必须按安装情况选取。
+软件不会自动下载模型或自动确认安装关系。模型数据不随本 PR 打包；没有 profile
+的部署应保留默认 calibrated 模式，不能直接使用此例启动。
+
+profile 的 `schema` 为 `piper.gripper_estimate/1`，包括 `root=world`、`source`、
+`commit`、按父节点先行排序的 `joints`、`vertices_m`、`joint_bounds_deg` 和
+`opening_range_mm`。每个 joint 包含 name、kind、parent、child、4×4 origin、axis
+及可选 mimic（joint、multiplier、offset）。长度使用米，角度使用弧度。
+vertices_m 包含 flange_link、gripper_base、gripper_link1、gripper_link2 四组
+部件局部凸包点；其中最小桌面高度即输出估算值。运行时只需已有 NumPy，无需 SciPy。
+loader 检查链路、有限坐标、刚体变换和覆盖范围，并记录实际文件 SHA-256；
+哈希用于追溯，不能替代对模型来源及安装匹配关系的核验。
+
+该模式直接使用现有六轴反馈和夹爪开度，不使用 SDK 末端位姿或额外 CAN 连接。
+输出 `state=estimated`、`estimated=true`、`calibration_verified=false`，
+`clearance_mm` 为估算高度，`conservative_clearance_mm=null`；并附模型版本、哈希、
+最低部件和桌面假设。反馈过期或超出模型范围时清空距离。消费者必须显式接受
+estimated 状态，不能按 calibrated 模式的 state=ok 使用。
+
+本地与现有预览程序核对时，使用其固定模型版本
+`680fa925cd00db7e2628563d2edc5540963045de`、同组关节角度及 99.7 mm 开度，
+得到相同的 112.0788112340331 mm。此核对只证明计算复现一致，不是真机精度标定。
+
+验证命令增加 `tests/test_piper_clearance_estimate.py`。2026-11-23 本次源码验证结果
+记录在提交操作前的测试输出中；本轮未部署新增估算模式，未验证画布数值显示。
+
+## 标定模式
+
 `piper_table_clearance` 是默认关闭的只读 sensor，以 5 Hz 发布 `data/json`
 到 `/{namespace}/piper/state/table_clearance`（ROS `std_msgs/String`）。
 支持 MCP `start/stop/info`；只读取已有 runtime 缓存，不创建 CAN 连接、不发送控制指令。
