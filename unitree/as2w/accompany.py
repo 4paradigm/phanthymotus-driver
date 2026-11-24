@@ -179,6 +179,7 @@ class AccompanyPlugin:
         self._accompany_entered_ms = None
         self._quiet_since_ms = None
         self._pub = None
+        self._node = None
         self._thread = None
         self._closing = threading.Event()
         self._last_error = ""
@@ -190,14 +191,26 @@ class AccompanyPlugin:
             return self._pub
         if _LOW_LAT_QOS is None:
             return None
-        try:
-            from rclpy.node import Node
-            node = Node("as2w_accompany")
-            self._pub = node.create_publisher(String, self._topic, _LOW_LAT_QOS)
-        except Exception as exc:
-            self._last_error = f"publisher unavailable: {exc}"
-            self._pub = None
-        return self._pub
+        with self._lock:
+            if self._pub is not None:
+                return self._pub
+            try:
+                from rclpy.node import Node
+                node = Node("as2w_accompany")
+                publisher = node.create_publisher(String, self._topic, _LOW_LAT_QOS)
+            except Exception as exc:
+                self._last_error = f"publisher unavailable: {exc}"
+                return None
+            self._node = node
+            self._pub = publisher
+            if self._executor is not None:
+                try:
+                    self._executor.add_node(node)
+                except Exception as exc:
+                    # Publishing works without being spun; record the refusal
+                    # so a lifecycle problem is not silent.
+                    self._last_error = f"executor refused the node: {exc}"
+            return self._pub
 
     def _publish(self, payload):
         publisher = self._publisher()
@@ -372,6 +385,24 @@ class AccompanyPlugin:
         thread, self._thread = self._thread, None
         if thread is not None:
             thread.join(timeout=2.0)
+        self._destroy_node()
+
+    def _destroy_node(self):
+        """Release the node and its writer instead of orphaning them.
+
+        The publisher keeps a DDS writer alive for the whole driver process if
+        the node is only dropped on the floor, and a stopped card would stay
+        half-alive in the plugin lifecycle.
+        """
+        with self._lock:
+            node, self._node = self._node, None
+            self._pub = None
+        if node is None:
+            return
+        try:
+            node.destroy_node()
+        except Exception as exc:
+            self._last_error = f"node destroy failed: {exc}"
 
     # ---------------------------------------------------------------- states
 

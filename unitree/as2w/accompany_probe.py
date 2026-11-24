@@ -41,6 +41,27 @@ import sys
 import threading
 import time
 
+
+def _install_logsafe():
+    try:
+        from common import logsafe
+        logsafe.install(check_fd=False)
+    except (ImportError, TypeError):
+        pass
+
+
+def _safe_payload(value, limit=200):
+    """Render an untrusted remote payload without control characters.
+
+    An undocumented vendor endpoint can answer with anything, including NUL and
+    terminal escape sequences. Undicipped bytes would corrupt the container log
+    stream, so escape to ASCII and cap the length. The raw value still lands in
+    the evidence JSON, which is read offline rather than streamed.
+    """
+    text = value if isinstance(value, str) else str(value)
+    return text.encode("unicode_escape").decode("ascii")[:limit]
+
+
 # ---------------------------------------------------------------- constants
 
 #: ``mode`` field of ``rt/lf/sportmodestate``, from the vendor example
@@ -237,7 +258,10 @@ def cmd_modes(args, findings):
     code, data = client.CheckMode()
     print(f"[probe] motion_switcher.CheckMode -> code={code}")
     if data is not None:
-        print(f"[probe] 当前/可用模式：{json.dumps(data, ensure_ascii=False)}")
+        # The response comes from the robot, not from us: escape and cap it
+        # instead of dumping an unbounded remote blob into the log stream.
+        print(f"[probe] 当前/可用模式："
+              f"{_safe_payload(json.dumps(data, ensure_ascii=False), 300)}")
     findings["motion_switcher"] = {"code": code, "data": data}
     return 0 if code == 0 else 3
 
@@ -420,7 +444,7 @@ def cmd_probe(args, findings):
         except Exception as exc:
             code, data = f"exception: {exc}", None
         results[str(value)] = {"code": code, "data": data}
-        print(f"  id={value} -> code={code} data={str(data)[:120]}")
+        print(f"  id={value} -> code={code} data={_safe_payload(data)}")
         time.sleep(1.0)
     findings["probe"] = results
     print("[probe] 判读方法：code=0 说明该 id 存在且接受了空参数，"
@@ -456,6 +480,7 @@ def build_parser():
 
 
 def main(argv=None):
+    _install_logsafe()
     parser = build_parser()
     args = parser.parse_args(argv)
     if not any((args.services, args.modes, args.watch, args.probe_ids)):

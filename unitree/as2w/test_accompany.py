@@ -509,5 +509,96 @@ class BundleWiringTests(unittest.TestCase):
         self.assertIn("accompany.py", text)
 
 
+class _FakeNode:
+    """Minimal rclpy node: records publishers and whether it was destroyed."""
+
+    created = []
+
+    def __init__(self, name):
+        self.name = name
+        self.destroyed = False
+        self.publishers = []
+        _FakeNode.created.append(self)
+
+    def create_publisher(self, msg_type, topic, qos):
+        publisher = types.SimpleNamespace(msg_type=msg_type, topic=topic, qos=qos)
+        self.publishers.append(publisher)
+        return publisher
+
+    def destroy_node(self):
+        self.destroyed = True
+
+
+class _Executor:
+    def __init__(self):
+        self.nodes = []
+
+    def add_node(self, node):
+        self.nodes.append(node)
+
+
+class NodeLifecycleTests(unittest.TestCase):
+    """A stopped card must not leave a node or a DDS writer behind."""
+
+    @classmethod
+    def setUpClass(cls):
+        _stubs()
+        cls.module = _load("as2w_accompany_node_test", ROOT / "accompany.py")
+        cls.Plugin = cls.module.AccompanyPlugin
+
+    def setUp(self):
+        self._saved = sys.modules.get("rclpy.node")
+        fake = types.ModuleType("rclpy.node")
+        fake.Node = _FakeNode
+        sys.modules["rclpy.node"] = fake
+        _FakeNode.created.clear()
+
+    def tearDown(self):
+        if self._saved is None:
+            sys.modules.pop("rclpy.node", None)
+        else:
+            sys.modules["rclpy.node"] = self._saved
+
+    def make(self, executor):
+        return self.Plugin({}, "test", executor, proxy=None,
+                           state_plugin=_FakeState(_remote()))
+
+    def test_node_is_retained_and_joined_to_the_executor(self):
+        executor = _Executor()
+        plugin = self.make(executor)
+        publisher = plugin._publisher()
+        self.assertIsNotNone(publisher)
+        self.assertEqual("/test/state/accompany", publisher.topic)
+        node = _FakeNode.created[-1]
+        self.assertIs(plugin._node, node)
+        self.assertEqual([node], executor.nodes,
+                         "the node must join the shared executor")
+
+    def test_stop_destroys_the_node_it_created(self):
+        plugin = self.make(_Executor())
+        plugin._publisher()
+        node = _FakeNode.created[-1]
+        plugin.stop()
+        self.assertTrue(node.destroyed, "stop() must release the node")
+        self.assertIsNone(plugin._node)
+        self.assertIsNone(plugin._pub)
+
+    def test_restart_builds_a_fresh_node(self):
+        plugin = self.make(_Executor())
+        plugin._publisher()
+        first = _FakeNode.created[-1]
+        plugin.stop()
+        plugin._publisher()
+        second = _FakeNode.created[-1]
+        self.assertIsNot(first, second)
+        self.assertFalse(second.destroyed)
+
+    def test_stop_without_a_node_is_safe(self):
+        plugin = self.make(_Executor())
+        plugin.stop()
+        self.assertIsNone(plugin._node)
+        self.assertIsNone(plugin._pub)
+
+
 if __name__ == "__main__":
     unittest.main()

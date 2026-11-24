@@ -198,6 +198,29 @@ class WatchDegradedLinkTest(unittest.TestCase):
         self.assertEqual({}, findings["watch"]["pairs"])
 
 
+class PayloadEscapingTest(unittest.TestCase):
+    """Untrusted vendor payloads must never reach the log stream raw."""
+
+    def test_nul_and_control_characters_are_escaped(self):
+        rendered = probe._safe_payload("a\x00b\rc\x1b[31m")
+        self.assertNotIn("\x00", rendered)
+        self.assertNotIn("\r", rendered)
+        self.assertNotIn("\x1b", rendered)
+        self.assertIn("\\x00", rendered)
+
+    def test_payload_is_capped(self):
+        self.assertEqual(200, len(probe._safe_payload("x" * 500)))
+
+    def test_cap_is_configurable_for_the_mode_dump(self):
+        self.assertEqual(300, len(probe._safe_payload("y" * 1000, 300)))
+
+    def test_structured_payload_is_rendered(self):
+        self.assertIn("WALK", probe._safe_payload({"mode": "WALK"}))
+
+    def test_install_logsafe_never_raises(self):
+        self.assertIsNone(probe._install_logsafe())
+
+
 class ArmedGuardTest(unittest.TestCase):
     def test_it_refuses_without_any_flag(self):
         with self.assertRaises(RuntimeError):
