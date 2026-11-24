@@ -77,7 +77,7 @@ def test_card_contract():
     assert set(config["required"]) == {"host", "user", "password"}
     assert config["properties"]["page_url"]["oneOf"] == config["properties"]["printer"]["oneOf"] == []
     # Nothing is detected on its own; the form says how to get choices.
-    assert "检测前台电脑" in config["properties"]["page_url"]["description"]
+    assert "点右边的「检测」" in config["properties"]["page_url"]["description"]
 
 
 def _form(plugin):
@@ -110,6 +110,9 @@ def test_page_and_printer_are_chosen_from_what_detect_found(plugin, monkeypatch)
         {"const": "https://visit.example/#/visitor/list", "title": "访客列表 — https://visit.example/#/visitor/list"},
         {"const": CONFIG["page_url"], "title": f"{CONFIG['page_url']}（当前设置，本次未找到）"}]
     assert "找到 2 台打印机、1 个网页" in note
+    # The settings dialog's 检测 button applies these in place (x-options-action).
+    assert result["options"] == choices and result["help"]["page_url"] == note
+    assert plugin.get_tool()["configSchema"]["properties"]["page_url"]["x-options-action"] == "detect"
     assert plugin.calls == [{"action": "login", "page_url": ""}]   # the window to change the page in
 
     plugin.dispatch("config", {"host": "10.0.0.6"})

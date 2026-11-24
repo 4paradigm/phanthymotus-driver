@@ -30,8 +30,7 @@ PACKAGE_VERSION = hashlib.sha256(b"".join(
 _CONFIG_KEYS = ("host", "user", "password", "port", "page_url", "printer")
 _CONNECTION_KEYS = ("host", "user", "password", "port")
 _ACTION_TITLES = {"list": "列出访客", "print": "打印访客贴", "detect": "检测前台电脑"}
-_NOT_DETECTED = ("还没检测：先填好前台电脑 IP、用户名和密码并保存，运行项目，在卡片上执行「检测前台电脑」；"
-                 "检测完停止项目，约一分钟后再打开这里选择")
+_NOT_DETECTED = "还没检测：填好前台电脑 IP、用户名和密码后，点右边的「检测」"
 # Said instead of the error where the next step differs for detect.
 _DETECT_MESSAGES = {"preparing": "正在安装或升级前台电脑上的程序（约 2–3 分钟），装好后再执行一次检测"}
 
@@ -60,10 +59,7 @@ class VisitorBadgePlugin:
         self._detected = ""
 
     def get_tool(self) -> dict:
-        cfg = self._snapshot()
-        with self._lock:
-            pages, printers = list(self._choices["pages"]), list(self._choices["printers"])
-            detected = self._detected or _NOT_DETECTED
+        choices = self._form_choices()
         actions = {
             "start": ([], "启动"), "stop": ([], "停止"), "info": ([], "配置状态"), "config": (list(_CONFIG_KEYS), "保存配置"),
             "list": ([], "列出今天还没入场的访客（姓名、被访人、时间、手机尾号）"),
@@ -88,15 +84,13 @@ class VisitorBadgePlugin:
                 "user": {"type": "string", "title": "Windows 用户名（管理员）", "scope": "shared"},
                 "password": {"type": "string", "title": "Windows 密码", "scope": "shared",
                              "format": "password", "x-sensitive": True},
+                # The dialog's 检测 button runs `detect` and fills both selects
+                # in place from its reply (x-options-action).
                 "page_url": {"type": "string", "title": "访客列表网页", "scope": "shared",
-                             "oneOf": _choices([(p["url"], f"{p['title'] or '网页'} — {p['url']}") for p in pages],
-                                               cfg["page_url"]),
-                             "description": detected},
+                             "oneOf": choices["options"]["page_url"], "description": choices["help"]["page_url"],
+                             "x-options-action": "detect"},
                 "printer": {"type": "string", "title": "打印机", "scope": "shared",
-                            "oneOf": _choices([(p["name"], p["name"] + ("（系统默认）" if p["default"] else "")
-                                                + ("（离线）" if p["offline"] else "")) for p in printers],
-                                              cfg["printer"]),
-                            "description": "不选则用 Windows 默认打印机"},
+                            "oneOf": choices["options"]["printer"], "description": "不选则用 Windows 默认打印机"},
                 "port": {"type": "integer", "title": "SSH 端口", "scope": "shared", "default": 22, "advanced": True},
             },
             # The page is chosen from what the front desk reports, which needs
@@ -143,6 +137,22 @@ class VisitorBadgePlugin:
     def _desk(self, cfg: dict | None = None) -> FrontDesk:
         cfg = cfg or self._snapshot()
         return FrontDesk(cfg["host"], cfg["user"], cfg["password"], int(cfg["port"] or 22), self._known_hosts)
+
+    def _form_choices(self) -> dict:
+        """The choices and help the settings offer, in x-options-action's reply shape."""
+        cfg = self._snapshot()
+        with self._lock:
+            pages, printers = list(self._choices["pages"]), list(self._choices["printers"])
+            detected = self._detected or _NOT_DETECTED
+        return {
+            "options": {
+                "page_url": _choices([(p["url"], f"{p['title'] or '网页'} — {p['url']}") for p in pages],
+                                     cfg["page_url"]),
+                "printer": _choices([(p["name"], p["name"] + ("（系统默认）" if p["default"] else "")
+                                      + ("（离线）" if p["offline"] else "")) for p in printers], cfg["printer"]),
+            },
+            "help": {"page_url": detected},
+        }
 
     def _snapshot(self) -> dict:
         with self._lock:
@@ -268,7 +278,7 @@ class VisitorBadgePlugin:
             # The window to pick a page in; left alone when already open.
             desk.job({"action": "login", "page_url": ""}, PACKAGE_VERSION, 20)
             if pages:
-                message = (f"已连接，找到 {len(printers)} 台打印机、{len(pages)} 个网页：停止项目，约一分钟后打开卡片设置选择。"
+                message = (f"已连接，找到 {len(printers)} 台打印机、{len(pages)} 个网页，可以在下拉框里选了。"
                            "要换网页，就在前台电脑的专用 Edge 里打开它，再检测一次")
             else:
                 message = (f"已连接，找到 {len(printers)} 台打印机。已在前台电脑打开 Edge："
@@ -284,8 +294,9 @@ class VisitorBadgePlugin:
                 elif printers:
                     self._choices["printers"] = printers
                 self._detected = f"检测（{time.strftime('%H:%M')}）：{message}"
+        # options/help: what the settings dialog's 检测 button applies in place.
         return {"status": "ok" if ok else "error", "message": message,
-                "printers": [p["name"] for p in printers], "pages": pages}
+                "printers": [p["name"] for p in printers], "pages": pages, **self._form_choices()}
 
 
 def _choices(options: list[tuple[str, str]], saved: str) -> list[dict]:
