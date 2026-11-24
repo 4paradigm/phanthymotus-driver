@@ -130,8 +130,8 @@ def test_detect_installs_first_then_opens_the_login_window(plugin, monkeypatch):
 
     monkeypatch.setattr(frontdesk.FrontDesk, "pages", pages)
     result = plugin.dispatch("detect", {})
-    assert result["status"] == "error" and "正在首次安装" in result["message"] and "请稍后再试" not in result["message"]
-    assert "正在首次安装" in _form(plugin)[1]
+    assert result["status"] == "error" and "正在安装" in result["message"] and "请稍后再试" not in result["message"]
+    assert "正在安装" in _form(plugin)[1]
     installed.set()
     plugin._installer.join(5)
     result = plugin.dispatch("detect", {})

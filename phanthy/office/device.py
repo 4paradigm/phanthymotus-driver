@@ -33,7 +33,7 @@ _ACTION_TITLES = {"list": "列出访客", "print": "打印访客贴", "detect": 
 _NOT_DETECTED = ("还没检测：先填好前台电脑 IP、用户名和密码并保存，运行项目，在卡片上执行「检测前台电脑」；"
                  "检测完停止项目，约一分钟后再打开这里选择")
 # Said instead of the error where the next step differs for detect.
-_DETECT_MESSAGES = {"preparing": "正在首次安装前台电脑（约 2–3 分钟），装好后再执行一次检测"}
+_DETECT_MESSAGES = {"preparing": "正在安装或升级前台电脑上的程序（约 2–3 分钟），装好后再执行一次检测"}
 
 
 def build_plugins(config: dict) -> list:
