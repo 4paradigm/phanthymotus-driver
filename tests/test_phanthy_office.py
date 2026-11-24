@@ -68,45 +68,60 @@ def test_card_contract():
     assert definition["name"] == "visitor_badge" and definition["type"] == "actuator"
     schema = definition["inputSchema"]
     assert schema["x-completion"]["actions"] == ["print"]
-    assert set(schema["x-action-params"]) >= {"list", "print", "status"}
+    assert set(schema["x-action-params"]) >= {"list", "print", "detect"}
+    assert {o["const"]: o["title"] for o in schema["properties"]["action"]["oneOf"]}["detect"] == "检测前台电脑"
     assert "setup" not in schema["x-action-params"]   # installing is the driver's business
     config = definition["configSchema"]
     assert config["properties"]["password"]["x-sensitive"] is True
     # The page is picked from what the front desk reports, after the connection is saved.
     assert set(config["required"]) == {"host", "user", "password"}
     assert config["properties"]["page_url"]["oneOf"] == config["properties"]["printer"]["oneOf"] == []
+    # Nothing is detected on its own; the form says how to get choices.
+    assert "检测前台电脑" in config["properties"]["page_url"]["description"]
 
 
-def _discovered(plugin):
+def _form(plugin):
+    props = plugin.get_tool()["configSchema"]["properties"]
+    return {k: v["oneOf"] for k, v in props.items() if "oneOf" in v}, props["page_url"]["description"]
+
+
+def _front_desk(monkeypatch, printers, pages):
+    monkeypatch.setattr(frontdesk.FrontDesk, "printers", lambda self: printers)
+    monkeypatch.setattr(frontdesk.FrontDesk, "pages", lambda self: pages)
+
+
+def test_nothing_reaches_the_front_desk_until_detect_is_run(plugin, monkeypatch):
+    monkeypatch.setattr(frontdesk.FrontDesk, "printers", lambda self: pytest.fail("contacted"))
     plugin.get_tool()
-    plugin._discovery.join(5)
-    return {k: v["oneOf"] for k, v in plugin.get_tool()["configSchema"]["properties"].items() if "oneOf" in v}
+    assert plugin.calls == []
 
 
-def test_page_and_printer_are_chosen_from_what_the_front_desk_reports(plugin, monkeypatch):
-    monkeypatch.setattr(frontdesk.FrontDesk, "printers", lambda self: [
-        {"name": "QL-820NWB", "default": False, "offline": False},
-        {"name": "Microsoft Print to PDF", "default": True, "offline": False}])
-    monkeypatch.setattr(frontdesk.FrontDesk, "pages", lambda self: [
-        {"url": "https://visit.example/#/visitor/list", "title": "访客列表"}])
-    choices = _discovered(plugin)
+def test_page_and_printer_are_chosen_from_what_detect_found(plugin, monkeypatch):
+    _front_desk(monkeypatch, [{"name": "QL-820NWB", "default": False, "offline": False},
+                              {"name": "Microsoft Print to PDF", "default": True, "offline": False}],
+                [{"url": "https://visit.example/#/visitor/list", "title": "访客列表"}])
+    result = plugin.dispatch("detect", {})
+    assert result["status"] == "ok" and result["printers"] == ["QL-820NWB", "Microsoft Print to PDF"]
+    choices, note = _form(plugin)
     assert choices["printer"] == [{"const": "QL-820NWB", "title": "QL-820NWB"},
                                   {"const": "Microsoft Print to PDF", "title": "Microsoft Print to PDF（系统默认）"}]
     # The saved page stays selectable even though this round did not see it.
     assert choices["page_url"] == [
         {"const": "https://visit.example/#/visitor/list", "title": "访客列表 — https://visit.example/#/visitor/list"},
         {"const": CONFIG["page_url"], "title": f"{CONFIG['page_url']}（当前设置，本次未找到）"}]
-    assert plugin.calls == []   # a page is already chosen: no login window
+    assert "找到 2 台打印机、1 个网页" in note
+    assert plugin.calls == []   # pages exist: no login window
 
     plugin.dispatch("config", {"host": "10.0.0.6"})
-    assert plugin.get_tool()["configSchema"]["properties"]["printer"]["oneOf"] == []
+    choices, note = _form(plugin)
+    assert choices["printer"] == [] and "还没检测" in note
 
 
-def test_discovery_installs_then_opens_the_login_window_once(plugin, monkeypatch):
+def test_detect_installs_first_then_opens_the_login_window(plugin, monkeypatch):
     plugin.dispatch("config", {"page_url": ""})
     installed = threading.Event()
     monkeypatch.setattr(frontdesk.FrontDesk, "printers", lambda self: [])
-    monkeypatch.setattr(frontdesk.FrontDesk, "install", lambda self, *a, **k: installed.set())
+    monkeypatch.setattr(frontdesk.FrontDesk, "install", lambda self, *a, **k: installed.wait(5))
 
     def pages(self):
         if not installed.is_set():
@@ -114,13 +129,30 @@ def test_discovery_installs_then_opens_the_login_window_once(plugin, monkeypatch
         return []
 
     monkeypatch.setattr(frontdesk.FrontDesk, "pages", pages)
-    _discovered(plugin)
+    result = plugin.dispatch("detect", {})
+    assert result["status"] == "error" and "正在首次安装" in result["message"]
+    assert "正在首次安装" in _form(plugin)[1]
+    installed.set()
     plugin._installer.join(5)
-    assert installed.is_set() and plugin.calls == []
-    for _ in range(2):
-        plugin._choices_at = 0.0
-        _discovered(plugin)
+    result = plugin.dispatch("detect", {})
+    assert result["status"] == "ok" and "已在前台电脑打开 Edge" in result["message"]
     assert plugin.calls == [{"action": "login", "page_url": ""}]
+
+
+@pytest.mark.parametrize("code", ["auth_failed", "unreachable"])
+def test_detect_shows_why_the_front_desk_cannot_be_reached(plugin, monkeypatch, code):
+    def fail(self):
+        raise frontdesk.FrontDeskError(code, "说明" + code)
+
+    monkeypatch.setattr(frontdesk.FrontDesk, "printers", fail)
+    result = plugin.dispatch("detect", {})
+    assert result["status"] == "error" and result["message"].endswith("说明" + code)
+    assert "说明" + code in _form(plugin)[1]
+
+
+def test_detect_needs_the_connection_settings():
+    result = device.VisitorBadgePlugin({}).dispatch("detect", {})
+    assert result["code"] == "not_configured"
 
 
 def test_list_needs_a_chosen_page(plugin):

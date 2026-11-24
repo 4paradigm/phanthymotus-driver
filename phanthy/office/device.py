@@ -29,6 +29,14 @@ PACKAGE_VERSION = hashlib.sha256(b"".join(
     p.read_bytes() for p in sorted(WINDOWS_PACKAGE.iterdir()) if p.is_file())).hexdigest()[:12]
 _CONFIG_KEYS = ("host", "user", "password", "port", "page_url", "printer")
 _CONNECTION_KEYS = ("host", "user", "password", "port")
+_ACTION_TITLES = {"list": "列出访客", "print": "打印访客贴", "detect": "检测前台电脑"}
+_NOT_DETECTED = ("还没检测：先填好前台电脑 IP、用户名和密码并保存，运行项目，在卡片上执行「检测前台电脑」；"
+                 "检测完停止项目、刷新页面，再打开这里选择")
+# What to do next, ahead of the error itself.
+_DETECT_HINTS = {
+    "preparing": "正在首次安装（约 2–3 分钟），装好后再执行一次检测。",
+    "install_failed": "安装失败：",
+}
 
 
 def build_plugins(config: dict) -> list:
@@ -49,28 +57,29 @@ class VisitorBadgePlugin:
         self._installer: threading.Thread | None = None
         self._install_error: FrontDeskError | None = None
         # The front desk's pages and printers, offered as choices in the card's
-        # settings; refreshed in the background from get_tool.
+        # settings; filled in by `detect`.
         self._choices = {"pages": [], "printers": []}
-        self._choices_at = 0.0
-        self._discovery: threading.Thread | None = None
-        self._login_opened = False
+        # Outcome of the last `detect`, shown under the settings it fills in.
+        self._detected = ""
 
     def get_tool(self) -> dict:
-        self._discover_in_background()
         cfg = self._snapshot()
         with self._lock:
             pages, printers = list(self._choices["pages"]), list(self._choices["printers"])
+            detected = self._detected or _NOT_DETECTED
         actions = {
             "start": ([], "启动"), "stop": ([], "停止"), "info": ([], "配置状态"), "config": (list(_CONFIG_KEYS), "保存配置"),
             "list": ([], "列出今天还没入场的访客（姓名、被访人、时间、手机尾号）"),
             "print": (["name", "host"], "给今天一位未入场访客打印访客贴；同名时用 host（被访人）区分。"
                                         "结果异步返回，失败时把 error 原样告诉用户，不要自行重试"),
-            "status": ([], "（管理员）检查前台电脑连接，列出已安装的打印机"),
+            "detect": ([], "（管理员）检测前台电脑：连接、首次安装、打印机和访客网页，"
+                           "结果供卡片设置里的下拉框选择"),
         }
         schema = action_schema(actions, {
             "name": {"type": "string", "description": "访客姓名"},
             "host": {"type": "string", "description": "被访人姓名，可选"},
         })
+        schema["properties"]["action"]["oneOf"] = [{"const": a, "title": t} for a, t in _ACTION_TITLES.items()]
         # A first print may also install the front desk (a few minutes).
         schema["x-completion"] = {"actions": ["print"], "timeout": int(self._print_timeout_s) + 300}
         definition = tool(self.PREFIX, "actuator",
@@ -85,13 +94,12 @@ class VisitorBadgePlugin:
                 "page_url": {"type": "string", "title": "访客列表网页", "scope": "shared",
                              "oneOf": _choices([(p["url"], f"{p['title'] or '网页'} — {p['url']}") for p in pages],
                                                cfg["page_url"]),
-                             "description": "保存前台电脑的 IP、用户名和密码后，前台会打开一个 Edge 窗口："
-                                            "在里面登录访客系统并打开访客列表，约一分钟后重新打开设置即可选择"},
+                             "description": detected},
                 "printer": {"type": "string", "title": "打印机", "scope": "shared",
                             "oneOf": _choices([(p["name"], p["name"] + ("（系统默认）" if p["default"] else "")
                                                 + ("（离线）" if p["offline"] else "")) for p in printers],
                                               cfg["printer"]),
-                            "description": "不选则用 Windows 默认打印机"},
+                            "description": "不选则用 Windows 默认打印机。" + detected},
                 "port": {"type": "integer", "title": "SSH 端口", "scope": "shared", "default": 22, "advanced": True},
             },
             # The page is chosen from what the front desk reports, which needs
@@ -114,9 +122,9 @@ class VisitorBadgePlugin:
                 before = [self._cfg[k] for k in _CONNECTION_KEYS]
                 self._cfg.update({k: args[k] for k in _CONFIG_KEYS if k in args})
                 if [self._cfg[k] for k in _CONNECTION_KEYS] != before:
-                    self._choices, self._choices_at, self._login_opened = {"pages": [], "printers": []}, 0.0, False
+                    self._choices, self._detected = {"pages": [], "printers": []}, ""
             return {"status": "ok", "adapter_ok": self._configured()}
-        handler = {"list": self._list, "print": self._print, "status": self._status}.get(action)
+        handler = {"list": self._list, "print": self._print, "detect": self._detect}.get(action)
         if handler is None:
             return {"status": "error", "code": "bad_action", "error": f"不支持的动作：{action}"}
         try:
@@ -131,42 +139,6 @@ class VisitorBadgePlugin:
 
     def _connected(self) -> bool:
         return all(self._cfg[k] for k in ("host", "user", "password"))
-
-    def _discover_in_background(self) -> None:
-        """Refresh the page and printer choices, at most every 30 s (5 min once a page shows up)."""
-        with self._lock:
-            interval = 300 if self._choices["pages"] else 30
-            if (not self._connected() or time.monotonic() - self._choices_at < interval
-                    or (self._discovery is not None and self._discovery.is_alive())):
-                return
-            self._choices_at = time.monotonic()
-            self._discovery = threading.Thread(target=self._discover, args=(dict(self._cfg),),
-                                               name="visitor_discover", daemon=True)
-            self._discovery.start()
-
-    def _discover(self, cfg: dict) -> None:
-        desk = self._desk(cfg)
-        try:
-            self._store_choices(cfg, printers=desk.printers())
-            try:
-                pages = desk.pages()
-            except FrontDeskError as exc:
-                if exc.code != "not_installed":
-                    raise
-                self._install(cfg, 0)   # raises `preparing`; a later refresh reads the pages
-                return
-            self._store_choices(cfg, pages=pages)
-            if not pages and not cfg["page_url"] and not self._login_opened:
-                # Nothing to choose yet: put the login window in front of the operator.
-                desk.job({"action": "login", "page_url": ""}, PACKAGE_VERSION, 20)
-                self._login_opened = True
-        except FrontDeskError as exc:
-            print(f"[visitor_badge] discovery: {exc.code}", flush=True)
-
-    def _store_choices(self, cfg: dict, **choices) -> None:
-        with self._lock:
-            if all(self._cfg[k] == cfg[k] for k in _CONNECTION_KEYS):   # not since reconfigured
-                self._choices.update(choices)
 
     def _desk(self, cfg: dict | None = None) -> FrontDesk:
         cfg = cfg or self._snapshot()
@@ -270,15 +242,49 @@ class VisitorBadgePlugin:
         threading.Thread(target=run, name=action_id, daemon=True).start()
         return {"status": "printing", "action_id": action_id}
 
-    def _status(self, args: dict) -> dict:
-        desk = self._desk()
+    def _detect(self, args: dict) -> dict:
+        """Check the front desk now and offer what it has in the settings.
+
+        Run by hand from the card, not in the background: whoever runs it is
+        at the settings and wants the answer, and a failure has to reach them
+        rather than a log. The outcome is also kept for the settings form.
+        """
+        cfg = self._snapshot()
+        if not self._connected():
+            return {"status": "error", "code": "not_configured",
+                    "error": "请先在卡片设置里填好前台电脑 IP、Windows 用户名和密码"}
+        desk = self._desk(cfg)
+        printers: list[dict] = []
+        pages: list[dict] = []
         try:
-            pages = desk.pages()
+            printers = desk.printers()
+            try:
+                pages = desk.pages()
+            except FrontDeskError as exc:
+                if exc.code != "not_installed":
+                    raise
+                self._install(cfg, 0)   # raises `preparing` while it runs
+                pages = desk.pages()
+            if pages:
+                message = f"已连接，找到 {len(printers)} 台打印机、{len(pages)} 个网页：停止项目后打开卡片设置选择"
+            else:
+                # Nothing to choose yet: put the login window in front of the operator.
+                desk.job({"action": "login", "page_url": ""}, PACKAGE_VERSION, 20)
+                message = (f"已连接，找到 {len(printers)} 台打印机。已在前台电脑打开 Edge："
+                           "请在里面登录访客系统并打开访客列表，然后再执行一次检测")
+            ok = True
         except FrontDeskError as exc:
-            if exc.code != "not_installed":
-                raise
-            pages = []
-        return {"configured": self._configured(), "printers": desk.printers(), "pages": pages}
+            message = _DETECT_HINTS.get(exc.code, "检测失败：") + str(exc)
+            ok = False
+        with self._lock:
+            if all(self._cfg[k] == cfg[k] for k in _CONNECTION_KEYS):   # not since reconfigured
+                if ok:
+                    self._choices = {"pages": pages, "printers": printers}
+                elif printers:
+                    self._choices["printers"] = printers
+                self._detected = f"检测（{time.strftime('%H:%M')}）：{message}"
+        return {"status": "ok" if ok else "error", "message": message,
+                "printers": [p["name"] for p in printers], "pages": pages}
 
 
 def _choices(options: list[tuple[str, str]], saved: str) -> list[dict]:
