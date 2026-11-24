@@ -34,6 +34,7 @@ COPY intent_control.py intent_motion.py intent_monitor.py intent_teaching.py /wo
 COPY unified_control.py user_motion.py path_capability.py preset.py /work/agilex/piper/
 COPY completion.py /work/agilex/piper/
 COPY camera_live.py camera_worker.py camera_owner.py /work/agilex/piper/
+COPY three_view_capture.py three_view_card.py /work/agilex/piper/
 COPY resource/ /work/agilex/piper/resource/
 COPY deploy/ /deploy/
 ENV PYTHONPATH=/work PYTHONUNBUFFERED=1 RCUTILS_COLORIZED_OUTPUT=0 \
