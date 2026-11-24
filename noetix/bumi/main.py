@@ -236,7 +236,7 @@ class BumiDeviceBundle:
                 tools.append(p.get_tool())
         return tools
 
-    def dispatch(self, tool_name: str, args: dict) -> dict | None:
+    def dispatch(self, tool_name: str, args: dict, *, response_sent=None) -> dict | None:
         for p in self._plugins:
             plugin_tools = p.get_tools() if hasattr(p, 'get_tools') else [p.get_tool()]
             for tool_def in plugin_tools:
@@ -245,6 +245,8 @@ class BumiDeviceBundle:
                         return p.dispatch(tool_name, args)
                     action = args.pop("action", tool_name)
                     args['_tool_name'] = tool_name
+                    if response_sent is not None:
+                        return p.dispatch(action, args, response_sent=response_sent)
                     result = p.dispatch(action, args)
                     return result
         return None
@@ -346,11 +348,18 @@ def make_handler():
                 elif method == "tools/call":
                     name   = params.get("name", "")
                     args   = params.get("arguments") or {}
-                    result = _bundle.dispatch(name, args)
-                    if result is None:
-                        err(-32601, f"Unknown tool: {name}")
-                    else:
-                        ok({"content": [{"type": "text", "text": json.dumps(result)}]})
+                    response_sent = (threading.Event() if name == "vision_capture"
+                                     and args.get("action") == "capture_rgbd" else None)
+                    try:
+                        result = (_bundle.dispatch(name, args, response_sent=response_sent)
+                                  if response_sent is not None else _bundle.dispatch(name, args))
+                        if result is None:
+                            err(-32601, f"Unknown tool: {name}")
+                        else:
+                            ok({"content": [{"type": "text", "text": json.dumps(result)}]})
+                    finally:
+                        if response_sent is not None:
+                            response_sent.set()
                 else:
                     err(-32601, f"Method not found: {method}")
             except Exception as e:

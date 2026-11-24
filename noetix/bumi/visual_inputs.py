@@ -46,6 +46,7 @@ class RawCameraPublisher:
         self.depth_scale = pipeline.get_active_profile().get_device().first_depth_sensor().get_depth_scale()
         self.epoch = uuid.uuid4().hex
         self.clocks = [ClockMap(), ClockMap()]
+        self.clock_diagnostic_logged = False
         # Sample the enabled raw branch at a bounded rate instead of duplicating
         # every 30 Hz capture frame over DDS.
         self.min_interval_s = max(0.0, float(min_interval_s))
@@ -81,7 +82,26 @@ class RawCameraPublisher:
                 src = meta[key]
                 if index == 1 and self.clocks[1].offset is None:
                     self.clocks[1].offset = self.clocks[0].offset
-                stamps.append(self.clocks[index].convert(src['source_ms'], src['domain'], wall))
+                try:
+                    stamps.append(self.clocks[index].convert(src['source_ms'], src['domain'], wall))
+                except ValueError as exc:
+                    clock = self.clocks[index]
+                    if (str(exc) == 'camera clock mapping drift or transport delay'
+                            and not self.clock_diagnostic_logged and clock.offset is not None):
+                        self.clock_diagnostic_logged = True
+                        mapped = int(src['source_ms']*1e6) + clock.offset
+                        record = dict(epoch=self.epoch, stream=key, frame_number=src['frame_number'],
+                                      domain=src['domain'], source_ms=src['source_ms'],
+                                      received_wall_ns=wall,
+                                      received_monotonic_ns=meta['received_monotonic_ns'],
+                                      mapped_ns=mapped, offset_ns=clock.offset,
+                                      residual_ns=wall-mapped)
+                        try:
+                            print('[raw_rgbd] clock_residual ' + json.dumps(
+                                record, allow_nan=False, separators=(',', ':')), flush=True)
+                        except (OSError, ValueError):
+                            pass
+                    raise
             if abs(stamps[0]-stamps[1]) > 20_000_000:
                 raise ValueError('RGB/depth capture skew exceeds 20 ms')
             # The field D435i reports inverse_brown_conrady with all-zero
