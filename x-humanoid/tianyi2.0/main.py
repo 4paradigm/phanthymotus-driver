@@ -480,7 +480,10 @@ class TianyiDeviceBundle:
                 self._plugins.append(WeighPlugin(
                     plugins_cfg["weigh"], namespace, ros2,
                     arm_call=lambda args: self._dispatch("arm", dict(args)),
-                    hand_call=lambda args: self._dispatch("hand", dict(args))))
+                    hand_call=lambda args: self._dispatch("hand", dict(args)),
+                    # The servo card streams arm/hand targets too; pose/retract
+                    # pause it before moving (explicit action wins over the stream).
+                    servo_call=lambda args: self._dispatch("servo", dict(args))))
                 print("[bundle] WeighPlugin loaded (weigh)")
             except Exception as e:
                 print(f"[bundle] WeighPlugin NOT loaded: {e}", flush=True)

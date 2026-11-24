@@ -200,7 +200,7 @@ class WeighEngine:
     """
 
     def __init__(self, config: dict | None = None, clock=time.monotonic, wall=time.time,
-                 sleep=time.sleep, log=_log, arm_call=None, hand_call=None):
+                 sleep=time.sleep, log=_log, arm_call=None, hand_call=None, servo_call=None):
         cfg = dict(DEFAULTS)
         cfg.update(config or {})
         cfg["sides"] = [s for s in SIDES if s in (cfg.get("sides") or SIDES)] or ["right"]
@@ -219,6 +219,7 @@ class WeighEngine:
         self._arm_started = False
         self._hand_call = hand_call                  # args → hand 卡 dispatch 结果（经 bundle）
         self._hand_started = False
+        self._servo_call = servo_call                # args → servo 卡 dispatch 结果；servo 卡未加载时返回 None
         self._origin = {}                            # side → pose 出发时的手臂姿态（度），retract 回到这里
         self._tare = {s: None for s in SIDES}
         self._last = {s: None for s in (*SIDES, "both")}
@@ -779,6 +780,45 @@ class WeighEngine:
         self._raw_sleep(dt)
         self._check_cancel()
 
+    def _servo_state(self):
+        """servo 卡（motus.control/1 指令流，同样驱动双臂和双手）的状态：
+        None=未加载 / 'idle' / 'paused' / 'running'，查询失败返回 'unknown'。"""
+        if self._servo_call is None:
+            return None
+        try:
+            r = self._servo_call({"action": "info"})
+        except Exception as exc:
+            self._log(f"[weigh] servo info failed: {exc}")
+            return "unknown"
+        if r is None:
+            return None
+        return r.get("state", "unknown") if isinstance(r, dict) else "unknown"
+
+    def _take_over_from_servo(self):
+        """显式动作优先于指令流：servo 正在推流时先暂停它（保持当前姿态，不自动恢复）。
+        返回 (problem, paused)。problem 非 None 时不得下发任何手臂/手指指令。"""
+        self._check_cancel()
+        state = self._servo_state()
+        if state in (None, "idle", "paused"):
+            return None, False
+        if state != "running":
+            return f"servo state {state!r}", False
+        try:
+            r = self._servo_call({"action": "pause"})
+        except Exception as exc:
+            return f"servo pause failed: {exc}", False
+        if not isinstance(r, dict) or r.get("state") != "paused":
+            return f"servo pause failed: {_brief(r)}", False
+        self._log("[weigh] servo stream paused before moving arms/fingers; resume it explicitly when done")
+        return None, True
+
+    def _servo_guard(self):
+        """每条手臂/手指指令之前调用：有人在动作进行中恢复了 servo 就停下，不和指令流抢关节。"""
+        state = self._servo_state()
+        if state in (None, "idle", "paused"):
+            return None
+        return f"servo {state}"
+
     def _call_arm(self, args: dict):
         self._check_cancel()
         if self._arm_call is None:
@@ -813,7 +853,12 @@ class WeighEngine:
                 self._log(f"[weigh] stage {label}: {s} {_fmt_deg(cur)} -> {_fmt_deg(targets[s])}")
             else:
                 self._log(f"[weigh] stage {label}: {s} held at {_fmt_deg(cur)}")
-        r = self._move_stage_inner(targets, label)
+        problem = self._servo_guard()
+        if problem:
+            r = {"ok": False, "stage": label, "code": "servo_active",
+                 "error": f"servo 卡在推流（{problem}），不和它抢关节；已停止，没有下发本段"}
+        else:
+            r = self._move_stage_inner(targets, label)
         if r["ok"]:
             self._log(f"[weigh] stage {label}: arrived in {r['seconds']}s at "
                       + " ".join(f"{s}={_fmt_deg(r['joints_deg'][s])}" for s in targets))
@@ -880,6 +925,9 @@ class WeighEngine:
             args = {"action": "set_fingers_raw", "side": side}
             args.update({k: max(0, min(100, int(v))) for k, v in fingers.items()})
             self._check_cancel()
+            if self._servo_guard():
+                self._log(f"[weigh] hand {shape}: servo is streaming, fingers unchanged")
+                return "servo_active"
             r = self._hand_call(args)
         except Exception as exc:
             self._log(f"[weigh] hand {shape} raised {exc}")
@@ -949,6 +997,12 @@ class WeighEngine:
                                    joints_deg=[_r(x, 2) for x in cur], rest_zone_deg=cfg["rest_zone_deg"])
         stages = self._merge_stages(("raise_forearm", "palm_up"), per_side)
         steps = []
+        servo_paused = False
+        if stages or hand != "keep":
+            problem, servo_paused = self._take_over_from_servo()
+            if problem:
+                return self._error("servo_active", side,
+                                   f"servo 卡正在驱动手臂/手指，且无法暂停（{problem}）；没有下发任何指令")
         if stages:
             bad = self._ensure_arm_started()
             if bad is not None:
@@ -974,6 +1028,7 @@ class WeighEngine:
                                    f"不要往掌心放东西；修好 hand 卡后重新 pose，或用 retract side={side} 收回",
                                    hand_problem=problem, arm_posed=True, steps=steps)
         out = {"state": "posed", "side": side, "experimental": True, "hand": hand,
+               **({"servo_paused": True} if servo_paused else {}),
                "already_in_pose": not stages, "pose_deg": poses if len(sides) > 1 else poses[side],
                "steps": steps}
         warnings = self._common_warnings(side)
@@ -1049,6 +1104,10 @@ class WeighEngine:
         stages = self._merge_stages(("palm_inward", "lower_arm"), per_side)
         if not stages:
             return {"state": "retracted", "side": side, "already_retracted": True, "steps": []}
+        problem, servo_paused = self._take_over_from_servo()
+        if problem:
+            return self._error("servo_active", side,
+                               f"servo 卡正在驱动手臂/手指，且无法暂停（{problem}）；没有下发任何指令")
         # 先张开手指（四指立起时转腕可能卡到东西），再动手臂。张不开就不动手臂：
         # 手指还立着时转腕会碰到或甩掉掌上的东西。
         hand_problem = self._set_hand("open", side)
@@ -1070,7 +1129,8 @@ class WeighEngine:
             self._tare[s] = None
             self._last[s] = None
             self._origin.pop(s, None)
-        return {"state": "retracted", "side": side, "experimental": True, "steps": steps}
+        return {"state": "retracted", "side": side, "experimental": True, "steps": steps,
+                **({"servo_paused": True} if servo_paused else {})}
 
     # ── read ──
 
@@ -1165,14 +1225,15 @@ class WeighPlugin:
     """腕部六维力称重卡。自己不创建任何发布者；pose/retract 经 arm 卡下发运动。"""
 
     def __init__(self, plugin_config: dict, namespace: str, ros2, arm_call=None, hand_call=None,
-                 acp_notify=None):
+                 acp_notify=None, servo_call=None):
         """arm_call(args) → dict：由 bundle 提供，等同于对 arm 卡调用 tools/call。
         acp_notify(action_id, status, result, tool)：异步动作完成时回调 Agent Core。"""
         self._acp_notify = acp_notify or _default_acp_notify
         self._sync_grace_s = SYNC_GRACE_S
         self._ns = namespace
         self._ros2 = ros2
-        self._engine = WeighEngine(plugin_config, arm_call=arm_call, hand_call=hand_call)
+        self._engine = WeighEngine(plugin_config, arm_call=arm_call, hand_call=hand_call,
+                                   servo_call=servo_call)
         self._sides = self._engine.cfg["sides"]
         self._node = None
         self._executor = None
@@ -1181,6 +1242,7 @@ class WeighPlugin:
         self._start_lock = threading.Lock()
         self._busy = threading.Lock()
         self._worker = None
+        self._stopping = False
 
     # ── 卡片定义 ────────────────────────────────────────────────────────────
 
@@ -1329,14 +1391,33 @@ class WeighPlugin:
                   f"on its own executor (subscribe-only; pose/retract go through the arm card; scale state {self._engine.cfg['state_file']})",
                   flush=True)
 
-    def stop(self) -> None:
-        # 先取消进行中的动作并等它退出：之后不会再有手臂/手指指令，也不会在没有传感器数据时继续。
+    def stop(self) -> bool:
+        """取消进行中的动作并等它退出，再拆订阅。返回 True=已停止；False=动作还没退出
+        （例如卡在 arm/hand 卡的调用里），此时保持订阅、报 stopping，由后台线程等它退出后再拆，
+        期间占着 busy，新动作进不来。取消标志一直保持，动作醒来后不会再下发指令。"""
         worker = self._worker
         if worker is not None and worker.is_alive():
             self._engine.cancel()
             worker.join(timeout=5.0)
             if worker.is_alive():
-                print("[weigh] stop: in-flight action did not exit within 5 s", flush=True)
+                print("[weigh] stop: in-flight action still running after 5 s; "
+                      "teardown deferred until it exits", flush=True)
+                if not self._stopping:
+                    self._stopping = True
+                    threading.Thread(target=self._finish_stop, args=(worker,),
+                                     name="weigh-stop", daemon=True).start()
+                return False
+        self._teardown()
+        return True
+
+    def _finish_stop(self, worker) -> None:
+        worker.join()
+        with self._busy:
+            self._teardown()
+            self._stopping = False
+        print("[weigh] stop: deferred teardown done", flush=True)
+
+    def _teardown(self) -> None:
         with self._start_lock:
             node, self._node = self._node, None
             if node is None:
@@ -1369,8 +1450,9 @@ class WeighPlugin:
                 return {"state": "error", "error": f"weigh start failed: {exc}"}
             return {"state": "ready"}
         if action == "stop":
-            self.stop()
-            return {"state": "idle"}
+            if self.stop():
+                return {"state": "idle"}
+            return {"state": "stopping", "error": "进行中的动作还没退出；它不会再下发指令，退出后自动停止"}
         if action == "info":
             return {"state": "ready" if self._node is not None else "idle", "sides": list(self._sides)}
         if action not in ("pose", "tare", "weigh", "calibrate", "read", "retract"):
@@ -1408,8 +1490,13 @@ class WeighPlugin:
     def _start_job(self, action: str, args: dict, t0: float) -> dict:
         """在工作线程里执行一个动作。SYNC_GRACE_S 内结束就同步返回结果；否则返回 action_id，
         做完后经 ACP 回调完成状态和完整结果。同一时间只允许一个动作。"""
+        if self._stopping:
+            return {"state": "error", "code": "stopping", "error": "卡片正在停止，等上一个动作退出后再调用"}
         if not self._busy.acquire(blocking=False):
             return {"state": "error", "code": "busy", "error": "本卡另一个动作正在进行"}
+        if self._stopping:
+            self._busy.release()
+            return {"state": "error", "code": "stopping", "error": "卡片正在停止，等上一个动作退出后再调用"}
         self._engine.clear_cancel()       # 持有 busy 说明上一个动作已退出
         action_id = f"weigh_{action}_{uuid4().hex[:8]}"
         done = threading.Event()

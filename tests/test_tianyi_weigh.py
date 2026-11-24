@@ -1017,3 +1017,100 @@ def test_stop_cancels_pending_pose_and_sends_nothing_more(hanging, tmp_path):
     p._sync_grace_s = 60
     assert p.dispatch("read", {"side": "right"})["state"] == "ok"
     assert p.dispatch("calibrate", {"side": "right", "scale": 1.05})["state"] == "calibrated"
+
+
+# ── servo 指令流：显式动作前先暂停它，动作中被恢复就停下 ──────────────────────
+
+class FakeServo:
+    def __init__(self, rig, state="running", pause_ok=True):
+        self.rig, self.state, self.pause_ok, self.calls = rig, state, pause_ok, []
+
+    def __call__(self, args):
+        self.calls.append(args["action"])
+        self.rig.order.append(("servo", args["action"]))
+        if args["action"] == "info":
+            return {"state": self.state}
+        if args["action"] == "pause":
+            if not self.pause_ok:
+                return {"state": "error", "message": "nope"}
+            self.state = "paused"
+            return {"state": "paused"}
+        return None
+
+
+def test_pose_pauses_running_servo_before_any_command(hanging):
+    servo = FakeServo(hanging)
+    hanging.engine._servo_call = servo
+    res = hanging.engine.pose({})
+    assert res["state"] == "posed" and res["servo_paused"] is True, res
+    first_cmd = next(i for i, o in enumerate(hanging.order) if o[0] in ("arm", "hand"))
+    assert hanging.order.index(("servo", "pause")) < first_cmd
+    assert "resume" not in servo.calls                       # 不自动恢复
+
+
+def test_pose_refuses_when_servo_cannot_be_paused(hanging):
+    hanging.engine._servo_call = FakeServo(hanging, pause_ok=False)
+    res = hanging.engine.pose({})
+    assert res["code"] == "servo_active", res
+    assert hanging.arm_calls == [] and hanging.hand_calls == []
+
+
+def test_servo_resumed_mid_pose_stops_before_next_stage(hanging):
+    servo = FakeServo(hanging, state="idle")
+    hanging.engine._servo_call = servo
+    hanging.events.append((hanging.t + 2.0, lambda: setattr(servo, "state", "running")))
+    res = hanging.engine.pose({})
+    assert res["state"] == "error" and res["code"] == "servo_active", res
+    assert len(hanging.moves()) == 1                           # 第二段没有下发
+    assert not [c for c in hanging.hand_calls if c["action"] == "set_fingers_raw"]
+
+
+def test_retract_pauses_running_servo_before_opening_fingers(hanging):
+    hanging.engine.pose({})
+    hanging.warm(1)
+    servo = FakeServo(hanging)
+    hanging.engine._servo_call = servo
+    hanging.order.clear()
+    res = hanging.engine.retract({})
+    assert res["state"] == "retracted" and res["servo_paused"] is True, res
+    assert hanging.order.index(("servo", "pause")) < hanging.order.index(("hand", "set_fingers_raw"))
+
+
+def test_servo_card_absent_is_fine(hanging):
+    hanging.engine._servo_call = lambda args: None               # bundle 里没有 servo 卡
+    assert hanging.engine.pose({})["state"] == "posed"
+
+
+# ── stop：动作卡在 arm 卡调用里时不报 idle，退出后才拆 ─────────────────────────
+
+def test_stop_with_stuck_worker_defers_teardown_and_blocks_new_actions(hanging, tmp_path):
+    p, calls, fired = _async_plugin(hanging, tmp_path)
+    p.stop = weigh.WeighPlugin.stop.__get__(p)
+    torn = []
+    p._teardown = lambda: torn.append(True)
+    inside, release = threading.Event(), threading.Event()
+    real_arm = hanging.engine._arm_call
+
+    def stuck_arm(args):
+        if args["action"] == "move_pos" and not release.is_set():
+            inside.set()
+            release.wait(10)                                    # arm 卡调用卡住
+        return real_arm(args)
+    hanging.engine._arm_call = stuck_arm
+    res = p.dispatch("pose", {"side": "right"})
+    assert "action_id" in res and inside.wait(10)
+    real_join = p._worker.join
+    p._worker.join = lambda timeout=None: real_join(0.2 if timeout else None)   # 测试里别真等 5 s
+    r = p.dispatch("stop", {})
+    assert r["state"] == "stopping" and torn == []
+    assert p.dispatch("weigh", {"side": "right"})["code"] in ("stopping", "busy")
+    n = len(hanging.arm_calls)
+    release.set()
+    assert fired.wait(10) and calls[0][1] == "cancelled"
+    deadline = time.time() + 10
+    while not torn and time.time() < deadline:
+        time.sleep(0.01)
+    assert torn == [True] and not p._stopping
+    # 只有卡住的那一条 move_pos 最终送达；取消之后没有第二段，也没有冻结指令
+    assert [c["action"] for c in hanging.arm_calls[n:]] == ["move_pos"]
+    assert not [c for c in hanging.hand_calls if c["action"] == "set_fingers_raw"]
