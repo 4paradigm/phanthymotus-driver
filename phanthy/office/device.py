@@ -31,7 +31,7 @@ _CONFIG_KEYS = ("host", "user", "password", "port", "page_url", "printer")
 _CONNECTION_KEYS = ("host", "user", "password", "port")
 _ACTION_TITLES = {"list": "列出访客", "print": "打印访客贴", "detect": "检测前台电脑"}
 _NOT_DETECTED = ("还没检测：先填好前台电脑 IP、用户名和密码并保存，运行项目，在卡片上执行「检测前台电脑」；"
-                 "检测完停止项目、刷新页面，再打开这里选择")
+                 "检测完停止项目，约一分钟后再打开这里选择")
 # Said instead of the error where the next step differs for detect.
 _DETECT_MESSAGES = {"preparing": "正在首次安装前台电脑（约 2–3 分钟），装好后再执行一次检测"}
 
@@ -266,7 +266,7 @@ class VisitorBadgePlugin:
                 self._install(cfg, 0)   # raises `preparing` while it runs
                 pages = desk.pages()
             if pages:
-                message = f"已连接，找到 {len(printers)} 台打印机、{len(pages)} 个网页：停止项目后打开卡片设置选择"
+                message = f"已连接，找到 {len(printers)} 台打印机、{len(pages)} 个网页：停止项目，约一分钟后打开卡片设置选择"
             else:
                 # Nothing to choose yet: put the login window in front of the operator.
                 desk.job({"action": "login", "page_url": ""}, PACKAGE_VERSION, 20)
