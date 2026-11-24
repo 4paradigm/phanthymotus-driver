@@ -104,6 +104,44 @@ def _config(*, loco=True, loco_servo=True, servo_config=None):
     }
 
 
+def test_audio_environment_registers_without_sdk_or_microphone_ownership(bundle_module):
+    bundle = bundle_module.BumiDeviceBundle(
+        {'plugins': {'audio_environment': {'enabled': True}}},
+        'bumi_test', FakeHighCtrl(), None, None)
+    tool = bundle.get_all_tools()[0]
+    assert (tool['name'], tool['type']) == ('audio_environment', 'processor')
+    bundle.start_all()
+    assert bundle.dispatch('audio_environment', {'action':'info'})['state'] == 'idle'
+    bundle.stop_all()
+
+
+def test_bad_audio_config_does_not_prevent_other_cards(bundle_module):
+    bundle = bundle_module.BumiDeviceBundle(
+        {'plugins': {'speaker': {'enabled': True},
+                     'audio_environment': {'enabled': True, 'hold_s': 0}}},
+        'bumi_test', object(), None, object())
+    assert [t['name'] for t in bundle.get_all_tools()] == ['speaker']
+
+
+def test_audio_environment_bare_bundle_call_returns_info_without_starting(bundle_module):
+    bundle = bundle_module.BumiDeviceBundle(
+        {"plugins": {"audio_environment": {"enabled": True}}},
+        "bumi_test", object(), None, None)
+    result = bundle.dispatch("audio_environment", {})
+    assert result["state"] == "idle"
+    assert result["status"] == "unknown"
+    assert result["input_topic"] == ""
+    assert result["topic_out"] == bundle.get_all_tools()[0]["topic_out"]
+
+
+def test_audio_environment_unknown_bundle_action_returns_none(bundle_module):
+    bundle = bundle_module.BumiDeviceBundle(
+        {"plugins": {"audio_environment": {"enabled": True}}},
+        "bumi_test", object(), None, None)
+    assert bundle.dispatch("audio_environment", {"action": "unsupported"}) is None
+    assert bundle.dispatch("audio_environment", {})["state"] == "idle"
+
+
 def test_enabled_loco_servo_registers_and_reuses_loco(bundle_module):
     high_ctrl = FakeHighCtrl()
     executor = object()
