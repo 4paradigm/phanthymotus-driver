@@ -49,6 +49,13 @@ not animated by the current Core; real opening width is available in Get status.
 On camera publishes the existing JPEG topic when its configured live stream and
 camera permission are enabled. Optional photo capture/import remains available.
 
+**Device diagnostics** (`piper_diagnostics`) reads the shared CAN receiver on
+demand. It reports receiver connection separately from feedback freshness,
+plus control mode, motor enable flags, controller faults and the gripper fault
+code when available. It requires no canvas data connection. Use **Read
+diagnostics** to take a snapshot. Unavailable feedback leaves the current
+controller fault state unknown.
+
 Long-running requests return a unique `action_id`; their real completed, error
 or cancelled result is POSTed to Core. Receipt timeout is 90 seconds, allowing
 preparation and delivery around the 60-second movement wait. Delivery checks

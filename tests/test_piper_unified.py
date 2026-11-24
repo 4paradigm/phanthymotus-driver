@@ -70,7 +70,8 @@ class UnifiedTests(unittest.TestCase):
     def test_three_card_schema_topics_and_legacy_request_rejection(self):
         self.config['camera'] = {'live': {'enabled': True}}
         tools = {t['name']: t for t in self.bundle.get_all_tools()}
-        self.assertEqual(set(tools), {'arm_control', 'joints', 'model', 'piper_photo', 'piper_camera_live'})
+        self.assertEqual(set(tools), {'arm_control', 'joints', 'model', 'piper_photo',
+                                     'piper_camera_live', 'piper_diagnostics'})
         arm = tools['arm_control']
         self.assertEqual(arm['title'], 'Arm control')
         schema = arm['inputSchema']
@@ -98,6 +99,44 @@ class UnifiedTests(unittest.TestCase):
         definition = yaml.safe_load((Path(__file__).resolve().parents[1] / 'agilex/piper/driver.yaml').read_text())
         self.assertEqual({(card['name'], card['type']) for card in definition['cards']},
                          {(tool['name'], tool['type']) for tool in self.bundle.get_all_tools()})
+
+    def test_diagnostics_reads_shared_feedback_without_command_or_reconnect(self):
+        def read(**arguments):
+            return self.bundle.dispatch('piper_diagnostics', arguments)
+
+        with patch.object(self.runtime, 'connected', side_effect=AssertionError('connect')), \
+             patch.object(self.runtime, 'read_state', side_effect=AssertionError('control read')):
+            self.assertEqual(read(action='start')['state'], 'ready')
+            self.assertEqual(read(action='stop')['state'], 'idle')
+            result = read(action='read')
+            self.assertEqual(result['state'], 'ok')
+            self.assertTrue(result['can_receiver_connected'])
+            self.assertTrue(result['feedback_fresh'])
+            self.assertLess(result['feedback_age_ms'], 500)
+
+            self.sdk.error = 1
+            result = read(action='info', input_topic='')
+            self.assertEqual(result['state'], 'fault')
+            self.assertEqual(result['controller']['error_code'], 1)
+
+            self.sdk.frozen = True
+            result = read()
+            self.assertEqual(result['state'], 'feedback_unavailable')
+            self.assertFalse(result['feedback_fresh'])
+            self.assertIsNone(result['controller'])
+            self.assertIn('feedback', result['reasons'])
+
+            with self.assertRaises(ValueError):
+                read(action='enable')
+            with self.assertRaises(ValueError):
+                read(action='read', speed_percent=5)
+
+            self.runtime.disconnect()
+            result = read(action='read')
+            self.assertEqual(result['state'], 'disconnected')
+            self.assertFalse(result['can_receiver_connected'])
+            self.assertIsNone(result['controller'])
+            self.assertEqual(self.sdk.calls, [])
 
     def test_start_status_and_default_selection_are_passive(self):
         self.call('start')
