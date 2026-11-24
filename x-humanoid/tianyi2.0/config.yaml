@@ -153,6 +153,16 @@ plugins:
     head_recording_enabled: false
   robot_faults:
     enabled: true
+  weigh:
+    # 手掌托举称重（实验性）。pose/retract 经 arm、hand 卡移动右臂和手指（需两卡启用），其余动作只读。
+    # 默认关闭。流程：pose（自动去皮）→ 放物体 → weigh → 取走 → retract。
+    enabled: false
+    sides: [left, right]    # 可用的手；调用时 side=left / right / both（两手相加）
+    state_file: /opt/phanthy-motus/data/tianyi-weigh.json   # 比例系数持久化
+    load_limit_kg: null     # 不设固定重量上限，由 current_ratio_max 判定
+    current_ratio_max: 0.6  # 任一右臂关节电流超过额定 60% → valid=false（掌心约 2 kg，未实测）
+    joint_dev_deg: 1.5      # 关节相对去皮时偏差超过 1.5° → valid=false
+    default_hand: cup       # pose 的手型：cup=四指立起 65 围住掌心（需 hand 卡启用）；open；keep
   laser_scan:
     enabled: true
   chassis_raw:

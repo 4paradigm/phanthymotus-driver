@@ -470,6 +470,21 @@ class TianyiDeviceBundle:
             self._plugins.append(HealthCheckPlugin(plugins_cfg["robot_faults"], namespace, ros2, slamtec_client))
             print("[bundle] HealthCheckPlugin loaded (health_check)")
 
+        if plugins_cfg.get("weigh", {}).get("enabled", False):
+            # Wrist force/torque weighing card (experimental, opt-in).
+            # It must never take the rest of the driver down with it.
+            try:
+                from weigh import WeighPlugin
+                # pose/retract move the arm and fingers through the arm/hand cards, via the
+                # same routing as tools/call (lazy start, preflight, feedback).
+                self._plugins.append(WeighPlugin(
+                    plugins_cfg["weigh"], namespace, ros2,
+                    arm_call=lambda args: self._dispatch("arm", dict(args)),
+                    hand_call=lambda args: self._dispatch("hand", dict(args))))
+                print("[bundle] WeighPlugin loaded (weigh)")
+            except Exception as e:
+                print(f"[bundle] WeighPlugin NOT loaded: {e}", flush=True)
+
         if plugins_cfg.get("laser_scan", {}).get("enabled", False):
             from device import LaserScanPlugin
             self._plugins.append(LaserScanPlugin(plugins_cfg["laser_scan"], namespace, ros2, slamtec_client))
