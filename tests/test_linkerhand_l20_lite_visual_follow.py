@@ -745,3 +745,50 @@ def test_shared_control_sink_owns_admission():
     assert len(client.writes) == before
     # The stream's own seq counter advanced only on admitted frames.
     assert stream["sink_seq"] >= 1
+
+
+def test_exhibition_full_cycle_through_control_sink():
+    """start -> resume -> follow -> watchdog silence -> auto-resume -> pause/resume.
+
+    The exhibition deployment depends on this whole cycle working through the
+    shared ControlSink: a visitor's hand leaving for a few seconds must not
+    leave the hand permanently dead when it comes back.
+    """
+    plugin = make_plugin()
+    client = start_with_fake_client(plugin)
+    stream = plugin._streams["card1"]
+    sink = stream["sink"]
+
+    # 1. start arms, resume with confirmation energizes.
+    assert stream["paused"] is True
+    plugin.dispatch("resume", {"instance_id": "card1", "confirm_motion": True})
+    assert plugin.accept(sample()) is True
+    assert client.torques[-1] != [0] * 10
+
+    # 2. Watchdog silence releases torque via the shared sink.
+    real_clock = sink._clock
+    fake = {"now": real_clock() + plugin.watchdog_ms + 1000}
+    sink._clock = lambda: fake["now"]
+    try:
+        plugin._on_watchdog()
+        assert stream["starved"] is True
+        assert client.torques[-1] == [0] * 10
+    finally:
+        sink._clock = real_clock
+
+    # 3. Visitor's hand returns: fresh data auto-re-energizes (no re-confirm UI).
+    stream["last_command_monotonic"] = 0.0
+    curl = dict(sample()["flexions"]); curl["index"] = 1.0
+    assert plugin.accept(sample(flexions=curl)) is True
+    assert stream["starved"] is False
+    assert client.torques[-1] != [0] * 10
+
+    # 4. pause releases; resume requires explicit confirmation and recovers.
+    plugin.dispatch("pause", {"instance_id": "card1"})
+    assert client.torques[-1] == [0] * 10
+    assert plugin.dispatch("resume", {"instance_id": "card1",
+                                      "confirm_motion": False})["state"] == "error"
+    plugin.dispatch("resume", {"instance_id": "card1", "confirm_motion": True})
+    stream["last_command_monotonic"] = 0.0
+    assert plugin.accept(sample()) is True
+    assert client.torques[-1] != [0] * 10
