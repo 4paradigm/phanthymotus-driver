@@ -8,7 +8,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 
 from common.vendor_runtime import DualDomainROS2
-from test_s10_front_depth import rig, configure, cloud
+from test_s10_front_depth import RECEIPT_STAMP, rig, configure, cloud
 from test_s10_pro_control import _load_device, FakeNative
 
 
@@ -127,10 +127,15 @@ def test_stop_start_recovers_destroyed_handle_and_resumes_depth_and_ssh_watchdog
     run_callback(runtime, rig.timers[-1].callback)
     assert rig.plugin.dispatch('info', {})['input']['transport'] == 'ssh'
     run_callback(runtime, lambda: rig.relays[-1].on_message(cloud(sec=12)))
+    # The frame keeps its driver receipt time even if completion runs later.
+    monkeypatch.setattr(time, 'time_ns', lambda: (RECEIPT_STAMP[0] + 1) * 10**9)
     run_callback(runtime, rig.plugin._worker.complete)
     assert len(rig.publications) == 2
-    assert rig.publications[-1].header.stamp.sec == 12
-    assert rig.plugin.dispatch('info', {})['state'] == 'running'
+    stamp = rig.publications[-1].header.stamp
+    assert (stamp.sec, stamp.nanosec) == RECEIPT_STAMP
+    info = rig.plugin.dispatch('info', {})
+    assert info['stats']['last_source_stamp'] == [12, 123]
+    assert info['state'] == 'running'
     rig.plugin.stop()
 
 
