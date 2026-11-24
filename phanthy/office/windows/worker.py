@@ -65,7 +65,11 @@ class Worker:
         page_url = str(job.get("page_url") or "")
         today = date.today().isoformat()
         if action == "login":
-            self.close()
+            if self._site is not None:
+                # Let the automation Edge release the profile, or the new
+                # window is handed to the exiting browser and never shows.
+                self.close()
+                time.sleep(2)
             open_for_login(PROFILE, page_url)
             return {"ok": True}
         if action == "list":

@@ -9,6 +9,7 @@ user's desktop session (windows/worker.py).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import ssl
@@ -23,6 +24,9 @@ from frontdesk import FrontDesk, FrontDeskError
 
 
 WINDOWS_PACKAGE = Path(__file__).resolve().parent / "windows"
+# What the front desk must be running; a mismatch makes the next job reinstall.
+PACKAGE_VERSION = hashlib.sha256(b"".join(
+    p.read_bytes() for p in sorted(WINDOWS_PACKAGE.iterdir()) if p.is_file())).hexdigest()[:12]
 _CONFIG_KEYS = ("host", "user", "password", "port", "page_url", "printer")
 
 
@@ -41,7 +45,8 @@ class VisitorBadgePlugin:
         self._print_timeout_s = float(cfg.get("print_timeout_s", 150))
         self._known_hosts = str(cfg.get("known_hosts", "/opt/phanthy-motus/data/visitor_badge/known_hosts"))
         self._printing = False
-        self._setup: dict = {"state": "idle"}
+        self._installer: threading.Thread | None = None
+        self._install_error: FrontDeskError | None = None
 
     def get_tool(self) -> dict:
         actions = {
@@ -49,14 +54,14 @@ class VisitorBadgePlugin:
             "list": ([], "列出今天还没入场的访客（姓名、被访人、时间、手机尾号）"),
             "print": (["name", "host"], "给今天一位未入场访客打印访客贴；同名时用 host（被访人）区分。"
                                         "结果异步返回，失败时把 error 原样告诉用户，不要自行重试"),
-            "setup": ([], "（管理员）安装/升级前台电脑上的自动化，并在前台打开 Edge 供登录访客系统"),
-            "status": ([], "（管理员）检查前台电脑连接、安装进度，列出已安装的打印机"),
+            "status": ([], "（管理员）检查前台电脑连接，列出已安装的打印机"),
         }
         schema = action_schema(actions, {
             "name": {"type": "string", "description": "访客姓名"},
             "host": {"type": "string", "description": "被访人姓名，可选"},
         })
-        schema["x-completion"] = {"actions": ["print"], "timeout": int(self._print_timeout_s) + 30}
+        # A first print may also install the front desk (a few minutes).
+        schema["x-completion"] = {"actions": ["print"], "timeout": int(self._print_timeout_s) + 300}
         definition = tool(self.PREFIX, "actuator",
                           "前台访客贴打印：查询今天的未入场访客，并在前台打印机上打印访客贴。", schema)
         definition["configSchema"] = {
@@ -84,13 +89,12 @@ class VisitorBadgePlugin:
 
     def dispatch(self, action: str, args: dict) -> dict:
         if action in ("start", "stop", "info"):
-            return {"state": "ready" if self._configured() else "unconfigured", "setup": self._setup}
+            return {"state": "ready" if self._configured() else "unconfigured"}
         if action == "config":
             with self._lock:
                 self._cfg.update({k: args[k] for k in _CONFIG_KEYS if k in args})
             return {"status": "ok", "adapter_ok": self._configured()}
-        handler = {"list": self._list, "print": self._print, "setup": self._start_setup,
-                   "status": self._status}.get(action)
+        handler = {"list": self._list, "print": self._print, "status": self._status}.get(action)
         if handler is None:
             return {"status": "error", "code": "bad_action", "error": f"不支持的动作：{action}"}
         try:
@@ -111,16 +115,61 @@ class VisitorBadgePlugin:
         with self._lock:
             return dict(self._cfg)
 
-    def _job(self, cfg: dict, timeout: float, **job) -> dict:
-        result = self._desk(cfg).job({"page_url": cfg["page_url"], "printer": cfg["printer"], **job}, timeout)
+    def _job(self, cfg: dict, deadline: float, job_timeout: float, **job) -> dict:
+        """Run a job, installing or upgrading the front desk first when needed."""
+        desk = self._desk(cfg)
+        job = {"page_url": cfg["page_url"], "printer": cfg["printer"], **job}
+        remaining = lambda: max(10.0, min(job_timeout, deadline - time.monotonic()))
+        try:
+            result = desk.job(job, PACKAGE_VERSION, remaining())
+        except FrontDeskError as exc:
+            if exc.code != "not_installed":
+                raise
+            self._install(cfg, deadline - time.monotonic() - 20)
+            result = desk.job(job, PACKAGE_VERSION, remaining())
+        if result.get("code") == "login_required":
+            # Put the login window in front of the operator; it is left alone
+            # if already open, so a retry does not interrupt a login.
+            try:
+                desk.job({"action": "login", "page_url": cfg["page_url"]}, PACKAGE_VERSION, 20)
+            except FrontDeskError:
+                pass
+            raise FrontDeskError("login_required", "访客系统需要登录：已在前台电脑打开 Edge，请前台登录后再试")
         if not result.get("ok"):
             raise FrontDeskError(str(result.get("code") or "failed"), str(result.get("error") or "前台电脑执行失败"))
         return result
 
+    def _install(self, cfg: dict, wait_s: float) -> None:
+        """Install the Windows side once, shared by every caller that needs it."""
+        with self._lock:
+            if self._installer is None or not self._installer.is_alive():
+                self._install_error = None
+                self._installer = threading.Thread(target=self._run_install, args=(cfg,),
+                                                   name="visitor_install", daemon=True)
+                self._installer.start()
+            installer = self._installer
+        installer.join(max(0.0, wait_s))
+        if installer.is_alive():
+            raise FrontDeskError("preparing", "正在首次准备前台电脑（约 2–3 分钟），请稍后再试")
+        if self._install_error is not None:
+            raise self._install_error
+
+    def _run_install(self, cfg: dict) -> None:
+        print(f"[visitor_badge] installing front desk {PACKAGE_VERSION}", flush=True)
+        try:
+            self._desk(cfg).install(WINDOWS_PACKAGE, PACKAGE_VERSION)
+            print("[visitor_badge] front desk installed", flush=True)
+        except Exception as exc:   # noqa: BLE001 — reported to whoever waits on it
+            self._install_error = exc if isinstance(exc, FrontDeskError) else \
+                FrontDeskError("install_failed", f"前台电脑安装失败：{str(exc)[:200]}")
+            print(f"[visitor_badge] install failed: {self._install_error.code}", flush=True)
+
     # ── actions ──────────────────────────────────────────────────────────────
 
     def _list(self, args: dict) -> dict:
-        result = self._job(self._snapshot(), self._list_timeout_s, action="list")
+        # Synchronous: must answer inside Agent Core's 60 s limit for an actuator.
+        result = self._job(self._snapshot(), time.monotonic() + self._list_timeout_s, self._list_timeout_s,
+                           action="list")
         return {"status": "listed", "date": result["date"], "count": len(result["visits"]),
                 "visits": result["visits"]}
 
@@ -140,7 +189,9 @@ class VisitorBadgePlugin:
 
         def run():
             try:
-                result = {"status": "printed", **self._job(cfg, self._print_timeout_s,
+                # Asynchronous, so it may wait out a first-time install.
+                deadline = time.monotonic() + self._print_timeout_s + 300
+                result = {"status": "printed", **self._job(cfg, deadline, self._print_timeout_s,
                                                            action="print", name=name, host=host)}
                 result.pop("ok", None)
                 status = "completed"
@@ -156,32 +207,8 @@ class VisitorBadgePlugin:
         threading.Thread(target=run, name=action_id, daemon=True).start()
         return {"status": "printing", "action_id": action_id}
 
-    def _start_setup(self, args: dict) -> dict:
-        cfg = self._snapshot()
-        self._desk(cfg)   # validate the connection fields before going async
-        with self._lock:
-            if self._setup["state"] == "installing":
-                return {"setup": self._setup}
-            self._setup = {"state": "installing", "since": time.strftime("%H:%M:%S")}
-
-        def run():
-            try:
-                self._desk(cfg).install(WINDOWS_PACKAGE)
-                self._desk(cfg).job({"action": "login", "page_url": cfg["page_url"]}, 30)
-                state = {"state": "installed", "hint": "已在前台电脑打开 Edge：请登录访客系统并打开访客列表，然后关闭窗口即可"}
-            except FrontDeskError as exc:
-                state = {"state": "failed", "code": exc.code, "error": str(exc)}
-            except Exception as exc:   # noqa: BLE001
-                state = {"state": "failed", "code": "internal_error", "error": str(exc)[:200]}
-            with self._lock:
-                self._setup = state
-            print(f"[visitor_badge] setup {state['state']} {state.get('code', '')}", flush=True)
-
-        threading.Thread(target=run, name="visitor_setup", daemon=True).start()
-        return {"setup": self._setup, "hint": "正在安装，几分钟内完成；用 status 查看进度"}
-
     def _status(self, args: dict) -> dict:
-        return {"setup": self._setup, "configured": self._configured(), "printers": self._desk().printers()}
+        return {"configured": self._configured(), "printers": self._desk().printers()}
 
 
 def _acp_complete(action_id: str, status: str, result: dict) -> None:

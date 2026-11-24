@@ -20,6 +20,7 @@ from pathlib import Path
 REMOTE_ROOT = "C:/ProgramData/VisitorBadge"
 UPLOAD = f"{REMOTE_ROOT}/upload"
 RUN_JOB = f"{REMOTE_ROOT}/app/run_job.ps1"
+VERSION_FILE = f"{REMOTE_ROOT}/app/version.txt"
 RESULT_MARKER = "VISITOR_RESULT:"
 
 
@@ -47,7 +48,7 @@ def _explain(detail: str) -> FrontDeskError:
     if "visitor_not_admin" in low:
         return FrontDeskError("not_admin", "这个 Windows 账户不是管理员，无法安装")
     if "visitor_not_installed" in low:
-        return FrontDeskError("not_installed", "前台电脑还没安装，请先执行 setup")
+        return FrontDeskError("not_installed", "前台电脑还没装上这个版本的自动化")
     if "visitor_timeout" in low:
         return FrontDeskError("worker_timeout", "前台电脑没有按时完成：可能锁屏/未登录桌面、Edge 卡住或打印机故障")
     return FrontDeskError("ssh_failed", "前台电脑执行失败：" + detail[-300:])
@@ -98,34 +99,39 @@ class FrontDesk:
         return done.stdout
 
     def powershell(self, script: str, timeout: float = 20) -> str:
+        # Encoded, so neither cmd.exe nor PowerShell as the remote default shell
+        # gets to reinterpret the quoting.
         encoded = base64.b64encode(script.encode("utf-16le")).decode()
         out = self._run(["ssh", "-T", "-p", str(self.port), *self._options(), self.target,
-                         f"powershell -NoProfile -NonInteractive -EncodedCommand {encoded}"], timeout)
+                         f"powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {encoded}"],
+                        timeout)
         return out.decode("utf-8", errors="replace")
 
-    def job(self, job: dict, timeout: float) -> dict:
-        """Run one job on the desktop-session worker (windows/run_job.ps1)."""
+    def job(self, job: dict, version: str, timeout: float) -> dict:
+        """Run one job on the desktop-session worker (windows/run_job.ps1).
+
+        Raises not_installed when the front desk lacks this driver's version
+        of the Windows side — absent or older alike.
+        """
         encoded = base64.b64encode(json.dumps(job, ensure_ascii=False).encode()).decode()
-        command = (f"if (!(Test-Path '{RUN_JOB}')) {{ 'VISITOR_NOT_INSTALLED'; exit 2 }}; "
-                   f"& '{RUN_JOB}' -Job {encoded} -TimeoutSec {int(timeout)}")
-        out = self._run(["ssh", "-T", "-p", str(self.port), *self._options(), self.target,
-                         f'powershell -NoProfile -ExecutionPolicy Bypass -Command "{command}"'], timeout + 15)
-        lines = [line for line in out.decode("utf-8", errors="replace").splitlines()
-                 if line.startswith(RESULT_MARKER)]
+        out = self.powershell(
+            f"$v = Get-Content -Raw -LiteralPath '{VERSION_FILE}' -ErrorAction SilentlyContinue\n"
+            f"if (-not $v -or $v.Trim() -ne '{version}') {{ 'VISITOR_NOT_INSTALLED'; exit 2 }}\n"
+            f"& '{RUN_JOB}' -Job {encoded} -TimeoutSec {int(timeout)}", timeout + 15)
+        lines = [line for line in out.splitlines() if line.startswith(RESULT_MARKER)]
         if len(lines) != 1:
             raise FrontDeskError("bad_response", "前台电脑返回了无法识别的结果")
         return json.loads(base64.b64decode(lines[0][len(RESULT_MARKER):]).decode("utf-8-sig"))
 
-    def install(self, package: Path, timeout: float = 900) -> None:
+    def install(self, package: Path, version: str, timeout: float = 900) -> None:
         """Copy windows/ (with its deps/) over and run install.ps1."""
         self.powershell(f"Remove-Item -Recurse -Force '{UPLOAD}' -ErrorAction SilentlyContinue; "
                         f"New-Item -ItemType Directory -Force -Path '{UPLOAD}' | Out-Null")
         self._run(["scp", "-r", "-P", str(self.port), *self._options(),
                    *[str(p) for p in sorted(package.iterdir())], f"{self.target}:{UPLOAD}/"], timeout)
-        out = self._run(["ssh", "-T", "-p", str(self.port), *self._options(), self.target,
-                         f'powershell -NoProfile -ExecutionPolicy Bypass -File "{UPLOAD}/install.ps1"'], timeout)
-        if b"VISITOR_INSTALL_OK" not in out:
-            raise FrontDeskError("install_failed", "安装没有完成：" + _text(out)[-300:])
+        out = self.powershell(f"& '{UPLOAD}/install.ps1' -Version '{version}'", timeout)
+        if "VISITOR_INSTALL_OK" not in out:
+            raise FrontDeskError("install_failed", "安装没有完成：" + " ".join(out.split())[-300:])
 
     def printers(self) -> list[dict]:
         out = self.powershell("[Console]::OutputEncoding=[Text.Encoding]::UTF8; "

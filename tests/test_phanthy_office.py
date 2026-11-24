@@ -45,7 +45,8 @@ def plugin(monkeypatch):
     calls, completions = [], []
     done = threading.Event()
 
-    def fake_job(self, job, timeout):
+    def fake_job(self, job, version, timeout):
+        assert version == device.PACKAGE_VERSION
         calls.append(job)
         return plugin.reply(job)
 
@@ -67,7 +68,8 @@ def test_card_contract():
     assert definition["name"] == "visitor_badge" and definition["type"] == "actuator"
     schema = definition["inputSchema"]
     assert schema["x-completion"]["actions"] == ["print"]
-    assert set(schema["x-action-params"]) >= {"list", "print", "setup", "status"}
+    assert set(schema["x-action-params"]) >= {"list", "print", "status"}
+    assert "setup" not in schema["x-action-params"]   # installing is the driver's business
     config = definition["configSchema"]
     assert config["properties"]["password"]["x-sensitive"] is True
     assert set(config["required"]) == {"host", "user", "password", "page_url"}
@@ -115,6 +117,41 @@ def test_list(plugin):
                                            "visits": [{"name": "张三"}]}
 
 
+def test_a_missing_or_old_front_desk_is_installed_then_the_job_runs(plugin, monkeypatch):
+    installs = []
+    monkeypatch.setattr(frontdesk.FrontDesk, "install",
+                        lambda self, package, version, timeout=900: installs.append(version))
+    answers = iter([frontdesk.FrontDeskError("not_installed", "x"),
+                    {"ok": True, "date": "2026-11-24", "visits": []}])
+
+    def reply(job):
+        answer = next(answers)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    plugin.reply = reply
+    assert plugin.dispatch("list", {})["status"] == "listed"
+    assert installs == [device.PACKAGE_VERSION] and len(plugin.calls) == 2
+
+
+def test_list_does_not_outwait_a_first_install(plugin, monkeypatch):
+    release = threading.Event()
+    monkeypatch.setattr(frontdesk.FrontDesk, "install", lambda self, *a, **k: release.wait(5))
+    monkeypatch.setattr(plugin, "_list_timeout_s", 20.5)   # leaves 0.5 s to wait on the install
+    plugin.reply = lambda job: (_ for _ in ()).throw(frontdesk.FrontDeskError("not_installed", "x"))
+    assert plugin.dispatch("list", {})["code"] == "preparing"
+    release.set()
+
+
+def test_login_required_opens_the_login_window_and_says_so(plugin):
+    plugin.reply = lambda job: {"ok": True} if job["action"] == "login" else \
+        {"ok": False, "code": "login_required", "error": "访客系统需要登录"}
+    result = plugin.dispatch("list", {})
+    assert result["code"] == "login_required" and "前台" in result["error"]
+    assert [c["action"] for c in plugin.calls] == ["list", "login"]
+
+
 def _visit(name, status, host="李四", tail="1234"):
     return visitor_site.Visit(visit_id=name + status, name=name, host=host, status=status, phone_tail=tail)
 
@@ -153,7 +190,7 @@ def test_frontdesk_rejects_incomplete_connection_settings():
 def test_frontdesk_job_reads_the_result_marker(monkeypatch, tmp_path):
     desk = frontdesk.FrontDesk("10.0.0.5", "desk", "pw", known_hosts=str(tmp_path / "known_hosts"))
     monkeypatch.setattr(desk, "_run", lambda argv, timeout: b"noise\r\nVISITOR_RESULT:eyJvayI6IHRydWV9\r\n")
-    assert desk.job({"action": "list"}, 10) == {"ok": True}
+    assert desk.job({"action": "list"}, "v1", 10) == {"ok": True}
 
 
 @pytest.mark.parametrize("stderr,code", [

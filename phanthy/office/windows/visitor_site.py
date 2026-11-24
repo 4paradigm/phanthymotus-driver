@@ -201,9 +201,28 @@ def close_profile_edge(profile_dir: Path) -> None:
         timeout=20)
 
 
+def _login_window_open(profile_dir: Path) -> bool:
+    """Is a login window (ours, not Playwright's) open on this profile?
+
+    Counts browser main processes only (no --type=), and not Playwright's own,
+    which it launches with --remote-debugging-pipe.
+    """
+    path = str(profile_dir).replace("'", "''")
+    found = _powershell(
+        f"@(Get-CimInstance Win32_Process -Filter \"Name='msedge.exe'\" | Where-Object {{ $_.CommandLine -and "
+        f"$_.CommandLine.IndexOf('{path}', [StringComparison]::OrdinalIgnoreCase) -ge 0 -and "
+        "$_.CommandLine -notmatch '--type=|--remote-debugging-pipe' }).Count")
+    return found.stdout.strip() not in ("", "0")
+
+
 def open_for_login(profile_dir: Path, url: str) -> None:
-    """Open a plain Edge window on the dedicated profile for the operator to log in."""
-    close_profile_edge(profile_dir)
+    """Open a plain Edge window on the dedicated profile for the operator to log in.
+
+    Left alone if one is already open, so a repeated request does not close a
+    login in progress.
+    """
+    if _login_window_open(profile_dir):
+        return
     subprocess.Popen(["cmd.exe", "/c", "start", "", "msedge", f"--user-data-dir={profile_dir}",
                       "--no-first-run", url or "about:blank"],
                      creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -251,7 +270,7 @@ class VisitorSite:
     @staticmethod
     def _check_login(page) -> None:
         if "login" in page.url.lower():
-            raise SiteError("login_required", "访客系统需要重新登录：请在前台电脑的 Edge 里登录（可先执行 setup 打开 Edge）")
+            raise SiteError("login_required", "访客系统需要登录")
 
     def _load_list(self, page) -> dict[str, str]:
         """Open the list page and capture the headers of its own visit query."""

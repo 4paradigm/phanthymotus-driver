@@ -1,7 +1,9 @@
-# Install or upgrade the front-desk side. The robot copies this directory to
-# C:\ProgramData\VisitorBadge\upload (with the pinned dependencies in deps\)
+# Install or upgrade the front-desk side. The robot does this by itself the first
+# time a job finds the front desk missing its version: it copies this directory
+# to C:\ProgramData\VisitorBadge\upload (with the pinned dependencies in deps\)
 # and runs this script over SSH as an administrator. Nothing is downloaded here.
 # ASCII only: Windows PowerShell 5.1 reads a BOM-less script in the ANSI code page.
+param([Parameter(Mandatory = $true)][string]$Version)
 $ErrorActionPreference = 'Stop'
 $root = 'C:\ProgramData\VisitorBadge'
 $upload = Join-Path $root 'upload'
@@ -60,4 +62,6 @@ Register-ScheduledTask -TaskName 'Visitor Badge Worker' -Action $action -Princip
     -Settings $settings -Force | Out-Null
 
 Remove-Item -LiteralPath $upload -Recurse -Force
+# Written last: the robot reinstalls whenever this does not match its own version.
+Set-Content -LiteralPath (Join-Path $app 'version.txt') -Value $Version -Encoding ascii
 'VISITOR_INSTALL_OK'
