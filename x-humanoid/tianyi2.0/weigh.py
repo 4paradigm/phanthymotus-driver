@@ -891,6 +891,14 @@ class WeighEngine:
         timeout = math.radians(delta) / cfg["pose_speed"] + cfg["pose_extra_timeout_s"]
         t0 = self._clock()
         while True:
+            # 运动途中 servo 被恢复（或开始推流）：关节交给指令流，立即退出，不再发任何指令
+            # （包括冻结），免得两边同时指挥同一组关节。
+            problem = self._servo_guard()
+            if problem:
+                st = {s: self._arm_state(s) for s in SIDES}
+                return {"ok": False, "code": "servo_active", "stage": label,
+                        "error": f"运动途中 servo 卡开始推流（{problem}），本卡已停止发送指令",
+                        "joints_deg": {s: [_r(x, 2) for x in st[s]["deg"]] for s in SIDES if st[s]}}
             st = {s: self._arm_state(s) for s in SIDES}
             if all(v is not None for v in st.values()):
                 degs = {s: [_r(x, 2) for x in st[s]["deg"]] for s in SIDES}

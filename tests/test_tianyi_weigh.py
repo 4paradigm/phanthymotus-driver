@@ -1122,12 +1122,19 @@ def test_plugin_prefix_and_marketplace_listing():
     assert re.search(r"^\s*- \{ name: weigh,\s+type: actuator \}\s*$", manifest, re.M)
 
 
-def test_timeout_freeze_is_skipped_when_servo_resumed(hanging):
+def test_freeze_is_skipped_when_servo_is_streaming(hanging):
+    hanging.engine._servo_call = FakeServo(hanging, state="running")
+    assert hanging.engine._freeze() == {"sent": False, "reason": "servo_active"}
+    assert hanging.arm_calls == []
+
+
+def test_servo_resumed_during_a_stage_stops_waiting_without_commands(hanging):
     servo = FakeServo(hanging, state="idle")
     hanging.engine._servo_call = servo
-    hanging.arm_stuck = True                                       # 第一段永远到不了位 → 超时
-    hanging.events.append((hanging.t + 5.0, lambda: setattr(servo, "state", "running")))
+    t0 = hanging.t
+    hanging.events.append((t0 + 1.5, lambda: setattr(servo, "state", "running")))   # 第一段运动中
     res = hanging.engine.pose({})
-    assert res["code"] == "arrive_timeout", res
-    assert len(hanging.moves()) == 1                               # 只有第一段，没有冻结指令
-    assert res["steps"][-1]["freeze"] == {"sent": False, "reason": "servo_active"}
+    assert res["code"] == "servo_active", res
+    assert len(hanging.moves()) == 1                       # 没有第二段，也没有冻结
+    assert hanging.t - t0 < 4.0                            # 不等到位或超时，立刻退出
+    assert not [c for c in hanging.hand_calls if c["action"] == "set_fingers_raw"]
