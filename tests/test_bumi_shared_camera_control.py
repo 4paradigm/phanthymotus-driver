@@ -228,11 +228,13 @@ def test_body_imu_stop_waits_for_its_inflight_json_publish(monkeypatch):
     completed = threading.Event()
     premature = []
     responses = []
+    packets = []
     def stop():
         responses.append(state.dispatch('stop', {'_tool_name': 'imu'}))
         completed.set()
     worker = threading.Thread(target=stop)
     def publish(message):
+        packets.append(json.loads(message.data))
         worker.start()
         worker.join(.02)
         premature.append(completed.is_set())
@@ -245,6 +247,8 @@ def test_body_imu_stop_waits_for_its_inflight_json_publish(monkeypatch):
     node._poll_loop()
     worker.join(1.)
     assert premature == [False]
+    assert packets[0]['stamp_ns'] == 10_000_000_000
+    assert packets[0]['timestamp_source'] == 'read_completion'
     assert responses[0]['state'] == 'idle' and node._imu_enabled is False
 
 

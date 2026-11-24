@@ -261,6 +261,7 @@ class _BumiStateNode(Node):
                         # visual card uses this to reject delayed/replayed samples.
                         imu_data = {
                             "stamp_ns":     int(self.get_clock().now().nanoseconds),
+                            "timestamp_source": "read_completion",
                             "quaternion":    [imu.ori[i] for i in range(4)],
                             "angular_vel":   [imu.angular_vel[i] for i in range(3)],
                             "linear_acc":    [imu.linear_acc[i] for i in range(3)],

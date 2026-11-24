@@ -40,7 +40,7 @@ def test_rgbd_public_metadata_contains_numeric_geometry_without_clock_or_source_
     assert entries[1]['vendor']['depth_unit'] == 'mm'
 
 
-def test_body_imu_public_packet_keeps_computable_numbers_only():
+def test_body_imu_public_packet_keeps_numeric_geometry_and_read_time():
     source = BodyImuSource('robot', MOUNT, lambda: ('robot_rgb_optical', None))
     packet = source.accept(dict(stamp_ns=1_000_000_000,
                                 quaternion=[0., 0., 0., 1.], angular_vel=[1., 2., 3.],
@@ -48,7 +48,11 @@ def test_body_imu_public_packet_keeps_computable_numbers_only():
     assert set(packet) == {'schema', 'stamp_ns', 'accel_stamp_ns', 'camera_frame_id',
                            'gyro_frame_id', 'accel_frame_id', 'camera_from_gyro',
                            'camera_from_accel', 'angular_velocity', 'linear_acceleration',
-                           'units', 'camera_from_gyro_translation', 'camera_from_accel_translation'}
+                           'units', 'camera_from_gyro_translation', 'camera_from_accel_translation',
+                           'stamp_source', 'clock_mapping'}
     assert packet['stamp_ns'] == packet['accel_stamp_ns'] == 1_000_000_000
+    assert packet['camera_from_gyro_translation'] == [.1, 0., 0.]
+    assert packet['camera_from_accel_translation'] == [0., .2, 0.]
+    assert source.status(1_010_000_000)['fusion']['state'] == 'ready'
     np.testing.assert_allclose(np.array(packet['camera_from_gyro']) @ [1., 2., 3.], [-2., -3., 1.])
     json.dumps(packet, allow_nan=False)

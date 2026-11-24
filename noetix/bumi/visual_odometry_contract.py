@@ -86,7 +86,7 @@ def camera_to_body(position, quaternion, mount):
 
 
 class CameraCalibration:
-    """Optional numeric camera mount; labels do not qualify the geometry."""
+    """Camera axes and optional translation to the body origin."""
 
     def __init__(self, data):
         if not isinstance(data, dict):
@@ -96,8 +96,10 @@ class CameraCalibration:
             self.id = data.get('calibration_id')  # Legacy internal configuration identity.
             if data.get('fixed_mount') is False:
                 raise ValueError('dynamic camera mount requires capture-time transforms')
-            finite(data['camera_to_body']['translation'], 3)
-            quat_matrix(data['camera_to_body']['quaternion'])
+            mount = data['camera_to_body']
+            if 'translation' in mount:
+                finite(mount['translation'], 3)
+            quat_matrix(mount['quaternion'])
         except (KeyError, TypeError) as exc:
             raise ValueError('incomplete numeric camera mount: '+str(exc)) from exc
 

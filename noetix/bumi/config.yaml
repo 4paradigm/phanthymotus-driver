@@ -69,15 +69,11 @@ plugins:
     # the extra DDS/CPU load instead of duplicating every 30 Hz camera frame.
     # Invalid values fall back to 10 Hz; the camera-side upper bound is 30 Hz.
     max_rate_hz: 10
-    # Numeric camera-to-body installation transform, in metres and xyzw.
+    # Level-forward axis convention. Supply a measured translation in metres
+    # for a body-origin pose, and measured IMU lever arms for full IMU fusion.
     calibration:
       camera_to_body:
-        translation: [0.0, 0.0, 0.0]
         quaternion: [-0.5, 0.5, -0.5, 0.5]
-      # IMU origins in RGB optical metres.
-      body_imu_translation:
-        gyro: [0.0, 0.0, 0.0]
-        accel: [0.0, 0.0, 0.0]
   # Independent raw leg kinematics, with SDK attitude for coordinate rotation.
   # 40 Hz reads / 20 Hz state/odom output; visual correction lives in Perception.
   leg_odometry:

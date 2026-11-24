@@ -511,9 +511,8 @@ relative to the first IMU sample of the current segment, wrapped to -180..180
 degrees) and `vendor.displacement_m` (distance from the first tracking pose in
 the segment). No loco card is wired to either output. The shipped config applies
 the level-forward optical-to-body axis convention so `position` uses
-robot body axes (x forward, y left, z up; `pose_reference: body_axes`). The preset
-keeps the reference origin at the camera and declares `calibrated: false`;
-zero translation is not a measured body origin. The card defaults to `initializing` and publishes no pose
+robot body axes (x forward, y left, z up; `pose_reference: body_axes`) at the
+camera origin. The card defaults to `initializing` and publishes no pose
 until the estimator is tracking; a fault ends that segment and recovery starts a
 fresh one automatically. Stopping the card reaps its estimator and private
 topics and disables the shared raw RGB-D branch through
@@ -570,12 +569,12 @@ The configured fixed camera-to-body rotation in
 in the RGB optical frame. Raw angular velocity and acceleration remain in body
 axes and the generic consumer applies the declared rotation once. A usable
 numeric fixed rotation is required; an `assumed` label does not block it.
-The `body_imu_translation` preset records the operator-confirmed zero offset
-for the gyro and accelerometer in RGB optical coordinates. The two configured
-vectors are published in metres.
+For full fusion, supply measured `body_imu_translation.gyro` and
+`body_imu_translation.accel` in RGB optical metres. The shipped preset supplies
+rotation assistance.
 
-Packets use `motus.imu/1` over `std_msgs/String`, with a body source identity,
-activation epoch and explicit `stamp_source: read_completion`. The SDK does not
+Packets use `motus.imu/1` over `std_msgs/String` with
+`stamp_source: read_completion`. The SDK does not
 expose a hardware sample timestamp. Its ROS wall-clock reading time is used
 unchanged on the RGB-D mapped wall timeline, with an unverified
 `host_wall_read_completion` mapping; it is never presented as synchronized
@@ -621,7 +620,7 @@ commands. Enable **both** `plugins.visual_odometry.enabled: true` and
 `plugins.fused_odometry.enabled: true` in `config.yaml`, then deploy the Bumi
 driver image. A live HighController connection is required.
 
-With the shipped `assumed: true` mount, VO reports `body_axes` at the camera
+With the shipped rotation-only preset, VO reports `body_axes` at the camera
 origin. This planar body-origin filter does not apply those visual corrections:
 it continues leg/IMU prediction, reports `visual_result=body_reference_unavailable`,
 and explains the received reference in status `reason` and odometry `last_error`.

@@ -55,6 +55,9 @@ class BodyImuSource:
                 raise ValueError('waiting for RGB-D camera frame')
             packet = dict(schema='motus.imu/1',
                 stamp_ns=stamp, accel_stamp_ns=stamp, camera_frame_id=camera_frame,
+                stamp_source='read_completion',
+                clock_mapping=dict(method='host_wall_read_completion', source_clock='ros_wall',
+                                   offset_ns=0, verified=False),
                 gyro_frame_id=self.frame, accel_frame_id=self.frame,
                 camera_from_gyro=self.rotation, camera_from_accel=self.rotation,
                 angular_velocity=angular, linear_acceleration=acceleration,

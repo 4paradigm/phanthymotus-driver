@@ -24,11 +24,11 @@ except ImportError:
 
 
 def fixed_body_mount(config):
-    """Convert the existing installation numbers; no calibration labels needed."""
+    """Convert a fixed body-origin mount when its translation is supplied."""
     if not isinstance(config, dict) or config.get('fixed_mount') is False:
         return None
     mount = config.get('camera_to_body')
-    if mount is None:
+    if mount is None or (isinstance(mount, dict) and 'translation' not in mount):
         return None
     translation = np.asarray(mount['translation'], dtype=float)
     q = np.asarray(mount['quaternion'], dtype=float)

@@ -185,17 +185,11 @@ class ChildProcesses:
 # ── Pose contract ────────────────────────────────────────────────────────────
 
 def mount_transform(calibration):
-    """Static base->optical TF values.
-
-    No measured mount is an explicit identity, not a zero-extrinsic guess: the
-    base frame then coincides with the optical frame, so the pose stays a camera
-    pose and ``pose_reference`` says ``rgb_optical``. A measured mount only
-    changes this TF; the estimator path is unchanged.
-    """
+    """Static pose-frame to optical TF, at the camera origin without translation."""
     if calibration is None:
         return [0., 0., 0.], [0., 0., 0., 1.]
     mount = calibration.data['camera_to_body']
-    return [float(v) for v in mount['translation']], [float(v) for v in mount['quaternion']]
+    return [float(v) for v in mount.get('translation', (0., 0., 0.))], [float(v) for v in mount['quaternion']]
 
 
 def estimate(msg, segment, frame_id):
@@ -361,15 +355,14 @@ class VisualOdometryNode:
     def pose_reference(self):
         if self.calibration is None:
             return 'rgb_optical'
-        return 'body'
+        return 'body' if 'translation' in self.calibration.data['camera_to_body'] else 'body_axes'
 
     def slam_extrinsic(self):
-        """Publish the numeric body-from-camera transform used by this node."""
+        """Publish the same numeric pose-frame transform used by RTAB-Map."""
         if self.calibration is None or not self.frame_id:
             return None
-        mount = self.calibration.data['camera_to_body']
-        rotation = quat_matrix(mount['quaternion'])
-        translation = [float(v) for v in mount['translation']]
+        translation, quaternion = mount_transform(self.calibration)
+        rotation = quat_matrix(quaternion)
         matrix = [[*rotation[i], translation[i]] for i in range(3)]
         matrix.append([0., 0., 0., 1.])
         return {
@@ -687,8 +680,8 @@ class VisualOdometryNode:
         from tf2_ros import StaticTransformBroadcaster
         root = '/'+self.segment
         # RTAB-Map wants a base frame distinct from the image frame and a TF to
-        # it. With no measured mount the transform is identity, so the base frame
-        # coincides with the optical frame rather than pretending to be a body point.
+        # it. Without a translation the pose frame stays at the optical origin,
+        # with either optical axes or the configured body axes.
         transform = TransformStamped()
         transform.header.stamp = self.node.get_clock().now().to_msg()
         transform.header.frame_id = self.base_frame()

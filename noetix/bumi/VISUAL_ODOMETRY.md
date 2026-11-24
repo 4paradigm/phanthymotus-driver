@@ -44,9 +44,9 @@ with each segment.
 Displacement is the 3-D straight-line distance from the **first tracking pose of
 the current segment**, not accumulated walking distance or validated accuracy.
 The shipping `config.yaml` uses a level-forward
-optical-to-body mount: `x` forward, `y` left, `z` up
-(`pose_reference=body_axes`, `extrinsic.calibrated=false`). The zero translation
-keeps the reference at the camera; it is not a measured body or IMU origin.
+optical-to-body axis convention: `x` forward, `y` left, `z` up
+(`pose_reference=body_axes`). The pose origin is the camera. Supply
+`camera_to_body.translation` measured in metres to report a body-origin pose.
 The numeric rotation remains usable for body-IMU assistance. Reset starts a new
 segment and distance origin.
 
@@ -174,15 +174,12 @@ The camera-IMU RSUSB build path and its modules have been removed.
 ## Generic pointcloud SLAM input evidence
 
 The visual-odometry `motus.odom/1` stream retains its existing status and pose
-ports. PR #371 accepts the numeric pose without a full driver-profile
-capability declaration or per-sample `stamp_source` and `clock_id`. Each sample carries `vendor.motus_slam.source_id`,
-`clock_mapping`, `clock_verified=false`, and, once the optical frame is known,
-`vendor.motus_slam.extrinsic`. This describes the same `base -> optical`
-mount used to launch RTAB-Map. The shipping preset retains `assumed: true` and
-`calibrated=false`, with ID `assumed-level-forward-optical-to-body`. These labels
-describe its provenance; PR371 accepts its numeric matrix without requiring
-calibration proof. Supply an actual measured installation transform before
-claiming a measured body origin.
+ports. PR #371 accepts the numeric pose without the full driver profile. Once
+the optical frame is known, `vendor.motus_slam.extrinsic` describes the same
+segment pose-frame transform used by RTAB-Map. With the shipping rotation-only
+preset its parent is the camera-origin `<segment>_base` frame. The shared
+`body_mount` sidecar uses an explicitly configured body-origin translation or
+a capture-time TF lookup.
 
 The public depth port now carries the normalized native-color optical grid,
 with its actual `motus.camera/1` calibration and capture clock. It no longer
@@ -198,13 +195,10 @@ rectified color intrinsics; consume its own declarations rather than raw-branch
 pixel metadata. This does not create or verify a physical camera-to-body mount.
 
 
-The cross-robot field definitions and clock/extrinsic trust requirements live
-in [Spatial SLAM Input Contract](../../docs/spatial_slam_input.md). The Driver
-code validates the published mount using the ROS-free
-`common.spatial_slam.validate_mount` helper. PR371's live consumer uses numeric
-format admission: `calibrated=false` does not prevent using the supplied matrix,
-and absent transforms assume already aligned incoming coordinates. Those
-arithmetic choices do not establish physical calibration.
+The [Spatial SLAM Input Contract](../../docs/spatial_slam_input.md) describes
+the optional fully declared profile and its validators. Bumi's visual odometry
+uses PR #371's numeric input path. Bumi validates its configured quaternion
+and any supplied translation before constructing the segment transform.
 
 
 ## Shared public depth safety
@@ -238,10 +232,8 @@ camera_info directly. The original body IMU display port remains data/json;
 use `imu.body_imu` (`/NS/state/imu_calibrated`, `sensor/imu`) for computation.
 It uses HighController body gyro/acceleration and the configured fixed mounting
 rotation, with explicit unverified SDK read-completion timestamps. No RealSense
-motion streams are requested. The consumer accepts read/receipt timestamps for every selected mode. This
-adapter currently omits the two translation vectors needed by full fusion;
-use attitude mode until those numeric fields are supplied. The camera-origin
-mount preset is not a physical IMU translation calibration.
+motion streams are requested. The shipped preset enables attitude assistance.
+Supply both measured `body_imu_translation` vectors to enable full fusion input.
 
 Tests in `tests/test_bumi_rgbd_adapter.py`, `tests/test_bumi_camera_imu.py` and
 `tests/bumi_visual_odometry/test_bundle_hook.py` exercise scale, geometry,

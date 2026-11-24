@@ -22,19 +22,23 @@ def calibration():
                 camera_to_body=dict(translation=[0.4, 0, 0.2], quaternion=[0, 0, 0, 1]))
 
 
-def test_shipped_mount_exposes_numeric_body_transform_without_certificates():
+def test_shipped_mount_exposes_body_axes_at_the_camera_origin():
     from pathlib import Path
     import yaml
+    from noetix.bumi.rgbd_camera import fixed_body_mount
     from noetix.bumi.visual_odometry import VisualOdometryNode
     config = yaml.safe_load((Path(__file__).resolve().parents[2] /
                              'noetix/bumi/config.yaml').read_text())
     node = object.__new__(VisualOdometryNode)
-    node.calibration = CameraCalibration(config['plugins']['visual_odometry']['calibration'])
+    preset = config['plugins']['visual_odometry']['calibration']
+    node.calibration = CameraCalibration(preset)
     node.namespace, node.segment, node.frame_id = 'robot', 'segment', 'robot_rgb_optical'
-    assert node.pose_reference() == 'body'
+    assert node.pose_reference() == 'body_axes'
     mount = node.slam_extrinsic()
     assert not {'calibrated', 'assumed', 'source', 'version'} & mount.keys()
     assert np.asarray(mount['matrix']).shape == (4, 4)
+    assert [row[3] for row in mount['matrix']] == [0., 0., 0., 1.]
+    assert fixed_body_mount(preset) is None
 
 
 def test_finite_rejects_nan_and_wrong_size():

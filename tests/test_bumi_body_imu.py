@@ -6,6 +6,7 @@ from types import SimpleNamespace as NS
 
 import numpy as np
 import pytest
+import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 MOUNT = dict(calibration_id='level-forward', fixed_mount=True, assumed=False,
@@ -29,8 +30,11 @@ def reading(stamp=1_000_000_000, **changes):
 def test_body_packet_keeps_raw_axes_and_read_time_and_inverts_fixed_camera_mount():
     imu = source()
     packet = imu.accept(reading(), 1_010_000_000)
-    assert not {'source_id', 'epoch', 'clock_id', 'stamp_source', 'clock_mapping',
+    assert not {'source_id', 'epoch', 'clock_id',
                 'rotation_source', 'translation_source', 'calibration_id'} & packet.keys()
+    assert packet['stamp_source'] == 'read_completion'
+    assert packet['clock_mapping'] == dict(method='host_wall_read_completion',
+                                          source_clock='ros_wall', offset_ns=0, verified=False)
     assert packet['gyro_frame_id'] == packet['accel_frame_id'] == 'robot_body_imu'
     assert packet['camera_frame_id'] == 'robot_rgb_optical'
     assert packet['stamp_ns'] == packet['accel_stamp_ns'] == 1_000_000_000
@@ -42,6 +46,17 @@ def test_body_packet_keeps_raw_axes_and_read_time_and_inverts_fixed_camera_mount
     assert imu.status(1_010_000_000)['state'] == 'ready'
     assert imu.status(1_010_000_000)['fusion']['state'] == 'unavailable'
     assert imu.status(1_500_000_001)['state'] == 'unavailable'
+
+
+def test_shipped_body_imu_uses_rotation_only_until_lever_arms_are_supplied():
+    mount = yaml.safe_load((ROOT/'noetix/bumi/config.yaml').read_text())[
+        'plugins']['visual_odometry']['calibration']
+    imu = source(mount)
+    packet = imu.accept(reading(), 1_010_000_000)
+    assert 'camera_from_gyro_translation' not in packet
+    assert 'camera_from_accel_translation' not in packet
+    assert imu.status(1_010_000_000)['state'] == 'ready'
+    assert imu.status(1_010_000_000)['fusion']['state'] == 'unavailable'
 
 
 @pytest.mark.parametrize('change', [
