@@ -184,13 +184,18 @@ class WatchDegradedLinkTest(unittest.TestCase):
         self.assertEqual(0, code)
         self.assertIn("?", output.getvalue())
         self.assertIn("None", findings["watch"]["modes"])
-        # With no mode frame, pairs/names stay empty by design; the FSM name
-        # still lives in the time-correlated samples, which is the evidence.
         samples = findings["watch"]["samples"]
         self.assertTrue(samples)
         self.assertEqual({"AI_ACCOMPANY"},
                          {sample["fsm_name"] for sample in samples})
         self.assertTrue(all(sample["mode"] is None for sample in samples))
+        # GetState worked even though no mode frame ever arrived, so the name
+        # tally must survive: an empty fsm_names would make the verdict claim
+        # "both channels invisible" and drop real evidence.
+        self.assertEqual({"AI_ACCOMPANY"}, set(findings["watch"]["fsm_names"]))
+        self.assertGreater(findings["watch"]["fsm_names"]["AI_ACCOMPANY"], 0)
+        # A pair needs both halves, so pairs stays empty on a degraded feed.
+        self.assertEqual({}, findings["watch"]["pairs"])
 
 
 class ArmedGuardTest(unittest.TestCase):

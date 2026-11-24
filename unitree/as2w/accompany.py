@@ -157,6 +157,7 @@ class AccompanyPlugin:
 
     def __init__(self, config, namespace, executor, proxy=None, state_plugin=None):
         self._namespace = namespace
+        self._topic = f"/{namespace}/state/accompany"
         self._executor = executor
         self._proxy = proxy
         self._state_plugin = state_plugin
@@ -192,8 +193,7 @@ class AccompanyPlugin:
         try:
             from rclpy.node import Node
             node = Node("as2w_accompany")
-            self._pub = node.create_publisher(
-                String, f"/{self._namespace}/state/accompany", _LOW_LAT_QOS)
+            self._pub = node.create_publisher(String, self._topic, _LOW_LAT_QOS)
         except Exception as exc:
             self._last_error = f"publisher unavailable: {exc}"
             self._pub = None
@@ -304,6 +304,16 @@ class AccompanyPlugin:
 
     # -------------------------------------------------------------- contract
 
+    def topic_out(self):
+        """The sensor stream this card publishes.
+
+        Agent Core learns sensor streams from ``tools/list``, so this must be
+        declared on the tool definition and not only returned by ``info``;
+        otherwise the dashboard never attaches the ``data/json`` renderer to
+        the stream the worker keeps publishing.
+        """
+        return [{"topic": self._topic, "format": "data/json"}]
+
     def get_tool(self):
         description = (
             "As2W ISS 3.0 accompany mode (伴随模式) supervisor — read-only. "
@@ -333,6 +343,7 @@ class AccompanyPlugin:
             "watch for exit evidence, and guide to show the procedure."
         )
         return {"name": "accompany", "type": "sensor", "multiInstance": False,
+                "topic_out": self.topic_out(),
                 "description": description,
                 "inputSchema": {"type": "object", "properties": {
                     "action": {"type": "string",
@@ -575,8 +586,7 @@ class AccompanyPlugin:
             if action == "start":
                 self.start()
             return {"state": "running" if self._thread is not None else "idle",
-                    "topic_out": [{"topic": f"/{self._namespace}/state/accompany",
-                                   "format": "data/json"}],
+                    "topic_out": self.topic_out(),
                     "capability": {
                         "can_enter": False,
                         "can_exit": False,

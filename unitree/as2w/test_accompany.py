@@ -123,6 +123,18 @@ class AccompanyContractTests(unittest.TestCase):
         self.assertEqual("sensor", tool["type"])
         self.assertFalse(tool["multiInstance"])
 
+    def test_tool_contract_declares_the_sensor_stream(self):
+        """Agent Core attaches renderers from tools/list, so topic_out must be there."""
+        tool = self.make().get_tool()
+        self.assertEqual([{"topic": "/test/state/accompany", "format": "data/json"}],
+                         tool["topic_out"])
+
+    def test_info_and_tool_agree_on_the_stream(self):
+        """The stream must not drift between the tool list and the info action."""
+        plugin = self.make()
+        self.assertEqual(plugin.get_tool()["topic_out"],
+                         plugin.dispatch("info", {})["topic_out"])
+
     def test_tool_contract_has_no_control_actions(self):
         """The vendor has no enter/exit call, so no action may pretend to have one."""
         tool = self.make().get_tool()

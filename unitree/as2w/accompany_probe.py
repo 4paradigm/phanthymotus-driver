@@ -329,6 +329,12 @@ def cmd_watch(args, findings):
         observation = watch_snapshot(with_mode, name, elapsed, code, modes)
         samples.append(observation)
         modes[with_mode] = modes.get(with_mode, 0) + 1
+        if name:
+            # GetState can report an FSM name while the SportModeState feed is
+            # degraded, so the name tally must not depend on with_mode: folding
+            # it into the pair count would discard valid evidence and let the
+            # verdict fall through to "both channels invisible".
+            names[name] = names.get(name, 0) + 1
         if with_mode != last_mode or name != last_name:
             label = mode_name(with_mode) if with_mode is not None else "?"
             mode_age = elapsed - mode_at_s
@@ -337,7 +343,6 @@ def cmd_watch(args, findings):
                   f"mode_age={mode_age:.2f}s")
             if with_mode is not None and name:
                 pairs[f"{with_mode}:{name}"] = pairs.get(f"{with_mode}:{name}", 0) + 1
-                names[name] = names.get(name, 0) + 1
             last_mode, last_name = with_mode, name
         time.sleep(0.25)
 
@@ -347,7 +352,10 @@ def cmd_watch(args, findings):
     for name in sorted(names):
         flag = "  <== 本仓库从未见过" if is_new_fsm_name(name) else ""
         print(f"  fsm_name={name}{flag}")
-    odd = [value for value in modes if undocumented_mode(value)]
+    # None is the "no frame arrived" bucket, not a mode value: a degraded link
+    # must not be reported as a vendor-secret mode.
+    odd = [value for value in modes
+           if value is not None and undocumented_mode(value)]
     if odd:
         print(f"[probe] 🟢 出现官方枚举之外的 mode 值 {odd}："
               "几乎可以确定是厂商未公开的模式，优先怀疑就是伴随态")

@@ -96,6 +96,23 @@ class Step2Test(unittest.TestCase):
         self.assertIn("H2", findings[0]["next"])
         self.assertIn("厂商渠道", findings[0]["next"])
 
+    def test_degraded_feed_still_reports_h1_from_fsm_name(self):
+        """GetState-only evidence must not fall through to "both invisible"."""
+        findings = vd.verdict_step2({
+            "watch": {"modes": {"None": 40}, "pairs": {},
+                      "fsm_names": {"AI_ACCOMPANY": 40}},
+        })
+        self.assertEqual(1, len(findings))
+        self.assertTrue(findings[0]["verdict"].startswith("H1"))
+
+    def test_degraded_feed_is_not_reported_as_an_undocumented_mode(self):
+        """A missing frame is a dead link, not a vendor-secret mode value."""
+        findings = vd.verdict_step2({
+            "watch": {"modes": {"None": 40}, "pairs": {}, "fsm_names": {}},
+        })
+        self.assertEqual(1, len(findings))
+        self.assertNotIn("独立 mode", findings[0]["verdict"])
+
     def test_empty_watch_also_verdicts_invisible(self):
         findings = vd.verdict_step2({"watch": {}})
         self.assertEqual(1, len(findings))

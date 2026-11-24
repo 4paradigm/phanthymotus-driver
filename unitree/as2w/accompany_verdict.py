@@ -99,8 +99,13 @@ def verdict_step2(data):
     watch = data.get("watch") or {}
     findings = []
     modes = watch.get("modes") or {}
-    odd_modes = sorted((key for key in modes if undocumented_mode(key)),
-                       key=lambda k: (not str(k).lstrip("-").isdigit(), str(k)))
+    # A degraded SportModeState feed records the missing frames under the
+    # string key "None". That is a dead link, not a vendor-secret mode value,
+    # so it must never be reported as an undocumented mode.
+    odd_modes = sorted(
+        (key for key in modes
+         if str(key).strip().lstrip("-").isdigit() and undocumented_mode(key)),
+        key=int)
     for key in odd_modes:
         findings.append({
             "step": 2,
