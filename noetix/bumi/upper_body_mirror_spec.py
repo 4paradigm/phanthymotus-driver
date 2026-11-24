@@ -108,9 +108,17 @@ def _effective_range(side: str, axis: str, margin: float) -> tuple[float, float]
 
 def clamp_arm(side: str, axis: str, deg: float,
               margin: float = LIMIT_MARGIN_DEG) -> float:
-    """Clamp one arm angle into its effective range."""
-    low, high = _effective_range(side, axis, margin)
+    """Clamp one arm angle into its effective range.
+
+    Raises on a non-finite angle rather than returning it: every comparison
+    against NaN is False, so a silent `return value` would hand NaN back to the
+    caller as if it had been clamped. `build_joint_commands` already filters
+    these, so this is the second line of defence for direct callers.
+    """
     value = float(deg)
+    if not math.isfinite(value):
+        raise ValueError(f"angle must be finite, got {deg!r}")
+    low, high = _effective_range(side, axis, margin)
     if value < low:
         return low
     if value > high:
@@ -137,7 +145,10 @@ def measured_arm_deg(measured_rad) -> dict:
     out = {}
     for side, axes in ARM_JOINT_INDEX.items():
         for axis, index in axes.items():
-            out[arm_key(side, axis)] = rad_to_deg(measured_rad[index])
+            value = float(measured_rad[index])
+            if not math.isfinite(value):
+                raise ValueError("measured joint positions must be finite")
+            out[arm_key(side, axis)] = rad_to_deg(value)
     return out
 
 

@@ -635,3 +635,18 @@ def test_an_unreadable_workmode_stops_commanding(monkeypatch):
         assert len(low.calls) == after
     finally:
         plugin.dispatch("stop", {})
+
+
+def test_clamp_arm_rejects_a_non_finite_angle():
+    """Returning NaN from a clamp function is worse than raising: it looks clamped."""
+    with pytest.raises(ValueError):
+        spec.clamp_arm("left", "pitch", float("nan"))
+    with pytest.raises(ValueError):
+        spec.clamp_arm("left", "pitch", float("inf"))
+
+
+def test_measured_arm_deg_rejects_non_finite_feedback():
+    measured = _measured(*([0.0] * 6))
+    measured[0] = float("nan")
+    with pytest.raises(ValueError):
+        spec.measured_arm_deg(measured)
