@@ -35,7 +35,7 @@ python3 -B -m rokae.helios_sensors.depth_socket \
 
 ### 画布预览
 
-`camera_depth` 的 `info` 返回 `preview_topic`。Core 中「查看数据流」可优先使用该话题。以第一个输出作为预览的 Core 版本，可在 Phanthy Motus 仓库根目录应用 [画布补丁](core-preview.patch)，随 Core 前端一起部署。两种 Core 版本的第一输出均是原始毫米深度，已有卡片接线继续使用原话题。
+`camera_depth` 的 `info` 返回 `preview_topic`。Core 中「查看数据流」可优先使用该话题。已在 Helios 的 Core `release.261118.56edda4` 上验证预览选择。该版本需要在 Core 前端应用 [画布补丁](core-preview.patch)，补丁也已在 Phanthy Motus 源码 `d7dab1461` 上验证可应用。两种 Core 版本的第一输出均是原始毫米深度，已有卡片接线继续使用原话题。
 
 ## 验证
 

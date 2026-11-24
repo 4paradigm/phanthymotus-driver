@@ -1,4 +1,6 @@
 import math
+import json
+import socket
 import struct
 import threading
 import time
@@ -9,6 +11,7 @@ import pytest
 from PIL import Image
 
 from rokae.helios_sensors.depth_preview import depth_preview_jpeg
+from rokae.helios_sensors.depth_socket import HEADER, read_depth_frame
 from rokae.helios_sensors.main import SensorCard
 from rokae.helios_sensors.orbbec import HEIGHT, WIDTH, encode_depth
 from rokae.helios_sensors.orientation import OrientationFilter
@@ -33,6 +36,37 @@ def test_depth_preview_keeps_raw_output_and_encodes_a_smaller_image():
 def test_invalid_depth_preview_input_is_recoverable(frame):
     with pytest.raises(ValueError):
         depth_preview_jpeg(frame)
+
+
+def test_depth_socket_reads_fragmented_header_metadata_and_frame():
+    captured = time.monotonic()
+    metadata = json.dumps({"captured_monotonic": captured, "K": [1.0]}).encode()
+    payload = b"depth frame"
+    header = HEADER.pack(123, len(metadata), len(payload))
+    receiver, sender = socket.socketpair()
+    chunks = (header[:3], header[3:], metadata[:5], metadata[5:], payload[:4], payload[4:])
+
+    def send_frame():
+        for chunk in chunks:
+            sender.sendall(chunk)
+            time.sleep(.005)
+
+    with receiver, sender:
+        worker = threading.Thread(target=send_frame)
+        worker.start()
+        try:
+            assert read_depth_frame(receiver) == ("frame", captured, 123, payload, [1.0])
+        finally:
+            worker.join(timeout=1)
+
+
+def test_depth_socket_reports_eof_with_partial_frame():
+    receiver, sender = socket.socketpair()
+    with receiver, sender:
+        sender.sendall(HEADER.pack(123, 2, 4) + b"{}xx")
+        sender.shutdown(socket.SHUT_WR)
+        with pytest.raises(OSError, match="disconnected"):
+            read_depth_frame(receiver)
 
 
 @pytest.mark.parametrize("bad_layout", [True, False], ids=["short-frame", "invalid-scale"])

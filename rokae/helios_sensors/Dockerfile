@@ -1,7 +1,9 @@
 ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
 FROM ${ROS_BASE_IMAGE}
 WORKDIR /driver
-RUN python3 -m pip install --no-cache-dir --only-binary=:all: --no-deps Pillow==12.3.0
+COPY requirements.txt /driver/rokae/helios_sensors/requirements.txt
+RUN python3 -m pip install --no-cache-dir --only-binary=:all: --no-deps \
+    -r /driver/rokae/helios_sensors/requirements.txt
 COPY common/__init__.py common/camera_info.py common/vendor_runtime.py common/logsafe.py /driver/common/
 COPY __init__.py main.py orbbec.py orientation.py depth_socket.py depth_preview.py driver.yaml /driver/rokae/helios_sensors/
 COPY deploy/ /deploy/

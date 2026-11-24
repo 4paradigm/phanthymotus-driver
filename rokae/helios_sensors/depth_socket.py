@@ -21,6 +21,42 @@ from .orbbec import HEIGHT, WIDTH, capture
 HEADER = struct.Struct("!QII")
 MAX_FRAME = WIDTH * HEIGHT * 2 + 1024
 MAX_METADATA = 4096
+SOCKET_TIMEOUT = 9
+
+
+def read_exact(link, size, deadline):
+    data = bytearray(size)
+    remaining = memoryview(data)
+    while remaining:
+        timeout = deadline - time.monotonic()
+        if timeout <= 0:
+            raise TimeoutError("timed out receiving a depth message")
+        link.settimeout(timeout)
+        count = link.recv_into(remaining)
+        if count == 0:
+            raise OSError("depth source disconnected during a message")
+        remaining = remaining[count:]
+    return data
+
+
+def read_depth_frame(link):
+    deadline = time.monotonic() + SOCKET_TIMEOUT
+    stamp, meta_size, frame_size = HEADER.unpack(read_exact(link, HEADER.size, deadline))
+    if not 0 < meta_size <= MAX_METADATA or frame_size > MAX_FRAME:
+        raise ValueError("invalid depth socket message length")
+    metadata = json.loads(read_exact(link, meta_size, deadline))
+    if not isinstance(metadata, dict):
+        raise ValueError("invalid depth socket metadata")
+    if not stamp:
+        raise RuntimeError(str(metadata.get("error", "host depth capture failed"))[:300])
+    if not frame_size:
+        raise ValueError("empty depth frame")
+    payload = read_exact(link, frame_size, deadline)
+    now = time.monotonic()
+    received = metadata.get("captured_monotonic", now)
+    if not isinstance(received, (int, float)) or not math.isfinite(received) or not 0 <= received <= now:
+        raise ValueError("invalid depth capture timestamp")
+    return "frame", received, stamp, payload, metadata.get("K")
 
 
 def from_depth_socket(path, stop, output):
@@ -28,32 +64,14 @@ def from_depth_socket(path, stop, output):
     output.cancel_join_thread()
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as link:
-            link.settimeout(9)
+            link.settimeout(SOCKET_TIMEOUT)
             link.connect(path)
-            with link.makefile("rb") as stream:
-                while not stop.is_set():
-                    header = stream.read(HEADER.size)
-                    if len(header) != HEADER.size:
-                        raise OSError("depth source disconnected")
-                    stamp, meta_size, frame_size = HEADER.unpack(header)
-                    if not 0 < meta_size <= MAX_METADATA or frame_size > MAX_FRAME:
-                        raise ValueError("invalid depth socket message length")
-                    metadata = json.loads(stream.read(meta_size))
-                    if not isinstance(metadata, dict):
-                        raise ValueError("invalid depth socket metadata")
-                    payload = stream.read(frame_size)
-                    if not stamp:
-                        raise RuntimeError(str(metadata.get("error", "host depth capture failed"))[:300])
-                    if not frame_size or len(payload) != frame_size:
-                        raise OSError("incomplete depth frame")
-                    now = time.monotonic()
-                    received = metadata.get("captured_monotonic", now)
-                    if not isinstance(received, (int, float)) or not math.isfinite(received) or not 0 <= received <= now:
-                        raise ValueError("invalid depth capture timestamp")
-                    try:
-                        output.put_nowait(("frame", received, stamp, payload, metadata.get("K")))
-                    except queue.Full:
-                        pass
+            while not stop.is_set():
+                frame = read_depth_frame(link)
+                try:
+                    output.put_nowait(frame)
+                except queue.Full:
+                    pass
     except (OSError, RuntimeError, ValueError) as exc:
         try:
             output.put(("error", str(exc)[:300]), timeout=.4)
