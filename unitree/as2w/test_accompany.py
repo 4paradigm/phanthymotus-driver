@@ -213,6 +213,42 @@ class AccompanyContractTests(unittest.TestCase):
         self.assertEqual("confirmed", result["confidence"])
         self.assertIn("指示灯", result["exit_evidence"]["detail"])
 
+    def test_stale_confirmed_fsm_expires_to_unknown(self):
+        """A dead GetState link must not keep claiming confirmed forever.
+
+        Regression for the third review round: after a confirmed accompany
+        poll, a lost link plus an unobservable P-key exit used to leave the
+        card reporting ``accompanying`` indefinitely.
+        """
+        plugin = self.make(config={"fsm_names": ["ai_accompany"]},
+                           proxy=_FakeProxy(fsm="AI_ACCOMPANY"))
+        plugin._poll_fsm()
+        self.assertEqual("accompanying", plugin.dispatch("status", {})["mode"])
+
+        with plugin._lock:
+            plugin._fsm_at_ms -= int(plugin._fsm_period * 3000) + 1000
+
+        result = plugin.dispatch("status", {})
+        self.assertEqual("unknown", result["mode"])
+        self.assertEqual("stale", result["confidence"])
+        self.assertEqual("fsm_stale", result["mode_source"])
+        self.assertIn("过期", result["note"])
+        self.assertIsNone(result["exit_evidence"],
+                         "stale state must not produce exit evidence")
+
+    def test_a_fresh_poll_after_expiry_restores_confirmed(self):
+        plugin = self.make(config={"fsm_names": ["ai_accompany"]},
+                           proxy=_FakeProxy(fsm="AI_ACCOMPANY"))
+        plugin._poll_fsm()
+        with plugin._lock:
+            plugin._fsm_at_ms -= int(plugin._fsm_period * 3000) + 1000
+        self.assertEqual("stale", plugin.dispatch("status", {})["confidence"])
+
+        plugin._poll_fsm()
+        result = plugin.dispatch("status", {})
+        self.assertEqual("accompanying", result["mode"])
+        self.assertEqual("confirmed", result["confidence"])
+
     def test_input_outside_accompany_does_not_become_exit_evidence(self):
         """Guards the noisy case: a stick nudge while idle is not an exit."""
         plugin = self.make()

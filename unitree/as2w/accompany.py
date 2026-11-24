@@ -375,6 +375,7 @@ class AccompanyPlugin:
         now_ms = int(time.time() * 1000)
         with self._lock:
             fsm_name = self._fsm_name
+            fsm_at_ms = self._fsm_at_ms
             last_input = dict(self._last_operator_input or {}) or None
             entered_ms = self._accompany_entered_ms
             remote_ms = self._last_remote_ms
@@ -411,6 +412,21 @@ class AccompanyPlugin:
             result["note"] = ("遥控器数据超过 0.5 s 未更新，最后一次有效帧已过期。"
                               "可能是距离过远、信号被遮挡或遥控器已关机；"
                               "伴随模式要求间距不超过 2.4 米。")
+            return result
+
+        # A cached name is only evidence while polls keep succeeding. If the
+        # DDS link drops, the robot may exit via a key this card cannot read
+        # (P key / joystick), so a formerly confirmed name must expire instead
+        # of reporting "accompanying" forever. Same three-period bound as
+        # _preflight().
+        fsm_age_ms = None if fsm_at_ms is None else max(0, now_ms - fsm_at_ms)
+        if fsm_age_ms is not None and fsm_age_ms > self._fsm_period * 3000:
+            result["confidence"] = "stale"
+            result["mode_source"] = "fsm_stale"
+            result["note"] = (
+                f"最后一次成功 GetState 已过期（{fsm_age_ms / 1000:.0f} s 前，"
+                f"fsm_name={fsm_name or '(空)'}），不能据此确认当前模式；"
+                "请检查 DDS 链路或等待下一次轮询成功。")
             return result
 
         if fsm_name and self._fsm_names and fsm_name in self._fsm_names:
