@@ -204,6 +204,11 @@ class BumiDeviceBundle:
                 plugins_cfg["vision_capture"], camera_plugin))
             print("[bundle] VisionCapturePlugin loaded")
 
+        if plugins_cfg.get('joint_activity_stats', {}).get('enabled', False):
+            from joint_activity_stats import JointActivityStatsPlugin
+            self._plugins.append(JointActivityStatsPlugin(
+                plugins_cfg['joint_activity_stats'], namespace, executor))
+
     def start_all(self) -> None:
         failed = 0
         for i, p in enumerate(self._plugins):
