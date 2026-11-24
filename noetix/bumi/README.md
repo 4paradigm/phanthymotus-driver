@@ -576,3 +576,97 @@ future consumer that publishes that chain (or runs a correctly configured
 `camera_link → bumi_visual_*_base` identity link — rather than assume they
 coincide, and must not hard-code a parent frame in place of the `frame_id`
 already carried by the input image header.
+
+## `vision_tf` card — turn a vision localisation into a tf transform
+
+`vision_tf` is a processor card that sits between a vision-localisation card
+(AR marker, stamped pose, pixel+depth, object list) and a tf-tree card:
+
+```
+vision card ──data/json──> vision_tf ──data/json──> tf-tree card
+   (left link)                                      (right link)
+```
+
+It consumes one `data/json` topic (`input_topic` supplied by the canvas at
+`start`) and publishes one `data/json` topic containing a list of tf-shaped
+edges:
+
+```json
+{
+  "stamp_ms": 1763551200123,
+  "source": "ar",
+  "parent_frame": "camera_optical_frame",
+  "pose_direction": "object_in_camera",
+  "rotation_order": "xyzw",
+  "units": "m",
+  "transforms": [
+    {
+      "parent": "camera_optical_frame",
+      "child": "vision_ar_17",
+      "stamp_ms": 1763551200100,
+      "stamp_source": "input",
+      "translation": [0.412, -0.108, 1.352],
+      "rotation": [0.0, 0.7071068, 0.0, 0.7071068],
+      "confidence": 0.92
+    }
+  ],
+  "rejected": 0, "sanitized": 0, "dropped": [], "degraded": "", "last_error": ""
+}
+```
+
+Every located object becomes one `parent → child` edge, with the parent a camera
+frame and the child `vision_<source>_<id>`. The card is disabled by default
+(`plugins.vision_tf.enabled: false` in `config.yaml`) because only deployments
+that attach vision targets to the body tf tree need it.
+
+### Where the camera frame and the rotation come from
+
+The camera's position on the robot is **not invented by this card**. It comes
+from the `camera_link` / `camera_optical_frame` fixed frames in
+`resource/bumi_model.urdf` (added alongside this work). `camera_optical_frame`
+already carries the optical→body rotation as a fixed joint
+(`rpy = (-π/2, 0, -π/2)`, quaternion `[-0.5, 0.5, -0.5, 0.5]` xyzw), which is
+why the visual convention (x right / y down / z depth) and the robot's spatial
+convention (x forward / y left / z up) line up when a tf tree reads that URDF.
+
+Consequently the card **does not rotate by default**: `input_frame: optical`
+passes the numbers through unchanged and uses `camera_optical_frame` as parent,
+letting the tree apply the URDF rotation once. If a caller wants machine-axis
+numbers directly, set `output_frame: body` — the card then applies the same
+rotation in `vision_tf_spec.camera_to_body_point` / `camera_to_body_quaternion`
+and uses `camera_link` as parent. Either way the rotation has a single source of
+truth; pick one, not both.
+
+### Adapters (the "various vision JSON" shapes)
+
+`adapter` selects how a target is parsed. Missing fields are rejected with a
+reason in `last_error` — never zero-filled.
+
+| adapter | expected shape |
+|---|---|
+| `pose` | `{position:[x,y,z], orientation:[x,y,z,w]}` (also accepts `{x,y,z}` objects) |
+| `pose_tf_like` | `{translation:[x,y,z], rotation:[x,y,z,w]}` |
+| `ar_marker` | `{marker_id, tvec:[x,y,z], rvec:[rx,ry,rz]}` or `quaternion` instead of rvec (both → rejected as ambiguous) |
+| `pixel_depth` | `{u, v, depth_m}` + pinhole intrinsics (defaults to image centre + configured `focal_px`) |
+
+### Parent frame, direction, time
+
+- `input_frame`: `optical` → `camera_optical_frame`, `body` → `camera_link`,
+  `base` → `base_link`. `output_frame: body` overrides to `camera_link`.
+- `pose_direction`: `object_in_camera` (default) uses the pose verbatim;
+  `camera_in_object` inverts it (`t' = -Rᵀt`, `q' = q⁻¹`).
+- Quaternions are **xyzw** everywhere (the renderer-only `imu_quat` wxzy order
+  in `device.py` is not used here).
+- A target's `stamp_ms` (or `header.stamp`) is kept verbatim as `stamp_source:
+  "input"`; with no stamp the receive time is used (`"receive"`). A target not
+  refreshed within `ttl_ms` (default 500) moves to `dropped`.
+
+### What it does not do
+
+No rotation by default, no tf-tree construction, no `/tf` or `/tf_static`
+publishing (that is the tf-tree card's job), no distortion correction (pixels
+must be ideal pinhole), and no hardware. It is deliberately not gated on the
+high/media controllers, so it loads in a data-only deployment.
+
+`start` requires `input_topic`; without it the card honestly reports
+`{"state":"idle","degraded":"no_input_topic"}` instead of claiming `running`.
