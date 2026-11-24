@@ -12,6 +12,8 @@ from socketserver import BaseRequestHandler
 import struct
 import time
 
+from common import logsafe
+
 from .orbbec import HEIGHT, WIDTH, capture
 
 
@@ -21,6 +23,7 @@ MAX_METADATA = 4096
 
 
 def from_depth_socket(path, stop, output):
+    logsafe.install(check_fd=False)
     output.cancel_join_thread()
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as link:

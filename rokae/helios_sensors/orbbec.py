@@ -11,6 +11,8 @@ import time
 import zlib
 from pathlib import Path
 
+from common import logsafe
+
 from .orientation import OrientationFilter
 
 
@@ -188,6 +190,7 @@ def imu_reader(sdk):
 
 def capture(kind, directory, serial, stop, output):
     """A child process owns the camera. It returns only data and status."""
+    logsafe.install(check_fd=False)
     # If the parent must terminate capture, a full queue must not hang child teardown.
     output.cancel_join_thread()
     try:

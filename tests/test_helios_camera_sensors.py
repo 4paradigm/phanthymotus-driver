@@ -55,6 +55,17 @@ def test_sensor_exposes_only_canvas_lifecycle_actions(kind, name):
     assert set(actions) <= {"start", "stop", "info", "config"}
 
 
+def test_sensor_replies_with_framework_lifecycle_states():
+    card = object.__new__(SensorCard)
+    calls = []
+    card.start = lambda: calls.append("start")
+    card.stop = lambda: calls.append("stop")
+
+    assert card.dispatch("start", {}) == {"state": "running"}
+    assert card.dispatch("stop", {}) == {"state": "idle"}
+    assert calls == ["start", "stop"]
+
+
 def initialize_orientation(fusion, accel=(0, 0, 9.80665)):
     for stamp in range(20_000, 360_001, 20_000):
         result = fusion.update(stamp, accel, (0, 0, 0))

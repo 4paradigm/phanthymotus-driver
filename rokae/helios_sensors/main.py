@@ -106,10 +106,10 @@ class SensorCard:
     def dispatch(self, action, args):
         if action == "start":
             self.start()
-        elif action == "stop":
+            return {"state": "running"}
+        if action == "stop":
             self.stop()
-        elif action not in ("read", "info", self.name):
-            raise ValueError(f"unsupported {self.name} action: {action}")
+            return {"state": "idle"}
         if action == "info":
             # The canvas asks for an instance's topic before opening the data
             # view. Resume passive preview if Core stopped the previous card.
@@ -124,7 +124,9 @@ class SensorCard:
                         K=self.intrinsics, source="derived-from-K" if self.intrinsics else "unknown",
                         pipeline=("native", "mm", "zlib"))]
             return result
-        return self.payload()
+        if action in ("read", self.name):
+            return self.payload()
+        raise ValueError(f"unsupported {self.name} action: {action}")
 
     def publish_status(self):
         if self.kind == "imu":
