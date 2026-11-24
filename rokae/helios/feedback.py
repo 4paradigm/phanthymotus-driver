@@ -164,6 +164,9 @@ class StreamFeedbackClient:
             with self._lock:
                 self._error = f"subscriber failed: {type(exc).__name__}"
 
+    def _on_connect(self):
+        """Optional per-connection parser reset; existing subscribers are stateless."""
+
     async def _subscribe_forever(self):
         import aiohttp
 
@@ -175,6 +178,7 @@ class StreamFeedbackClient:
                     ws = await asyncio.wait_for(session.ws_connect(self.url, max_msg_size=self._max_msg_size),
                                                 self.connect_timeout)
                     try:
+                        self._on_connect()
                         with self._lock:
                             self._connected = True
                             self._data = None

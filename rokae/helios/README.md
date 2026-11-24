@@ -1,14 +1,49 @@
 # ROKAE Helios-2.1 状态卡片
 
-通过现有 iNex 和底盘 WebSocket 读取 20 轴关节及双电池状态。两张传感器卡可独立开始、停止，不提供运动、使能、模式切换或充放电控制。
+通过现有 iNex 和底盘 WebSocket 读取 20 轴关节、双电池状态及相对平面位姿。三张传感器卡可独立开始、停止，不提供运动、使能、模式切换或充放电控制。
 
 | 工具 | 类型 | 输出 |
 |---|---|---|
 | `joints` | sensor | 关节骨架和逐轴状态，默认 10 Hz |
 | `battery` | sensor | 两块电池状态，默认 1 Hz |
+| `odometry` | sensor | 相对位置 x/y、相对朝向 yaw，默认 10 Hz；停止再开始重新置零 |
 | `model` | resource | 运行时读取本机 iNex 的 URDF，骨架渲染器自动调用 |
 
 ## 数据与单位
+
+### 相对位姿
+
+`odometry` 被动读取底盘 `UiDatagram.current_state.pose`，没有 online、heartbeat、
+导航、速度或使能请求。第一条有效观测作为本轮参考原点：其位置为 `(0, 0)`、
+朝向为 `0`；之后将地图坐标差旋转到起始朝向，x 向前、y 向左，yaw 为相对
+起始朝向的角度（rad，归一化至 `[-pi, pi]`）。重复 start 不改原点；stop 后
+再 start 才重新置零。短暂断线重连保留原点。
+
+只提供位置和朝向，不计算速度、累计里程、轨迹或 TF。不把定位重置/跳变当作
+真实行驶距离；此来源是底盘地图定位状态，不声称它是独立、连续的编码器里程计。
+底盘切图、重定位后需重新开始本卡，不能保证跨定位重置的连续性。
+
+- `/{namespace}/state/relative_pose`（`data/json`）：x/y/yaw 和基本连接、时效信息。
+- `/{namespace}/state/odom`（`state/odom`）：`common/odom.py` 的 `motus.odom/1`。
+  `info().odom_interface.provides=[]`，六个 twist 轴始终为 null；没有速度测量，
+  不能据此判断速度为零。参考系为本卡定义的固定 `relative_start`，不是机器人
+  当前机身系。标准 pose 的 z=0、roll/pitch=0 是明确的二维模型约定，不是高度测量。
+
+**位置单位不得猜测。** 默认 `odometry_position_unit: unverified`，显示 x/y
+保留原始尺度并标注 `source_unverified`，标准输出的 pose 为 null。厂家确认
+本机位置单位后，在共享配置中选 `m` 或 `mm`，才发布米制标准位姿；单位改变会
+重新开始订阅并置零。航向角的弧度约定依据已安装底盘页面的 `180*theta/pi` 显示
+换算。没有把软件静止接收称作距离/角度精度验收。
+
+停止、断线、无效或默认 1 秒无有效位姿时，显示坐标清空为 null。无关电池、
+雷达报文和重复/回退的 source timeStamp 不刷新有效期。接收时间用本机单调时钟
+判断过期；输出 `stamp_ms` 保留该次数据的接收时间，不因定时发布而刷新。原厂
+timeStamp 单独保留为 source_stamp_ms，不宣称它等于硬件采集时刻或已完成跨设备
+同步。新连接允许原厂时钟从新起点恢复。
+
+协议投影、坐标定义、PR519 格式对应及验收边界见 [ODOMETRY_INTERFACE.md](ODOMETRY_INTERFACE.md)。
+
+### 关节与电池
 
 `joints` 只发布一条流 `/rokae_helios/state/joints`（`sensor/skeleton`）：每轴 `q`（rad）、`dq`（rad/s）、`motor_torque_nm`、`gravity_torque_nm`（Nm），按名称匹配 URDF；另含连接状态 `state` / `available`、`message`、数据年龄、接收时间和 `torque_status`。
 
@@ -52,7 +87,7 @@
 
 ## 画布与 Core 前端
 
-在卡片共享配置中保存状态地址，再将 `joints` 和 `battery` 加入画布并启动。`model` 无需单独运行；首次请求时读取同一 iNex 地址的 `/api/robot_3d_model` 及其同源 `urdf_url`，核对 20 轴名称后在进程内缓存。没有把厂家模型打入镜像。模型服务暂不可用时明确返回错误，不影响关节和电池订阅启动。监控页从 `joints` 自动生成骨架。
+在卡片共享配置中保存状态地址，再将需要的 `joints`、`battery` 或 `odometry` 加入画布并启动。`model` 无需单独运行；首次请求时读取同一 iNex 地址的 `/api/robot_3d_model` 及其同源 `urdf_url`，核对 20 轴名称后在进程内缓存。没有把厂家模型打入镜像。模型服务暂不可用时明确返回错误，不影响传感器订阅启动。监控页从 `joints` 自动生成骨架。
 
 官方 Core 无需修改即可使用：监控页按真实 Driver ID 读取 URDF 显示骨架，电池在日志视图每字段一行、"最新"模式每字段一格。已知差异：
 
@@ -64,7 +99,7 @@
 
 ## 配置
 
-默认读取上身 `ws://192.168.0.161:8888/ws` 及底盘 `ws://192.168.0.100/ws/AGVInfo`。可通过共享配置 `state_url` / `battery_state_url`，或环境变量 `HELIOS_STATE_URL` / `HELIOS_BATTERY_STATE_URL` 覆盖。地址字段声明为敏感配置，避免打包 Solution 时公开私有地址。
+默认读取上身 `ws://192.168.0.161:8888/ws` 及底盘 `ws://192.168.0.100/ws/AGVInfo`。可通过共享配置 `state_url` / `battery_state_url` / `odometry_state_url`，或对应环境变量 `HELIOS_STATE_URL` / `HELIOS_BATTERY_STATE_URL` / `HELIOS_ODOMETRY_STATE_URL` 覆盖。地址字段声明为敏感配置，避免打包 Solution 时公开私有地址。
 
 `config.yaml` 控制发布、过期、连接和重连时间。MCP 仅监听 `127.0.0.1:15747`，ROS domain 42，复用 `common/vendor_runtime.py` 注册到 Core。WebSocket 只读订阅，不安装或运行厂家运动 SDK。
 
@@ -73,7 +108,7 @@
 仓库根目录安装本 Driver 的 requirements 及 pytest 后执行：
 
 ```bash
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=. python -m pytest -q tests/test_helios_joints.py tests/test_helios_battery.py tests/test_helios_torque.py tests/test_helios_model.py
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=. python -m pytest -q tests/test_helios_joints.py tests/test_helios_battery.py tests/test_helios_torque.py tests/test_helios_model.py tests/test_helios_odometry.py tests/test_odom_format.py
 python scripts/check_service_yml.py rokae/helios
 ```
 
