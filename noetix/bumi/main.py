@@ -204,6 +204,17 @@ class BumiDeviceBundle:
                 plugins_cfg["vision_capture"], camera_plugin))
             print("[bundle] VisionCapturePlugin loaded")
 
+        # Host observations remain available without either SDK controller.
+        if plugins_cfg.get("system_health", {}).get("enabled", False):
+            from system_health import SystemHealthPlugin
+            try:
+                self._plugins.append(SystemHealthPlugin(
+                    plugins_cfg["system_health"], namespace, executor))
+                print("[bundle] SystemHealthPlugin loaded")
+            except ValueError as e:
+                print(f"[bundle] WARNING: system_health skipped, invalid config: {e}",
+                      flush=True)
+
     def start_all(self) -> None:
         failed = 0
         for i, p in enumerate(self._plugins):
