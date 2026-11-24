@@ -30,6 +30,8 @@ the last step inside `build_joint_commands`.
 
 from __future__ import annotations
 
+import math
+
 JOINT_COUNT = 21
 
 #: Index of each observable arm axis in the 21-motor vector. The order matches
@@ -117,11 +119,11 @@ def clamp_arm(side: str, axis: str, deg: float,
 
 
 def deg_to_rad(deg: float) -> float:
-    return float(deg) * 3.141592653589793 / 180.0
+    return float(deg) * math.pi / 180.0
 
 
 def rad_to_deg(rad: float) -> float:
-    return float(rad) * 180.0 / 3.141592653589793
+    return float(rad) * 180.0 / math.pi
 
 
 def measured_arm_deg(measured_rad) -> dict:
@@ -156,6 +158,13 @@ def build_joint_commands(measured_rad, targets_deg, *, keep_kp, keep_kd,
     if len(measured_rad) != JOINT_COUNT:
         raise ValueError(f"expected {JOINT_COUNT} measured positions, got {len(measured_rad)}")
 
+    # A non-finite feedback value is a dead encoder or a torn DDS sample, not a
+    # pose. Copying it into the hold commands would put NaN into every joint, so
+    # the whole tick is refused and the card stops instead.
+    for value in measured_rad:
+        if not math.isfinite(float(value)):
+            raise ValueError("measured joint positions must be finite")
+
     commands = [
         {
             "pos": float(measured_rad[i]),
@@ -174,6 +183,10 @@ def build_joint_commands(measured_rad, targets_deg, *, keep_kp, keep_kd,
             target = targets_deg.get(key)
             if target is None or float(target) == UNMEASURED_DEG:
                 # No observation for this axis: hold what the motor reports.
+                continue
+            if not math.isfinite(float(target)):
+                # NaN compares False against every clamp bound, so it would pass
+                # straight through to `MotorCmd.pos`. Hold instead.
                 continue
             commands[index]["pos"] = deg_to_rad(clamp_arm(side, axis, target, margin))
             commands[index]["kp"] = float(arm_kp)
@@ -222,11 +235,16 @@ def targets_from_payload(payload: dict) -> dict:
     for side, axes in ARM_JOINT_INDEX.items():
         for axis in axes:
             field = f"{arm_key(side, axis)}_deg"
-            value = payload.get(field)
             try:
-                targets[arm_key(side, axis)] = float(value)
+                number = float(payload.get(field))
             except (TypeError, ValueError):
                 targets[arm_key(side, axis)] = UNMEASURED_DEG
+                continue
+            # NaN and infinity compare False against every bound, so a clamp
+            # passes them straight through. They are not angles; treat them the
+            # same as "never measured" and hold the joint.
+            targets[arm_key(side, axis)] = (
+                number if math.isfinite(number) else UNMEASURED_DEG)
     return targets
 
 
@@ -242,12 +260,3 @@ def max_step_for(rate_limit_deg_s: float, control_hz: float) -> float:
     if control_hz <= 0:
         raise ValueError("control_hz must be positive")
     return float(rate_limit_deg_s) / float(control_hz)
-
-
-def describe_targets(targets_deg: dict) -> str:
-    """One flat line for the throttled status log."""
-    parts = []
-    for key in sorted(ZERO_TARGETS_DEG):
-        value = targets_deg.get(key, UNMEASURED_DEG)
-        parts.append(f"{key}={value:.1f}")
-    return " ".join(parts)

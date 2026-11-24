@@ -538,3 +538,100 @@ def test_range_checks_raise_instead_of_clamping(monkeypatch):
         card.UpperBodyMirrorPlugin({"control_hz": 5.0}, "bumi", executor)
     with pytest.raises(ValueError):
         card.UpperBodyMirrorPlugin({"keep_kp": 0.0}, "bumi", executor)
+
+
+# ── non-finite input and feedback ────────────────────────────────────────────
+
+def test_a_nan_payload_axis_is_treated_as_unmeasured():
+    """NaN compares False against every clamp bound, so it would reach the motor.
+
+    `clamp_arm` uses `<` and `>`, both of which are False for NaN, so the value
+    passes through untouched and lands in `MotorCmd.pos`. Treating it like
+    "never measured" holds the joint instead.
+    """
+    targets = spec.targets_from_payload(
+        {"l_pitch_deg": float("nan"), "r_pitch_deg": 10.0})
+    assert targets["l_pitch"] == spec.UNMEASURED_DEG
+    assert targets["r_pitch"] == pytest.approx(10.0)
+
+
+def test_an_infinite_payload_axis_is_treated_as_unmeasured():
+    targets = spec.targets_from_payload(
+        {"l_pitch_deg": float("inf"), "r_pitch_deg": float("-inf")})
+    assert targets["l_pitch"] == spec.UNMEASURED_DEG
+    assert targets["r_pitch"] == spec.UNMEASURED_DEG
+
+
+def test_non_finite_measured_positions_are_rejected():
+    """A dead encoder or a torn DDS sample must stop the tick, not be held.
+
+    Holding NaN would put it into all 21 commands, including the legs.
+    """
+    measured = _measured(*([0.0] * 6))
+    measured[4] = float("nan")
+    with pytest.raises(ValueError):
+        spec.build_joint_commands(measured, _targets(),
+                                  keep_kp=10.0, keep_kd=0.5,
+                                  arm_kp=5.0, arm_kd=0.5)
+
+
+def test_a_non_finite_target_holds_instead_of_reaching_the_motor():
+    measured = _measured(0.2, 0.3, -0.4, 0.5, -0.6, -0.7)
+    targets = _targets(l_pitch=float("nan"), r_pitch=float("inf"))
+    commands = spec.build_joint_commands(
+        measured, targets,
+        keep_kp=10.0, keep_kd=0.5, arm_kp=5.0, arm_kd=0.5)
+    assert commands[0]["pos"] == measured[0]
+    assert commands[0]["kp"] == 10.0
+    assert commands[10]["pos"] == measured[10]
+
+
+# ── protection mode is not a start-time check ────────────────────────────────
+
+def test_entering_protection_during_a_run_stops_commanding(monkeypatch):
+    """Workmode 26 can arrive mid-run (a fall, a motor fault).
+
+    Re-reading it only at `start` means the loop keeps writing set_joint after
+    the robot has said stop — overriding the one safety decision it made alone.
+    """
+    import time
+
+    _card, plugin, high, low = _plugin(monkeypatch, mode=2)
+    plugin.dispatch("start", {})
+    try:
+        time.sleep(0.08)
+        assert low.calls, "control loop never sent a command"
+        high.mode = 26
+        time.sleep(0.2)
+        info = plugin.dispatch("info", {})
+        assert info["state"] == "error"
+        assert "protection" in info["last_error"]
+        after = len(low.calls)
+        time.sleep(0.2)
+        assert len(low.calls) == after, "kept commanding after protection mode"
+    finally:
+        plugin.dispatch("stop", {})
+
+
+def test_an_unreadable_workmode_stops_commanding(monkeypatch):
+    """Same rule when the mode cannot be read: unknown is not permission."""
+    import time
+
+    _card, plugin, high, low = _plugin(monkeypatch, mode=2)
+    plugin.dispatch("start", {})
+    try:
+        time.sleep(0.08)
+
+        def _boom():
+            raise RuntimeError("dds gone")
+
+        high.get_mode = _boom
+        time.sleep(0.2)
+        info = plugin.dispatch("info", {})
+        assert info["state"] == "error"
+        assert "unreadable" in info["last_error"]
+        after = len(low.calls)
+        time.sleep(0.2)
+        assert len(low.calls) == after
+    finally:
+        plugin.dispatch("stop", {})

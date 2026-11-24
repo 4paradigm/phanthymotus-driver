@@ -106,10 +106,13 @@ RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
 # layers cannot be conditional at runtime, so keeping that cost out of default
 # Bumi images requires a build-time switch: pass --build-arg INSTALL_POSE_DEPS=1
 # to build an image that can run this card. torch, torchvision and ultralytics
-# are pinned in pose-requirements.txt so a rebuild cannot silently swap the
-# runtime or invalidate the recorded ARM64 image-size evidence. The headless
-# opencv above needs no GUI libs; the pose weight is fetched on first run and
-# cached, or `model_path` points at a pre-downloaded copy on an offline robot.
+# are pinned in pose-requirements.txt: those three dominate the image and are
+# what the recorded ARM64 size evidence measures. Their transitive dependencies
+# still resolve at build time, so a rebuild can shift a few tens of MiB in
+# packages this file does not name — a hash-checked lock file would be needed to
+# close that, and the size evidence says so too. The headless opencv above needs
+# no GUI libs; the pose weight is fetched on first run and cached, or
+# `model_path` points at a pre-downloaded copy on an offline robot.
 COPY pose-requirements.txt /work/pose-requirements.txt
 ARG INSTALL_POSE_DEPS=0
 RUN if [ "$INSTALL_POSE_DEPS" = "1" ]; then \
@@ -145,11 +148,14 @@ RUN cd /work/noetix_sdk_bumi && \
     cmake .. \
         -DCMAKE_CXX_STANDARD=17 \
         -Dpybind11_DIR=$(python3 -c "import pybind11; print(pybind11.get_cmake_dir())") && \
-    make -j$(nproc) highcontrol_py mediacontrol_py && \
+    make -j$(nproc) highcontrol_py lowcontrol_py mediacontrol_py && \
     echo "[build] pybind modules built successfully"
 
-# Verify .so files exist
+# Verify .so files exist. `lowcontrol_py` is what `upper_body_mirror` needs to
+# command the motors; without it that card starts and immediately reports
+# "low-level SDK unavailable", which is a card that can never move the robot.
 RUN ls /work/noetix_sdk_bumi/build/highcontrol_py*.so && \
+    ls /work/noetix_sdk_bumi/build/lowcontrol_py*.so && \
     ls /work/noetix_sdk_bumi/build/mediacontrol_py*.so
 
 # ROS2 domain isolation

@@ -454,6 +454,21 @@ class UpperBodyMirrorPlugin:
         log = self._node.get_logger()
 
         while not self._stop_event.is_set() and token is self._run_token:
+            # Protection is re-read every tick, not just at start. The robot can
+            # enter workmode 26 while the card is running — a fall, a motor
+            # fault — and continuing to write set_joint would override the one
+            # safety decision the robot made on its own.
+            mode = self._read_workmode()
+            if mode is None or mode == _PROTECTION_WORKMODE:
+                self._last_error = (
+                    "robot entered protection mode; stopped commanding"
+                    if mode == _PROTECTION_WORKMODE
+                    else "workmode unreadable; stopped commanding")
+                self._status = "error"
+                self._stop_event.set()
+                log.error(f"upper_body_mirror stopped: {self._last_error}")
+                break
+
             now = time.monotonic()
             with self._lock:
                 targets = dict(self._latest_targets)
