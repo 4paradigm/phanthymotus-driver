@@ -179,10 +179,13 @@ def test_recent_pages_reads_the_edge_history_newest_first(tmp_path):
     assert visitor_site.recent_pages(tmp_path / "missing") == []
 
 
-def test_config_reports_adapter_ok_only_when_complete():
+def test_config_reports_adapter_ok_once_the_connection_is_complete():
     plugin = device.VisitorBadgePlugin({})
     assert plugin.dispatch("config", {"host": "10.0.0.5"})["adapter_ok"] is False
-    assert plugin.dispatch("config", CONFIG)["adapter_ok"] is True
+    # No page yet, and still ok: Agent Core blocks every action, detect included,
+    # on adapter_ok false — and detect is how the page gets chosen.
+    no_page = {k: v for k, v in CONFIG.items() if k != "page_url"}
+    assert plugin.dispatch("config", no_page)["adapter_ok"] is True
 
 
 def test_print_needs_configuration_before_going_async():

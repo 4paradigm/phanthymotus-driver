@@ -123,7 +123,10 @@ class VisitorBadgePlugin:
                 self._cfg.update({k: args[k] for k in _CONFIG_KEYS if k in args})
                 if [self._cfg[k] for k in _CONNECTION_KEYS] != before:
                     self._choices, self._detected = {"pages": [], "printers": []}, ""
-            return {"status": "ok", "adapter_ok": self._configured()}
+            # Connection only: Agent Core refuses every action, `detect`
+            # included, while this is false — and the page is chosen from
+            # what `detect` finds. `list`/`print` check the page themselves.
+            return {"status": "ok", "adapter_ok": self._connected()}
         handler = {"list": self._list, "print": self._print, "detect": self._detect}.get(action)
         if handler is None:
             return {"status": "error", "code": "bad_action", "error": f"不支持的动作：{action}"}
