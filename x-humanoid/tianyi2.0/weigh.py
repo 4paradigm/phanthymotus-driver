@@ -1,21 +1,34 @@
 """x-humanoid/tianyi2.0/weigh.py — 天轶2.0 腕部六维力托举称重卡（实验性）。
 
-用法（上层 Skill / 大模型）：
-  0. 每个动作都必须填写 ``side``（left / right / both），并与 pose 时一致；
-  1. ``pose``：把手臂摆到托举姿态（掌心朝上），再把四指立起围住掌心（``hand=cup``），
-     然后自动 ``tare``（必做；掌心须空着，去皮失败则 pose 失败）；
-  2. 也可以分开调用 ``tare`` 去皮；
-  3. 放上物体后调用 ``weigh``，得到重量；
-  4. ``calibrate`` 设定比例系数：放已知重量物体实测（known_mass_kg），或直接写入（scale）；
-  5. ``read`` 不阻塞，返回去皮状态、上一次结果和实时读数；
-  6. ``retract``：称完收回手臂（掌心上还有物体时拒绝，避免掉落；张不开手指时不动手臂）。
+卡片上只有两个动作（side 选 right / left，默认 right）：
+  - ``weigh``：一次走完整个流程，不需要大模型编排——
+      1. 手臂已在托举姿态、cup 手型、去皮有效：直接进入第 2 步；
+         否则把手臂抬到托举姿态（掌心朝上），四指立起围住掌心（cup），空手去皮；
+      2. 语音提示「请在 5 秒内把物品放到右手掌心」，播完才开始计时；
+      3. 检测到物品后等读数稳定，测量；
+      4. 语音播报重量。称完手臂保持举起，可以接着称下一件。
+  - ``reset``：张开手指、放下手臂、清除去皮（掌上还有物品时拒绝，并提示先取走）。
 
-pose / retract 超过约 0.5 s 时走 ACP，先返回 ``action_id``，完成后通知 Agent Core。
-tare / weigh / calibrate 同步返回测量结果。
+两个动作都走 ACP（先返回 action_id，做完通知 Agent Core）。Agent Core 对成功的通知
+只保留 elapsed_s/distance_m/duration_s（collector._slim_acp_result），重量不会出现在
+完成通知里，所以：
+  - 人直接用卡片时，重量由机器人播报；
+  - skill / 大模型要用数值时，读 ``weigh_state`` 传感器（``WeighStatePlugin``，
+    ``/{ns}/state/weigh``）的 ``sides.<side>.last``；
+  - 测出了重量但播报失败时，按失败上报，完成通知里带上完整结果（失败的通知不裁剪）。
 
-只有 ``pose`` / ``retract`` 会让手臂和手指运动，而且不自己发指令：经 bundle 调用 arm 卡的
-``move_pos``（复用它的急停/故障/限位预检、电流上限和运动反馈）和 hand 卡的 ``set_fingers_raw``。其余动作只订阅 ``/arm_6dof_{side}``（WrenchStamped，约 100 Hz）
-和 ``/arm/status``（MotorStatusMsg，抽帧到约 50 Hz），用本卡自己的执行器线程。
+维护用的 ``calibrate``（设定比例系数）和 ``read``（查看状态）不在卡片上显示，
+经 MCP 直接调用，同步返回。
+
+已知限制：零点只存在内存里。驱动重启时如果手臂还举着，本卡不知道掌上有没有东西，
+下一次 weigh 会直接重新去皮（开头会播报「请先不要往手上放东西」）；此时掌上若有物品，
+读数会错。重启后先 reset（勾选 confirm_empty）再称最稳妥。
+
+只有 ``weigh`` / ``reset`` 会让手臂和手指运动，而且不自己发指令：经 bundle 调用 arm 卡的
+``move_pos``（复用它的急停/故障/限位预检、电流上限和运动反馈）、hand 卡的
+``set_fingers_raw`` 和 tts 卡的 ``speak``。力和关节数据只订阅 ``/arm_6dof_{side}``
+（WrenchStamped，约 100 Hz）和 ``/arm/status``（MotorStatusMsg，抽帧到约 50 Hz），
+用本卡自己的执行器线程。
 
 原理：传感器读数 = 零点偏置 + 手自身重力 + 物体重力。姿态不变时前两项不变，
 所以 mass = |F − F₀| / g / scale，用三维力向量，不只看 fz。姿态一变 F₀ 就失效，
@@ -99,7 +112,7 @@ DEFAULTS = {
     "history_s": 12.0,               # 缓冲区保留时长（≥ 最长窗口 5 s；/arm/status 约 500 Hz）
     "poll_s": 0.2,
     "joint_min_interval_s": 0.02,    # /arm/status 抽帧间隔（原始约 490 Hz）
-    # ── pose / retract（只支持右手）──
+    # ── 托举姿态（左臂默认取右臂的镜像）──
     # 托举姿态：2026-11-23 可行性测试实测姿态，[肩pitch,肩roll,肩yaw,肘pitch,腕yaw,腕pitch,腕roll]（度）
     "pose_deg": [5.0, 5.6, 0.0, -90.0, -90.0, 9.0, 0.1],
     "rest_deg": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],   # 没有记录到出发姿态时，retract 回到这里
@@ -119,7 +132,18 @@ DEFAULTS = {
     },
     "default_hand": "cup",
     "hand_settle_s": 1.5,            # 手指动作后静置再去皮 / 再动手臂
+    # ── 一键称重（卡片的 weigh 动作）──
+    "place_window_s": 5.0,           # 提示播完后，等人把物品放到掌心的时间
+    "detect_kg": 0.05,               # 掌上读数超过此值算"放上了物品"（与 retract_max_load_kg 一致）
+    "measure_timeout_s": 10.0,       # 检测到物品后，等读数稳定并测量的上限
+    "announce": True,                # 语音提示和播报结果（经 tts 卡）；False = 不出声
+    "announce_timeout_s": 30.0,      # 等一句话播完的上限
+    # reset 判断"掌上是否还有物品"时，同一姿态下的旧零点最多沿用多久。比去皮有效期长：
+    # 称完手臂保持举起，过了 15 分钟再复位很常见；零点 20 分钟漂移 ≤ 8 g，远小于 50 g 的判据。
+    "empty_check_max_age_s": 3600.0,
 }
+
+SIDE_NAMES = {"right": "右手", "left": "左手", "both": "双手"}
 
 # 托举序列的中间段：先抬肘、掌心朝内（腕 yaw 保持出发值），再转腕 yaw 让掌心朝上。
 # 2026-11-23 现场确认：腕 yaw 负方向掌心朝上；先转腕再抬肘则掌心朝下，所以顺序不能反。
@@ -127,6 +151,19 @@ _WRIST_YAW = 4
 
 # 这些原因说明"再等也没用"，立即返回。
 _FATAL = {"no_force_data", "no_joint_data", "joint_error"}
+
+# 一键称重失败时对人说的话（按错误码）。没列出的错误码说一句通用的。
+_FAIL_SPEECH = {
+    "no_object": "没有检测到物品，本次称重结束",
+    "not_stable": "物品还在晃动，没有称出来，请放稳后重新称重",
+    "object_on_hand": "手上还有东西，请先拿走，再重新称重",
+    "unknown_start_pose": "手臂不在初始位置，请先复位",
+    "tare_failed": "去皮没有成功，请保持手上没有东西，再重新称重",
+    "hand_failed": "手指没有摆好，称重已停止",
+    "pose_changed_since_tare": "手臂位置变了，请复位后重新称重",
+    "joint_error": "手臂电机报错，称重已停止",
+    "servo_active": "手臂正在被其他程序控制，称重已停止",
+}
 
 
 def _log(message: str) -> None:
@@ -147,7 +184,8 @@ def _brief(result) -> str:
             "calibrated", "reasons", "warnings", "noise_kg", "max_joint_dev_deg", "max_current_ratio",
             "lever_arm_m", "tare_age_s", "samples", "waited_s", "timed_out", "rate_hz",
             "old_scale", "reference_mass_kg", "computed_scale", "load_kg", "already_in_pose",
-            "already_retracted", "tared", "tare_valid", "joints_deg")
+            "already_retracted", "tared", "tare_valid", "joints_deg", "load_kg", "stage", "seq",
+            "announce_problems")
     parts = [f"{k}={result[k]}" for k in keys if k in result and result[k] not in (None, [], "")]
     if isinstance(result.get("tare"), dict):
         parts.append("tare={" + _brief(result["tare"]) + "}")
@@ -201,7 +239,8 @@ class WeighEngine:
     """
 
     def __init__(self, config: dict | None = None, clock=time.monotonic, wall=time.time,
-                 sleep=time.sleep, log=_log, arm_call=None, hand_call=None, servo_call=None):
+                 sleep=time.sleep, log=_log, arm_call=None, hand_call=None, servo_call=None,
+                 tts_call=None):
         cfg = dict(DEFAULTS)
         cfg.update(config or {})
         cfg["sides"] = [s for s in SIDES if s in (cfg.get("sides") or SIDES)] or ["right"]
@@ -221,9 +260,16 @@ class WeighEngine:
         self._hand_call = hand_call                  # args → hand 卡 dispatch 结果（经 bundle）
         self._hand_started = False
         self._servo_call = servo_call                # args → servo 卡 dispatch 结果；servo 卡未加载时返回 None
+        self._tts_call = tts_call                    # args → tts 卡 dispatch 结果（经 bundle，带 _on_done）
         self._origin = {}                            # side → pose 出发时的手臂姿态（度），retract 回到这里
         self._tare = {s: None for s in SIDES}
+        self._hand = {s: None for s in SIDES}        # 本卡最后一次设成功的手型；None = 不确定
         self._last = {s: None for s in (*SIDES, "both")}
+        # 发布给 weigh_state 传感器：每只手最近一次测出的结果（不随去皮/收回清除），
+        # 以及最近一次 weigh 调用的结局。seq 每次 weigh 调用加一。
+        self._seq = 0
+        self._results = {s: None for s in (*SIDES, "both")}
+        self._attempt = None
         self._scales = self._load_scales()
 
     # ── 数据输入（ROS 回调线程调用，必须很快） ─────────────────────────────
@@ -429,8 +475,8 @@ class WeighEngine:
 
     @staticmethod
     def _side_arg(args: dict) -> str:
-        """引擎内部缺省为 right。经 MCP 的调用在 WeighPlugin.dispatch 处就要求显式填写 side：
-        卡片被多个调用方共用，不能保存一只"当前手"去替调用方做选择。"""
+        """缺省为 right（卡片上的默认值）。每次调用各自决定用哪只手，卡片不保存"当前手"
+        去替别的调用方做选择。"""
         value = (args or {}).get("side")
         return "right" if value in (None, "") else str(value)
 
@@ -1036,6 +1082,8 @@ class WeighEngine:
             # 手型没摆成（例如四指没立起来）就不算 pose 成功：不去皮、不切换当前手，
             # 免得上层以为可以往掌心放东西。
             problem = self._set_hand(hand, side)
+            for s in sides:
+                self._hand[s] = None if problem else hand
             if problem:
                 return self._error("hand_failed", side,
                                    f"手臂已到托举姿态，但手型 {hand} 没有设置成功（{problem}）。"
@@ -1093,20 +1141,13 @@ class WeighEngine:
                                    f"{s} 臂不在托举姿态，出于安全不自动收回。请用 arm 卡操作",
                                    joints_deg=[_r(x, 2) for x in cur])
             # 只要这只手臂要动，就先确认掌上是空的（托举姿态和中间姿态都一样）：
-            # 张开手指、转腕或放下手臂都可能让物体掉下去。去皮有效时看读数，否则要求确认。
+            # 张开手指、转腕或放下手臂都可能让物体掉下去。有可用的零点时看读数，否则要求确认。
             # 零点只在去皮时的姿态下有意义：姿态变了（例如停在中间姿态）就不能靠读数判断。
-            tare = self._tare[s]
-            problem, _ = self._tare_problem(s)
-            if tare is not None and problem is None:
-                live = self.analyze(s, cfg["block_s"], now)
-                if live.get("F") is None or live.get("q") is None:
-                    return self._error("force_data_unavailable", side,
-                                       f"{s} 手没有新鲜的力数据，无法判断掌上是否有物体")
-                dev = math.degrees(max(abs(x - y) for x, y in zip(live["q"], tare["q"])))
-                if dev > cfg["joint_dev_deg"]:
-                    problem = "pose_changed_since_tare"
-            if tare is not None and problem is None:
-                load = _norm(_sub(live["F"][:3], tare["F"][:3])) / G / self.scale_info(s)["scale"]
+            load, problem = self._palm_load(s, cfg["empty_check_max_age_s"], now)
+            if problem == "force_data_unavailable":
+                return self._error("force_data_unavailable", side,
+                                   f"{s} 手没有新鲜的力数据，无法判断掌上是否有物体")
+            if problem is None:
                 if load > cfg["retract_max_load_kg"]:
                     return self._error("object_on_hand", side,
                                        f"{s} 手掌上还有约 {load * 1000:.0f} g，先取走物体再收回",
@@ -1125,6 +1166,8 @@ class WeighEngine:
         # 先张开手指（四指立起时转腕可能卡到东西），再动手臂。张不开就不动手臂：
         # 手指还立着时转腕会碰到或甩掉掌上的东西。
         hand_problem = self._set_hand("open", side)
+        for s in sides:
+            self._hand[s] = None if hand_problem else "open"
         if hand_problem:
             return self._error("hand_open_failed", side,
                                f"张开手指失败（{hand_problem}），手臂没有动。"
@@ -1145,6 +1188,215 @@ class WeighEngine:
             self._origin.pop(s, None)
         return {"state": "retracted", "side": side, "experimental": True, "steps": steps,
                 **({"servo_paused": True} if servo_paused else {})}
+
+    # ── 一键称重（卡片的 weigh / reset） ────────────────────────────────────────
+
+    def _palm_load(self, side, max_age, now=None):
+        """用同一姿态下的零点估计掌上重量（kg）。返回 (load, problem)，problem 非 None 时 load 为 None：
+        not_tared / tare_expired / force_data_unavailable / pose_changed_since_tare。
+        max_age 可以比去皮有效期长——这里只回答"掌上有没有东西"，不是给出称重结果。"""
+        tare = self._tare[side]
+        if tare is None:
+            return None, "not_tared"
+        now = self._clock() if now is None else now
+        if now - tare["t"] > max_age:
+            return None, "tare_expired"
+        live = self.analyze(side, self.cfg["block_s"], now)
+        if live.get("F") is None or live.get("q") is None:
+            return None, "force_data_unavailable"
+        dev = math.degrees(max(abs(x - y) for x, y in zip(live["q"], tare["q"])))
+        if dev > self.cfg["joint_dev_deg"]:
+            return None, "pose_changed_since_tare"
+        return _norm(_sub(live["F"][:3], tare["F"][:3])) / G / self.scale_info(side)["scale"], None
+
+    def _in_pose(self, side, now=None) -> bool:
+        now = self._clock() if now is None else now
+        cur = self._arm_deg(side, now)
+        return cur is not None and self._within(cur, self._pose_deg(side), self.cfg["arrive_tol_deg"])
+
+    def _ready(self, side) -> bool:
+        """手臂在托举姿态、手型是 cup、去皮有效且姿态没变：可以直接请人放物品。"""
+        if not self._in_pose(side) or self._hand.get(side) != self.cfg["default_hand"]:
+            return False
+        if self._tare_problem(side)[0]:
+            return False
+        return self._palm_load(side, self.cfg["tare_ttl_s"])[1] is None
+
+    def _announce(self, text: str, wait: bool = True):
+        """经 tts 卡说一句话；wait=True 时等它播完（stop 可以取消等待）。
+        返回 None 表示成功（或配置为不出声），否则返回问题字符串。"""
+        if not self.cfg["announce"]:
+            return None
+        if self._tts_call is None:
+            self._log(f"[weigh] announce skipped, tts unavailable: {text}")
+            return "tts_unavailable"
+        done = threading.Event()
+        status = {}
+
+        def on_done(st):
+            status["status"] = st
+            done.set()
+
+        self._check_cancel()
+        try:
+            r = self._tts_call({"action": "speak", "text": text, "_on_done": on_done})
+        except Exception as exc:
+            self._log(f"[weigh] announce failed: {exc}")
+            return "tts_call_failed"
+        if r is None:
+            self._log(f"[weigh] announce skipped, tts card not loaded: {text}")
+            return "tts_unavailable"
+        if not isinstance(r, dict) or r.get("state") == "error" or r.get("error"):
+            self._log(f"[weigh] announce rejected: {_brief(r)}")
+            return "tts_rejected"
+        self._log(f"[weigh] announce: {text}")
+        if not wait:
+            return None
+        t0 = self._clock()
+        while not done.is_set():
+            if self._clock() - t0 > self.cfg["announce_timeout_s"]:
+                self._log(f"[weigh] announce timed out: {text}")
+                return "announce_timeout"
+            self._sleep(self.cfg["poll_s"])
+        st = status.get("status")
+        return None if st == "completed" else f"announce_{st}"
+
+    @staticmethod
+    def _speak_mass(mass_g) -> str:
+        if mass_g < 1000:
+            return f"{int(round(mass_g))}克"
+        return f"{mass_g / 1000:.2f}".rstrip("0").rstrip(".") + "千克"
+
+    def _result_speech(self, res) -> str:
+        if res.get("state") == "weighed":
+            if res.get("valid"):
+                if "below_resolution" in (res.get("warnings") or []):
+                    return "读数太小，请把物品放好后重新称重"
+                return f"称好了，物品大约{self._speak_mass(res['mass_g'])}"
+            if any(r.endswith(("current_high", "over_load_limit")) for r in res.get("reasons") or []):
+                return "物品可能太重，这次结果无效，请换轻一些的物品"
+            return "这次称重结果无效，请重新称重"
+        return _FAIL_SPEECH.get(res.get("code"), "称重没有完成，请查看卡片上的提示")
+
+    def _wait_for_object(self, sides, window):
+        """等掌上读数之和超过 detect_kg。返回 (load_kg, problem)；problem 为 None、no_object，
+        或零点不能用的原因（例如有人把手臂推离了去皮时的姿态）。"""
+        t0 = self._clock()
+        while True:
+            total = 0.0
+            for s in sides:
+                load, problem = self._palm_load(s, self.cfg["tare_ttl_s"])
+                if problem:
+                    return None, problem
+                total += load
+            if total >= self.cfg["detect_kg"]:
+                return total, None
+            if self._clock() - t0 >= window:
+                return total, "no_object"
+            self._sleep(self.cfg["poll_s"])
+
+    def auto_weigh(self, args: dict) -> dict:
+        """卡片的 weigh：必要时摆姿态并去皮 → 提示放物品 → 等放稳 → 测量 → 播报。称完手臂不动。"""
+        side = self._side_arg(args)
+        try:
+            sides = self._sides_of(side)
+        except ValueError as exc:
+            return self._error("bad_side", side, str(exc))
+        cfg = self.cfg
+        self._seq += 1
+        seq = self._seq
+        notes = []
+        where = SIDE_NAMES.get(side, side)
+
+        def say(text, wait=True):
+            problem = self._announce(text, wait)
+            if problem:
+                notes.append(problem)
+            return problem
+
+        if not all(self._ready(s) for s in sides):
+            # 手臂已在托举姿态、零点却不能直接用（过期、驱动重启后手型不确定等）：重新去皮之前
+            # 先确认掌上是空的，否则会把物品当成零点，之后的读数全错。
+            for s in sides:
+                if self._in_pose(s):
+                    load, _ = self._palm_load(s, cfg["empty_check_max_age_s"])
+                    if load is not None and load > cfg["detect_kg"]:
+                        return self._finish_auto(self._error(
+                            "object_on_hand", side,
+                            f"{SIDE_NAMES[s]}掌上还有约 {load * 1000:.0f} g，去皮时须空着；请先取走再调用 weigh",
+                            load_kg=_r(load)), "prepare", side, seq, notes, say)
+            say(f"开始称重，请先不要往{where}上放东西", wait=False)
+            prepared = self.pose({"side": side})
+            if prepared.get("state") != "posed":
+                return self._finish_auto(prepared, "prepare", side, seq, notes, say)
+        loads = [self._palm_load(s, cfg["tare_ttl_s"])[0] for s in sides]
+        if sum(x for x in loads if x is not None) < cfg["detect_kg"]:
+            window = cfg["place_window_s"]
+            say(f"请在{window:g}秒内把物品放到{where}掌心")
+            _, problem = self._wait_for_object(sides, window)
+            if problem == "no_object":
+                return self._finish_auto(self._error(
+                    "no_object", side,
+                    f"提示后 {window:g} 秒内没有检测到物品（阈值 {cfg['detect_kg']} kg）。"
+                    "手臂保持举起，可以再次调用 weigh"), "place", side, seq, notes, say)
+            if problem:
+                return self._finish_auto(self._error(
+                    problem, side, f"等待放物品时零点不能用了（{problem}），请 reset 后重新称重"),
+                    "place", side, seq, notes, say)
+        res = self.weigh({"side": side, "timeout_s": cfg["measure_timeout_s"]})
+        return self._finish_auto(res, "measure", side, seq, notes, say)
+
+    def _finish_auto(self, res, stage, side, seq, notes, say):
+        """记录结果（供 weigh_state 发布）、播报，并决定上报的状态。"""
+        res = dict(res, stage=stage, seq=seq)
+        if res.get("state") == "weighed":
+            self._results[side] = {
+                "seq": seq, "side": side, "valid": bool(res.get("valid")),
+                "mass_kg": res.get("mass_kg"), "mass_g": res.get("mass_g"),
+                "reasons": list(res.get("reasons") or []), "warnings": list(res.get("warnings") or []),
+                "scale": res.get("scale"), "calibrated": res.get("calibrated"),
+                "measured_at": res.get("measured_at"), "measured_at_ms": int(self._wall() * 1000)}
+        final_problem = say(self._result_speech(res))
+        if notes:
+            res["announce_problems"] = list(notes)
+        if res.get("state") == "weighed" and final_problem:
+            # 测出来了但人没听到：按失败上报。失败的 ACP 通知不会被 Agent Core 裁剪，
+            # 重量（mass_kg / mass_g）会随通知一起出现在 activity 栏。
+            res.update(state="error", code="announce_failed",
+                       error=f"称重完成，但语音没有播出来（{final_problem}）；重量见 mass_kg / mass_g")
+        self._attempt = {"seq": seq, "side": side, "stage": stage, "state": res.get("state"),
+                         "code": res.get("code"), "at_ms": int(self._wall() * 1000)}
+        return res
+
+    def reset(self, args: dict) -> dict:
+        """卡片的 reset：张开手指、放下手臂、清除去皮。掌上还有物品时拒绝并语音提示。"""
+        res = self.retract(args)
+        if res.get("state") == "retracted":
+            for s in self._sides_of(res["side"]):
+                self._tare[s] = None
+                self._last[s] = None
+            return dict(res, state="reset")
+        speech = {"object_on_hand": "手上还有东西，请先拿走，再复位",
+                  "load_unknown": "无法确认手上有没有东西，请先拿走物品，再勾选确认后复位"}.get(res.get("code"))
+        if speech:
+            problem = self._announce(speech)
+            if problem:
+                res = dict(res, announce_problems=[problem])
+        return res
+
+    def snapshot(self) -> dict:
+        """weigh_state 传感器的内容：每只手是否就绪、去皮状态和最近一次测出的结果。不阻塞。"""
+        now = self._clock()
+        sides = {}
+        for s in self.cfg["sides"]:
+            problem, age = self._tare_problem(s)
+            sides[s] = {"in_pose": self._in_pose(s, now), "hand": self._hand.get(s),
+                        "tare_valid": problem is None, "tare_age_s": _r(age, 1),
+                        "last": self._results.get(s)}
+        out = {"experimental": True, "seq": self._seq, "sides": sides, "last_attempt": self._attempt}
+        if self._results.get("both"):
+            out["both_last"] = self._results["both"]
+        return out
 
     # ── read ──
 
@@ -1218,13 +1470,18 @@ class WeighEngine:
 _RELIABLE_DEPTH = 10
 
 
-# agent-core/src/collector.py 的 _slim_acp_result 对成功的 ACP 通知只保留
-# elapsed_s、distance_m、duration_s。测量动作同步返回，以保留 mass_kg、valid 等字段。
-# 手臂运动超过 SYNC_GRACE_S 时返回 action_id，完成后通知 Agent Core。
-ASYNC_ACTIONS = ("pose", "retract")
-SYNC_ACTIONS = ("tare", "weigh", "calibrate")
-RUNNING_STATE = {"pose": "posing", "retract": "retracting"}
-COMPLETION_TIMEOUT_S = 120
+# 卡片上只露 weigh / reset，两者都会动手臂、要等人放物品，走 ACP：超过 SYNC_GRACE_S 时
+# 先返回 action_id，做完通知 Agent Core。agent-core/src/collector.py 的 _slim_acp_result
+# 对成功的通知只保留 elapsed_s、distance_m、duration_s，所以重量靠语音播报，数值由
+# weigh_state 传感器发布；测出来却没播出来时按失败上报（失败的通知不裁剪）。
+CARD_ACTIONS = ("weigh", "reset")
+ASYNC_ACTIONS = CARD_ACTIONS
+# 维护用，不在卡片上显示，经 MCP 直接调用、同步返回：calibrate 设定比例系数，read 查看状态。
+MAINTENANCE_ACTIONS = ("calibrate", "read")
+ENGINE_METHODS = {"weigh": "auto_weigh", "reset": "reset", "calibrate": "calibrate"}
+RUNNING_STATE = {"weigh": "weighing", "reset": "resetting"}
+# 最坏情况：两段摆臂各约 13 s + 手指 + 去皮 ≤ 10 s + 两次播报各 ≤ 30 s + 放物品 5 s + 测量 ≤ 10 s。
+COMPLETION_TIMEOUT_S = 180
 SYNC_GRACE_S = 0.5
 
 
@@ -1235,20 +1492,21 @@ def _default_acp_notify(action_id: str, status: str, result: dict, tool: str = "
 
 
 class WeighPlugin:
-    """腕部六维力称重卡。自己不创建任何发布者；pose/retract 经 arm 卡下发运动。"""
+    """腕部六维力称重卡。自己不创建任何发布者；手臂、手指和语音都经 bundle 调用对应的卡。"""
 
     PREFIX = "weigh"
 
     def __init__(self, plugin_config: dict, namespace: str, ros2, arm_call=None, hand_call=None,
-                 acp_notify=None, servo_call=None):
-        """arm_call(args) → dict：由 bundle 提供，等同于对 arm 卡调用 tools/call。
+                 acp_notify=None, servo_call=None, tts_call=None):
+        """arm_call / hand_call / servo_call / tts_call(args) → dict：由 bundle 提供，等同于对
+        对应的卡调用 tools/call（tts_call 额外带 _on_done 回调）。
         acp_notify(action_id, status, result, tool)：异步动作完成时回调 Agent Core。"""
         self._acp_notify = acp_notify or _default_acp_notify
         self._sync_grace_s = SYNC_GRACE_S
         self._ns = namespace
         self._ros2 = ros2
         self._engine = WeighEngine(plugin_config, arm_call=arm_call, hand_call=hand_call,
-                                   servo_call=servo_call)
+                                   servo_call=servo_call, tts_call=tts_call)
         self._sides = self._engine.cfg["sides"]
         self._node = None
         self._executor = None
@@ -1263,79 +1521,42 @@ class WeighPlugin:
 
     def get_tool(self) -> dict:
         cfg = self._engine.cfg
-        window = {"type": "number", "minimum": 1,
-                  "maximum": min(MAX_DURATION_S, cfg["max_timeout_s"] - 1.0),
-                  "default": cfg["default_duration_s"],
-                  "description": "稳定窗口长度（秒），默认 3"}
-        timeout = {"type": "number", "minimum": 2, "maximum": cfg["max_timeout_s"],
-                   "default": cfg["default_timeout_s"],
-                   "description": f"最长等待读数稳定的时间（秒），默认 {cfg['default_timeout_s']:g}"}
+        window = cfg["place_window_s"]
         return {
             "name": "weigh",
             "type": "actuator",
             "description": (
-                "天轶2.0 掌心托举称重（实验性）。side 选 left / right / both，both 时两只手同时托、"
-                "分别称重后相加（例如一只手放一件，或一个大件两手一起托）。"
-                "流程：pose 把手臂摆到托举姿态（掌心朝上、四指立起围住掌心）并自动去皮——调用前手臂须垂下、"
-                "掌心空着、周围无人无物；然后请人把物体放到掌心，调用 weigh 得到重量；称完先取走物体，"
-                "再 retract（先张开手指再收回手臂）。只有 pose/retract 会移动手臂和手指，其余动作只读。"
-                "每次调用都必须填写 side，并与 pose 时一致。手臂或手型变了必须重新 tare。"
-                f"适用约 {cfg['resolution_kg']} kg 以上的静止物体，"
-                + (f"上限 {cfg['load_limit_kg']} kg；" if cfg["load_limit_kg"] else
-                   f"上限由腕部电流决定（超过额定 {int(cfg['current_ratio_max'] * 100)}% 判无效，估计掌心约 2 kg，未实测）；")
-                + "结果带 valid 标记，valid=false 时不要使用 mass_kg。不能替代电子秤计量。"
-                "pose/retract 需要较长时间时先返回 action_id，完成后发送通知。"
-                "tare/weigh/calibrate 同步返回测量结果，默认采集约 3 秒，重量直接出现在 weigh 返回值里。"
+                "天轶2.0 掌心称重（实验性）。weigh：机器人自己抬起手臂、四指立起托住掌心并去皮，"
+                f"语音提示「请在{window:g}秒内把物品放到右手掌心」，物品放稳后测量并播报重量；"
+                "称完手臂保持举起，可以接着称下一件。reset：张开手指、放下手臂（掌上还有物品时拒绝）。"
+                "side 选 right（默认）或 left。调用前手臂须垂下或已在托举姿态，周围无人无物。"
+                "重量由机器人播报，完成通知里不含重量；需要数值时，weigh 完成后读取 weigh_state 传感器"
+                "（sides.<side>.last.mass_kg，valid=true 才可用，用 seq / measured_at_ms 确认是这一次的结果）。"
+                f"适用约 {cfg['detect_kg']} kg 以上的静止物体，不能替代电子秤计量。"
             ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string",
-                               "enum": ["pose", "tare", "weigh", "calibrate", "read", "retract"],
-                               "description": "pose=摆托举姿态并去皮 tare=去皮 weigh=称重 "
-                                              "calibrate=设定比例系数 read=查看状态 retract=收回手臂"},
-                    "side": {"type": "string",
-                             "enum": list(self._sides) + (["both"] if len(self._sides) == 2 else []),
-                             "description": "用哪只手：left / right / both（两手结果相加）。必填，"
-                                            "pose 之后的各个动作要用同一个值"},
-                    "duration_s": window,
-                    "timeout_s": timeout,
-                    "known_mass_kg": {"type": "number", "minimum": cfg["min_calibration_kg"],
-                                      "maximum": cfg["load_limit_kg"] or cfg["max_calibration_kg"],
-                                      "description": "实测校准：手上物体的已知重量（kg）。与 scale 二选一"},
-                    "scale": {"type": "number", "minimum": cfg["scale_min"], "maximum": cfg["scale_max"],
-                              "description": "手动设定比例系数（原始读数 / 真实重量）。与 known_mass_kg 二选一"},
-                    "hand": {"type": "string", "enum": ["cup", "open", "keep"], "default": "cup",
-                             "description": "pose 的手型：cup=四指立起围住掌心（默认，物体放得稳）"
-                                            " open=手指摊开 keep=不动手指"},
+                    "action": {"type": "string", "enum": list(CARD_ACTIONS),
+                               "description": "weigh=称重（全自动） reset=复位：张开手指、放下手臂"},
+                    "side": {"type": "string", "enum": list(self._sides),
+                             "default": "right" if "right" in self._sides else self._sides[0],
+                             "description": "用哪只手，默认右手"},
                     "confirm_empty": {"type": "boolean", "default": False,
-                                      "description": "retract：没有有效去皮、无法检测掌上物体时，确认掌心已空"},
+                                      "description": "仅 reset：机器人提示无法确认手上有没有东西时"
+                                                     "（例如驱动重启过），确认掌心已空后勾选"},
                 },
-                "required": ["action", "side"],
+                "required": ["action"],
                 "x-action-params": {
-                    "pose": {"params": ["side", "hand", "duration_s", "timeout_s"],
-                             "description": "移动手臂到托举姿态（先抬前臂、再转腕让掌心朝上，约 12 秒；both 两臂同时动），"
-                                            "再把四指立起围住掌心（hand=cup，默认），然后自动去皮。"
-                                            "只能从手臂垂下或已在托举姿态时调用；"
-                                            "调用前确认掌心空着、手臂周围无人无物"},
-                    "tare": {"params": ["side", "duration_s", "timeout_s"],
-                             "description": "去皮：手臂已停在托举姿态且掌心空着时调用，记录零点和关节角"},
-                    "weigh": {"params": ["side", "duration_s", "timeout_s"],
-                              "description": "称重：放上物体后调用，等读数稳定后返回重量（kg）；需先 tare。"
-                                             "both 返回两手之和，per_side 里是各手的读数"},
-                    "calibrate": {"params": ["side", "known_mass_kg", "scale", "duration_s", "timeout_s"],
-                                  "description": "设定比例系数（每只手各自一个）：传 known_mass_kg 放已知重量物体实测校准"
-                                                 "（需先 tare，只能 left 或 right），或传 scale 直接写入（可 both）；结果持久保存"},
-                    "read": {"params": ["side"],
-                             "description": "立即返回去皮状态、上一次称重结果和实时读数，不等待"},
-                    "retract": {"params": ["side", "confirm_empty"],
-                                "description": "收回手臂：先张开手指，再转腕让掌心朝内、放下前臂，回到 pose 之前的姿态。"
-                                               "掌上检测到物体时拒绝，须先取走物体"},
+                    "weigh": {"params": ["side"],
+                              "description": "称重：必要时抬臂并去皮（约 15 秒），语音提示放物品，"
+                                             "放稳后测量并播报重量；称完手臂保持举起"},
+                    "reset": {"params": ["side", "confirm_empty"],
+                              "description": "复位：张开手指、放下手臂、清除去皮；掌上有物品时拒绝"},
                 },
-                # 与 arm / arm_gesture / hand 同一通道：pose/retract 经 arm 卡驱动双臂指令（未选中的手臂保持原位）、
-                # 经 hand 卡设手型；tare/weigh 也要等手臂和手指上的其他动作做完。
                 "x-completion": {"actions": list(ASYNC_ACTIONS), "timeout": COMPLETION_TIMEOUT_S},
-                "x-resource": ["arm_l", "arm_r", "hand_l", "hand_r"],
+                # 经 arm 卡驱动双臂指令（未选中的手臂保持原位）、经 hand 卡设手型、经 tts 卡说话。
+                "x-resource": ["arm_l", "arm_r", "hand_l", "hand_r", "mouth"],
             },
         }
 
@@ -1472,13 +1693,18 @@ class WeighPlugin:
             return {"state": "stopping", "error": "进行中的动作还没退出；它不会再下发指令，退出后自动停止"}
         if action == "info":
             return {"state": "ready" if self._node is not None else "idle", "sides": list(self._sides)}
-        if action not in (*ASYNC_ACTIONS, *SYNC_ACTIONS, "read"):
+        if action not in (*CARD_ACTIONS, *MAINTENANCE_ACTIONS):
             return {"error": f"unknown action: {action}"}
-        if args.get("side") in (None, ""):
-            result = {"state": "error", "code": "side_required", "experimental": True,
-                      "error": "必须填写 side（left / right / both），并与 pose 时一致"}
-            print(f"[weigh] {action} args={args} -> {_brief(result)}", flush=True)
-            return result
+        if action in CARD_ACTIONS:
+            # 卡片动作：side 可省略，默认右手；只接受卡片上列出的手。
+            side = args.get("side")
+            if side in (None, ""):
+                args["side"] = "right" if "right" in self._sides else self._sides[0]
+            elif side not in self._sides:
+                result = {"state": "error", "code": "bad_side", "experimental": True,
+                          "error": f"side 只能是 {list(self._sides)}，收到 {side!r}"}
+                print(f"[weigh] {action} args={args} -> {_brief(result)}", flush=True)
+                return result
         try:
             self.start()   # 卡片未 start 也能直接调用：首次调用时订阅
         except Exception as exc:
@@ -1493,7 +1719,7 @@ class WeighPlugin:
 
     def _call_engine(self, action: str, args: dict) -> dict:
         try:
-            return getattr(self._engine, action)(args)
+            return getattr(self._engine, ENGINE_METHODS[action])(args)
         except Cancelled:
             print(f"[weigh] {action} cancelled by stop", flush=True)
             return {"state": "cancelled", "code": "cancelled", "experimental": True,
@@ -1505,7 +1731,7 @@ class WeighPlugin:
             return {"state": "error", "code": "internal_error", "error": f"{type(exc).__name__}: {exc}"}
 
     def _start_job(self, action: str, args: dict, t0: float) -> dict:
-        """在可取消的工作线程中执行动作。测量同步返回，较长的手臂动作走 ACP。"""
+        """在可取消的工作线程中执行动作。卡片动作超过宽限期走 ACP，维护动作同步返回。"""
         if self._stopping:
             return {"state": "error", "code": "stopping", "error": "卡片正在停止，等上一个动作退出后再调用"}
         if not self._busy.acquire(blocking=False):
@@ -1549,6 +1775,119 @@ class WeighPlugin:
             if done.is_set():
                 return job["result"]
             job["async"] = True
+        message = ("称重进行中：机器人会语音提示放物品并播报重量。完成通知里不含重量，"
+                   "需要数值时在完成后读取 weigh_state 传感器" if action == "weigh"
+                   else "复位进行中：张开手指、放下手臂")
         return {"state": RUNNING_STATE[action], "action_id": action_id,
-                "side": self._engine._side_arg(args), "experimental": True,
-                "message": "动作在后台进行，完成后会收到结果；也可以之后用 read 查看 last_result"}
+                "side": self._engine._side_arg(args), "experimental": True, "message": message}
+
+    def snapshot(self) -> dict:
+        """weigh_state 传感器读取的状态（见 WeighEngine.snapshot）。"""
+        return self._engine.snapshot()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# WeighStatePlugin — 传感器卡（name=weigh_state）：发布最近一次称重结果
+# ══════════════════════════════════════════════════════════════════════════════
+
+class WeighStatePlugin:
+    """把 weigh 卡的状态和最近一次结果发布到 ``/{ns}/state/weigh``（data/json，默认 2 Hz）。
+
+    weigh 走 ACP，成功的完成通知会被 Agent Core 裁掉重量；skill / 大模型要用数值，就在
+    weigh 完成后读这个传感器。只发布 JSON 状态，不发任何控制指令；sensor 类型不受 ACP
+    barrier 阻塞，weigh 进行中也能随时读。
+    """
+
+    PREFIX = "weigh_state"
+
+    def __init__(self, plugin_config: dict, namespace: str, ros2, weigh_plugin):
+        self._ros2 = ros2
+        self._weigh = weigh_plugin
+        self._topic = f"/{namespace}/state/weigh"
+        self._period = 1.0 / max(0.2, float((plugin_config or {}).get("rate_hz", 2.0)))
+        self._lock = threading.Lock()
+        self._running = False
+        self._pub = None
+        self._thread = None
+
+    def get_tool(self) -> dict:
+        return {
+            "name": "weigh_state",
+            "type": "sensor",
+            "multiInstance": False,
+            "readOnly": True,
+            "description": (
+                "天轶2.0 掌心称重的结果（实验性，配合 weigh 卡使用）。sides.<right|left>.last 是该手最近一次"
+                "测出的结果：mass_kg / mass_g、valid（false 时不要使用重量）、reasons、seq、measured_at_ms；"
+                "in_pose / tare_valid 表示手臂是否已在托举姿态、去皮是否有效。last_attempt 是最近一次 weigh"
+                "调用的结局（含失败，例如 no_object）。调用 weigh 前记下 seq，完成后 seq 变大且 last.seq 与之"
+                "相同，才是这一次的结果。"
+            ),
+            "inputSchema": {"type": "object", "properties": {}},
+            "topic_out": [{"topic": self._topic, "format": "data/json"}],
+        }
+
+    def _produce(self) -> dict:
+        payload = self._weigh.snapshot()
+        payload["timestamp_ms"] = int(time.time() * 1000)
+        return payload
+
+    def start(self) -> None:
+        with self._lock:
+            if self._running:
+                return
+            from rclpy.node import Node
+            from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+            from std_msgs.msg import String
+            if self._pub is None:
+                node = Node("tianyi2_weigh_state_pub", context=self._ros2.ctx_core)
+                self._ros2.executor_core.add_node(node)
+                qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, history=HistoryPolicy.KEEP_LAST,
+                                 depth=_RELIABLE_DEPTH, durability=DurabilityPolicy.VOLATILE)
+                self._pub = (node.create_publisher(String, self._topic, qos), String)
+            try:
+                self._weigh.start()      # 订阅力和关节数据，in_pose / tare 状态才是实时的
+            except Exception as exc:
+                print(f"[weigh_state] weigh subscription failed: {exc}", flush=True)
+            self._running = True
+            self._thread = threading.Thread(target=self._loop, name="weigh-state", daemon=True)
+            self._thread.start()
+        print(f"[weigh_state] publishing {self._topic} every {self._period:.1f}s", flush=True)
+
+    def stop(self) -> None:
+        with self._lock:
+            self._running = False
+            thread, self._thread = self._thread, None
+        if thread is not None:
+            thread.join(timeout=2.0)
+
+    def _loop(self) -> None:
+        pub, String = self._pub
+        failures = 0
+        while self._running:
+            try:
+                msg = String()
+                msg.data = json.dumps(self._produce(), ensure_ascii=False)
+                pub.publish(msg)
+            except Exception as exc:
+                failures += 1
+                if failures == 1 or failures % 100 == 0:
+                    print(f"[weigh_state] publish failed (count={failures}): {exc}", flush=True)
+            time.sleep(self._period)
+
+    def dispatch(self, action: str, args: dict) -> dict | None:
+        topic_out = [{"topic": self._topic, "format": "data/json"}]
+        if action == "start":
+            try:
+                self.start()
+            except Exception as exc:
+                return {"state": "error", "error": f"weigh_state start failed: {exc}"}
+            return {"state": "running", "topic_out": topic_out}
+        if action == "stop":
+            self.stop()
+            return {"state": "idle", "topic_out": topic_out}
+        if action == "info":
+            return {"state": "running" if self._running else "idle", "topic_out": topic_out}
+        if action == "read":
+            return self._produce()
+        return {"state": "error", "error": f"unknown action: {action}"}

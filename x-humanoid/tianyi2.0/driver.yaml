@@ -53,3 +53,4 @@ cards:
   - { name: light,              type: actuator }
   - { name: vision_capture,     type: actuator }
   - { name: weigh,              type: actuator }
+  - { name: weigh_state,        type: sensor }

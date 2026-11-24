@@ -433,3 +433,39 @@ def test_no_cancel_event_single_slot_left_in_the_plugin():
     code = [ln for ln in tts.split("\n")
             if "self._cancel_event" in ln and not ln.lstrip().startswith("#")]
     assert code == [], code
+
+
+# ── 驱动内部调用：回调调用方，不发 ACP ───────────────────────────────────────
+
+def test_internal_speak_reports_to_its_callback_not_to_acp():
+    """weigh 卡经 bundle 调 speak 时带 _on_done：Agent Core 没有登记这条 action_id，
+    回 ACP 只会是一条孤儿通知；weigh 卡要的是「这句播完了」再开始计时。"""
+    p = make_plugin(script=[plan(0.2), plan(0.15)])
+    got = []
+    r = p.dispatch("speak", {"text": "请在5秒内把物品放到右手掌心", "_on_done": got.append})
+    assert r["state"] == "speaking"
+    assert wait_for(lambda: got == ["completed"]), got
+    plain = p.dispatch("speak", {"text": "普通播报。"})
+    assert wait_for(lambda: len(p.acp) == 1)
+    assert p.acp == [(plain["action_id"], "completed")]      # 只有普通那条回了 ACP
+    assert [s[1] for s in p.lyre.submitted] == ["请在5秒内把物品放到右手掌心", "普通播报。"]
+
+
+def test_flushed_internal_speak_also_reports_to_its_callback():
+    p = make_plugin(script=[plan(5.0), DEAD], grace=5.0)
+    a = p._speak("正在播的。", force=False)
+    got = []
+    b = p.dispatch("speak", {"text": "排队的内部提示。", "_on_done": got.append})
+    assert wait_for(lambda: len(p.lyre.submitted) == 1)
+    p.dispatch("interrupt", {})
+    assert wait_for(lambda: got == ["cancelled"]), got
+    assert wait_for(lambda: len(p.acp) == 1)
+    assert dict(p.acp) == {a["action_id"]: "cancelled"}
+    assert b["action_id"] not in dict(p.acp)
+
+
+def test_non_callable_on_done_is_ignored():
+    """MCP 传不了可调用对象；传个字符串也只当普通播报。"""
+    p = make_plugin(script=[plan(0.15)])
+    r = p.dispatch("speak", {"text": "外部调用。", "_on_done": "x"})
+    assert wait_for(lambda: p.acp == [(r["action_id"], "completed")]), p.acp

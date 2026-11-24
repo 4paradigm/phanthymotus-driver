@@ -472,20 +472,31 @@ class TianyiDeviceBundle:
 
         if plugins_cfg.get("weigh", {}).get("enabled", False):
             # Wrist force/torque weighing card (experimental; on by default, moves
-            # the arms only on an explicit pose/retract).
+            # the arms only on an explicit weigh/reset).
             # It must never take the rest of the driver down with it.
             try:
                 from weigh import WeighPlugin
-                # pose/retract move the arm and fingers through the arm/hand cards, via the
-                # same routing as tools/call (lazy start, preflight, feedback).
-                self._plugins.append(WeighPlugin(
+                # weigh/reset move the arm and fingers through the arm/hand cards and
+                # speak through the tts card, via the same routing as tools/call (lazy
+                # start, preflight, feedback). tts_call passes an _on_done callback, so
+                # the tts card reports back to weigh instead of posting its own ACP.
+                weigh_plugin = WeighPlugin(
                     plugins_cfg["weigh"], namespace, ros2,
                     arm_call=lambda args: self._dispatch("arm", dict(args)),
                     hand_call=lambda args: self._dispatch("hand", dict(args)),
-                    # The servo card streams arm/hand targets too; pose/retract
+                    # The servo card streams arm/hand targets too; weigh/reset
                     # pause it before moving (explicit action wins over the stream).
-                    servo_call=lambda args: self._dispatch("servo", dict(args))))
+                    servo_call=lambda args: self._dispatch("servo", dict(args)),
+                    tts_call=lambda args: self._dispatch("tts", dict(args)))
+                self._plugins.append(weigh_plugin)
                 print("[bundle] WeighPlugin loaded (weigh)")
+                if plugins_cfg.get("weigh_state", {}).get("enabled", False):
+                    # Publishes the latest weighing result for skills: weigh's ACP
+                    # completion is slimmed by agent-core and does not carry the mass.
+                    from weigh import WeighStatePlugin
+                    self._plugins.append(WeighStatePlugin(
+                        plugins_cfg["weigh_state"], namespace, ros2, weigh_plugin))
+                    print("[bundle] WeighStatePlugin loaded (weigh_state)")
             except Exception as e:
                 print(f"[bundle] WeighPlugin NOT loaded: {e}", flush=True)
 
