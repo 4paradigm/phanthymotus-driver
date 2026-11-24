@@ -114,14 +114,14 @@ def start_with_fake_client(plugin, client=None):
 
 # ── registration and geometry ───────────────────────────────────────────────
 
-def test_card_is_registered_with_a_data_json_input():
+def test_card_is_registered_with_a_control_input():
     full = load_config(DRIVER / "config.yaml")
     plugins = build_plugins(full, "", None)
     tools = {item["name"]: item for item in DriverBundle(plugins).get_all_tools()}
     assert "hand_visual_follow" in tools
     tool = tools["hand_visual_follow"]
     assert tool["type"] == "actuator"
-    assert tool["topic_in"][0]["format"] == "data/json"
+    assert tool["topic_in"][0]["format"] == "control/hand_flex"
     assert tool["inputSchema"]["x-is-dangerous"] is True
     enum = tool["inputSchema"]["properties"]["action"]["enum"]
     assert "start" in enum and "stop" in enum and "info" in enum
@@ -582,3 +582,12 @@ def test_sway_roll_travel_are_independent_and_spare_fingers():
     assert t_b[9] > t_a[9], "smaller roll travel -> roll pulled toward open"
     for i in (2, 3, 4, 5, 6, 7, 8):
         assert t_a[i] == t_b[i], "four fingers must be untouched"
+
+
+def test_input_declares_control_hand_flex_format():
+    """Driver must declare the same control format as hand_landmarks output."""
+    plugin = make_plugin()
+    definition = plugin.get_tool()
+    tin = definition.get('topic_in', [])
+    assert any(t.get('format') == 'control/hand_flex' for t in tin), tin
+    assert not any(t.get('format') == 'data/json' for t in tin)

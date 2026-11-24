@@ -5,7 +5,7 @@ completion, a halfway pause and a poll to the target. That is the right shape
 for an LLM deciding to close a hand, and the wrong shape for a vision model
 emitting a new hand shape several times a second.
 
-This card is the stream-shaped path. It subscribes to ``data/json`` from the
+This card is the stream-shaped path. It subscribes to ``control/hand_flex`` from the
 ActuCore hand-vision card, maps five normalized finger curls onto the L20 Lite's
 *own calibrated* open/fist poses, limits the step per tick, and writes raw
 0..255 positions over the same Modbus connection. It is deliberately a driver
@@ -450,7 +450,7 @@ class VisualFollowPlugin:
                 "confirm_motion": {"type": "boolean", "enum": [True, False],
                                    "description": "确认手及周围安全后选 true；只有 resume 需要"},
                 "input_topic": {"type": "string",
-                                "description": "ROS2 话题，需连接上游 motus.hand/1 的 data/json 输出"},
+                                "description": "ROS2 话题，需连接上游 hand_landmarks 的 control/hand_flex 输出"},
                 "bound_side": {"type": "string", "enum": ["left", "right"]},
                 "instance_id": {"type": "string"},
             },
@@ -475,8 +475,8 @@ class VisualFollowPlugin:
             PREFIX, "actuator",
             "手部视觉连续跟随：把 0..1 的五指弯曲量按已标定姿态映射到 L20 Lite 原始关节位置。",
             schema,
-            topic_in=[{"format": "data/json",
-                       "desc": "motus.hand/1 手部关键点与五指弯曲量"}],
+            topic_in=[{"format": "control/hand_flex",
+                       "desc": "control/hand_flex 五指弯曲量指令流（motus.hand/1 payload）"}],
         )
         definition["title"] = "L20 Lite 视觉跟随"
         return definition
@@ -652,7 +652,7 @@ class VisualFollowPlugin:
             # stays torque-free until a human picks "resume" and confirms.
             topic = str(args.get("input_topic") or "")
             if not topic:
-                return {"state": "error", "error": "input_topic is required; wire a motus.hand/1 data/json source"}
+                return {"state": "error", "error": "input_topic is required; wire a control/hand_flex source"}
             side, port = self._side_for(instance_id)
             connection = self._connection(instance_id, side, port)
             with self.hand._bus_lock:
