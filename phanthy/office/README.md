@@ -1,4 +1,6 @@
-# 前台访客贴打印（frontdesk/visitor_badge）
+# Phanthy 办公室场景（phanthy/office）
+
+办公室场景的设备驱动。目前包含前台访客贴打印。
 
 机器人查询当天还没入场的访客，并在前台打印机上打印访客贴。
 

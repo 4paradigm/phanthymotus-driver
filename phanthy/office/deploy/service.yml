@@ -1,6 +1,6 @@
-frontdesk-visitor-badge:
+phanthy-office:
   image: __IMAGE__
-  container_name: embodied-frontdesk-visitor-badge
+  container_name: embodied-phanthy-office
   network_mode: host
   volumes:
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro

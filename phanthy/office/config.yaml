@@ -1,5 +1,5 @@
 mcp_port: 15750
-name: "Front Desk Visitor Badge Printer"
+name: "Phanthy Office"
 
 plugins:
   visitor_badge:

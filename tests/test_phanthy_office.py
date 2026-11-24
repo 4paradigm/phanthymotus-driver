@@ -15,7 +15,7 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DRIVER = ROOT / "frontdesk" / "visitor_badge"
+DRIVER = ROOT / "phanthy" / "office"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))   # for `common`
 
