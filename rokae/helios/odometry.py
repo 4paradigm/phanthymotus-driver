@@ -1,4 +1,4 @@
-"""Read-only chassis localization and body-frame speed for Navi."""
+"""Vendor odometry pose and body-frame speed, in the loco_state layout."""
 
 from __future__ import annotations
 
@@ -13,26 +13,22 @@ from common.odom import build_interface, build_sample
 from common.vendor_runtime import tool
 from .chassis_pose_pb2 import UiDatagram
 from .feedback import StreamFeedbackClient, positive_number, validate_url
+from .sdk_odometry import SdkOdometryClient
 
 
 SPEED_AXES = ("vx", "vy", "wz")
 
 
-def parse_pose_frame(raw):
-    """Decode the chassis state pose and its optional speed feedback."""
+def parse_speed_frame(raw):
+    """Decode current_state.speed and its enclosing chassis timestamp."""
     message = UiDatagram()
     try:
         message.ParseFromString(raw)
     except DecodeError as exc:
-        raise ValueError("invalid chassis pose Protobuf frame") from exc
+        raise ValueError("invalid chassis state Protobuf frame") from exc
     if not message.HasField("current_state"):
         return None
     state = message.current_state
-    if not state.HasField("pose"):
-        raise ValueError("current_state has no pose")
-    values = [float(state.pose.x), float(state.pose.y), float(state.pose.theta)]
-    if not all(math.isfinite(value) for value in values):
-        raise ValueError("chassis pose contains non-finite values")
     stamp = state.timeStamp if state.timeStamp > 0 else None
     speed = None
     if state.HasField("speed") and stamp is not None:
@@ -40,27 +36,26 @@ def parse_pose_frame(raw):
         # distinguishes a real stationary observation from a missing speed.
         speed = [value if math.isfinite(value) else None
                  for value in (state.speed.vx, state.speed.vy, state.speed.w)]
-    return {"x": values[0], "y": values[1], "yaw": values[2],
-            "source_stamp_ms": stamp, "speed": speed}
+    return {"source_stamp_ms": stamp, "speed": speed}
 
 
-class PoseFeedbackClient(StreamFeedbackClient):
+class SpeedFeedbackClient(StreamFeedbackClient):
     def __init__(self, url, **kwargs):
         self._last_stamp = None
-        super().__init__(url, parser=self._parse, data_key="pose", binary=True,
+        super().__init__(url, parser=self._parse, data_key="speed_feedback", binary=True,
                          max_msg_size=8 * 1024 * 1024, **kwargs)
 
     def _parse(self, raw):
-        pose = parse_pose_frame(raw)
-        if pose is None:
+        feedback = parse_speed_frame(raw)
+        if feedback is None:
             return None
-        stamp = pose["source_stamp_ms"]
+        stamp = feedback["source_stamp_ms"]
         if stamp is not None and self._last_stamp is not None and stamp <= self._last_stamp:
             # Replayed frames must not keep a frozen observation fresh.
             return None
         if stamp is not None:
             self._last_stamp = stamp
-        return pose
+        return feedback
 
     def _on_connect(self):
         self._last_stamp = None
@@ -69,34 +64,28 @@ class PoseFeedbackClient(StreamFeedbackClient):
 class HeliosOdometry:
     PREFIX = "odometry"
 
-    def __init__(self, config, namespace="rokae_helios", ros2=None, client=None):
+    def __init__(self, config, namespace="rokae_helios", ros2=None, client=None, native=None):
         self._config = config
         self._ros2 = ros2
         self._node = None
         self._publishers = []
         self._lock = threading.RLock()
-        self._origin = None
         self._hz = positive_number(config.get("odometry_publish_hz", 10), "odometry_publish_hz")
         if self._hz > 30:
             raise ValueError("odometry_publish_hz must not exceed 30")
-        # A producer must not call an unverified map unit a metre. The standard
-        # pose port stays null until the installation declares m or mm.
-        self._unit = config.get("odometry_position_unit", "unverified")
-        if self._unit not in ("unverified", "m", "mm"):
-            raise ValueError("odometry_position_unit must be unverified, m or mm")
-        self._scale = 0.001 if self._unit == "mm" else 1.0
-        self._frame = f"{namespace}/relative_start"
+        self._frame = f"{namespace}/odom"
         self._child = f"{namespace}/chassis_planar"
         self._topics = [
-            {"topic": f"/{namespace}/state/relative_pose", "format": "data/json"},
+            {"topic": f"/{namespace}/loco/state", "format": "data/json"},
             {"topic": f"/{namespace}/state/odom", "format": "state/odom"},
         ]
         url = (os.getenv("HELIOS_ODOMETRY_STATE_URL") or config.get("odometry_state_url")
                or config.get("battery_state_url"))
         self.client = client or self._new_client(url)
+        self._native = native if native is not None else SdkOdometryClient(config, self.client.stale_timeout)
 
     def _new_client(self, url):
-        return PoseFeedbackClient(
+        return SpeedFeedbackClient(
             url, stale_timeout_s=self._config.get("odometry_stale_timeout_s", 1),
             connect_timeout_s=self._config.get("connect_timeout_s", 3),
             reconnect_delay_s=self._config.get("reconnect_delay_s", 1),
@@ -105,27 +94,20 @@ class HeliosOdometry:
     def _odom_interface(self):
         return build_interface(
             provides=SPEED_AXES, frame="body", rate_hz=self._hz,
-            pose_drift="none" if self._unit == "unverified" else "unbounded",
+            pose_drift="unbounded" if self._native.installed else "none",
             timing={"stamp_source": "received"},
         )
 
     def get_tools(self):
         sensor = tool(
             "odometry", "sensor",
-            "Helios 只读相对位姿：首次有效位姿为原点，输出 x、y、yaw；"
-            "停止后再开始重新置零。来自底盘定位结果，不保证连续轮式里程计；"
-            "标准端口另提供 Navi 所需的机体系线速度和角速度。位置单位未确认时仅显示原始尺度，"
-            "标准 state/odom 的 pose 为 null。",
+            "Helios 里程计，持续显示原厂底盘坐标中的 x、y、yaw 和机体系速度。"
+            "位姿由原厂 SDK 提供，单位为米和弧度。标准端口同时提供 Navi 速度反馈。",
             topic_out=self._topics,
         )
         sensor["configSchema"] = {"type": "object", "properties": {
             "odometry_state_url": {"type": "string", "scope": "shared", "x-sensitive": True,
                                    "description": "底盘只读状态 WebSocket 地址（留空使用部署配置）"},
-            "odometry_position_unit": {
-                "type": "string", "scope": "shared", "enum": ["unverified", "m", "mm"],
-                "default": "unverified",
-                "description": "厂家位置单位：未确认保留原始尺度；确认米或毫米后才输出标准米制位姿",
-            },
         }}
         return [sensor]
 
@@ -149,66 +131,77 @@ class HeliosOdometry:
                     node.destroy_node()
                     raise
             self.client.start()
+            self._native.start()
 
     def stop(self):
         with self._lock:
             self.client.stop()
-            self._origin = None
+            self._native.stop()
             if self._node is not None:
                 self._ros2.executor_core.remove_node(self._node)
                 self._node.destroy_node()
                 self._node = None
             self._publishers = []
 
-    def payload(self, snap=None):
+    def payload(self):
         with self._lock:
-            if snap is None:
-                snap = self.client.snapshot()
-            pose = snap.get("pose") if snap["available"] else None
-            relative = {"x": None, "y": None, "yaw": None}
-            if pose:
-                if self._origin is None:
-                    self._origin = (pose["x"], pose["y"], pose["yaw"])
-                ox, oy, heading = self._origin
-                dx, dy = (pose["x"] - ox) * self._scale, (pose["y"] - oy) * self._scale
-                c, s = math.cos(heading), math.sin(heading)
-                angle = pose["yaw"] - heading
-                relative = {"x": c * dx + s * dy, "y": -s * dx + c * dy,
-                            "yaw": math.atan2(math.sin(angle), math.cos(angle))}
-            return {**relative, "state": snap["state"], "available": snap["available"],
-                    "position_unit": "source_unverified" if self._unit == "unverified" else "m",
-                    "yaw_unit": "rad", "age_ms": snap["age_ms"],
-                    "stamp_ms": snap["received_at_ms"],
-                    "source_stamp_ms": pose["source_stamp_ms"] if pose else None}
+            return self._snapshot()
 
-    def odom_payload(self, value, speed=None):
+    def _snapshot(self):
+        snap = self.client.snapshot()
+        raw = snap["speed_feedback"] if snap["available"] else None
+        speed = raw.get("speed") if raw else None
+        vx, vy, wz = speed if speed is not None else (None, None, None)
+        native = self._native.snapshot()
+        speed_available = all(value is not None for value in (vx, vy, wz))
+        available = native is not None and speed_available
+        return {
+            "position": [native["x"], native["y"], None] if native else None,
+            "rpy": [None, None, native["yaw"]] if native else None,
+            "velocity": [vx, vy, None],
+            "yaw_speed": wz,
+            "frame_id": self._frame,
+            "child_frame_id": self._child,
+            "units": {"linear": "m/s", "angular": "rad/s", "length": "m", "angle": "rad"},
+            "available": available,
+            "pose_state": ("online" if native else "waiting" if self._native.installed else "sdk_unavailable"),
+            "speed_state": "unavailable" if snap["available"] and not speed_available else snap["state"],
+            "sample_timestamps_ms": {
+                "pose": native["stamp_ms"] if native else None,
+                "speed": snap["received_at_ms"] if speed is not None else None,
+            },
+            "pose_source_stamp_ns": native["source_stamp_ns"] if native else None,
+            "speed_source_stamp_ms": raw["source_stamp_ms"] if speed is not None else None,
+        }
+
+    def odom_payload(self, value):
         pose = None
-        if value["available"] and self._unit != "unverified":
-            angle = value["yaw"]
+        stamps = value["sample_timestamps_ms"]
+        if value["position"] is not None:
+            x, y, _ = value["position"]
+            angle = value["rpy"][2]
             pose = {
-                "stamp_ms": value["stamp_ms"], "frame_id": self._frame, "child_frame_id": self._child,
-                "position": {"x": value["x"], "y": value["y"], "z": 0.0},
+                "stamp_ms": stamps["pose"], "frame_id": self._frame, "child_frame_id": self._child,
+                "position": {"x": x, "y": y, "z": 0.0},
                 "orientation": {"x": 0.0, "y": 0.0, "z": math.sin(angle / 2), "w": math.cos(angle / 2)},
             }
         # Preserve receipt time when republishing: an old observation must not
         # become fresh merely because a timer fired. Source time is separate.
-        stamp = value["stamp_ms"] or 0
-        vx, vy, wz = speed if value["available"] and speed is not None else (None, None, None)
+        vx, vy, _ = value["velocity"]
         return build_sample(
-            stamp_ms=stamp, frame="body", twist=[vx, vy, None, None, None, wz], pose=pose,
-            vendor={"source_stamp_ms": value["source_stamp_ms"], "stamp_source": "received",
-                    "state": value["state"], "available": value["available"],
-                    "pose_source": "chassis_ui_localization", "planar": True,
-                    "twist_source": "chassis_current_state_speed",
-                    "position_unit_verified": self._unit != "unverified"},
+            stamp_ms=stamps["speed"] or 0, frame="body",
+            twist=[vx, vy, None, None, None, value["yaw_speed"]], pose=pose,
+            vendor={"source_stamp_ms": value["speed_source_stamp_ms"], "stamp_source": "received",
+                    "pose_source_stamp_ns": value["pose_source_stamp_ns"],
+                    "pose_state": value["pose_state"], "speed_state": value["speed_state"],
+                    "available": value["available"], "pose_source": "vmr_sdk_odometry",
+                    "planar": True, "twist_source": "chassis_current_state_speed"},
         )
 
     def _publish(self):
         with self._lock:
-            snap = self.client.snapshot()
-            value = self.payload(snap)
-            speed = snap["pose"].get("speed") if snap["available"] else None
-            for publisher, payload in zip(self._publishers, (value, self.odom_payload(value, speed))):
+            value = self._snapshot()
+            for publisher, payload in zip(self._publishers, (value, self.odom_payload(value))):
                 msg = self._message_type()
                 msg.data = json.dumps(payload, ensure_ascii=False, allow_nan=False)
                 publisher.publish(msg)
@@ -219,29 +212,21 @@ class HeliosOdometry:
         with self._lock:
             if action == "info":
                 return {**self.get_tools()[0], "odom_interface": self._odom_interface(),
-                        "pose_source": "chassis_ui_localization", "planar": True,
+                        "pose_source": "vmr_sdk_odometry", "planar": True,
                         "frame_id": self._frame, "child_frame_id": self._child,
-                        "position_unit_verified": self._unit != "unverified"}
+                        "sdk_installed": self._native.installed}
             if action in (self.PREFIX, "read", "status"):
                 return {"data": self.payload(), "topic_out": self._topics}
             if action in ("start", "config"):
-                unit = args.get("odometry_position_unit", self._unit)
-                if unit not in ("unverified", "m", "mm"):
-                    raise ValueError("odometry_position_unit must be unverified, m or mm")
                 url = args.get("odometry_state_url")
                 target_url = validate_url(url) if url else self.client.url
-                if target_url != self.client.url or unit != self._unit:
+                if target_url != self.client.url:
                     replacement = self._new_client(target_url)
                     self.client.stop()
                     self.client = replacement
-                    self._origin = None
-                    self._unit = unit
-                    self._scale = 0.001 if unit == "mm" else 1.0
                 self.start()
                 return {"state": "running" if action == "start" else "configured", "topic_out": self._topics}
             if action == "stop":
-                self.client.stop()
-                self._origin = None
-                self._publish()
+                # Match loco_state: the canvas's stop leaves observation active.
                 return {"state": "idle", "topic_out": self._topics}
             raise ValueError(f"unsupported odometry action: {action}")

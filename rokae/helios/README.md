@@ -1,49 +1,30 @@
 # ROKAE Helios-2.1 状态卡片
 
-通过现有 iNex 和底盘 WebSocket 读取 20 轴关节、双电池状态及相对平面位姿。三张传感器卡可独立开始、停止，不提供运动、使能、模式切换或充放电控制。
+通过 iNex、底盘 WebSocket 和可选的原厂 SDK 读取 20 轴关节、双电池状态、里程计位姿和速度。
 
 | 工具 | 类型 | 输出 |
 |---|---|---|
 | `joints` | sensor | 关节骨架和逐轴状态，默认 10 Hz |
 | `battery` | sensor | 两块电池状态，默认 1 Hz |
-| `odometry` | sensor | 相对位置 x/y、相对朝向 yaw，默认 10 Hz；停止再开始重新置零 |
+| `odometry` | sensor | 原厂里程计位置和朝向、机体系速度，默认 10 Hz |
 | `model` | resource | 运行时读取本机 iNex 的 URDF，骨架渲染器自动调用 |
 
 ## 数据与单位
 
-### 相对位姿
+### 里程计
 
-`odometry` 被动读取底盘 `UiDatagram.current_state`，没有 online、heartbeat、
-导航、速度或使能请求。第一条有效观测作为本轮参考原点：其位置为 `(0, 0)`、
-朝向为 `0`；之后将地图坐标差旋转到起始朝向，x 向前、y 向左，yaw 为相对
-起始朝向的角度（rad，归一化至 `[-pi, pi]`）。重复 start 不改原点；stop 后
-再 start 才重新置零。短暂断线重连保留原点。
+- `/{namespace}/loco/state`（`data/json`）显示原厂 `position=[x,y,null]`、
+  `rpy=[null,null,yaw]`、`velocity=[vx,vy,null]` 和 `yaw_speed`。位置采用米，
+  yaw 采用弧度。`position` 和 `rpy` 来自 VMR SDK 的 `odometry.odom_state`。
+- `/{namespace}/state/odom`（`state/odom`）提供 `motus.odom/1`。`pose` 采用同一原厂位姿，
+  参考系为 `/{namespace}` 命名空间下的 `odom → chassis_planar`。标准报文用平面模型
+  的 `z=0` 和 yaw 四元数表达。`twist=[vx,vy,null,null,null,wz]` 仍来自底盘 WebSocket。
+- 卡片持续采样。画布停卡或启动时保留原厂坐标，Driver 退出时关闭两路订阅。
+  断线、过期或 SDK 缺失时相应数据为空，两路反馈独立判断状态和接收时间。
 
-显示流只提供位置和朝向，标准流同时提供底盘速度反馈。不把定位重置/跳变当作
-真实行驶距离；此来源是底盘地图定位状态，不声称它是独立、连续的编码器里程计。
-底盘切图、重定位后需重新开始本卡，不能保证跨定位重置的连续性。
-
-- `/{namespace}/state/relative_pose`（`data/json`）：x/y/yaw 和基本连接、时效信息。
-- `/{namespace}/state/odom`（`state/odom`）：`common/odom.py` 的 `motus.odom/1`。
-  `info().odom_interface.provides=["vx","vy","wz"]`。Navi 使用机体系
-  `twist=[vx,vy,null,null,null,wz]`，线速度单位 m/s，角速度单位 rad/s。
-  有效的静止反馈为零，缺失、无效或过期的轴为 null。pose 仍以固定的
-  `relative_start` 为参考系。标准 pose 的 z=0、roll/pitch=0 是二维模型约定。
-  在 Core 画布将该卡片的 `state/odom` 端口接入 Navi 的同格式输入。
-
-**位置单位不得猜测。** 默认 `odometry_position_unit: unverified`，显示 x/y
-保留原始尺度并标注 `source_unverified`，标准输出的 pose 为 null。厂家确认
-本机位置单位后，在共享配置中选 `m` 或 `mm`，才发布米制标准位姿；单位改变会
-重新开始订阅并置零。航向角的弧度约定依据已安装底盘页面的 `180*theta/pi` 显示
-换算。没有把软件静止接收称作距离/角度精度验收。
-
-停止、断线、无效或默认 1 秒无有效位姿时，显示坐标清空为 null。无关电池、
-雷达报文和重复/回退的 source timeStamp 不刷新有效期。接收时间用本机单调时钟
-判断过期；输出 `stamp_ms` 保留该次数据的接收时间，不因定时发布而刷新。原厂
-timeStamp 单独保留为 source_stamp_ms，不宣称它等于硬件采集时刻或已完成跨设备
-同步。新连接允许原厂时钟从新起点恢复。
-
-协议投影、坐标定义、PR519 格式对应及验收边界见 [ODOMETRY_INTERFACE.md](ODOMETRY_INTERFACE.md)。
+升级后，已有画布若仍引用旧的 `state/relative_pose`，重新添加 `odometry` 卡片即可选用
+`loco/state`。Navi 继续订阅原来的 `state/odom` 话题。位姿部署与接口说明见
+[ODOMETRY_INTERFACE.md](ODOMETRY_INTERFACE.md)。
 
 ### 关节与电池
 
@@ -103,7 +84,7 @@ timeStamp 单独保留为 source_stamp_ms，不宣称它等于硬件采集时刻
 
 默认读取上身 `ws://192.168.0.161:8888/ws` 及底盘 `ws://192.168.0.100/ws/AGVInfo`。可通过共享配置 `state_url` / `battery_state_url` / `odometry_state_url`，或对应环境变量 `HELIOS_STATE_URL` / `HELIOS_BATTERY_STATE_URL` / `HELIOS_ODOMETRY_STATE_URL` 覆盖。地址字段声明为敏感配置，避免打包 Solution 时公开私有地址。
 
-`config.yaml` 控制发布、过期、连接和重连时间。MCP 仅监听 `127.0.0.1:15747`，ROS domain 42，复用 `common/vendor_runtime.py` 注册到 Core。WebSocket 只读订阅，不安装或运行厂家运动 SDK。
+`config.yaml` 控制发布、过期、连接和重连时间。MCP 仅监听 `127.0.0.1:15747`，ROS domain 42，复用 `common/vendor_runtime.py` 注册到 Core。WebSocket 使用只读订阅。里程计位姿可通过 [原厂 SDK 挂载配置](deploy/compose.native-odom.yml) 启用。
 
 ## 本地验证
 

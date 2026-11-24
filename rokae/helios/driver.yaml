@@ -6,7 +6,7 @@ hardware_model: helios-2.1
 image_name: rokae-helios
 port: 15747
 mcp_url: http://localhost:15747/mcp
-description: Read-only 20-axis joints, dual batteries and relative planar pose via installed iNex and chassis UI streams
+description: Read-only 20-axis joints, dual batteries and vendor odometry with chassis velocity feedback
 build_context_extras:
   - ../../common
 cards:

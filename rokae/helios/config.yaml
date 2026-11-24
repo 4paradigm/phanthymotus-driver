@@ -8,9 +8,8 @@ battery_stale_timeout_s: 3.0
 odometry_state_url: ws://192.168.0.100/ws/AGVInfo
 odometry_publish_hz: 10
 odometry_stale_timeout_s: 1.0
-# Declare m or mm only after verifying the installed chassis position unit.
-# The display retains source units; the standard pose stays null otherwise.
-odometry_position_unit: unverified
+odometry_sdk_host: 192.168.0.100
+odometry_sdk_port: 9003
 publish_hz: 10
 stale_timeout_s: 1.0
 connect_timeout_s: 3.0
