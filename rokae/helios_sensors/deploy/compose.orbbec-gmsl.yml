@@ -1,5 +1,5 @@
-# Use after the generated deployment file. Discover the devices on the host
-# and map only the nodes owned by the two configured Gemini cameras.
+# Merge after the generated deployment file, which supplies the image and
+# local log rotation. Map only the nodes owned by the two configured cameras.
 services:
   rokae-helios-sensors:
     volumes:

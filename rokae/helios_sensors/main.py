@@ -232,6 +232,7 @@ class SensorCard:
             try:
                 self.run_capture()
             except (OSError, RuntimeError, ValueError) as exc:
+                # OSError includes capture timeouts, so a stalled camera also retries.
                 with self.lock:
                     if self.stop_capture.is_set():
                         return

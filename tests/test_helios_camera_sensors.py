@@ -68,6 +68,36 @@ def test_sensor_dispatch_follows_framework_contract():
     assert calls == ["start", "stop"]
 
 
+def test_sensor_retries_when_camera_frames_time_out(monkeypatch):
+    card = object.__new__(SensorCard)
+    card.kind, card.serial = "imu", "test"
+    card.lock, card.stop_capture = threading.RLock(), threading.Event()
+    card.thread, card.topic, card.count = object(), {}, 1
+    card.frame_id, card.device_stamp, card.error = "test_frame", 123, None
+    card.values = {"accel_z_m_s2": 9.8}
+    card.received = time.monotonic()
+    attempts, statuses, delays = [], [], []
+
+    def capture():
+        attempts.append(card.payload()["state"])
+        if len(attempts) == 1:
+            raise TimeoutError("no fresh camera frames")
+        card.stop_capture.set()
+
+    card.run_capture = capture
+    card.publish_status = lambda: statuses.append(card.payload())
+    monkeypatch.setattr(card.stop_capture, "wait", delays.append)
+
+    card.run()
+
+    assert attempts == ["online", "reconnecting"]
+    assert delays == [3]
+    assert len(statuses) == 1
+    assert statuses[0]["state"] == "reconnecting"
+    assert statuses[0]["error"] == "no fresh camera frames"
+    assert statuses[0]["accel_z_m_s2"] is None
+
+
 def initialize_orientation(fusion, accel=(0, 0, 9.80665)):
     for stamp in range(20_000, 360_001, 20_000):
         result = fusion.update(stamp, accel, (0, 0, 0))

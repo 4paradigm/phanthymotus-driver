@@ -1,4 +1,5 @@
-# Apply after the GMSL overlay when the depth camera captures only on the host.
+# Merge after the generated deployment file and the GMSL overlay for host depth.
+# The generated deployment supplies the image and local log rotation.
 services:
   rokae-helios-sensors:
     group_add:
