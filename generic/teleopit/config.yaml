@@ -1,0 +1,20 @@
+mcp_port: 15719
+name: Teleopit 动作仿真
+bind_host: 127.0.0.1
+ros_namespace: ""
+ros:
+  core_domain_id: 42
+teleopit:
+  # 管理员先显式安装上游；留空时读取 TELEOPIT_ROOT / TELEOPIT_PYTHON。
+  upstream_root: ""
+  worker_python: ""
+  policy_path: ""
+  source: bvh
+  bvh_path: ""
+  max_steps: 500
+  human_height: 1.75
+  render: true
+  pico_host: 0.0.0.0
+  pico_port: 63901
+  pico_advertise_host: ""
+  input_timeout_s: 10
