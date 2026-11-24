@@ -107,6 +107,7 @@ class _TfTreeNode(Node):
         self._conflicting_children = set()  # transient: cleared when a child is unambiguous again
         self._rejected_unknown_parent = 0
         self._expired_vision = 0
+        self._rejected_bad_payload = 0
         self._stale_joint_samples = 0
         self._conflicting_parent = 0  # cumulative counter for the status topic
         self._camera_extrinsic_assumed = False  # zero mount translation = unmeasured
@@ -317,6 +318,7 @@ class _TfTreeNode(Node):
         with self._vision_lock:
             self._rejected_unknown_parent += report["unknown_parent"]
             self._expired_vision += report["expired"]
+            self._rejected_bad_payload += report["invalid_payload"]
 
             # The tf2 constraint is *simultaneous* parents for one child, not a
             # parent changing between batches (a tracked target can legitimately
@@ -505,6 +507,7 @@ class _TfTreeNode(Node):
             vision_targets = len(self._vision)
             rejected = self._rejected_unknown_parent
             expired = self._expired_vision
+            bad_payload = self._rejected_bad_payload
             conflicting = self._conflicting_parent
         payload = spec.status_payload(
             state="running" if self._running else "idle",
@@ -519,6 +522,7 @@ class _TfTreeNode(Node):
             vision_targets=vision_targets,
             rejected_unknown_parent=rejected,
             expired_vision=expired,
+            rejected_bad_payload=bad_payload,
             conflicting_parent=conflicting,
             degraded=self._degraded(),
             last_error=self._parse_error or "",

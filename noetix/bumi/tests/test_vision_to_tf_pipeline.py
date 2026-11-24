@@ -44,7 +44,8 @@ def test_vision_tf_output_is_consumed_by_tf_tree_without_rejection():
     live, report = tspec.merge_vision(batch["transforms"], 10_000, 500)
 
     assert len(live) == 1
-    assert report == {"unknown_parent": 0, "invalid_child": 0, "expired": 0}
+    assert report == {"unknown_parent": 0, "invalid_child": 0, "expired": 0,
+                      "invalid_payload": 0}
     edge = live[0]
     assert edge["parent"] == "camera_optical_frame"
     assert edge["child"] == "vision_ar_17"

@@ -266,6 +266,25 @@ def _vision_msg(entries):
     return types.SimpleNamespace(data=json.dumps({"transforms": entries}))
 
 
+def test_malformed_vision_edge_does_not_crash_the_callback(card_module):
+    """P1 regression: a bad edge on the wired-in topic must not raise.
+
+    Before validation was added at the merge boundary, an empty/short vector
+    reached `_vision_transform` and raised IndexError inside the ROS callback,
+    killing the subscription. Now the edge is rejected and counted instead.
+    """
+    plugin = _make_card(card_module)
+    node = plugin._node
+    import time as real_time
+    now = int(real_time.time() * 1000)
+    node._on_vision(_vision_msg([{
+        "parent": "base_link", "child": "target", "stamp_ms": now,
+        "translation": [], "rotation": [],
+    }]))
+    assert node._rejected_bad_payload == 1
+    assert node._vision == {}
+
+
 def test_vision_transform_uses_its_own_stamp(card_module):
     plugin = _make_card(card_module)
     node = plugin._node

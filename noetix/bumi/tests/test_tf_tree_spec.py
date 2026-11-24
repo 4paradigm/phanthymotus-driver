@@ -192,6 +192,42 @@ def test_merge_vision_accepts_small_future_skew():
     assert report["expired"] == 0
 
 
+def test_merge_vision_rejects_malformed_payload():
+    """P1 regression: a wired-in bad edge must never reach the ROS callback.
+
+    `_vision_transform` indexes translation[0:3] and rotation[0:4] directly.
+    A short vector raises IndexError in the subscription thread; a non-numeric
+    or NaN/inf value produces an invalid TF that poisons every tf2 lookup; a
+    zero quaternion is not a rotation. All must be rejected at the boundary.
+    """
+    bad = [
+        _vision_entry(child="empty", translation=[], rotation=[]),
+        _vision_entry(child="short_t", translation=[0.1, 0.2]),
+        _vision_entry(child="short_r", rotation=[0.0, 0.0, 0.0]),
+        _vision_entry(child="text", translation=["a", "b", "c"]),
+        _vision_entry(child="nan", translation=[float("nan"), 0, 0]),
+        _vision_entry(child="inf", rotation=[0, 0, 0, float("inf")]),
+        _vision_entry(child="zero_q", rotation=[0.0, 0.0, 0.0, 0.0]),
+    ]
+    live, report = spec.merge_vision(bad, 10000, 500)
+    assert live == []
+    assert report["invalid_payload"] == len(bad)
+
+
+def test_merge_vision_keeps_valid_payload_and_defaults_missing_fields():
+    """A valid edge passes with finite values; absent vectors use identity."""
+    live, report = spec.merge_vision(
+        [_vision_entry(),
+         _vision_entry(child="no_vectors", translation=None, rotation=None)],
+        10000, 500)
+    assert [e["child"] for e in live] == ["person_head", "no_vectors"]
+    assert all(math.isfinite(v) for v in live[0]["translation"])
+    # Absent fields keep the historical identity default.
+    assert live[1]["translation"] == [0.0, 0.0, 0.0]
+    assert live[1]["rotation"] == [0.0, 0.0, 0.0, 1.0]
+    assert report["invalid_payload"] == 0
+
+
 # ── status payload ───────────────────────────────────────────────────────────
 
 

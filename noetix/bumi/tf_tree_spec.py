@@ -373,6 +373,26 @@ _INVALID_CHILD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _STAMP_SKEW_MS = 5000.0
 
 
+def _finite_vec(value, n):
+    """Return ``n`` finite floats, or None when the value is malformed.
+
+    Vision edges arrive over an operator-wired ``data/json`` topic, so their
+    translation/rotation cannot be trusted. ``_vision_transform`` indexes them
+    directly when building a ROS message; a short vector raises IndexError in
+    the subscription callback and a non-finite value produces an invalid TF.
+    Reject both here, at the boundary, before anything reaches the broadcaster.
+    """
+    if not isinstance(value, (list, tuple)) or len(value) < n:
+        return None
+    try:
+        out = [float(v) for v in value[:n]]
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not all(math.isfinite(v) for v in out):
+        return None
+    return out
+
+
 def merge_vision(transforms, now_ms, ttl_ms):
     """Split an incoming vision batch into live transforms and rejected ones.
 
@@ -380,17 +400,22 @@ def merge_vision(transforms, now_ms, ttl_ms):
     ``parent``, ``child``, ``stamp_ms``, ``translation`` (xyz) and ``rotation``
     (xyzw). Returns a ``(live, report)`` pair where ``live`` is the list of
     entries that should be published and ``report`` is a dict of the rejection
-    counters: ``unknown_parent``, ``invalid_child``, ``expired``.
+    counters: ``unknown_parent``, ``invalid_child``, ``expired`` and
+    ``invalid_payload``.
 
     An entry is dropped when its parent frame is unknown, its child name is
-    malformed, or its ``stamp_ms`` is older than ``now_ms - ttl_ms``. Rejections
-    are counted, never silently published, so the status topic can say why a
-    target disappeared.
+    malformed, its ``stamp_ms`` is unusable, or its translation/rotation is not
+    a finite, correctly-sized vector (a zero quaternion is invalid too).
+    Rejections are counted, never silently published, so the status topic can
+    say why a target disappeared. Payload validation matters because the input
+    topic is operator-wired: a malformed edge must not raise inside the ROS
+    callback or put an invalid TF on the wire.
     """
     live = []
     unknown_parent = 0
     invalid_child = 0
     expired = 0
+    invalid_payload = 0
 
     for entry in transforms or []:
         parent = entry.get("parent", "")
@@ -425,12 +450,37 @@ def merge_vision(transforms, now_ms, ttl_ms):
         if now_ms - stamp_ms > ttl_ms:
             expired += 1
             continue
-        live.append(entry)
+
+        # Validate the payload the publisher will actually index into. A short
+        # vector raises IndexError; a NaN/inf produces an invalid TransformStamped
+        # that quietly poisons every downstream tf2 lookup. A zero quaternion is
+        # not a rotation at all. Rewriting the validated values back keeps the
+        # broadcaster free of re-parsing and guarantees finite output.
+        raw_translation = entry.get("translation")
+        raw_rotation = entry.get("rotation")
+        # Absent fields keep the historical identity default; a PRESENT but
+        # malformed value is rejected. This preserves callers that omit these
+        # fields while stopping a wired-in bad edge from crashing the callback.
+        translation = ([0.0, 0.0, 0.0] if raw_translation is None
+                       else _finite_vec(raw_translation, 3))
+        rotation = ([0.0, 0.0, 0.0, 1.0] if raw_rotation is None
+                    else _finite_vec(raw_rotation, 4))
+        if translation is None or rotation is None:
+            invalid_payload += 1
+            continue
+        if math.sqrt(sum(v * v for v in rotation)) <= 1e-12:
+            invalid_payload += 1
+            continue
+        validated = dict(entry)
+        validated["translation"] = translation
+        validated["rotation"] = rotation
+        live.append(validated)
 
     return live, {
         "unknown_parent": unknown_parent,
         "invalid_child": invalid_child,
         "expired": expired,
+        "invalid_payload": invalid_payload,
     }
 
 
@@ -441,7 +491,7 @@ def status_payload(*, state, stamp_ms, root_frame, link_count, dynamic_frames,
                    static_frames, tf_hz, last_joint_age_ms, joints_stale,
                    vision_targets, rejected_unknown_parent, expired_vision,
                    conflicting_parent, degraded, last_error,
-                   camera_extrinsic_assumed=False):
+                   camera_extrinsic_assumed=False, rejected_bad_payload=0):
     """Build the flat `data/json` status payload.
 
     Every value is a top-level scalar, because the dashboard renders a nested
@@ -463,6 +513,7 @@ def status_payload(*, state, stamp_ms, root_frame, link_count, dynamic_frames,
         "vision_targets": int(vision_targets),
         "rejected_unknown_parent": int(rejected_unknown_parent),
         "expired_vision": int(expired_vision),
+        "rejected_bad_payload": int(rejected_bad_payload),
         "conflicting_parent": int(conflicting_parent),
         # True when the URDF camera mount translation is still the nominal
         # zero placeholder: every vision target below it carries this offset.
