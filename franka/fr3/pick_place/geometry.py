@@ -14,7 +14,7 @@ def transform(value, name):
     return matrix
 
 
-def locate(observation, position, handeye):
+def locate(observation, position, handeye, *, depth=None):
     """Return a measured surface point, never a grasp pose or motion command."""
     meta = observation['metadata']
     calibration = meta['calibration']
@@ -33,7 +33,8 @@ def locate(observation, position, handeye):
             not 1 <= width <= 4096 or not 1 <= height <= 4096):
         raise ValueError('Snapshot and RGB intrinsics dimensions differ')
     x,y = [min(round((v+1)*n/2), n-1) for v,n in zip(position,(width,height))]
-    depth = decode_depth(observation['depth_zlib'], width, height)
+    if depth is None:
+        depth = decode_depth(observation['depth_zlib'], width, height)
     patch = depth[max(0,y-2):y+3, max(0,x-2):x+3]
     valid = patch[patch>0]
     if valid.size < max(3, patch.size*.6) or np.ptp(valid)>30:

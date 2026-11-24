@@ -15,7 +15,10 @@ class PickExecutionTests(unittest.TestCase):
     def setUp(self):
         self.card = fixtures.ObserveTests().dual_plugin()
         self.card.enabled = True
-        self.enterContext(patch('franka.fr3.pick_place.transfer.destination', return_value=np.zeros(3)))
+        self.decode_depth = self.enterContext(patch(
+            'franka.fr3.pick_place.alignment.decode_depth', return_value=np.zeros((1, 1))))
+        self.destination = self.enterContext(patch(
+            'franka.fr3.pick_place.transfer.destination', return_value=np.zeros(3)))
         self.card.config['force_n'] = 30
         self.card.planning_profile['handeye']['accepted'] = True
         self.card.controller_configuration = Mock()
@@ -133,7 +136,7 @@ class PickExecutionTests(unittest.TestCase):
                 def moveit_targets(_, pick, *args, **kwargs):
                     return dict(targets, approach=pick['yaw_deg'],
                                 descent=targets['descent'] + pick.get('retreat', 0) + pick['yaw_deg'])
-                with patch('franka.fr3.pick_place.scene.estimate', return_value={'diameter_mm': 25, 'table_normal_base': [0, 0, 1]}), \
+                with patch('franka.fr3.pick_place.scene.estimate', return_value={'diameter_mm': 25, 'table_normal_base': [0, 0, 1]}) as estimate, \
                      patch('franka.fr3.pick_place.planning.grasp_targets', side_effect=grasp_targets) as geometry, \
                      patch('franka.fr3.pick_place.transfer.moveit_targets', side_effect=moveit_targets), \
                      patch('franka.fr3.pick_place.remote_execution.RemoteExecution', return_value=executor):
@@ -141,6 +144,9 @@ class PickExecutionTests(unittest.TestCase):
                     self.assertEqual(reply['state'], 'running')
                     self.assertTrue(done.wait(3))
                 self.assertEqual(self.card.last_result['state'], 'completed', self.card.last_result)
+                self.assertIs(estimate.call_args.kwargs['depth'], self.decode_depth.return_value)
+                self.assertIs(self.destination.call_args.kwargs['depth'], self.decode_depth.return_value)
+                self.assertEqual(self.decode_depth.call_count, self.destination.call_count)
                 self.assertEqual(geometry.call_args.args[1], {'diameter_mm': 25, 'table_normal_base': [0, 0, 1]})
                 self.assertEqual(approaches, [0])
                 executor.prepare_trajectory.assert_called_once()
@@ -254,3 +260,37 @@ class HandOpeningTests(unittest.TestCase):
              patch('franka.fr3.pick_place.remote_execution.time.monotonic', side_effect=[1, 2]):
             with self.assertRaisesRegex(RuntimeError, 'target=80.00 mm, feedback=78.00 mm'):
                 RemoteExecution.open_hand(executor, 'place_open')
+
+
+class PlanningCacheTests(unittest.TestCase):
+    def test_reuses_planner_but_not_local_arm_and_restarts_after_close(self):
+        from franka.fr3.pick_place.controller_session import PlanningCache
+
+        for_planner = Event()
+        cache = PlanningCache()
+        remote = Mock(local=None, alive=Mock(return_value=True))
+
+        @contextmanager
+        def start():
+            yield remote
+            for_planner.set()
+
+        connection = ('192.0.2.10', 'pnp', 'test-password')
+        with patch('franka.fr3.pick_place.controller_session.ControllerSession') as session:
+            session.return_value.start.side_effect = start
+            self.addCleanup(cache.close)
+            warmed = cache.warm(connection, '192.0.2.1')
+            cancel = Event()
+            for local in (Mock(), Mock()):
+                self.assertIs(cache.warm(connection, '192.0.2.1'), warmed)
+                with cache.use(warmed, cancel, local) as lease:
+                    self.assertIs(lease.local, local)
+                    self.assertIs(lease.action_cancel, cancel)
+                    self.assertIsNone(remote.local)
+            session.assert_called_once()
+            cache.close()
+            self.assertTrue(for_planner.wait(2))
+            restarted = cache.warm(connection, '192.0.2.1')
+            self.assertIsNot(restarted, warmed)
+            restarted.result(timeout=2)
+            self.assertEqual(session.call_count, 2)

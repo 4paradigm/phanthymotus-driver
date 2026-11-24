@@ -7,11 +7,12 @@ from .alignment import decode_depth
 from .geometry import locate, transform
 
 
-def estimate(observation, position, handeye):
-    surface = locate(observation, position, handeye)
+def estimate(observation, position, handeye, *, depth=None):
     metadata = observation['metadata']
     intr = metadata['calibration']['rgb_intrinsics']
-    depth = decode_depth(observation['depth_zlib'], metadata['width'], metadata['height'])
+    if depth is None:
+        depth = decode_depth(observation['depth_zlib'], metadata['width'], metadata['height'])
+    surface = locate(observation, position, handeye, depth=depth)
     rows, columns = np.mgrid[0:depth.shape[0]:2, 0:depth.shape[1]:2]
     valid = (depth[rows, columns] > 100) & (depth[rows, columns] < 2000)
     columns, rows = columns[valid], rows[valid]
@@ -87,10 +88,10 @@ def fit_points(points, target, camera_origin, pixels=None, outline=None):
     normal = axes[-1]
     if (camera_origin-table) @ normal < 0:
         normal = -normal
-    if (target-table) @ normal < .015:
-        raise ValueError('Selected target is not sufficiently above the table')
-    # Use the object's upper surface to avoid table grooves and contact-edge noise.
     target_height = float((target-table) @ normal)
+    if target_height < .010:
+        raise ValueError(f'Selected target is not sufficiently above the table ({target_height*1000:.1f} mm; minimum 10 mm)')
+    # Use the object's upper surface to avoid table grooves and contact-edge noise.
     foreground_height = max(.008, target_height*.3)
     selected_mask = (distance < .075) & ((points-table) @ normal > foreground_height)
     if outline is not None:

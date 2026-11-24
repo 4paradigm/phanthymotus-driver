@@ -693,35 +693,98 @@ class RosPublisherCleanupTests(unittest.TestCase):
             self.make_publisher()
         self.node_class.assert_not_called()
 
-    def test_create_timer_failure_destroys_node_and_its_publisher(self):
-        self.node.create_timer.side_effect = RuntimeError("cannot create timer")
-        with self.assertRaisesRegex(RuntimeError, "cannot create timer"):
-            self.make_publisher()
-        self.node.destroy_node.assert_called_once_with()
-        self.ros2.executor_core.add_node.assert_not_called()
-
-    def test_executor_attach_failure_destroys_created_node(self):
-        self.ros2.executor_core.add_node.side_effect = RuntimeError("cannot add node")
-        with self.assertRaisesRegex(RuntimeError, "cannot add node"):
-            self.make_publisher()
-        self.node.destroy_node.assert_called_once_with()
-
-    def test_executor_remove_failure_still_destroys_node(self):
-        publisher = self.make_publisher()
-        self.ros2.executor_core.remove_node.side_effect = RuntimeError("cannot remove node")
-        with self.assertRaisesRegex(RuntimeError, "cannot remove node"):
-            publisher.close()
-        self.node.destroy_node.assert_called_once_with()
+    def test_publishes_without_shared_executor_and_stops_before_destroy(self):
+        published = threading.Event()
+        publisher = device.RosPublisher(self.ros2, "/franka/card_a/state/joints", 10, published.set)
+        self.addCleanup(publisher.close)
+        self.assertTrue(published.wait(2))
         publisher.close()
-        self.node.destroy_node.assert_called_once_with()
-
-    def test_normal_close_removes_and_destroys_node_once(self):
-        publisher = self.make_publisher()
+        published.clear()
         publisher.close()
-        publisher.close()
-        self.ros2.executor_core.remove_node.assert_called_once_with(self.node)
+        self.assertFalse(published.wait(.2))
+        self.assertEqual(self.ros2.executor_core.mock_calls, [])
         self.node.destroy_node.assert_called_once_with()
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_joint_skeleton_uses_shared_pnp_stream_and_display_up():
+    from scipy.spatial.transform import Rotation
+
+    provider = mock.Mock()
+    provider.snapshot.return_value = ("192.0.2.20", {"left": "192.0.2.3"}, "pnp", "secret")
+    up = [-1., 0., 0.]
+    sensor = device.PnpJointStatesPlugin(
+        {"joint_states": {"display_up_base": {"left": up}}}, "franka", None, provider)
+    sensor._manager = mock.Mock()
+    sensor._manager.read_active_state.return_value = {}
+    sensor._publisher_factory = FakePublisher
+    stream = mock.Mock(address="192.0.2.3")
+    stream.snapshot.return_value = {"connected": True, "q": [0.] * 7, "timestamp_ms": 42}
+    settings = sensor.get_tools()[0]["configSchema"]
+    assert set(settings["properties"]) == {"arm"}
+    args = dict(_tool_name="joint_states", instance_id="test", arm="left")
+    with mock.patch("franka.fr3.joint_monitor.PnpJointStream", return_value=stream) as opened:
+        info = sensor.dispatch("config", args)
+    opened.assert_called_once_with("192.0.2.20", "pnp", "secret", "left", "192.0.2.3", idle=True)
+    assert info["state"] == "running"
+    entry = sensor._instances["test"]
+    publisher = entry.publisher
+    sensor._publish(entry, entry.start_epoch)
+    payload = publisher.frames[-1]
+    w, x, y, z = payload["imu_quat"]
+    assert abs(Rotation.from_quat([x, y, z, w]).apply(up)[2] - 1.) < 1e-9
+    assert payload["timestamp_ms"] == 42
+    sensor._manager.read_active_state.return_value = {"connected": True, "q": [.1] * 7, "timestamp_ms": 43}
+    sensor._publish(entry, entry.start_epoch)
+    assert publisher.frames[-1]["timestamp_ms"] == 43
+    assert [joint["q"] for joint in publisher.frames[-1]["joints"]] == [.1] * 7
+    sensor._manager.read_active_state.return_value = {"connected": False}
+    stream.snapshot.return_value = {"connected": True, "q": [.2] * 7, "timestamp_ms": 44}
+    sensor._publish(entry, entry.start_epoch)
+    assert publisher.frames[-1]["timestamp_ms"] == 44
+    assert [joint["q"] for joint in publisher.frames[-1]["joints"]] == [.2] * 7
+    sensor.dispatch("stop", args)
+    stream.close.assert_called_once()
+    sensor._manager.acquire.assert_not_called()
+    sensor._manager.release.assert_not_called()
+
+
+def test_idle_monitor_yields_before_local_fci_and_resumes_after_close():
+    from franka.fr3.joint_monitor import JointStreams
+
+    address = "192.0.2.3"
+    trace = []
+    monitor = mock.Mock(address=address)
+    monitor.set_idle.side_effect = lambda enabled: trace.append(("idle", enabled))
+    local = FakeSession(address)
+
+    def allocate(*_args, **_kwargs):
+        trace.append("open local")
+        return local
+
+    close = local.close
+
+    def close_local():
+        trace.append("close local")
+        close()
+
+    local.close = close_local
+    streams = JointStreams()
+    manager = hardware.SessionManager(session_factory=allocate, joint_streams=streams)
+    with mock.patch("franka.fr3.joint_monitor.PnpJointStream", return_value=monitor) as factory:
+        first = streams.open("192.0.2.20", "pnp", "secret", "left", address)
+        second = streams.open("192.0.2.20", "pnp", "secret", "left", address)
+    assert first is second
+    factory.assert_called_once()
+    session = manager.acquire(address, "vision", exclusive=True)
+    session.ready()
+    assert manager.read_active_state(address)["connected"]
+    manager.release(address, "vision")
+    assert trace == [("idle", False), "open local", "close local", ("idle", True)]
+    streams.close(first)
+    monitor.close.assert_not_called()
+    streams.close(second)
+    monitor.close.assert_called_once()

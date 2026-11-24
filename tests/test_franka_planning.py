@@ -102,10 +102,67 @@ class GraspTargetTests(unittest.TestCase):
 
         q = np.radians(self.observation['metadata']['joint_degree'])
         model = Kinematics(q, np.eye(4))
-        for offset in np.linspace(-.1, .1, 11):
-            sample = q + offset
-            measured = model.clearance(sample)
+        samples = q + np.linspace(-.1, .1, 11)[:, None]
+        chains, starts, ends = model.geometry(samples)
+        clearances = model.sample_clearances(starts, ends)
+        for sample, chain, measured in zip(samples, chains, clearances):
+            np.testing.assert_allclose(chain, model.frames(sample))
+            self.assertAlmostEqual(measured, model.clearance(sample), places=12)
             a, b = model._capsule_starts, model._capsule_ends
             reference = min(reference_segment_distance(a[i], b[i], a[j], b[j]) - _RADII[i] - _RADII[j]
                             for i, j in zip(_FIRST, _SECOND))
             self.assertAlmostEqual(measured, reference, places=12)
+
+    def test_batched_retiming_matches_previous_spline_and_derivative_bounds(self):
+        from scipy.interpolate import BPoly
+        from franka.fr3.pick_place.remote_execution import quintic_segments
+
+        rng = np.random.default_rng(535)
+        times = np.r_[0., np.cumsum(rng.uniform(.005, .1, 80))]
+        p, v, a = rng.normal(size=(3, len(times), 7))
+        v[[0, -1]] = a[[0, -1]] = 0.
+        coefficients, bounds = quintic_segments(times, p, v, a)
+        reference = BPoly.from_derivatives(times, np.stack((p, v, a), axis=1))
+        np.testing.assert_allclose(coefficients, reference.c.transpose(1, 0, 2), atol=1e-14)
+        np.testing.assert_allclose(bounds, [np.max(np.abs(reference.derivative(d).c)) for d in (1, 2, 3)])
+
+    def test_controller_worker_builds_identical_spline_without_driver_files(self):
+        import copy
+        import io
+        import json
+        import time
+        from contextlib import redirect_stdout
+        from types import SimpleNamespace
+        from franka.fr3.pick_place import spline_worker
+        from franka.fr3.pick_place.kinematics import Kinematics
+        from franka.fr3.pick_place.remote_execution import RemoteExecution
+
+        worker_state = {}
+        def call(source, request, timeout):
+            output = io.StringIO()
+            with redirect_stdout(output):
+                exec(source, dict(worker_state=worker_state, json=json,
+                                  request=json.loads(json.dumps(request, allow_nan=False))))
+            return json.loads(next(line[11:] for line in output.getvalue().splitlines()
+                                   if line.startswith('FR3_RESULT ')))
+
+        q = [0., -.3, 0., -1.5, 0., 1.5, 0.]
+        test = RemoteExecution.__new__(RemoteExecution)
+        test.arm = SimpleNamespace(call=call)
+        test.q, test.active = q, {}
+        test.profile, test.scene, test.visible_surface = {}, None, None
+        test.options, test.hand_points = {'speed_deg_s': 8.}, np.zeros((1, 3))
+        test.deadline, test.planning_deadline = time.monotonic() + 10, None
+        test.check = lambda: None
+        test.model = Kinematics(q, np.eye(4))
+        plan = dict(code=1, succeeded=True, joint_names=[f'fr3_joint{i}' for i in range(1, 8)],
+                    points=[dict(positions=q, velocities=[], accelerations=[], time_ns=0),
+                            dict(positions=[.01, *q[1:]], velocities=[], accelerations=[], time_ns=10**9)])
+        spline_worker.load(test.arm)
+        spline_worker.initialize(test, {'O_T_EE': np.eye(4).flatten(order='F').tolist()})
+        _, expected = test.build_trajectory('approach', q, copy.deepcopy(plan), False, False)
+        test.q = q
+        actual, end = spline_worker.checked_spline(test, 'approach', q, plan, False, False)
+        self.assertEqual(actual['points'], expected['points'])
+        np.testing.assert_allclose(actual['segments'][0][1], expected['segments'][0][1])
+        self.assertEqual(end, [.01, *q[1:]])

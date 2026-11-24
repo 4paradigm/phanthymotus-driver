@@ -4,7 +4,6 @@ from pathlib import Path
 import xml.etree.ElementTree as ET
 
 import numpy as np
-from hardware import JOINT_LOWER, JOINT_UPPER
 from .arm_collision import CAPSULES, EXCLUDED_PAIRS
 
 
@@ -34,11 +33,17 @@ def segment_distances(a, b, c, d):
 
 
 class Kinematics:
-    def __init__(self, q, actual):
+    def __init__(self, q, actual, *, urdf=None, limits=None):
         from .planning import rigid, rotation
-        self.low, self.high = np.asarray(JOINT_LOWER)+.05, np.asarray(JOINT_UPPER)-.05
+        if limits is None:
+            from hardware import JOINT_LOWER, JOINT_UPPER
+            limits = JOINT_LOWER, JOINT_UPPER
+        low, high = limits
+        self.low, self.high = np.asarray(low)+.05, np.asarray(high)-.05
+        root = ET.fromstring(urdf) if urdf is not None else ET.parse(
+            Path(__file__).parents[1]/'resource/fr3.urdf').getroot()
         self.origins = []
-        for joint in ET.parse(Path(__file__).parents[1]/'resource/fr3.urdf').findall('joint'):
+        for joint in root.findall('joint'):
             o = joint.find('origin'); x, y, z = map(float, o.get('rpy').split())
             self.origins.append(rigid(rotation((0,0,1),z)@rotation((0,1,0),y)@rotation((1,0,0),x),
                                       list(map(float,o.get('xyz').split()))))
@@ -48,17 +53,34 @@ class Kinematics:
     def frames(self, q):
         if self._last_q is not None and np.array_equal(q, self._last_q):
             return self._last_chain
-        chain = [np.eye(4)]
-        for origin, angle in zip(self.origins, [*q, 0]):
-            c, s = np.cos(angle), np.sin(angle)
-            rotation = np.array([[c, -s, 0., 0.], [s, c, 0., 0.],
-                                 [0., 0., 1., 0.], [0., 0., 0., 1.]])
-            chain.append(chain[-1] @ origin @ rotation)
-        self._last_q, self._last_chain = np.asarray(q).copy(), np.asarray(chain)
-        transforms = self._last_chain[_LINKS]
-        self._capsule_starts = (transforms[:, :3, :3] @ _STARTS[..., None])[..., 0] + transforms[:, :3, 3]
-        self._capsule_ends = (transforms[:, :3, :3] @ _ENDS[..., None])[..., 0] + transforms[:, :3, 3]
+        chains, starts, ends = self.geometry(np.asarray(q)[None, :])
+        self.cache_sample(q, chains[0], starts[0], ends[0])
         return self._last_chain
+
+    def geometry(self, samples):
+        chain = [np.broadcast_to(np.eye(4), (len(samples), 4, 4))]
+        angles = np.column_stack((samples, np.zeros(len(samples))))
+        for origin, angle in zip(self.origins, angles.T):
+            c, s = np.cos(angle), np.sin(angle)
+            rotation = np.broadcast_to(np.eye(4), chain[-1].shape).copy()
+            rotation[:, 0, 0] = rotation[:, 1, 1] = c
+            rotation[:, 1, 0], rotation[:, 0, 1] = s, -s
+            chain.append(chain[-1] @ origin @ rotation)
+        chains = np.stack(chain, axis=1)
+        transforms = chains[:, _LINKS]
+        starts = (transforms[..., :3, :3] @ _STARTS[..., None])[..., 0] + transforms[..., :3, 3]
+        ends = (transforms[..., :3, :3] @ _ENDS[..., None])[..., 0] + transforms[..., :3, 3]
+        return chains, starts, ends
+
+    def cache_sample(self, q, chain, starts, ends):
+        self._last_q, self._last_chain = np.asarray(q).copy(), chain
+        self._capsule_starts, self._capsule_ends = starts, ends
+
+    def sample_clearances(self, starts, ends):
+        endpoints = (values[:, pairs].reshape(-1, 3) for values, pairs in
+                     ((starts, _FIRST), (ends, _FIRST), (starts, _SECOND), (ends, _SECOND)))
+        distances = segment_distances(*endpoints).reshape(len(starts), len(_FIRST))
+        return np.min(distances - _RADII[_FIRST] - _RADII[_SECOND], axis=1)
 
     def pose(self, q):
         return self.frames(q)[-1] @ self.offset

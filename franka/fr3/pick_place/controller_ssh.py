@@ -24,7 +24,8 @@ def command_for(controller_ip, username):
         '-o', 'GlobalKnownHostsFile=/dev/null',
         '-o', f'UserKnownHostsFile={ACCESS / "known_hosts"}',
         '-o', 'HostKeyAlias=franka-pnp-controller',
-        '-o', 'ConnectTimeout=5', '-o', 'NumberOfPasswordPrompts=1',
+        '-o', 'ConnectTimeout=5', '-o', 'ServerAliveInterval=10',
+        '-o', 'ServerAliveCountMax=2', '-o', 'NumberOfPasswordPrompts=1',
         '-o', 'PubkeyAuthentication=no', '-o', 'PreferredAuthentications=password',
         f'{username}@{address}',
         'source /opt/ros/jazzy/setup.bash && '
@@ -44,12 +45,13 @@ rclpy.init()
 # so DDS discovery need not start from scratch with a new Python process.
 rclpy.init = lambda: None
 rclpy.shutdown = lambda: None
+worker_state = {}
 for line in sys.stdin:
     try:
         sequence, source, request = json.loads(line)
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
-            exec(compile(source, "<franka-planning>", "exec"), {"request": request, "json": json})
+            exec(compile(source, "<franka-planning>", "exec"), {"request": request, "json": json, "worker_state": worker_state})
         result = next(line[11:] for line in output.getvalue().splitlines() if line.startswith("FR3_RESULT "))
         reply = {"result": json.loads(result)}
     except Exception as error:
@@ -84,7 +86,7 @@ def planning_worker(endpoint, username, password, domain, cancel):
             reader = threading.Thread(target=read_responses, daemon=True)
             reader.start()
 
-            def call(source, payload, timeout):
+            def call(source, payload, timeout, action_cancel=None):
                 sequence = next(requests)
                 try:
                     process.stdin.write(json.dumps([sequence, source, payload], allow_nan=False) + '\n')
@@ -92,7 +94,7 @@ def planning_worker(endpoint, username, password, domain, cancel):
                 except BrokenPipeError as error:
                     raise RuntimeError('PNP planning worker disconnected') from error
                 deadline = time.monotonic() + timeout
-                while not cancel.is_set():
+                while not cancel.is_set() and not (action_cancel and action_cancel.is_set()):
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise TimeoutError('PNP planning request timed out')
@@ -110,6 +112,7 @@ def planning_worker(endpoint, username, password, domain, cancel):
                     return reply['result']
                 raise RuntimeError('Pick cancelled')
 
+            call.alive = lambda: process.poll() is None
             try:
                 yield call
             finally:

@@ -128,6 +128,34 @@ class AlignmentCompletionTests(TestCase):
         self.assertEqual(definition["inputSchema"]["x-completion"]["actions"],
                          ["start_trajectory", "play", "stop_trajectory", "stop_motion", "delete_trajectory"])
 
+    def test_teach_uses_shared_host_credentials_and_arm_mapping(self):
+        addresses = {"left": "192.0.2.3", "right": "192.0.2.2"}
+        configuration = MagicMock()
+        configuration.snapshot.return_value = ("192.0.2.20", addresses, "operator", "shared-secret")
+        plugin = PnpRemoteTeleopPlugin(controller_configuration=configuration)
+        self.assertNotIn("configSchema", plugin.get_tools()[0])
+        with patch.object(pnp_initialize, "initialize", return_value={"state": "ready", "slave_ips": addresses}) as init, \
+             patch("franka.fr3.pnp_discovery.discover") as discover:
+            result = plugin.dispatch("start", {"ssh_user": "old", "ssh_password": "old", "pnp_host": "192.0.2.99"})
+            plugin._init_thread.join(2)
+        args, kwargs = init.call_args
+        self.assertEqual(args[:2], ("operator@192.0.2.20", "shared-secret"))
+        self.assertEqual(kwargs, {"slave_ips": addresses, "read_vendor": False})
+        self.assertEqual(plugin._hosts["right"], "operator@192.0.2.20")
+        self.assertNotIn("shared-secret", str(result))
+        discover.assert_not_called()
+
+    def test_teach_waits_for_shared_controller_configuration(self):
+        configuration = MagicMock()
+        configuration.snapshot.side_effect = RuntimeError("Discovery still running")
+        plugin = PnpRemoteTeleopPlugin(controller_configuration=configuration)
+        with patch.object(pnp_initialize, "initialize") as init:
+            result = plugin.dispatch("start", {})
+        self.assertEqual(result["state"], "error")
+        self.assertIn("Controller Configuration is not ready", result["message"])
+        self.assertFalse(plugin._loaded)
+        init.assert_not_called()
+
     def test_visible_stop_preserves_pause_behavior(self):
         plugin = PnpRemoteTeleopPlugin()
         plugin._loaded = True

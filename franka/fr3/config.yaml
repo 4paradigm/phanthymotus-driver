@@ -13,6 +13,12 @@ motion_arm_ips:
   left: 172.16.0.3
   right: 172.16.0.2
 
+joint_states:
+  # Table-up direction in each installed robot's base frame, for display only.
+  display_up_base:
+    left: [-0.70475, -0.70922, -0.01836]
+    right: [-0.72886, 0.68442, -0.01816]
+
 vision_pick_and_drop:
   default_arm: left
   observation_joints_deg: "-35.06,20.81,23.42,-144.09,114.94,132.07,-121.36"

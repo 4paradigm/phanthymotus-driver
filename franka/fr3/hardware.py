@@ -559,8 +559,9 @@ class RobotSession:
 class SessionManager:
     """Share sessions by IP and retain each one until its last card releases it."""
 
-    def __init__(self, *, session_factory=None, **session_options):
+    def __init__(self, *, session_factory=None, joint_streams=None, **session_options):
         self._session_factory = session_factory
+        self._joint_streams = joint_streams
         self._options = session_options
         self._lock = threading.Lock()
         self._close_lock = threading.Lock()
@@ -568,6 +569,11 @@ class SessionManager:
         self._retiring = {}
         self._exclusive = {}
         self._closed = False
+
+    def read_active_state(self, address):
+        with self._lock:
+            entry = self._sessions.get(address)
+        return entry[0].snapshot() if entry else {}
 
     def acquire(self, address, owner, *, exclusive=False):
         address = canonical_ip(address)
@@ -586,11 +592,20 @@ class SessionManager:
                         if not existing[0].stopped:
                             raise RuntimeError(f"Previous reader for {address} is still stopping; retry shortly")
                         del self._sessions[address]
+                        if self._joint_streams:
+                            self._joint_streams.resume(address)
                     if exclusive and address in self._sessions and self._sessions[address][1] - {owner}:
                         raise RuntimeError(f"Franka connection {address} is already in use")
                     if address not in self._sessions:
                         factory = self._session_factory or RobotSession
-                        self._sessions[address] = (factory(address, **self._options), set())
+                        if self._joint_streams:
+                            self._joint_streams.pause(address)
+                        try:
+                            self._sessions[address] = (factory(address, **self._options), set())
+                        except Exception:
+                            if self._joint_streams:
+                                self._joint_streams.resume(address)
+                            raise
                     session, owners = self._sessions[address]
                     session.register_owner(owner)
                     owners.add(owner)
@@ -624,6 +639,8 @@ class SessionManager:
                 session.release_owner(owner)
             finally:
                 session.close()
+            if self._joint_streams:
+                self._joint_streams.resume(address)
         except RuntimeError:
             with self._lock:
                 if not self._closed:

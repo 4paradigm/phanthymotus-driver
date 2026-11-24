@@ -76,6 +76,8 @@ class PickPlacePlugin:
         self.enabled = False
         self.hand_initialized = False
         self.controller_configuration = controller_configuration
+        from .controller_session import PlanningCache
+        self.planners = PlanningCache()
 
     def apply_arm_mapping(self, addresses):
         addresses = mapping(addresses)
@@ -179,6 +181,7 @@ class PickPlacePlugin:
             self.enabled = False
             self.observation = None
             self.hand_initialized = False
+        self.planners.close()
         self.inputs.stop()
 
     def cancel(self):
@@ -240,8 +243,9 @@ class PickPlacePlugin:
                 except (ValueError, OverflowError) as exc:
                     return dict(ok=False,code='INVALID_CONFIG',message=str(exc))
                 if cfg != self.config:
+                    arm_changed = arm != self.arm
                     self.arm_configs[self.arm] = dict(self.config)
-                    if arm != self.arm:
+                    if arm_changed:
                         self.inputs.select_serial(profile.get('camera_serial', ''))
                         self.hand_initialized = False
                     self.arm, self.address = arm, self.addresses[arm]
@@ -250,6 +254,8 @@ class PickPlacePlugin:
                     self.config = cfg
                     self.arm_configs[arm] = dict(cfg)
                     self.observation = None
+                    if arm_changed:
+                        self.warm_planner()
                 return dict(ok=True, **cfg)
             if action == 'start':
                 previous_topics=tuple(self.inputs.topics)
@@ -282,6 +288,7 @@ class PickPlacePlugin:
                         same_source=False
                     if not same_source:self.observation=None
                 self.enabled = bool(camera_topics)
+                self.warm_planner()
                 return self.info()
             if action in ('observe', 'grab_to', 'grab_by'):
                 if args.get('confirm_motion') is not True:
@@ -367,12 +374,23 @@ class PickPlacePlugin:
         frame(self.planning_profile or {}, s.get('F_T_EE'))
         return s
 
+    def warm_planner(self):
+        if not self.enabled or self.controller_configuration is None:
+            return
+        try:
+            host, addresses, username, password = self.controller_configuration.snapshot()
+        except RuntimeError:
+            return
+        if self.arm in addresses:
+            self.planners.warm((host, username, password), addresses[self.arm])
+
     @contextmanager
     def controller(self, active):
-        from .controller_session import ControllerSession
         if active.get('controller_connection') is None:
             raise RuntimeError('PNP controller configuration is not ready')
-        endpoint, username, password = active['controller_connection']
+        ready = self.planners.warm(active['controller_connection'], self.address)
+        warm = ready.done()
+        started = time.monotonic()
         owner = active['owner']
         local = self.manager.acquire(self.address, owner, exclusive=True)
         try:
@@ -382,8 +400,11 @@ class PickPlacePlugin:
                     raise RuntimeError('Pick cancelled')
                 if time.monotonic() >= deadline:
                     raise RuntimeError('Orin native Franka control connection is not ready')
-            with ControllerSession(endpoint, username, password, active['cancel'],
-                                   local=local).start(self.address) as controller:
+            local_ready = time.monotonic()
+            with self.planners.use(ready, active['cancel'], local) as controller:
+                print(f'[fr3 planner session] action={active["action_id"]} warm={warm} '
+                      f'native_s={local_ready-started:.3f} planner_wait_s={time.monotonic()-local_ready:.3f}',
+                      flush=True)
                 yield controller
         finally:
             self.manager.release(self.address, owner)
@@ -555,6 +576,7 @@ class PickPlacePlugin:
             self.active = None
 
     def run_transfer(self, active):
+        from .alignment import decode_depth
         from .remote_execution import GraspMiss, RemoteExecution
         from .hand_collision import TableClearanceError
         from .planning import grasp_targets
@@ -577,8 +599,14 @@ class PickPlacePlugin:
                         active['observation'], self.observation = self.observation, None
                 active['stage'] = 'planning'
                 photo, profile = active['observation'], active['profile']
-                scene = estimate(photo, active['position'], profile['handeye'])
+                scene_started = time.monotonic()
+                metadata = photo['metadata']
+                depth = decode_depth(photo['depth_zlib'], metadata['width'], metadata['height'])
+                decoded = time.monotonic()
+                scene = estimate(photo, active['position'], profile['handeye'], depth=depth)
+                scene_ready = time.monotonic()
                 candidates = grasp_targets(photo, scene, profile)
+                targets_ready = time.monotonic()
                 live = self.state(active)
                 live_pose = np.asarray(live['O_T_EE']).reshape(4,4,order='F')
                 saved_pose = np.asarray(photo['metadata']['O_T_EE']).reshape(4,4,order='F')
@@ -586,7 +614,9 @@ class PickPlacePlugin:
                 angle = math.acos(np.clip((np.trace(relative)-1)/2,-1,1))
                 if np.linalg.norm(live_pose[:3,3]-saved_pose[:3,3]) > .002 or angle > math.radians(1):
                     raise RuntimeError('End-effector pose changed since observation')
+                state_ready = time.monotonic()
                 executor = RemoteExecution(active, arm, hand, active['options'], live, profile, scene)
+                validation_ready = time.monotonic()
                 if executor.fresh(hand)['is_grasped']:
                     raise RuntimeError('Hand already reports a held object')
                 opening = min(executor.fresh(hand)['max_width'], .08)
@@ -596,7 +626,13 @@ class PickPlacePlugin:
                       f'hand_s={hand_ready-started:.3f} controller_s={controller_ready-hand_ready:.3f} '
                       f'observation_and_target_s={time.monotonic()-controller_ready:.3f}', flush=True)
                 executor.planning_deadline = deadline
-                delta = destination(photo, scene, profile['handeye'], active['transfer'])
+                placement_started = time.monotonic()
+                delta = destination(photo, scene, profile['handeye'], active['transfer'], depth=depth)
+                print(f'[fr3 observation processing] action={active["action_id"]} '
+                      f'auto_observe_s={scene_started-controller_ready:.3f} depth_s={decoded-scene_started:.3f} '
+                      f'scene_s={scene_ready-decoded:.3f} targets_s={targets_ready-scene_ready:.3f} '
+                      f'state_s={state_ready-targets_ready:.3f} init_s={validation_ready-state_ready:.3f} '
+                      f'placement_s={time.monotonic()-placement_started:.3f}', flush=True)
                 ranked = []
                 for pick in candidates:
                     executor.check()

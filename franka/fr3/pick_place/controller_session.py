@@ -1,6 +1,7 @@
 """Own one isolated official MoveIt instance for a visual card action."""
+from concurrent.futures import Future, wait
 from contextlib import contextmanager
-import ipaddress
+from copy import copy
 import random
 import subprocess
 import tempfile
@@ -22,18 +23,16 @@ from launch.actions import ExecuteProcess, IncludeLaunchDescription, SetLaunchCo
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
 
-address, domain, fake = sys.argv[1:]
-# A socket owned by this process serializes launches for this arm without
-# creating a persistent service or modifying the installed workspace.
+domain = sys.argv[1]
+# Reserve the isolated DDS domain across Orins sharing this PNP host.
 lock = socket.socket()
-lock.bind(("127.0.0.1", 41000 + int(address.split(".")[-1])))
+lock.bind(("127.0.0.1", 41000 + int(domain)))
 os.environ["ROS_DOMAIN_ID"] = domain
 os.environ["ROS_AUTOMATIC_DISCOVERY_RANGE"] = "LOCALHOST"
 os.environ.pop("ROS_LOCALHOST_ONLY", None)
 os.environ["ROS_LOG_DIR"] = "/tmp"
 path = get_package_share_directory("franka_fr3_moveit_config") + "/launch/moveit.launch.py"
-args = ["robot_ip:=" + ("127.0.0.1" if fake == "true" else address),
-        "use_fake_hardware:=" + fake]
+args = ["robot_ip:=127.0.0.1", "use_fake_hardware:=true"]
 # Use the installed launch graph, omitting only RViz and the separate gripper
 # launch. The hand model remains loaded and Orin retains the hand connection.
 source = PythonLaunchDescriptionSource(path)
@@ -60,33 +59,98 @@ sys.exit(service.run())
 """
 
 
+class PlanningCache:
+    """Keep only a fake-hardware planner alive between local motion leases."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.entry = None
+
+    def close(self):
+        with self.lock:
+            if self.entry is not None:
+                self.entry[1].set()
+
+    def warm(self, connection, address):
+        key = (connection, address)
+        with self.lock:
+            previous = None
+            if self.entry is not None:
+                old_key, stop, ready, closed = self.entry
+                if old_key == key and not stop.is_set() and not closed.is_set():
+                    if not ready.done() or (ready.exception() is None and ready.result().alive()):
+                        return ready
+                stop.set()
+                previous = closed
+            stop, closed, ready = threading.Event(), threading.Event(), Future()
+            self.entry = key, stop, ready, closed
+
+            def run():
+                try:
+                    if previous is not None:
+                        previous.wait()
+                    if stop.is_set():
+                        raise RuntimeError('MoveIt planning session was closed')
+                    with ControllerSession(*connection, stop, local=None).start() as planner:
+                        ready.set_result(planner)
+                        stop.wait()
+                except Exception as error:
+                    if not ready.done():
+                        ready.set_exception(error)
+                finally:
+                    closed.set()
+
+            threading.Thread(target=run, name='fr3-moveit-planner', daemon=True).start()
+            return ready
+
+    @contextmanager
+    def use(self, ready, cancel, local):
+        try:
+            while not cancel.is_set():
+                if wait([ready], timeout=.1).done:
+                    planner = copy(ready.result())
+                    planner.local = local
+                    planner.action_cancel = cancel
+                    yield planner
+                    return
+            raise RuntimeError('Pick cancelled')
+        except Exception:
+            with self.lock:
+                if self.entry is not None and self.entry[2] is ready:
+                    self.entry[1].set()
+            raise
+
+
 class ControllerSession:
     def __init__(self, endpoint, username, password, cancel, *, local):
         self.connection = endpoint, username, password
         self.cancel = cancel
+        self.action_cancel = None
         self.local = local
         self.domain = random.randrange(130, 190)
 
+    def alive(self):
+        return self.process.poll() is None and self._planning_call.alive()
+
     def call(self, source, payload, timeout):
         self.check()
-        value = self._planning_call(source, payload, timeout)
+        value = self._planning_call(source, payload, timeout, self.action_cancel)
         self.check()
         return value
 
     def check(self):
-        if self.cancel.is_set():
+        if self.cancel.is_set() or (self.action_cancel and self.action_cancel.is_set()):
             raise RuntimeError('Pick cancelled')
-        if self.process.poll() is not None:
-            raise RuntimeError('Controller MoveIt launch exited')
+        if not self.alive():
+            raise RuntimeError('Controller MoveIt session disconnected')
 
     @contextmanager
-    def start(self, address):
+    def start(self):
         import shlex
-        address = str(ipaddress.IPv4Address(address))
         endpoint, username, password = self.connection
         command = command_for(endpoint, username)
         command[-1] = command[-1].removesuffix('python3 -') + shlex.join([
-            'python3', '-u', '-c', _LAUNCH, address, str(self.domain), "true",
+            'python3', '-u', '-c', _LAUNCH, str(self.domain),
         ])
         with tempfile.TemporaryFile() as secret:
             secret.write(password.encode() + b'\n')
@@ -108,6 +172,9 @@ class ControllerSession:
             try:
                 with planning_worker(*self.connection, self.domain, self.cancel) as self._planning_call:
                     self.call(_READY, {}, 35)
+                    self.call(rpc._PREPARE_CLIENTS, {}, 25)
+                    from .spline_worker import load
+                    load(self)
                     yield self
             finally:
                 finished.set()
@@ -120,7 +187,7 @@ class ControllerSession:
                     self.process.wait(timeout=5)
 
     def plan_joint(self, joints, start=None):
-        payload = dict(action='/move_action', joints=list(joints), joint_bounds=rpc.JOINT_PATH_BOUNDS)
+        payload = dict(joints=list(joints), joint_bounds=rpc.JOINT_PATH_BOUNDS)
         if start is not None:
             payload['start'] = start
         return self.call(rpc._PLAN, payload, 40)
@@ -138,7 +205,7 @@ class ControllerSession:
         return self.local.stop_motion(**kwargs)
 
     def flange_at(self, joints):
-        return self.call(rpc._FK, dict(service='/compute_fk', base_frame='fr3_link0',
+        return self.call(rpc._FK, dict(base_frame='fr3_link0',
                                       link='fr3_link8', joints=list(joints)), 15)['pose']
 
     def solve_ik(self, pose, start):
@@ -151,7 +218,7 @@ class ControllerSession:
         return joints
 
     def plan_cartesian(self, poses, speed_scale, start):
-        return self.call(rpc._CARTESIAN, dict(service='/compute_cartesian_path', frame='fr3_link0',
+        return self.call(rpc._CARTESIAN, dict(frame='fr3_link0',
                                              link='fr3_link8', poses=poses,
                                              speed_scale=speed_scale, start=start, joint_bounds=rpc.JOINT_PATH_BOUNDS), 22)
 

@@ -36,7 +36,7 @@ def image_table_axes(camera, normal):
     return np.column_stack((right, down))
 
 
-def destination(observation, scene, handeye, options):
+def destination(observation, scene, handeye, options, *, depth=None):
     normal = np.asarray(scene['table_normal_base'],dtype=float)
     table = np.asarray(scene['table_point_base_mm'])/1000
     source = np.asarray(scene['centre_base_mm'])/1000
@@ -45,7 +45,7 @@ def destination(observation, scene, handeye, options):
     if 'displacement_mm' in options:
         delta = image_table_axes(camera, normal) @ np.asarray(options['displacement_mm']) / 1000
     else:
-        surface = locate(observation,options['target_position'],handeye)
+        surface = locate(observation, options['target_position'], handeye, depth=depth)
         ray = np.asarray(surface['base_xyz_mm'])/1000-camera[:3,3]
         denominator = ray@normal
         if denominator>=-1e-6:
