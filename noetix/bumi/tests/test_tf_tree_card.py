@@ -232,6 +232,24 @@ def test_stale_joint_sample_stops_dynamic_stream(card_module):
         module.time.monotonic = original
 
 
+def test_already_stale_joint_sample_is_rejected(card_module):
+    """P1 regression: a joint sample whose producer stamp is already older than
+    max_joint_age_s when read must not be published as a fresh pose."""
+    plugin = _make_card(card_module)  # max_joint_age_s = 0.5
+    node = plugin._node
+    now_ns = node.get_clock().now().nanoseconds
+    stale_ns = now_ns - int(2.0 * 1e9)  # 2 s old at receipt
+    msg = types.SimpleNamespace(data=json.dumps({
+        "stamp_ns": stale_ns, "timestamp_source": "read_completion",
+        "joints": [{"name": "l_arm_pitch_joint", "q": 0.2}],
+    }))
+    node._dynamic_bc.sent.clear()
+    node._on_joints(msg)
+    assert node._dynamic_bc.sent == []  # nothing published from a stale sample
+    assert node._stale_joint_samples == 1
+    assert node._last_joint_at is None  # never accepted as a fresh sample
+
+
 # ── vision lifecycle ─────────────────────────────────────────────────────────
 
 
@@ -290,6 +308,49 @@ def test_conflict_degraded_recovers(card_module):
     assert node._degraded() == ""
     # The cumulative counter still records that a conflict happened.
     assert node._conflicting_parent == 1
+
+
+def test_vision_callback_and_ttl_sweep_are_concurrent_safe(card_module):
+    """P1 regression: the ROS callback writes the vision maps while the status
+    thread prunes them. Without a shared lock this raises
+    'dictionary changed size during iteration' and kills the thread."""
+    import threading
+    import time as real_time
+
+    plugin = _make_card(card_module, ttl_ms=100)
+    node = plugin._node
+    errors = []
+
+    now = int(real_time.time() * 1000)
+    def entry(i):
+        return {"parent": "camera_optical_frame", "child": f"obj_{i}",
+                "stamp_ms": now, "translation": [0, 0, 1],
+                "rotation": [0, 0, 0, 1]}
+
+    def writer():
+        try:
+            for i in range(200):
+                node._on_vision(_vision_msg([entry(i % 10)]))
+        except Exception as exc:  # pragma: no cover - fails only without the lock
+            errors.append(exc)
+
+    def sweeper():
+        try:
+            for _ in range(200):
+                with node._vision_lock:
+                    node._prune_vision(int(real_time.time() * 1000))
+                    _ = len(node._vision)
+                _ = node.snapshot()
+        except Exception as exc:  # pragma: no cover
+            errors.append(exc)
+
+    threads = [threading.Thread(target=writer), threading.Thread(target=sweeper)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+    assert all(not t.is_alive() for t in threads)
+    assert errors == []
 
 
 # ── registration surface ─────────────────────────────────────────────────────

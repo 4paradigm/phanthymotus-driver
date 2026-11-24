@@ -506,8 +506,9 @@ status and the ROS probe live in [VISUAL_ODOMETRY.md](VISUAL_ODOMETRY.md).
 `resource/bumi_model.urdf` declares two extra frames so that vision results can
 hang off the body tf tree instead of floating: `camera_link` (body axes, origin
 at the camera optical centre) and `camera_optical_frame` (optical axes), joined
-by two `fixed` joints off `base_link`. They carry no `<inertial>` — empty links
-are valid URDF and this bundle does not run dynamics.
+by two `fixed` joints hanging off `waist_yaw_link` (the head turns with the
+waist). They carry no `<inertial>` — empty links are valid URDF and this bundle
+does not run dynamics.
 
 ### Where the camera is, and which parent link
 

@@ -338,6 +338,27 @@ def test_a_superseded_publish_thread_publishes_nothing(monkeypatch):
     assert published == []
 
 
+# ── only optical input may be rotated to body axes ───────────────────────────
+
+def test_body_input_with_body_output_is_not_rotated_twice():
+    """Body-axis input already uses machine convention; output=body must pass it
+    through, not apply the optical->body rotation a second time."""
+    batch = _run({"position": [1, 2, 3], "orientation": [0, 0, 0, 1],
+                  "marker_id": 1},
+                 _cfg(input_frame="body", output_frame="body"))
+    edge = batch["transforms"][0]
+    assert edge["translation"] == [1.0, 2.0, 3.0]
+    assert edge["rotation"] == [0.0, 0.0, 0.0, 1.0]
+    assert edge["parent"] == "camera_link"
+
+
+def test_base_to_body_is_rejected_at_config_time():
+    """Converting base-axis input to body needs a measured camera-to-base
+    extrinsic; it must fail validation rather than emit plausible wrong edges."""
+    with pytest.raises(ValueError, match="unsupported"):
+        _cfg(input_frame="base", output_frame="body")
+
+
 # ── non-finite numbers never become a transform ──────────────────────────────
 
 @pytest.mark.parametrize("bad_value", ["NaN", "Infinity", "-Infinity"])

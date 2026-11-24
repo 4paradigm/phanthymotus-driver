@@ -363,6 +363,13 @@ def validate_config(cfg):
     output_frame = str(cfg.get("output_frame", "optical"))
     if output_frame not in OUTPUT_FRAMES:
         raise ValueError(f"output_frame must be one of {OUTPUT_FRAMES}")
+    # base-axis input -> body output would need the measured camera-to-base
+    # extrinsic (translation included), which this card deliberately does not
+    # own. Reject the combination rather than emit plausible but wrong edges.
+    if input_frame == "base" and output_frame == "body":
+        raise ValueError(
+            "input_frame=base with output_frame=body is unsupported: it needs "
+            "a measured camera-to-base transform; use output_frame=optical")
     direction = str(cfg.get("pose_direction", "object_in_camera"))
     if direction not in POSE_DIRECTIONS:
         raise ValueError(f"pose_direction must be one of {POSE_DIRECTIONS}")
@@ -468,8 +475,10 @@ def transforms_from_json(raw, cfg, *, receive_ms, targets):
         if cfg["pose_direction"] == "camera_in_object":
             pos, rot = invert_transform(pos, rot)
 
-        if cfg["output_frame"] == "body":
-            # Card-side optical->body rotation (see module docstring).
+        # Rotate only when converting optical axes to body axes. A body-axis
+        # input is already in machine convention: rotating it again (or moving
+        # its origin to camera_link) would silently corrupt the transform.
+        if cfg["input_frame"] == "optical" and cfg["output_frame"] == "body":
             pos = camera_to_body_point(pos)
             rot = camera_to_body_quaternion(rot)
 

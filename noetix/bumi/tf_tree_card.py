@@ -98,11 +98,16 @@ class _TfTreeNode(Node):
         self._last_stamp_ns = 0
 
         # Vision state: the live child→transform entries, keyed by child frame.
+        # The ROS callback and the status/TTL thread touch these from different
+        # threads, so all reads/writes go through _vision_lock; snapshots are
+        # taken under it before broadcasting.
+        self._vision_lock = threading.RLock()
         self._vision = {}          # child -> {parent, translation, rotation, ...}
         self._vision_parent = {}   # child -> parent, for conflict detection
         self._conflicting_children = set()  # transient: cleared when a child is unambiguous again
         self._rejected_unknown_parent = 0
         self._expired_vision = 0
+        self._stale_joint_samples = 0
         self._conflicting_parent = 0  # cumulative counter for the status topic
 
         self._running = False
@@ -243,14 +248,29 @@ class _TfTreeNode(Node):
     def _on_joints(self, msg: String) -> None:
         """Parse the joint JSON and publish one round of dynamic tf.
 
-        The stamp is the receive time: the publisher does not timestamp joint
-        samples (see device.py), so there is no better source, and the freshness
-        gate below is what stops a stale pose from being published.
+        Timestamp from the producer's read-completion stamp (device.py now
+        emits `stamp_ns`), not from callback time: the joint topic is a deep
+        best-effort queue, so callback time could present a seconds-old pose as
+        current. A sample already older than max_joint_age_s when read is
+        rejected outright rather than broadcast and then declared stale.
         """
         try:
             data = json.loads(msg.data or "{}")
         except (ValueError, TypeError):
             return
+        now_ns = int(self.get_clock().now().nanoseconds)
+        sample_ns = data.get("stamp_ns")
+        try:
+            sample_ns = int(sample_ns)
+        except (TypeError, ValueError):
+            sample_ns = None
+        if sample_ns is not None:
+            age_s = (now_ns - sample_ns) / 1e9
+            if age_s < -0.001 or age_s > self._max_joint_age_s:
+                # Future-dated or already-stale at receipt: never publish it.
+                self._stale_joint_samples += 1
+                return
+
         joints = data.get("joints") or []
         values = {}
         for joint in joints:
@@ -265,7 +285,8 @@ class _TfTreeNode(Node):
             return
         self._joint_values = values
         self._last_joint_at = time.monotonic()
-        self._last_stamp_ns = self.get_clock().now().nanoseconds
+        # Stamp the TF edges with the sample's own read-completion time.
+        self._last_stamp_ns = sample_ns if sample_ns is not None else now_ns
 
         if self._tree is None:
             return
@@ -281,42 +302,44 @@ class _TfTreeNode(Node):
         live, report = spec.merge_vision(
             data.get("transforms"), now_ms, self._vision_ttl_ms)
 
-        self._rejected_unknown_parent += report["unknown_parent"]
-        self._expired_vision += report["expired"]
+        with self._vision_lock:
+            self._rejected_unknown_parent += report["unknown_parent"]
+            self._expired_vision += report["expired"]
 
-        # The tf2 constraint is *simultaneous* parents for one child, not a
-        # parent changing between batches (a tracked target can legitimately
-        # re-appear under another frame). Detect conflicts within this batch;
-        # accept a changed parent from the previous batch as new truth. Counting
-        # cross-batch changes as conflicts would latch `degraded` forever.
-        batch_parents = {}
-        for entry in live:
-            batch_parents.setdefault(entry.get("child"), set()).add(
-                entry.get("parent"))
-        for child, parents in batch_parents.items():
-            if len(parents) > 1:
-                self._conflicting_parent += 1
-                self._conflicting_children.add(child)
-            else:
-                self._conflicting_children.discard(child)
+            # The tf2 constraint is *simultaneous* parents for one child, not a
+            # parent changing between batches (a tracked target can legitimately
+            # re-appear under another frame). Detect conflicts within this batch;
+            # accept a changed parent from the previous batch as new truth.
+            batch_parents = {}
+            for entry in live:
+                batch_parents.setdefault(entry.get("child"), set()).add(
+                    entry.get("parent"))
+            for child, parents in batch_parents.items():
+                if len(parents) > 1:
+                    self._conflicting_parent += 1
+                    self._conflicting_children.add(child)
+                else:
+                    self._conflicting_children.discard(child)
 
-        # Only unambiguous children are published; on conflict keep the last
-        # known transform rather than picking an arbitrary parent from the batch.
-        for entry in live:
-            child = entry.get("child")
-            if child in self._conflicting_children:
-                continue
-            self._vision_parent[child] = entry.get("parent")
-            self._vision[child] = entry
+            # Only unambiguous children are published; on conflict keep the last
+            # known transform rather than picking an arbitrary parent.
+            for entry in live:
+                child = entry.get("child")
+                if child in self._conflicting_children:
+                    continue
+                self._vision_parent[child] = entry.get("parent")
+                self._vision[child] = entry
 
-        # TTL is the single expiry mechanism. A target that walked out of frame
-        # ages out on its own; relying on "missing in the new batch" instead
-        # would break an upstream that publishes only changed entries.
-        self._prune_vision(now_ms)
-        if self._vision:
-            self._dynamic_bc.sendTransform(
-                [self._vision_transform(entry)
-                 for entry in self._vision.values()])
+            # TTL is the single expiry mechanism. A target that walked out of
+            # frame ages out on its own; relying on "missing in the new batch"
+            # would break an upstream that publishes only changed entries.
+            self._prune_vision(now_ms)
+            # Snapshot under the lock; the broadcaster may be called from the
+            # status thread concurrently, so never iterate the live dict there.
+            to_publish = [self._vision_transform(entry)
+                          for entry in self._vision.values()]
+        if to_publish:
+            self._dynamic_bc.sendTransform(to_publish)
 
     def _prune_vision(self, now_ms: int) -> None:
         """Drop live vision entries whose own stamp aged past the TTL."""
@@ -425,7 +448,9 @@ class _TfTreeNode(Node):
             return "urdf_unparsed"
         if self._last_joint_at is None:
             return "no_joints"
-        if self._conflicting_children:
+        with self._vision_lock:
+            conflicting = bool(self._conflicting_children)
+        if conflicting:
             return "conflicting_parent"
         if self._joint_age_s() > self._max_joint_age_s:
             return "joints_stale"
@@ -441,13 +466,14 @@ class _TfTreeNode(Node):
         while self._running and generation == self._generation:
             # Vision TTL must decay even when the upstream card went silent —
             # no incoming batch means no other chance to sweep stale frames.
-            if self._vision:
+            with self._vision_lock:
                 had = len(self._vision)
                 self._prune_vision(int(time.time() * 1000))
-                if len(self._vision) != had and self._vision:
-                    self._dynamic_bc.sendTransform(
-                        [self._vision_transform(entry)
-                         for entry in self._vision.values()])
+                to_publish = ([self._vision_transform(entry)
+                               for entry in self._vision.values()]
+                              if len(self._vision) != had and self._vision else [])
+            if to_publish:
+                self._dynamic_bc.sendTransform(to_publish)
             self._publish_status()
             if self._stopped.wait(interval):
                 break
@@ -463,6 +489,11 @@ class _TfTreeNode(Node):
 
         link_count, dynamic, static = self.frame_counts
         age = self._joint_age_s()
+        with self._vision_lock:
+            vision_targets = len(self._vision)
+            rejected = self._rejected_unknown_parent
+            expired = self._expired_vision
+            conflicting = self._conflicting_parent
         payload = spec.status_payload(
             state="running" if self._running else "idle",
             stamp_ms=int(time.time() * 1000),
@@ -473,10 +504,10 @@ class _TfTreeNode(Node):
             tf_hz=self._tf_hz,
             last_joint_age_ms=int((age * 1000) if age is not None else -1),
             joints_stale=(age is not None and age > self._max_joint_age_s),
-            vision_targets=len(self._vision),
-            rejected_unknown_parent=self._rejected_unknown_parent,
-            expired_vision=self._expired_vision,
-            conflicting_parent=self._conflicting_parent,
+            vision_targets=vision_targets,
+            rejected_unknown_parent=rejected,
+            expired_vision=expired,
+            conflicting_parent=conflicting,
             degraded=self._degraded(),
             last_error=self._parse_error or "",
         )
@@ -489,6 +520,8 @@ class _TfTreeNode(Node):
     def snapshot(self) -> dict:
         link_count, dynamic, static = self.frame_counts
         age = self._joint_age_s()
+        with self._vision_lock:
+            vision_targets = len(self._vision)
         return {
             "state": "running" if self._running else "idle",
             "root_frame": self._tree["root"] if self._tree else "",
@@ -497,7 +530,7 @@ class _TfTreeNode(Node):
             "static_frames": static,
             "tf_hz": round(self._tf_hz, 1),
             "last_joint_age_ms": int((age * 1000) if age is not None else -1),
-            "vision_targets": len(self._vision),
+            "vision_targets": vision_targets,
             "degraded": self._degraded(),
             "last_error": self._parse_error or "",
         }
