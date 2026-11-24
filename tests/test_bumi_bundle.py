@@ -104,6 +104,24 @@ def _config(*, loco=True, loco_servo=True, servo_config=None):
     }
 
 
+def test_sound_facing_shares_existing_loco_without_authority(bundle_module, monkeypatch):
+    module = types.ModuleType("sound_facing_card")
+    captured = []
+
+    class Facing:
+        def __init__(self, settings, namespace, executor, loco_plugin, *, source_plugin=None):
+            captured.append((settings, namespace, executor, loco_plugin))
+
+    module.SoundFacingPlugin = Facing
+    monkeypatch.setitem(sys.modules, "sound_facing_card", module)
+    config = _config(loco_servo=False)
+    config["plugins"]["bumi_sound_facing"] = {"enabled": True}
+    executor = object()
+    bundle = bundle_module.BumiDeviceBundle(config, "sim", executor, FakeHighCtrl(), None)
+    assert captured == [({"enabled": True}, "sim", executor, bundle._plugins[0])]
+    assert len(bundle._plugins) == 2
+
+
 def test_enabled_loco_servo_registers_and_reuses_loco(bundle_module):
     high_ctrl = FakeHighCtrl()
     executor = object()
