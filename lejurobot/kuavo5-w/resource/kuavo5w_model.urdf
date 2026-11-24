@@ -1,0 +1,314 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Display-only skeleton from controller biped_s63; see README.md for provenance. -->
+<robot name="biped_s63">
+  <link name="dummy_link" />
+  <link name="base_link">
+    </link>
+  <joint name="base_link_to_dummy_link" type="fixed">
+    <origin xyz="0 0 0" rpy="0 0 0" />
+    <parent link="base_link" />
+    <child link="dummy_link" />
+  </joint>
+  <link name="wheel_left_front">
+    </link>
+  <joint name="wheel_left_front_joint" type="continuous">
+    <origin xyz="0.23865 0.23865 0.13035" rpy="0 0 0.7854" />
+    <parent link="base_link" />
+    <child link="wheel_left_front" />
+    <axis xyz="1 0 0" />
+  </joint>
+  <link name="wheel_right_front">
+    </link>
+  <joint name="wheel_right_front_joint" type="continuous">
+    <origin xyz="0.23865 -0.23865 0.13035" rpy="0 0 -0.7854" />
+    <parent link="base_link" />
+    <child link="wheel_right_front" />
+    <axis xyz="1 0 0" />
+  </joint>
+  <link name="wheel_left_behind">
+    </link>
+  <joint name="wheel_left_behind_joint" type="continuous">
+    <origin xyz="-0.23865 0.23865 0.13035" rpy="0 0 2.3562" />
+    <parent link="base_link" />
+    <child link="wheel_left_behind" />
+    <axis xyz="1 0 0" />
+  </joint>
+  <link name="wheel_right_behind">
+    </link>
+  <joint name="wheel_right_behind_joint" type="continuous">
+    <origin xyz="-0.23865 -0.23865 0.13035" rpy="0 0 -2.3562" />
+    <parent link="base_link" />
+    <child link="wheel_right_behind" />
+    <axis xyz="1 0 0" />
+  </joint>
+  <link name="base_to_joint">
+    </link>
+  <joint name="base_to_joint" type="fixed">
+    <origin xyz="0.093 0 0.30085" rpy="0 0 0" />
+    <parent link="base_link" />
+    <child link="base_to_joint" />
+    <axis xyz="0 1 0" />
+  </joint>
+  <link name="knee_link">
+    </link>
+  <joint name="knee_joint" type="revolute">
+    <origin xyz="0 0 0.1055" rpy="0 0 0" />
+    <parent link="base_to_joint" />
+    <child link="knee_link" />
+    <axis xyz="0 1 0" />
+    <limit lower="0" upper="1.44862327915529" effort="668.53" velocity="25.33" />
+    <dynamics damping="0.0" friction="0.0" />
+  </joint>
+  <link name="leg_link">
+    </link>
+  <joint name="leg_joint" type="revolute">
+    <origin xyz="-0.46521 0 0.18325" rpy="0 0 0" />
+    <parent link="knee_link" />
+    <child link="leg_link" />
+    <axis xyz="0 1 0" />
+    <limit lower="-2.80998009571087" upper="0.0" effort="668.53" velocity="25.33" />
+  </joint>
+  <link name="waist_link">
+    </link>
+  <joint name="waist_pitch_joint" type="revolute">
+    <origin xyz="0.48296 0 0.12941" rpy="0 0 0" />
+    <parent link="leg_link" />
+    <child link="waist_link" />
+    <axis xyz="0 1 0" />
+    <limit lower="-0.15707963267949" upper="2.9845130209103" effort="618.48" velocity="25.33" />
+    <dynamics damping="0.0" friction="0.0" />
+  </joint>
+  <link name="waist_yaw_link">
+    </link>
+  <joint name="waist_yaw_joint" type="revolute">
+    <origin xyz="0 0 0.25" rpy="0 0 0" />
+    <parent link="waist_link" />
+    <child link="waist_yaw_link" />
+    <axis xyz="0 0 1" />
+    <limit lower="-3.14159265358979" upper="3.14159265358979" effort="618.48" velocity="25.33" />
+    <dynamics damping="0.0" friction="0.0" />
+  </joint>
+  <link name="zarm_l1_link">
+    </link>
+  <joint name="zarm_l1_joint" type="revolute">
+    <origin xyz="0 0.253 0.227" rpy="0 0 0" />
+    <parent link="waist_yaw_link" />
+    <child link="zarm_l1_link" />
+    <axis xyz="0 1 0" />
+    <limit lower="-3.14159265358979" upper="1.5707963267949" effort="85.0" velocity="13.0" />
+    <dynamics damping="0.0" friction="0.0" />
+  </joint>
+  <link name="zarm_l2_link">
+    </link>
+  <joint name="zarm_l2_joint" type="revolute">
+    <origin xyz="0 0 0" rpy="0 0 0" />
+    <parent link="zarm_l1_link" />
+    <child link="zarm_l2_link" />
+    <axis xyz="1 0 0" />
+    <limit lower="-0.349065850398866" upper="3.49065850398866" effort="75.0" velocity="8.0" />
+    <dynamics damping="0.0" friction="0.0" />
+  </joint>
+  <link name="zarm_l3_link">
+    </link>
+  <joint name="zarm_l3_joint" type="revolute">
+    <origin xyz="0 0 0" rpy="0 0 0" />
+    <parent link="zarm_l2_link" />
+    <child link="zarm_l3_link" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.48352986419518" upper="1.48352986419518" effort="57.0" velocity="7.5" />
+    <dynamics damping="0.0" friction="0.0" />
+  </joint>
+  <link name="zarm_l4_link">
+    </link>
+  <joint name="zarm_l4_joint" type="revolute">
+    <origin xyz="0.02 0 -0.2837" rpy="0 0 0" />
+    <parent link="zarm_l3_link" />
+    <child link="zarm_l4_link" />
+    <axis xyz="0 1 0" />
+    <limit lower="-2.61799387799149" upper="0.0" effort="75.0" velocity="8.0" />
+    <dynamics damping="0.0" friction="0.0" />
+  </joint>
+  <link name="zarm_l5_link">
+    </link>
+  <joint name="zarm_l5_joint" type="revolute">
+    <origin xyz="-0.02 0 -0.1195" rpy="0 0 0" />
+    <parent link="zarm_l4_link" />
+    <child link="zarm_l5_link" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.5707963267949" upper="1.5707963267949" effort="14.1" velocity="17.5" />
+    <dynamics damping="0.0" friction="0.0" />
+  </joint>
+  <link name="zarm_l6_link">
+    </link>
+  <joint name="zarm_l6_joint" type="revolute">
+    <origin xyz="0.0 0 -0.114" rpy="0 0 0" />
+    <parent link="zarm_l5_link" />
+    <child link="zarm_l6_link" />
+    <axis xyz="1 0 0" />
+    <limit lower="-1.30899693899575" upper="0.698131700797732" effort="14.1" velocity="17.5" />
+    <dynamics damping="0.0" friction="0.0" />
+  </joint>
+  <link name="zarm_l7_link">
+    </link>
+  <joint name="zarm_l7_joint" type="revolute">
+    <origin xyz="0 0 -0.021" rpy="0 0 0" />
+    <parent link="zarm_l6_link" />
+    <child link="zarm_l7_link" />
+    <axis xyz="0 1 0" />
+    <limit lower="-0.698131700797732" upper="0.698131700797732" effort="14.1" velocity="17.5" />
+    <dynamics damping="0.0" friction="0.0" />
+  </joint>
+  <link name="zarm_l7_end_effector">
+    </link>
+  <joint name="zarm_l7_end_effector_joint" type="fixed">
+    <origin xyz="0 0.0 -0.17" rpy="0 0 0" />
+    <parent link="zarm_l7_link" />
+    <child link="zarm_l7_end_effector" />
+  </joint>
+  <link name="zarm_l7_end_effector_1">
+  </link>
+  <joint name="zarm_l7_end_effector_1_joint" type="fixed">
+    <origin xyz="0 0.0 -0.08" rpy="0 0 0" />
+    <parent link="zarm_l7_link" />
+    <child link="zarm_l7_end_effector_1" />
+  </joint>
+  <link name="zarm_l7_end_effector_2">
+  </link>
+  <joint name="zarm_l7_end_effector_2_joint" type="fixed">
+    <origin xyz="0.03 0.0 -0.17" rpy="0 0 0" />
+    <parent link="zarm_l7_link" />
+    <child link="zarm_l7_end_effector_2" />
+  </joint>
+  <link name="zarm_r1_link">
+    </link>
+  <joint name="zarm_r1_joint" type="revolute">
+    <origin xyz="0 -0.253 0.227" rpy="0 0 0" />
+    <parent link="waist_yaw_link" />
+    <child link="zarm_r1_link" />
+    <axis xyz="0 1 0" />
+    <limit lower="-3.14159265358979" upper="1.5707963267949" effort="85.0" velocity="13.0" />
+    <dynamics damping="0.0" friction="0.0" />
+  </joint>
+  <link name="zarm_r2_link">
+    </link>
+  <joint name="zarm_r2_joint" type="revolute">
+    <origin xyz="0 0 0" rpy="0 0 0" />
+    <parent link="zarm_r1_link" />
+    <child link="zarm_r2_link" />
+    <axis xyz="1 0 0" />
+    <limit lower="-3.49065850398866" upper="0.349065850398866" effort="75.0" velocity="8.0" />
+    <dynamics damping="0.0" friction="0.0" />
+  </joint>
+  <link name="zarm_r3_link">
+    </link>
+  <joint name="zarm_r3_joint" type="revolute">
+    <origin xyz="0 0 0" rpy="0 0 0" />
+    <parent link="zarm_r2_link" />
+    <child link="zarm_r3_link" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.48352986419518" upper="1.48352986419518" effort="57.0" velocity="7.5" />
+    <dynamics damping="0.0" friction="0.0" />
+  </joint>
+  <link name="zarm_r4_link">
+    </link>
+  <joint name="zarm_r4_joint" type="revolute">
+    <origin xyz="0.02 0 -0.2837" rpy="0 0 0" />
+    <parent link="zarm_r3_link" />
+    <child link="zarm_r4_link" />
+    <axis xyz="0 1 0" />
+    <limit lower="-2.61799387799149" upper="0.0" effort="75.0" velocity="8.0" />
+    <dynamics damping="0.0" friction="0.0" />
+  </joint>
+  <link name="zarm_r5_link">
+    </link>
+  <joint name="zarm_r5_joint" type="revolute">
+    <origin xyz="-0.02 0 -0.1195" rpy="0 0 0" />
+    <parent link="zarm_r4_link" />
+    <child link="zarm_r5_link" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.5707963267949" upper="1.5707963267949" effort="14.1" velocity="17.5" />
+    <dynamics damping="0.0" friction="0.0" />
+  </joint>
+  <link name="zarm_r6_link">
+    </link>
+  <joint name="zarm_r6_joint" type="revolute">
+    <origin xyz="0.0 0 -0.114" rpy="0 0 0" />
+    <parent link="zarm_r5_link" />
+    <child link="zarm_r6_link" />
+    <axis xyz="1 0 0" />
+    <limit lower="-0.698131700797732" upper="1.30899693899575" effort="14.1" velocity="17.5" />
+    <dynamics damping="0.0" friction="0.0" />
+  </joint>
+  <link name="zarm_r7_link">
+    </link>
+  <joint name="zarm_r7_joint" type="revolute">
+    <origin xyz="0.0 0 -0.021" rpy="0 0 0" />
+    <parent link="zarm_r6_link" />
+    <child link="zarm_r7_link" />
+    <axis xyz="0 1 0" />
+    <limit lower="-0.698131700797732" upper="0.698131700797732" effort="14.1" velocity="17.5" />
+    <dynamics damping="0.0" friction="0.0" />
+  </joint>
+  <link name="zarm_r7_end_effector">
+    </link>
+  <joint name="zarm_r7_end_effector_joint" type="fixed">
+    <origin xyz="0 0.0 -0.17" rpy="0 0 0" />
+    <parent link="zarm_r7_link" />
+    <child link="zarm_r7_end_effector" />
+  </joint>
+  <link name="zarm_r7_end_effector_1">
+  </link>
+  <joint name="zarm_r7_end_effector_1_joint" type="fixed">
+    <origin xyz="0 0.0 -0.08" rpy="0 0 0" />
+    <parent link="zarm_r7_link" />
+    <child link="zarm_r7_end_effector_1" />
+  </joint>
+  <link name="zarm_r7_end_effector_2">
+  </link>
+  <joint name="zarm_r7_end_effector_2_joint" type="fixed">
+    <origin xyz="0.03 0.0 -0.17" rpy="0 0 0" />
+    <parent link="zarm_r7_link" />
+    <child link="zarm_r7_end_effector_2" />
+  </joint>
+  <link name="zhead_1_link">
+    </link>
+  <joint name="zhead_1_joint" type="revolute">
+    <origin xyz="0 0 0.43935" rpy="0 0 0" />
+    <parent link="waist_yaw_link" />
+    <child link="zhead_1_link" />
+    <axis xyz="0 0 1" />
+    <limit lower="-1.57" upper="1.57" effort="15.5" velocity="2.198" />
+    <dynamics damping="0.0" friction="0.0" />
+  </joint>
+  <link name="zhead_2_link">
+    </link>
+  <joint name="zhead_2_joint" type="revolute">
+    <origin xyz="0 0 0" rpy="0 0 0" />
+    <parent link="zhead_1_link" />
+    <child link="zhead_2_link" />
+    <axis xyz="0 1 0" />
+    <limit lower="-0.526" upper="0.526" effort="14.5" velocity="2.198" />
+    <dynamics damping="0.0" friction="0.0" />
+  </joint>
+  <link name="head_camera_base">
+    </link>
+  <joint name="head_camera_base_joint" type="fixed">
+    <origin xyz="0.099619 0 0.032844" rpy="0 0.3406 0" />
+    <parent link="zhead_2_link" />
+    <child link="head_camera_base" />
+  </joint>
+  <link name="head_camera_depth">
+    </link>
+  <joint name="head_camera_depth_joint" type="fixed">
+    <origin xyz="0.011715 0.0475 0.014311" rpy="0 0 0" />
+    <parent link="head_camera_base" />
+    <child link="head_camera_depth" />
+  </joint>
+  <link name="radar">
+    </link>
+  <joint name="radar" type="fixed">
+    <origin xyz="0 0 -0.078453" rpy="0 0 0" />
+    <parent link="zhead_1_link" />
+    <child link="radar" />
+  </joint>
+</robot>

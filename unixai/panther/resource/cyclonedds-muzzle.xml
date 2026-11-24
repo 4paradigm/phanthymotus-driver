@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CycloneDDS xmlns="https://cdds.io/config">
+  <Domain Id="any">
+    <Tracing>
+      <Verbosity>none</Verbosity>
+      <OutputFile>/dev/null</OutputFile>
+    </Tracing>
+  </Domain>
+</CycloneDDS>
