@@ -259,6 +259,56 @@ def test_already_stale_joint_sample_is_rejected(card_module):
     assert node._last_joint_at is None  # never accepted as a fresh sample
 
 
+def test_non_finite_joint_value_is_rejected(card_module):
+    """P1 regression: a NaN/Inf SDK reading must never reach forward kinematics.
+
+    `float("nan")` passes a bare try/except and would flow into
+    `joint_local_pose`, whose matrix→quaternion conversion can divide by zero
+    and abort the callback, freezing the tree. The whole sample is dropped and
+    counted so status can report it.
+    """
+    plugin = _make_card(card_module)
+    node = plugin._node
+    for bad in ("nan", "inf", "-inf"):
+        node._on_joints(types.SimpleNamespace(data=json.dumps({
+            "joints": [{"name": "l_arm_pitch_joint", "q": bad}],
+        })))
+    assert node._rejected_bad_joints == 3
+    assert node._joint_values == {}  # nothing poisoned the retained pose
+    assert node._last_joint_at is None  # no bad sample was ever accepted
+
+    # A subsequent good sample still works — rejection is not sticky.
+    node._on_joints(types.SimpleNamespace(data=json.dumps({
+        "joints": [{"name": "l_arm_pitch_joint", "q": 0.2}],
+    })))
+    assert node._joint_values["l_arm_pitch_joint"] == pytest.approx(0.2)
+    assert node._last_joint_at is not None
+
+
+def test_partially_bad_joint_sample_is_rejected_whole(card_module):
+    """One bad joint rejects the entire sample, not just that joint.
+
+    Dropping only the bad joint would let FK fall back to `q=0` for it — an
+    unsignalled pose snap. Freezing at the last good pose is safer.
+    """
+    plugin = _make_card(card_module)
+    node = plugin._node
+    node._on_joints(types.SimpleNamespace(data=json.dumps({
+        "joints": [{"name": "l_arm_pitch_joint", "q": 0.2}],
+    })))
+    assert node._joint_values["l_arm_pitch_joint"] == pytest.approx(0.2)
+    node._on_joints(types.SimpleNamespace(data=json.dumps({
+        "joints": [
+            {"name": "l_arm_pitch_joint", "q": 0.9},
+            {"name": "l_arm_roll_joint", "q": "nan"},
+        ],
+    })))
+    assert node._rejected_bad_joints == 1
+    # Retained pose is still the last fully-good sample (0.2, no roll entry).
+    assert node._joint_values["l_arm_pitch_joint"] == pytest.approx(0.2)
+    assert "l_arm_roll_joint" not in node._joint_values
+
+
 # ── vision lifecycle ─────────────────────────────────────────────────────────
 
 

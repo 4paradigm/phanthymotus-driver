@@ -36,6 +36,7 @@ fresh" stance the `media_status` card takes for unreadable states.
 from __future__ import annotations
 
 import json
+import math
 import threading
 import time
 from pathlib import Path
@@ -108,6 +109,7 @@ class _TfTreeNode(Node):
         self._rejected_unknown_parent = 0
         self._expired_vision = 0
         self._rejected_bad_payload = 0
+        self._rejected_bad_joints = 0
         self._stale_joint_samples = 0
         self._conflicting_parent = 0  # cumulative counter for the status topic
         self._camera_extrinsic_assumed = False  # zero mount translation = unmeasured
@@ -286,14 +288,31 @@ class _TfTreeNode(Node):
 
         joints = data.get("joints") or []
         values = {}
+        bad_joint_values = 0
         for joint in joints:
             name = joint.get("name")
             if name is None:
                 continue
             try:
-                values[name] = float(joint.get("q", 0.0))
-            except (TypeError, ValueError):
+                q = float(joint.get("q", 0.0))
+            except (TypeError, ValueError, OverflowError):
+                bad_joint_values += 1
                 continue
+            # A NaN/Inf from a bad SDK reading must not enter forward kinematics:
+            # it produces invalid TF values and can divide by zero in
+            # quat_from_matrix, aborting this callback and freezing the tree.
+            # Drop the sample rather than publish a poisoned pose.
+            if not math.isfinite(q):
+                bad_joint_values += 1
+                continue
+            values[name] = q
+        if bad_joint_values:
+            self._rejected_bad_joints += bad_joint_values
+            # Reject the WHOLE sample, not just the bad joint. A partial update
+            # would leave the bad joint to FK's `.get(name, 0.0)` default — an
+            # unsignalled snap to q=0, which is worse than freezing at the last
+            # good pose. If bad readings persist, the age check reports stale.
+            return
         if not values:
             return
         self._joint_values = values
@@ -508,6 +527,7 @@ class _TfTreeNode(Node):
             rejected = self._rejected_unknown_parent
             expired = self._expired_vision
             bad_payload = self._rejected_bad_payload
+            bad_joints = self._rejected_bad_joints
             conflicting = self._conflicting_parent
         payload = spec.status_payload(
             state="running" if self._running else "idle",
@@ -523,6 +543,7 @@ class _TfTreeNode(Node):
             rejected_unknown_parent=rejected,
             expired_vision=expired,
             rejected_bad_payload=bad_payload,
+            rejected_bad_joints=bad_joints,
             conflicting_parent=conflicting,
             degraded=self._degraded(),
             last_error=self._parse_error or "",

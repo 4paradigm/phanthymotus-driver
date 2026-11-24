@@ -491,7 +491,8 @@ def status_payload(*, state, stamp_ms, root_frame, link_count, dynamic_frames,
                    static_frames, tf_hz, last_joint_age_ms, joints_stale,
                    vision_targets, rejected_unknown_parent, expired_vision,
                    conflicting_parent, degraded, last_error,
-                   camera_extrinsic_assumed=False, rejected_bad_payload=0):
+                   camera_extrinsic_assumed=False, rejected_bad_payload=0,
+                   rejected_bad_joints=0):
     """Build the flat `data/json` status payload.
 
     Every value is a top-level scalar, because the dashboard renders a nested
@@ -514,6 +515,7 @@ def status_payload(*, state, stamp_ms, root_frame, link_count, dynamic_frames,
         "rejected_unknown_parent": int(rejected_unknown_parent),
         "expired_vision": int(expired_vision),
         "rejected_bad_payload": int(rejected_bad_payload),
+        "rejected_bad_joints": int(rejected_bad_joints),
         "conflicting_parent": int(conflicting_parent),
         # True when the URDF camera mount translation is still the nominal
         # zero placeholder: every vision target below it carries this offset.
