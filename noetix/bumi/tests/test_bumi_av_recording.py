@@ -164,10 +164,13 @@ def test_schema_and_queued_audio_option_are_real(monkeypatch, tmp_path):
     from unittest.mock import Mock
     monkeypatch.setattr(module.threading, "Thread", Mock())
     schema = plugin.get_tool()["inputSchema"]
-    assert schema["properties"]["include_audio"]["default"] is False
+    option = schema["properties"]["include_audio"]
+    assert option["default"] is True
+    assert option["enum"] == [True, False]
+    assert [choice["title"] for choice in option["oneOf"]] == ["true（有声，默认）", "false（无声）"]
     assert "include_audio" in schema["x-action-params"]["record_video"]["params"]
     assert schema["x-completion"]["timeout"] >= 75
-    result = plugin.dispatch("record_video", {"duration_s": 10, "include_audio": True})
+    result = plugin.dispatch("record_video", {"duration_s": 10})
     assert result["state"] == "queued" and result["include_audio"] is True
     assert plugin._active_recording["include_audio"] is True
     assert plugin._video_topic == "/robot/camera/color"
@@ -249,9 +252,9 @@ def test_audio_option_type_is_validated(monkeypatch, tmp_path, value):
 
 def test_mic_disabled_and_encoder_missing_fail_before_start(monkeypatch, tmp_path):
     plugin, module = make_plugin(monkeypatch, tmp_path, mic_enabled=False)
-    assert plugin.dispatch("record_video", {"include_audio": True})["code"] == "AUDIO_UNAVAILABLE"
+    assert plugin.dispatch("record_video", {})["code"] == "AUDIO_UNAVAILABLE"
     monkeypatch.setattr(module.shutil, "which", lambda name: None)
-    assert plugin.dispatch("record_video", {})["code"] == "ENCODER_UNAVAILABLE"
+    assert plugin.dispatch("record_video", {"include_audio": False})["code"] == "ENCODER_UNAVAILABLE"
 
 
 def test_configured_maximum_is_reflected_in_schema_and_default(monkeypatch, tmp_path):
@@ -385,10 +388,12 @@ def test_real_ten_second_stopwatch_clock_with_camera_drops(monkeypatch, tmp_path
     monkeypatch.setattr(av, "make_input_node", Mock(return_value=node))
     notify = Mock()
     monkeypatch.setattr(module, "_acp_notify", notify)
-    active = {"action_id": "real-ffmpeg-test", "duration_s": duration, "include_audio": include_audio,
-              "cancel_event": threading.Event()}
-    plugin._active_recording = active
-    plugin._record_video_async(active)
+    args = {"duration_s": duration} if include_audio else {"duration_s": duration, "include_audio": False}
+    with monkeypatch.context() as patch:
+        patch.setattr(module.threading, "Thread", Mock())
+        queued = plugin.dispatch("record_video", args)
+    assert queued["state"] == "queued" and queued["include_audio"] is include_audio
+    plugin._record_video_async(plugin._active_recording)
     info = plugin._last_recording
     assert info["ok"] and info["status"] == "completed", info
     assert info["include_audio"] is include_audio

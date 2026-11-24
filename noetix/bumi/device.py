@@ -3141,13 +3141,17 @@ class VisionCapturePlugin:
                 "duration_s": {"type": "integer", "minimum": 1, "maximum": self._max_duration_s,
                                "default": min(5, self._max_duration_s),
                                "description": "默认值为5秒（可填写1–30秒）"},
-                "include_audio": {"type": "boolean", "default": False, "title": "录制现场声音",
-                                  "description": "开启后录制现有 mic 的声音并合成 AAC 音轨。默认关闭。无音频、断流或仅零 PCM 会明确失败，不降级成无声录像。"},
+                "include_audio": {
+                    "type": "boolean", "default": True, "enum": [True, False],
+                    "oneOf": [{"const": True, "title": "true（有声，默认）"},
+                              {"const": False, "title": "false（无声）"}],
+                    "description": "true 为有声（默认），false 为无声。有声模式下麦克风不可用时返回错误。",
+                },
             }, "required": ["action"], "additionalProperties": False,
                 "x-action-params": {
                     "start": {"params": [], "description": "启用卡片；拍照与录像操作各自检查设备是否就绪。"},
                     "capture_photo": {"params": [], "description": "拍摄并保存一张当前 RGB 照片。"},
-                    "record_video": {"params": ["duration_s", "include_audio"], "description": "按真实时间录制并保存 1–30 秒视频，可选现场声音，默认 5 秒、无声。"},
+                    "record_video": {"params": ["duration_s", "include_audio"], "description": "录像默认 5 秒、带现场声音。include_audio=true 为有声，false 为无声。"},
                     "info": {"params": [], "description": "查看保存目录与相机状态。"},
                     "stop": {"params": [], "description": "停用卡片并请求取消当前录像；立即返回 idle，清理终态由 ACP/info 报告。"},
                 },
@@ -3283,7 +3287,7 @@ class VisionCapturePlugin:
             return {"ok": False, "code": "INVALID_DURATION", "message": "duration_s must be an integer"}
         if not 1 <= requested <= self._max_duration_s:
             return {"ok": False, "code": "INVALID_DURATION", "message": f"duration_s must be between 1 and {self._max_duration_s}"}
-        include_audio = args.get("include_audio", False)
+        include_audio = args.get("include_audio", True)
         if type(include_audio) is not bool:
             return {"ok": False, "code": "INVALID_AUDIO_OPTION", "message": "include_audio must be a boolean"}
         if not self._camera_ready():

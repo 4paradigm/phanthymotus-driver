@@ -6,7 +6,8 @@
 ## 画布测试
 
 1. 部署待测 Bumi 驱动，启用 `camera`、`mic` 和 `vision_capture`，确认相机预览刷新。
-2. 在 `vision_capture` 选择 `record_video`，设置 `duration_s=10` 和 `include_audio=true`。
+2. 在 `vision_capture` 选择 `record_video`，设置 `duration_s=10`。`include_audio` 默认
+   为 `true`（有声），选择 `false` 录制无声视频。
    卡片内部订阅设备数据。在 Skill 中使用时，将 `vision_capture` 绑定到 `decision_core`。
 3. 提前启动秒表，将数字完整放在相机画面内。从开始到结束按秒表读出整数，
    并在起始、中段和结束附近各拍一次手。

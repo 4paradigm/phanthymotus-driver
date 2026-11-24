@@ -225,8 +225,8 @@ are left untouched.
   readiness is checked by the photo/video actions, not canvas activation.
 - `capture_photo`: save one current RGB JPEG.
 - `record_video`: asynchronously save an MP4/H.264 video; `duration_s` is
-  an integer from 1 to 30, default 5 seconds. Set `include_audio: true` to
-  include microphone AAC audio (default false). Audio capture must be enabled.
+  an integer from 1 to 30, default 5 seconds. `include_audio: true` (default)
+  includes microphone AAC audio. Set `include_audio: false` for video only.
 - `info`: return storage directories, camera/frame freshness and active recording.
 - `stop`: immediately return lifecycle `idle` and request cancellation. If a
   recording exists, `cancellation_pending=true` means cleanup is still running;
