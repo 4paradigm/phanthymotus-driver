@@ -147,6 +147,8 @@ class KuavoSensors:
         self._torque_unit = config.get('joint_torque_unit')
         self._imu_topic = config.get('imu_topic', '/imu')
         self._standard_imu_at = None
+        self._static_rotations = {}
+        self._body_gravity = None
         if self._torque_unit not in (None, 'N*m'):
             raise ValueError('joint_torque_unit must be null or hardware-verified N*m')
         self._topics = {'joints': f'/{namespace}/state/joints',
@@ -170,6 +172,7 @@ class KuavoSensors:
         for topic in ('/sensors_data_raw', '/sensors_data_raw_shm'):
             ros1.subscribe(topic, 'kuavo_msgs/sensorsData',
                            lambda msg, source=topic: self._on_joint_raw(msg, source), throttle_ms=100)
+        ros1.subscribe('/tf_static', 'tf2_msgs/TFMessage', self._on_static_tf)
         ros1.subscribe(self._imu_topic, 'sensor_msgs/Imu', self._on_standard_imu)
         ros1.subscribe('/motus/kuavo5w/camera_imu', 'std_msgs/String', self._on_camera_imu)
         ros1.subscribe('/motus/kuavo5w/camera_imu/status', 'std_msgs/String', self._on_camera_imu_status)
@@ -183,7 +186,8 @@ class KuavoSensors:
                 self._model_sha256 = None
                 self._vendor_arm_bounds = None
                 self._identity_checked_at = None
-                self._standard_imu_at = None
+                self._standard_imu_at = self._body_gravity = None
+                self._static_rotations.clear()
                 self._joint_capture_ns = self._joint_captured_at = None
                 self._joint_header_ns = None
                 self._data.clear()
@@ -819,6 +823,75 @@ class KuavoSensors:
                     'valid': bool(result) or odom_valid,
                     'reason': None if result or odom_valid else 'missing_or_stale_pose_and_odometry'}
 
+    def _on_static_tf(self, message):
+        if not self._session()[0]:
+            return
+        with self._lock:
+            for transform in message.get('transforms', []):
+                child = transform.get('child_frame_id') if isinstance(transform, dict) else None
+                if not isinstance(child, str) or not child.lstrip('/'):
+                    continue
+                child = child.lstrip('/')
+                try:
+                    parent = transform['header']['frame_id'].lstrip('/')
+                    rotation = xyz(transform['transform']['rotation'], ('w', 'x', 'y', 'z'))
+                    norm = math.sqrt(sum(v*v for v in rotation))
+                    if not parent or not child or abs(norm-1.) > .05:
+                        raise ValueError('invalid static transform')
+                    edge = parent, [v/norm for v in rotation]
+                    if self._static_rotations.get(child) != edge:
+                        self._static_rotations[child] = edge
+                        self._body_gravity = None
+                except (KeyError, TypeError, ValueError, AttributeError):
+                    self._static_rotations.pop(child, None)
+                    self._body_gravity = None
+
+    def _gravity_in_body(self, message, orientation):
+        header = message.get('header', {})
+        try:
+            ns = ros_time_ns(header.get('stamp'), 'IMU capture time')
+        except ValueError:
+            return None
+        norm = math.sqrt(sum(v*v for v in orientation))
+        w, x, y, z = (v/norm for v in orientation)
+        up = [2*(x*z-w*y), 2*(y*z+w*x), 1-2*(x*x+y*y)]
+        # Resolve rigid branches through their common ancestor. A moving joint
+        # never appears on /tf_static and cannot be used as an IMU mount.
+        frame = header.get('frame_id')
+        if not isinstance(frame, str) or not frame:
+            return None
+        frame = frame.lstrip('/')
+        body_path = {'base_link': []}
+        body = 'base_link'
+        while body in self._static_rotations:
+            parent, rotation = self._static_rotations[body]
+            if parent in body_path:
+                return None
+            w, x, y, z = rotation
+            body_path[parent] = [(w, -x, -y, -z)] + body_path[body]
+            body = parent
+        rotations = []
+        seen = set()
+        while frame not in body_path:
+            if frame in seen or frame not in self._static_rotations:
+                return None
+            seen.add(frame)
+            frame, rotation = self._static_rotations[frame]
+            rotations.append(rotation)
+        for w, x, y, z in rotations + body_path[frame]:
+            a, b, c = up
+            # Unit quaternion vector rotation: v + 2w(q x v) + 2q x (q x v).
+            u, v, h = 2*(y*c-z*b), 2*(z*a-x*c), 2*(x*b-y*a)
+            up = [a+w*u+y*h-z*v, b+w*v+z*u-x*h, c+w*h+x*v-y*u]
+        gravity = dict(frame_id='base_link', stamp_ns=ns, up=up)
+        covariance = message.get('orientation_covariance')
+        if (isinstance(covariance, list) and len(covariance) == 9 and all(map(finite, covariance))
+                and all(covariance[i] >= 0. for i in (0, 4, 8)) and any(covariance)):
+            # An upper bound invariant under mounting rotation. ROS all-zero means unknown.
+            gravity['variance_bound_rad2'] = max(sum(abs(v) for v in covariance[i:i+3])
+                                                 for i in (0, 3, 6))
+        return gravity
+
     def _on_standard_imu(self, message):
         if not self._session()[0]:
             return
@@ -841,11 +914,13 @@ class KuavoSensors:
                     'free_acceleration': None, 'frame_id': message.get('header', {}).get('frame_id'),
                     'units': {'gyroscope': 'rad/s', 'accelerometer': 'm/s^2', 'rpy': 'rad'},
                     'vendor': {'topic': self._imu_topic, **provenance}}
+                self._body_gravity = self._gravity_in_body(message, quat) if orientation else None
                 self._standard_imu_at = self._seen['imu'] = time.monotonic()
                 self._errors.pop('imu', None)
             except (KeyError, TypeError, ValueError, AttributeError) as exc:
                 self._data.pop('imu', None)
                 self._seen.pop('imu', None)
+                self._body_gravity = None
                 self._errors['imu'] = str(exc)
 
     def _on_camera_imu_status(self, message):
@@ -967,6 +1042,11 @@ class KuavoSensors:
                     twist=mean_twist(window), pose=payload.get('pose'),
                     vendor={**payload.get('vendor', {}), 'samples': len(window)})
                 payload['motion_model'] = 'planar'
+                capture = payload['vendor'].get('motus_slam', {}).get('stamp_ns')
+                gravity = self._body_gravity
+                if (valid and gravity and type(capture) is int and
+                        abs(capture-gravity['stamp_ns']) <= 50_000_000):
+                    payload['vendor']['body_gravity'] = dict(gravity)
             elif card == 'joints' and not valid:
                 payload['joints'] = []
             return {**payload, 'valid': bool(valid), 'reason': reason,
