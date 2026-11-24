@@ -966,6 +966,7 @@ class KuavoSensors:
                 payload = build_sample(stamp_ms=payload.get('stamp_ms', int(time.time()*1000)),
                     twist=mean_twist(window), pose=payload.get('pose'),
                     vendor={**payload.get('vendor', {}), 'samples': len(window)})
+                payload['motion_model'] = 'planar'
             elif card == 'joints' and not valid:
                 payload['joints'] = []
             return {**payload, 'valid': bool(valid), 'reason': reason,

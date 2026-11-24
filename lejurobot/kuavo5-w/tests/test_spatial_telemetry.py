@@ -62,6 +62,7 @@ class SpatialTelemetryTests(unittest.TestCase):
         ros,node=FakeRos1(),FakeNode();hub=KuavoSensors({},'test',ros,node)
         try:
             hub._on_odom(self.odom());s=hub.snapshot('loco_state')
+            self.assertEqual(s.get('motion_model'), 'planar')
             self.assertEqual(s['pose']['stamp_ms'],1234.567891)
             self.assertNotEqual(s['stamp_ms'],s['pose']['stamp_ms'])
             self.assertEqual(s['vendor']['motus_slam']['stamp_ns'],1234567891)
