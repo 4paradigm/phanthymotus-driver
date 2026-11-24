@@ -2,6 +2,16 @@ mcp_port: 15704
 ros_namespace: ""   # 留空则自动使用 hostname
 
 plugins:
+  vision_tf:
+    enabled: true
+  tf_tree:
+    enabled: true
+    # 厂商 V3 头壳包围盒中心 + RGB 光心相对头部中心的偏移（前 5、左 3.5、上 0.5 cm）。
+    camera_mount:
+      parent: waist_yaw_link
+      xyz_m: [0.0555, 0.0351, 0.3104]
+      rpy_rad: [0.0, 0.0, 0.0]  # 假设镜头水平朝前，画面上方朝上
+    hand_frames: []
   state:
     enabled: true
   loco:
