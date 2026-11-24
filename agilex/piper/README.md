@@ -64,6 +64,28 @@ those fixes for the complete canvas experience. A `trigger` activity label is
 presentation; Get status is a synchronous query and its completion does not
 change the previous movement result.
 
+## Grasp check
+
+**Grasp check** (`piper_grasp_check`) is a separate read-only sensor card.
+Use **Read gripper feedback** to record the opening and signed motor torque
+for a closed empty gripper and for a known held part on the installed jaws.
+Use **Check grasp** after the gripper has settled. Enter the expected opening
+range of the held part (`min_width_mm`, `max_width_mm`), the measured empty
+opening and tolerance (`empty_width_mm`, `empty_tolerance_mm`), and a nonzero
+`holding_effort_threshold_nm` in the measured holding direction. The card
+uses these inputs only to evaluate measured feedback.
+
+The result is `grasped` (`is_grasped: true`) when at least three distinct,
+fresh frames spanning 120 ms show openings in the expected range with at
+most 0.5 mm of variation and holding torque at or beyond the threshold in
+the calibrated direction.
+`empty` (`false`) means the opening is stable in the calibrated empty band.
+`indeterminate` (`null`) covers overlapping ranges, weak or opposite torque,
+unstable opening, missing feedback, faults, and in-progress motion. The
+estimate identifies contact consistent with the calibrated part width. Object
+identity and retention during motion require separate checks. No canvas data
+connection is required.
+
 ## Build and packaging
 
 ```bash
