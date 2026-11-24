@@ -32,11 +32,8 @@ _CONNECTION_KEYS = ("host", "user", "password", "port")
 _ACTION_TITLES = {"list": "列出访客", "print": "打印访客贴", "detect": "检测前台电脑"}
 _NOT_DETECTED = ("还没检测：先填好前台电脑 IP、用户名和密码并保存，运行项目，在卡片上执行「检测前台电脑」；"
                  "检测完停止项目、刷新页面，再打开这里选择")
-# What to do next, ahead of the error itself.
-_DETECT_HINTS = {
-    "preparing": "正在首次安装（约 2–3 分钟），装好后再执行一次检测。",
-    "install_failed": "安装失败：",
-}
+# Said instead of the error where the next step differs for detect.
+_DETECT_MESSAGES = {"preparing": "正在首次安装前台电脑（约 2–3 分钟），装好后再执行一次检测"}
 
 
 def build_plugins(config: dict) -> list:
@@ -277,7 +274,7 @@ class VisitorBadgePlugin:
                            "请在里面登录访客系统并打开访客列表，然后再执行一次检测")
             ok = True
         except FrontDeskError as exc:
-            message = _DETECT_HINTS.get(exc.code, "检测失败：") + str(exc)
+            message = _DETECT_MESSAGES.get(exc.code) or str(exc)
             ok = False
         with self._lock:
             if all(self._cfg[k] == cfg[k] for k in _CONNECTION_KEYS):   # not since reconfigured

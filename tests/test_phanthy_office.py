@@ -130,7 +130,7 @@ def test_detect_installs_first_then_opens_the_login_window(plugin, monkeypatch):
 
     monkeypatch.setattr(frontdesk.FrontDesk, "pages", pages)
     result = plugin.dispatch("detect", {})
-    assert result["status"] == "error" and "正在首次安装" in result["message"]
+    assert result["status"] == "error" and "正在首次安装" in result["message"] and "请稍后再试" not in result["message"]
     assert "正在首次安装" in _form(plugin)[1]
     installed.set()
     plugin._installer.join(5)
@@ -309,6 +309,14 @@ def test_frontdesk_job_reads_the_result_marker(monkeypatch, tmp_path):
 ])
 def test_ssh_failures_become_actionable_codes(stderr, code):
     assert frontdesk._explain(stderr).code == code
+
+
+def test_powershell_error_records_read_as_text():
+    raw = ('#< CLIXML\r\n<Objs Version="1.1.0.1"><S S="Error">&amp; : The term \'C:\\x\\python.exe\' is not '
+           'recognized_x000D__x000A_</S><S S="Error">VISITOR_NOT_ADMIN_x000D__x000A_</S></Objs>').encode()
+    text = frontdesk._text(raw)
+    assert text == "& : The term 'C:\\x\\python.exe' is not recognized VISITOR_NOT_ADMIN"
+    assert frontdesk._explain(text).code == "not_admin"
 
 
 def test_a_marker_on_stdout_wins_over_powershell_noise_on_stderr(monkeypatch, tmp_path):

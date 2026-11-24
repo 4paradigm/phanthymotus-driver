@@ -8,6 +8,7 @@ under the data volume, so a container restart does not reset the trust.
 from __future__ import annotations
 
 import base64
+import html
 import json
 import os
 import re
@@ -36,6 +37,11 @@ def _text(raw: bytes) -> str:
     text = raw.decode("utf-8", errors="replace")
     if text.count("\ufffd") * 4 > len(text):
         text = raw.decode("gbk", errors="replace")   # zh-CN Windows error output
+    if "#< CLIXML" in text:
+        # PowerShell over SSH serialises its error stream; keep just the text.
+        errors = re.findall(r'<S S="Error">(.*?)</S>', text, re.S)
+        rest = re.sub(r"#< CLIXML|<Objs.*?</Objs>", " ", text, flags=re.S)
+        text = rest + " " + html.unescape("".join(errors)).replace("_x000D__x000A_", " ")
     return " ".join(text.split())
 
 

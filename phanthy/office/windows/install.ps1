@@ -24,8 +24,21 @@ foreach ($line in Get-Content -LiteralPath (Join-Path $upload 'deps.txt')) {
     }
 }
 
-$python = Join-Path $root 'Python312\python.exe'
-if (!(Test-Path -LiteralPath $python)) {
+# Any Python 3.12 will do: it only creates the venv the worker runs from. One
+# already registered for this account has to be used rather than installed
+# over - the installer then just reports success and puts nothing in TargetDir
+# (seen on a front desk where somebody had installed 3.12.10 by hand).
+function Find-Python {
+    $candidates = @(Join-Path $root 'Python312\python.exe')
+    foreach ($hive in 'HKCU', 'HKLM') {
+        $key = "${hive}:\Software\Python\PythonCore\3.12\InstallPath"
+        $dir = (Get-ItemProperty -LiteralPath $key -ErrorAction SilentlyContinue).'(default)'
+        if ($dir) { $candidates += Join-Path $dir 'python.exe' }
+    }
+    $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+}
+$python = Find-Python
+if (!$python) {
     $installer = Join-Path $deps 'python-3.12.10-amd64.exe'
     $signature = Get-AuthenticodeSignature -LiteralPath $installer
     if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Python Software Foundation') {
@@ -35,6 +48,8 @@ if (!(Test-Path -LiteralPath $python)) {
         '/quiet', 'InstallAllUsers=0', "TargetDir=`"$(Join-Path $root 'Python312')`"", 'PrependPath=0',
         'Include_launcher=0', 'Include_test=0', 'Include_symbols=0', 'Include_debug=0')
     if ($process.ExitCode -notin @(0, 3010)) { throw "VISITOR_PYTHON_INSTALL_FAILED $($process.ExitCode)" }
+    $python = Find-Python
+    if (!$python) { throw 'VISITOR_PYTHON_NOT_FOUND' }
 }
 $venv = Join-Path $root 'venv'
 if (!(Test-Path -LiteralPath (Join-Path $venv 'Scripts\python.exe'))) {
