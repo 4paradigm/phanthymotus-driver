@@ -1,0 +1,19 @@
+frontdesk-visitor-badge:
+  image: __IMAGE__
+  container_name: embodied-frontdesk-visitor-badge
+  network_mode: host
+  volumes:
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+    # Pinned SSH host key of the front-desk PC.
+    - /opt/phanthy-motus/data:/opt/phanthy-motus/data
+  environment:
+    - ROS_DOMAIN_ID=42
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+    - PYTHONUNBUFFERED=1
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: always

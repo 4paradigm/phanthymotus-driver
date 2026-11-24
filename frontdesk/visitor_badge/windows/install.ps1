@@ -1,0 +1,63 @@
+# Install or upgrade the front-desk side. The robot copies this directory to
+# C:\ProgramData\VisitorBadge\upload (with the pinned dependencies in deps\)
+# and runs this script over SSH as an administrator. Nothing is downloaded here.
+# ASCII only: Windows PowerShell 5.1 reads a BOM-less script in the ANSI code page.
+$ErrorActionPreference = 'Stop'
+$root = 'C:\ProgramData\VisitorBadge'
+$upload = Join-Path $root 'upload'
+$deps = Join-Path $upload 'deps'
+$app = Join-Path $root 'app'
+
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+if (!(New-Object Security.Principal.WindowsPrincipal($identity)).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw 'VISITOR_NOT_ADMIN'
+}
+
+foreach ($line in Get-Content -LiteralPath (Join-Path $upload 'deps.txt')) {
+    if (!$line.Trim() -or $line.StartsWith('#')) { continue }
+    $name, $sha = ($line -split '\s+')[0, 1]
+    if ((Get-FileHash -LiteralPath (Join-Path $deps $name) -Algorithm SHA256).Hash -ne $sha) {
+        throw "VISITOR_BAD_DEPENDENCY $name"
+    }
+}
+
+$python = Join-Path $root 'Python312\python.exe'
+if (!(Test-Path -LiteralPath $python)) {
+    $installer = Join-Path $deps 'python-3.12.10-amd64.exe'
+    $signature = Get-AuthenticodeSignature -LiteralPath $installer
+    if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'Python Software Foundation') {
+        throw 'VISITOR_BAD_PYTHON_SIGNATURE'
+    }
+    $process = Start-Process -FilePath $installer -Wait -PassThru -WindowStyle Hidden -ArgumentList @(
+        '/quiet', 'InstallAllUsers=0', "TargetDir=`"$(Join-Path $root 'Python312')`"", 'PrependPath=0',
+        'Include_launcher=0', 'Include_test=0', 'Include_symbols=0', 'Include_debug=0')
+    if ($process.ExitCode -notin @(0, 3010)) { throw "VISITOR_PYTHON_INSTALL_FAILED $($process.ExitCode)" }
+}
+$venv = Join-Path $root 'venv'
+if (!(Test-Path -LiteralPath (Join-Path $venv 'Scripts\python.exe'))) {
+    & $python -m venv $venv
+    if ($LASTEXITCODE) { throw 'VISITOR_VENV_FAILED' }
+}
+& (Join-Path $venv 'Scripts\python.exe') -m pip install --no-index --find-links $deps `
+    --disable-pip-version-check --quiet 'playwright==1.51.0'
+if ($LASTEXITCODE) { throw 'VISITOR_PIP_FAILED' }
+
+New-Item -ItemType Directory -Force -Path (Join-Path $app 'data\jobs') | Out-Null
+foreach ($name in @('worker.py', 'visitor_site.py', 'run_job.ps1')) {
+    Copy-Item -LiteralPath (Join-Path $upload $name) -Destination $app -Force
+}
+
+# Edge must run on the user's desktop, which an SSH session does not have: the
+# worker runs as an interactive scheduled task of this same account. pythonw,
+# so it does not flash a console over the front-desk screen.
+$action = New-ScheduledTaskAction -Execute (Join-Path $venv 'Scripts\pythonw.exe') `
+    -Argument "`"$(Join-Path $app 'worker.py')`"" -WorkingDirectory $app
+$principal = New-ScheduledTaskPrincipal -UserId $identity.Name -LogonType Interactive -RunLevel Highest
+$settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable `
+    -ExecutionTimeLimit (New-TimeSpan -Minutes 10) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+Register-ScheduledTask -TaskName 'Visitor Badge Worker' -Action $action -Principal $principal `
+    -Settings $settings -Force | Out-Null
+
+Remove-Item -LiteralPath $upload -Recurse -Force
+'VISITOR_INSTALL_OK'

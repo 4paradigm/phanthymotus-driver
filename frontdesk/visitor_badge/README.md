@@ -1,0 +1,61 @@
+# 前台访客贴打印（frontdesk/visitor_badge）
+
+机器人查询当天还没入场的访客，并在前台打印机上打印访客贴。
+
+```
+Agent ── visitor_badge 卡片 ──SSH──> 前台 Windows 电脑：专用 Edge（访客系统网页） + 打印机
+```
+
+机器人和前台电脑之间只用 SSH：机器人不保存访客数据，前台电脑也不开放任何业务端口。
+打印就是在访客系统网页上点「打印访客贴」，Edge 以 kiosk 方式直接打印到 Windows 默认打印机。
+
+## 卡片
+
+一张 `visitor_badge` 卡片（actuator），端口 15750。
+
+| 动作 | 用途 |
+|---|---|
+| `list` | 今天还没入场的访客：姓名、被访人、时间、来访事由、手机尾号 |
+| `print` (`name`, `host`) | 打印一位未入场访客的访客贴；同名时用 `host`（被访人）区分。异步执行，结果经 ACP 回报 |
+| `setup` | 安装/升级前台电脑上的自动化，并在前台打开专用 Edge 供登录 |
+| `status` | 检查连接、安装进度，列出前台电脑上的打印机 |
+
+`print` 只在访客系统里该访客的状态变成「已入场」后才报成功。同一位访客再打一次会得到
+`already_admitted`，所以不会重复打印。打印机缺纸之类的物理故障是看不到的。
+
+## 前台电脑的前提
+
+- Windows 10/11 x64，已安装 Microsoft Edge 和打印机驱动
+- 开启 **OpenSSH 服务器**（设置 → 可选功能），用一个**管理员账户**的用户名和密码登录
+- 这个账户要**保持登录在桌面上**：Edge 在这个用户的桌面里运行和打印
+- 不需要外网：Python 和 Playwright 随驱动镜像带过去，安装在 `C:\ProgramData\VisitorBadge`
+
+## 首次配置
+
+1. 部署驱动，把 `visitor_badge` 卡片放到画布上，在卡片配置里填前台电脑 IP、Windows 用户名和密码。
+2. 在卡片上执行 `setup`。几分钟后（用 `status` 看进度）前台电脑上会打开一个专用 Edge 窗口。
+3. 在这个窗口里登录访客系统，打开访客列表页，把地址栏的网址填到卡片的「访客列表网页」里，
+   然后关掉这个窗口。登录状态保存在专用 Edge 里，以后会自动用。
+4. 打印机：`status` 会列出前台电脑上的打印机，把名称填到「打印机」里；留空就用 Windows 默认打印机。
+5. 第一次打印前，在 Windows 的打印首选项里核对一次标签纸尺寸、方向和边距。
+
+登录过期时，`list`/`print` 会返回 `login_required`：再执行一次 `setup`（会重新打开 Edge）并登录。
+
+## 适用范围
+
+`windows/visitor_site.py` 是针对一套具体访客系统写的：它通过 `/smart-admin-api/visitInfo/page/query`
+读访客，靠「查看」和「打印访客贴」这些页面文字定位按钮。换一套访客系统，只需要改这一个文件。
+
+## 结构
+
+| 文件 | 运行在 | 作用 |
+|---|---|---|
+| `device.py` | 机器人 | MCP 卡片、异步打印和 ACP 回报 |
+| `frontdesk.py` | 机器人 | SSH/SCP（密码走 `SSH_ASKPASS`，主机指纹固定在数据卷里） |
+| `windows/install.ps1` | 前台电脑 | 校验依赖、装 Python/Playwright、注册桌面会话里的计划任务 |
+| `windows/run_job.ps1` | 前台电脑 | SSH 调用入口：把任务交给桌面会话里的 worker 并取回结果 |
+| `windows/worker.py` | 前台电脑 | 在用户桌面会话里执行 `list`/`print`/`login`，空闲几秒后退出 |
+| `windows/visitor_site.py` | 前台电脑 | 访客系统适配：查询、定位访客、打印、确认状态 |
+| `windows/deps.txt` | 构建时 | Windows 依赖清单（sha256 固定），构建镜像时下载 |
+
+前台电脑上的日志在 `C:\ProgramData\VisitorBadge\app\data\worker.log`。
