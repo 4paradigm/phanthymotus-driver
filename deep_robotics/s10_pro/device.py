@@ -401,9 +401,9 @@ class S10Nodes:
         header = values.get("header", {}) if isinstance(values, dict) else {}
         stamp = header.get("stamp", {}) if isinstance(header, dict) else {}
         if isinstance(stamp, dict):
-            for key in ("sec", "nanosec"):
-                if key in stamp:
-                    payload[key] = stamp[key]
+            sec, nanosec = stamp.get("sec"), stamp.get("nanosec")
+            if type(sec) is int and type(nanosec) is int and 0 <= nanosec < 1_000_000_000:
+                payload.update(sec=sec, nanosec=nanosec)
         for key, value in (values.items() if isinstance(values, dict) else ()):
             if key not in {"header", "orientation", "angular_velocity", "linear_acceleration"}:
                 payload[key] = value

@@ -225,7 +225,8 @@ def test_state_cards_expose_core_topics_when_ros_nodes_are_present(monkeypatch):
     assert plugin.dispatch("info", {"_tool_name": "lidar_map"})["topic_out"][0]["format"] == "sensor/pointcloud"
 
 
-def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
+@pytest.fixture
+def s10_ros(monkeypatch):
     device = _load_device(monkeypatch)
 
     class FakePublisher:
@@ -265,10 +266,13 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
             ]
 
         def destroy_node(self):
-            pass
+            self.subscriptions.clear()
 
     class Executor:
         def add_node(self, _node):
+            pass
+
+        def spin_once(self, timeout_sec=None):
             pass
 
     class String:
@@ -292,6 +296,8 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
 
     ros_node = ModuleType("rclpy.node")
     ros_node.Node = FakeNode
+    exceptions = ModuleType("rclpy.exceptions")
+    exceptions.InvalidHandle = type("InvalidHandle", (Exception,), {})
     callback_groups = ModuleType("rclpy.callback_groups")
     callback_groups.MutuallyExclusiveCallbackGroup = type(
         "MutuallyExclusiveCallbackGroup", (), {})
@@ -318,7 +324,7 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
     drdds_msg = ModuleType("drdds.msg")
     drdds_msg.JointsData, drdds_msg.BatteryData, drdds_msg.MotionInfo = JointsData, BatteryData, MotionInfo
     for module_name, module in {
-        "rclpy.node": ros_node, "rclpy.callback_groups": callback_groups,
+        "rclpy.node": ros_node, "rclpy.callback_groups": callback_groups, "rclpy.exceptions": exceptions,
         "rclpy.qos": qos_module, "sensor_msgs.msg": sensor_msg,
         "std_msgs.msg": standard_msg, "drdds.msg": drdds_msg,
     }.items():
@@ -364,8 +370,13 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
 
     ros2 = SimpleNamespace(
         ctx_robot=object(), ctx_core=object(),
-        executor_robot=Executor(), executor_core=Executor(),
+        executor_robot=Executor(), executor_core=Executor(), _threads=[],
     )
+    return device, ros2
+
+
+def test_robot_ros_samples_are_forwarded_to_agent_core(s10_ros, monkeypatch):
+    device, ros2 = s10_ros
     camera_rtsp = {
         "camera_front": "rtsp://10.21.33.103:8554/video4",
         "camera_rear": "rtsp://10.21.33.103:8554/video0",
@@ -429,6 +440,20 @@ def test_robot_ros_samples_are_forwarded_to_agent_core(monkeypatch):
     assert loco_definition["topic_out"] == [{"topic": "/robot/loco_state", "format": "data/json"}]
     odom_definition = next(card for card in state_card.get_tools() if card["name"] == "odom")
     assert odom_definition["topic_out"] == [nodes.topics["odom"]]
+
+    # An unsynchronized robot clock uses the receipt of each new MotionInfo.
+    # Navi can use these sample times without a separate component timestamp.
+    with monkeypatch.context() as clock:
+        for received_ms, vx in ((1_795_000_000_000, .15), (1_795_000_000_100, .18)):
+            clock.setattr(time, "time", lambda: received_ms / 1000)
+            callbacks["/MOTION_INFO"]({
+                "header": {"stamp": {"sec": 1_795_000_093, "nanosec": 0}},
+                "data": {"vel_x": vx, "vel_y": .02, "vel_yaw": .03},
+            })
+            odom = json.loads(nodes.publishers["odom"].messages[-1].data)
+            assert odom["schema"] == "motus.odom/1" and odom["frame"] == "body"
+            assert odom["stamp_ms"] == received_ms and odom["vendor"]["stamp_source"] == "received"
+            assert odom["twist"] == [vx, .02, None, None, None, .03] and odom["pose"] is None
 
     nodes._handle_media_result("camera_rear", None, b"\xff\xd8jpeg\xff\xd9")
     camera_output = nodes.camera_publishers["camera_rear"].messages[-1]
