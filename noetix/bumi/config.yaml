@@ -115,3 +115,21 @@ plugins:
     # 1€ 滤波：慢动作重平滑、快挥手不留滞后。min_cutoff 越小越平滑。
     filter_min_cutoff: 1.0
     filter_beta: 0.02
+  # 驱动上半身镜像：订阅上面那张卡输出的六轴角度，实时驱动 Bumi 的 6 个手臂关节。
+  # 注意：LowController.set_joint 只接受 21 条指令，所以这张卡在运行时接管了全部
+  # 电机——腿保持实测位置不动，但它不做平衡控制，也不是"只动手臂"。默认关闭，
+  # 需要在画布上显式 start 才会真正下发；首次测试请确保机器人有支撑。
+  upper_body_mirror:
+    enabled: false   # 默认关闭：会真实驱动机器人
+    # 角度来源，默认即本 bundle 内跟踪卡输出的话题；接别的源时才需要改。
+    # angles_topic: /<namespace>/upper_body_track/angles
+    control_hz: 50            # 内部下发频率；高于跟踪卡的 10Hz，用来插值平滑
+    rate_limit_deg_s: 30      # 单个关节最大角速度；有人扶、无吊架时建议 ≤30
+    lost_timeout_s: 0.5       # 超过此时长没有跟踪结果即视为人已离开，按限速回零
+    limit_margin_deg: 10      # 在机械硬限位基础上再向内留的余量（肘部因此不会完全伸直）
+    # 增益：非手臂关节用 keep_* 把站立姿态撑住，手臂用 arm_* 跟随。
+    keep_kp: 10.0
+    keep_kd: 0.5
+    arm_kp: 5.0
+    arm_kd: 0.5
+    send_commands: true       # false = 只计算不下发，用来核对映射和限幅而不让机器人动

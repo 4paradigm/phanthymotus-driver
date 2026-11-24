@@ -225,3 +225,73 @@ def test_upper_body_track_is_skipped_when_disabled(bundle_module, monkeypatch):
 
     assert bundle.get_all_tools() == []
 
+
+
+class FakeUpperBodyMirrorPlugin:
+    def __init__(self, plugin_config, namespace, executor, high_ctrl):
+        self.plugin_config = plugin_config
+        self.namespace = namespace
+        self.executor = executor
+        self.high_ctrl = high_ctrl
+
+    def get_tool(self):
+        return {"name": "upper_body_mirror", "type": "actuator"}
+
+    def start(self):
+        return {"state": "ready"}
+
+    def stop(self):
+        return {"state": "idle"}
+
+    def dispatch(self, action, _args):
+        return {"state": action}
+
+
+def test_upper_body_mirror_registers_when_a_controller_exists(bundle_module, monkeypatch):
+    """A card that writes motors must be registered exactly when there is one.
+
+    The gate is the mirror image of the tracking card's rule: a card that
+    reports a subsystem must not be gated on it, and a card that acts on one
+    must be. Registering without a controller would give a card that answers
+    `ready` and then commands nothing.
+    """
+    fake = types.ModuleType("upper_body_mirror_card")
+    fake.UpperBodyMirrorPlugin = FakeUpperBodyMirrorPlugin
+    monkeypatch.setitem(sys.modules, "upper_body_mirror_card", fake)
+
+    config = _config(loco=False, loco_servo=False)
+    config["plugins"]["upper_body_mirror"] = {"enabled": True}
+
+    bundle = bundle_module.BumiDeviceBundle(
+        config, "bumi_test", object(), high_ctrl=object(), media_ctrl=None)
+
+    assert [tool["name"] for tool in bundle.get_all_tools()] == ["upper_body_mirror"]
+    assert bundle._plugins[0].namespace == "bumi_test"
+
+
+def test_upper_body_mirror_is_skipped_without_a_controller(bundle_module, monkeypatch):
+    fake = types.ModuleType("upper_body_mirror_card")
+    fake.UpperBodyMirrorPlugin = FakeUpperBodyMirrorPlugin
+    monkeypatch.setitem(sys.modules, "upper_body_mirror_card", fake)
+
+    config = _config(loco=False, loco_servo=False)
+    config["plugins"]["upper_body_mirror"] = {"enabled": True}
+
+    bundle = bundle_module.BumiDeviceBundle(
+        config, "bumi_test", object(), high_ctrl=None, media_ctrl=None)
+
+    assert bundle.get_all_tools() == []
+
+
+def test_upper_body_mirror_is_skipped_when_disabled(bundle_module, monkeypatch):
+    fake = types.ModuleType("upper_body_mirror_card")
+    fake.UpperBodyMirrorPlugin = FakeUpperBodyMirrorPlugin
+    monkeypatch.setitem(sys.modules, "upper_body_mirror_card", fake)
+
+    config = _config(loco=False, loco_servo=False)
+    config["plugins"]["upper_body_mirror"] = {"enabled": False}
+
+    bundle = bundle_module.BumiDeviceBundle(
+        config, "bumi_test", object(), high_ctrl=object(), media_ctrl=None)
+
+    assert bundle.get_all_tools() == []

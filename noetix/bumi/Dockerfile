@@ -174,6 +174,8 @@ COPY sound_direction.py /work/sound_direction.py
 COPY direction_card.py /work/direction_card.py
 COPY upper_body_track_spec.py /work/upper_body_track_spec.py
 COPY upper_body_track_card.py /work/upper_body_track_card.py
+COPY upper_body_mirror_spec.py /work/upper_body_mirror_spec.py
+COPY upper_body_mirror_card.py /work/upper_body_mirror_card.py
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/
 

@@ -549,3 +549,37 @@ documents the pinned ARM64 wheels behind the enabled image's growth (about
 101 MiB across torch, torchvision and ultralytics; the default image is
 unchanged), why the ARM64 torch wheel is already the smallest official build,
 and the commands to measure the full-image delta on an ARM64 builder.
+
+### `upper_body_mirror` — driving the arms
+
+The second card closes the loop: it subscribes to the angles topic above and
+commands the arms. It is **disabled by default**, and it is **not** an
+arm-only card.
+
+`LowController.set_joint` accepts exactly 21 motor commands — any other length
+raises — so every tick this card sends all 21: the fifteen joints it does not
+track hold the position they are measured at, and the six arm joints follow the
+operator. Sending 21 commands means taking the motors from whatever drove them
+before, so the card says plainly what it is: a whole-body takeover that keeps
+the legs still and implements no balance controller. Arm swings still move the
+centre of mass; the first runs belong on a supported robot.
+
+What it does to stay inside that envelope:
+
+- targets are clamped inside the mechanical stops with a 10° margin, so the
+  elbow never fully straightens;
+- every axis is rate limited (30°/s by default), applied to the commanded pose
+  rather than trusting the upstream filter to have smoothed enough;
+- the first command after `start` is the pose the arm is already in, so
+  enabling the card is never itself a movement;
+- once mirroring has begun, an operator missing for `lost_timeout_s` makes the
+  arms drift back to zero at the same rate limit instead of freezing in
+  mid-air; a card started with nobody in frame simply holds;
+- workmode 26 (protection), a missing controller, and an SDK failure all refuse
+  to command rather than retrying into a robot that has said no.
+
+Rate, timeout, margin and the four gains live in `config.yaml`. The angle source
+defaults to `/{namespace}/upper_body_track/angles`; `start` takes an
+`angles_topic` override for wiring a different source. Setting
+`send_commands: false` runs the whole pipeline and skips only `set_joint`, which
+is how to check the mapping and the limits without letting the robot move.
