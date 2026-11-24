@@ -13,21 +13,23 @@
 
 ### 相对位姿
 
-`odometry` 被动读取底盘 `UiDatagram.current_state.pose`，没有 online、heartbeat、
+`odometry` 被动读取底盘 `UiDatagram.current_state`，没有 online、heartbeat、
 导航、速度或使能请求。第一条有效观测作为本轮参考原点：其位置为 `(0, 0)`、
 朝向为 `0`；之后将地图坐标差旋转到起始朝向，x 向前、y 向左，yaw 为相对
 起始朝向的角度（rad，归一化至 `[-pi, pi]`）。重复 start 不改原点；stop 后
 再 start 才重新置零。短暂断线重连保留原点。
 
-只提供位置和朝向，不计算速度、累计里程、轨迹或 TF。不把定位重置/跳变当作
+显示流只提供位置和朝向，标准流同时提供底盘速度反馈。不把定位重置/跳变当作
 真实行驶距离；此来源是底盘地图定位状态，不声称它是独立、连续的编码器里程计。
 底盘切图、重定位后需重新开始本卡，不能保证跨定位重置的连续性。
 
 - `/{namespace}/state/relative_pose`（`data/json`）：x/y/yaw 和基本连接、时效信息。
 - `/{namespace}/state/odom`（`state/odom`）：`common/odom.py` 的 `motus.odom/1`。
-  `info().odom_interface.provides=[]`，六个 twist 轴始终为 null；没有速度测量，
-  不能据此判断速度为零。参考系为本卡定义的固定 `relative_start`，不是机器人
-  当前机身系。标准 pose 的 z=0、roll/pitch=0 是明确的二维模型约定，不是高度测量。
+  `info().odom_interface.provides=["vx","vy","wz"]`。Navi 使用机体系
+  `twist=[vx,vy,null,null,null,wz]`，线速度单位 m/s，角速度单位 rad/s。
+  有效的静止反馈为零，缺失、无效或过期的轴为 null。pose 仍以固定的
+  `relative_start` 为参考系。标准 pose 的 z=0、roll/pitch=0 是二维模型约定。
+  在 Core 画布将该卡片的 `state/odom` 端口接入 Navi 的同格式输入。
 
 **位置单位不得猜测。** 默认 `odometry_position_unit: unverified`，显示 x/y
 保留原始尺度并标注 `source_unverified`，标准输出的 pose 为 null。厂家确认

@@ -1,8 +1,4 @@
-"""Read-only planar pose, relative to the first sample of a subscription.
-
-This observes the chassis UI's localization pose, not wheel encoder odometry.
-No velocity, path length, map, TF or robot command is produced.
-"""
+"""Read-only chassis localization and body-frame speed for Navi."""
 
 from __future__ import annotations
 
@@ -19,8 +15,11 @@ from .chassis_pose_pb2 import UiDatagram
 from .feedback import StreamFeedbackClient, positive_number, validate_url
 
 
+SPEED_AXES = ("vx", "vy", "wz")
+
+
 def parse_pose_frame(raw):
-    """Decode only current_state.pose; control_speed is deliberately unknown."""
+    """Decode the chassis state pose and its optional speed feedback."""
     message = UiDatagram()
     try:
         message.ParseFromString(raw)
@@ -34,9 +33,15 @@ def parse_pose_frame(raw):
     values = [float(state.pose.x), float(state.pose.y), float(state.pose.theta)]
     if not all(math.isfinite(value) for value in values):
         raise ValueError("chassis pose contains non-finite values")
-    # Zero coordinates are valid. A missing source clock remains unknown.
+    stamp = state.timeStamp if state.timeStamp > 0 else None
+    speed = None
+    if state.HasField("speed") and stamp is not None:
+        # Proto3 omits zero-valued scalars. Presence of the speed message
+        # distinguishes a real stationary observation from a missing speed.
+        speed = [value if math.isfinite(value) else None
+                 for value in (state.speed.vx, state.speed.vy, state.speed.w)]
     return {"x": values[0], "y": values[1], "yaw": values[2],
-            "source_stamp_ms": state.timeStamp if state.timeStamp > 0 else None}
+            "source_stamp_ms": stamp, "speed": speed}
 
 
 class PoseFeedbackClient(StreamFeedbackClient):
@@ -86,11 +91,6 @@ class HeliosOdometry:
             {"topic": f"/{namespace}/state/relative_pose", "format": "data/json"},
             {"topic": f"/{namespace}/state/odom", "format": "state/odom"},
         ]
-        self._odom_interface = build_interface(
-            provides=[], frame="world", rate_hz=self._hz,
-            pose_drift="none" if self._unit == "unverified" else "unbounded",
-            timing={"stamp_source": "received"},
-        )
         url = (os.getenv("HELIOS_ODOMETRY_STATE_URL") or config.get("odometry_state_url")
                or config.get("battery_state_url"))
         self.client = client or self._new_client(url)
@@ -102,12 +102,19 @@ class HeliosOdometry:
             reconnect_delay_s=self._config.get("reconnect_delay_s", 1),
         )
 
+    def _odom_interface(self):
+        return build_interface(
+            provides=SPEED_AXES, frame="body", rate_hz=self._hz,
+            pose_drift="none" if self._unit == "unverified" else "unbounded",
+            timing={"stamp_source": "received"},
+        )
+
     def get_tools(self):
         sensor = tool(
             "odometry", "sensor",
             "Helios 只读相对位姿：首次有效位姿为原点，输出 x、y、yaw；"
             "停止后再开始重新置零。来自底盘定位结果，不保证连续轮式里程计；"
-            "不提供速度、累计里程或运动控制。位置单位未确认时仅显示原始尺度，"
+            "标准端口另提供 Navi 所需的机体系线速度和角速度。位置单位未确认时仅显示原始尺度，"
             "标准 state/odom 的 pose 为 null。",
             topic_out=self._topics,
         )
@@ -153,9 +160,10 @@ class HeliosOdometry:
                 self._node = None
             self._publishers = []
 
-    def payload(self):
+    def payload(self, snap=None):
         with self._lock:
-            snap = self.client.snapshot()
+            if snap is None:
+                snap = self.client.snapshot()
             pose = snap.get("pose") if snap["available"] else None
             relative = {"x": None, "y": None, "yaw": None}
             if pose:
@@ -173,7 +181,7 @@ class HeliosOdometry:
                     "stamp_ms": snap["received_at_ms"],
                     "source_stamp_ms": pose["source_stamp_ms"] if pose else None}
 
-    def odom_payload(self, value):
+    def odom_payload(self, value, speed=None):
         pose = None
         if value["available"] and self._unit != "unverified":
             angle = value["yaw"]
@@ -185,18 +193,22 @@ class HeliosOdometry:
         # Preserve receipt time when republishing: an old observation must not
         # become fresh merely because a timer fired. Source time is separate.
         stamp = value["stamp_ms"] or 0
+        vx, vy, wz = speed if value["available"] and speed is not None else (None, None, None)
         return build_sample(
-            stamp_ms=stamp, frame="world", twist=[None] * 6, pose=pose,
+            stamp_ms=stamp, frame="body", twist=[vx, vy, None, None, None, wz], pose=pose,
             vendor={"source_stamp_ms": value["source_stamp_ms"], "stamp_source": "received",
                     "state": value["state"], "available": value["available"],
                     "pose_source": "chassis_ui_localization", "planar": True,
+                    "twist_source": "chassis_current_state_speed",
                     "position_unit_verified": self._unit != "unverified"},
         )
 
     def _publish(self):
         with self._lock:
-            value = self.payload()
-            for publisher, payload in zip(self._publishers, (value, self.odom_payload(value))):
+            snap = self.client.snapshot()
+            value = self.payload(snap)
+            speed = snap["pose"].get("speed") if snap["available"] else None
+            for publisher, payload in zip(self._publishers, (value, self.odom_payload(value, speed))):
                 msg = self._message_type()
                 msg.data = json.dumps(payload, ensure_ascii=False, allow_nan=False)
                 publisher.publish(msg)
@@ -206,7 +218,7 @@ class HeliosOdometry:
             return None
         with self._lock:
             if action == "info":
-                return {**self.get_tools()[0], "odom_interface": self._odom_interface,
+                return {**self.get_tools()[0], "odom_interface": self._odom_interface(),
                         "pose_source": "chassis_ui_localization", "planar": True,
                         "frame_id": self._frame, "child_frame_id": self._child,
                         "position_unit_verified": self._unit != "unverified"}
@@ -225,11 +237,6 @@ class HeliosOdometry:
                     self._origin = None
                     self._unit = unit
                     self._scale = 0.001 if unit == "mm" else 1.0
-                    self._odom_interface = build_interface(
-                        provides=[], frame="world", rate_hz=self._hz,
-                        pose_drift="none" if unit == "unverified" else "unbounded",
-                        timing={"stamp_source": "received"},
-                    )
                 self.start()
                 return {"state": "running" if action == "start" else "configured", "topic_out": self._topics}
             if action == "stop":

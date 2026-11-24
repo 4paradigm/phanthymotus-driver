@@ -1,5 +1,5 @@
 // Read-only projection of the installed chassis UI protocol.
-// UiDatagram.current_state=6, RobotState.pose=1/timeStamp=3.
+// UiDatagram.current_state=6, RobotState.pose=1/speed=2/timeStamp=3.
 // Source: /static/proto/uidata.proto and /static/proto/robottype.proto.
 syntax = "proto3";
 package helios_pose_readonly;
@@ -12,7 +12,15 @@ message PlanarPose {
 
 message RobotState {
   PlanarPose pose = 1;
+  RobotSpeed speed = 2;
   int64 timeStamp = 3;
+}
+
+message RobotSpeed {
+  double vx = 1;
+  double vy = 2;
+  double w = 3;
+  int64 timeStamp = 4;
 }
 
 message UiDatagram {
