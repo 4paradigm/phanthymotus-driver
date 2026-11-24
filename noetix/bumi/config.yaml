@@ -95,7 +95,6 @@ plugins:
     max_duration_s: 30
   live_stream:
     enabled: true
-    # Enter the full Huya URL in the Card gear; never commit credentials.
-    credential_path: /opt/phanthy-motus/data/live_stream/huya-rtmp-url
+    # The RTMP address is a card setting entered on the canvas, never here.
     fps: 15
     video_bitrate_kbps: 1200

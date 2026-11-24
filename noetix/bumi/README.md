@@ -1,13 +1,5 @@
 # Noetix Bumi driver
 
-## 虎牙直播 Card
-
-使用说明、配置教程、故障排查和安全注意事项统一放在 [live_stream/README.md](live_stream/README.md)。
-
----
-
-
-
 The bundle exposes Bumi sensor, locomotion, audio, camera, motion-state, and independent sound-direction cards. The direction card is implemented in `direction_card.py`; the other cards remain in `device.py`.
 
 ## `mic` and `sound_direction`
@@ -269,6 +261,35 @@ Configuration is under `plugins.vision_capture`: `output_dir`, `fps`
 (default/max 15), and `max_duration_s` (default/max 30). Rebuild the driver
 image to install the new FFmpeg dependency. All runtime implementation remains
 in `device.py`; no extra runtime Python file is required.
+
+## `live_stream` card
+
+Pushes a camera and a microphone to any platform that gives out an RTMP push
+address (Huya, Xiaohongshu, Bilibili, ...). Implemented in `live_stream.py`.
+
+On the canvas, connect `camera` (`image/jpeg`) and `mic` (`audio/pcm-16k`)
+into `live_stream`, and enter the platform's full push address — server plus
+stream key, e.g. `rtmp://<server>/live/<key>` — in the card's settings
+(`rtmp_url`, a password field excluded from exported solutions).
+
+- `start`: subscribe to the connected inputs. Does **not** go live.
+- `go_live`: start one ffmpeg (H.264 + AAC, FLV) to the saved address. Returns
+  `live` once ffmpeg has stayed up for 3 seconds, or the redacted ffmpeg error
+  if the platform rejected the address or key.
+- `end_live` / `stop`: stop the stream (`stop` also drops the subscriptions).
+- `info`: `state` (`idle` / `live` / `error`), `duration_s`, and the age of
+  the last video frame and audio chunk.
+
+`go_live`, `end_live` and `info` are agent-callable, so the agent can start a
+broadcast when asked to. The address itself is only a card setting.
+
+Video runs at `plugins.live_stream.fps` (default 15) with the latest frame
+repeated when the camera is late; audio is padded with silence when the mic is
+late, so the two stay in sync. A camera silent for 10 seconds ends the stream.
+The address is on ffmpeg's command line, so it is visible to anyone who can
+list processes on the robot — the same people who can read the card settings.
+Confirm picture and sound from the platform's viewer side; `live` only means
+ffmpeg is sending.
 
 ## New cards
 
