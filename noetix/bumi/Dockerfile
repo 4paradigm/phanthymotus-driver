@@ -40,7 +40,9 @@ RUN find /etc/apt \( -name '*.list' -o -name '*.sources' \) \
         libasound2-dev \
         libssl-dev \
         libeigen3-dev \
-        libboost-dev && \
+        libboost-dev \
+        libgl1 \
+        libglib2.0-0 && \
     rm -rf /var/lib/apt/lists/*
 
 # RTAB-Map RGB-D odometry, bundle-local (single container). The estimator runs as
@@ -101,6 +103,13 @@ RUN apt-get update && \
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     pyyaml netifaces numpy opencv-python-headless pyrealsense2 pybind11
 
+# Fall-alarm card: YOLOv11-pose. ultralytics pulls torch/torchvision (CPU-only
+# on ARM64 via PyPI) and opencv-python; libgl1/libglib2.0-0 above satisfy the
+# latter's GUI libs. The pose weight itself is fetched on first run, or point
+# config `model_path` at a pre-downloaded copy for offline robots.
+RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} ultralytics && \
+    python3 -c 'import ultralytics; from ultralytics import YOLO'
+
 # The bundle image must be able to start the estimator child and this card's
 # Python imports; fail the build here rather than on a robot. Docker's default
 # shell is /bin/sh (dash), where `source` does not exist — use bash explicitly
@@ -154,6 +163,7 @@ COPY visual_odometry_probe.py /work/visual_odometry_probe.py
 COPY odom_spec.py /work/odom_spec.py
 COPY sound_direction.py /work/sound_direction.py
 COPY direction_card.py /work/direction_card.py
+COPY fall_alarm/ /work/fall_alarm/
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/
 

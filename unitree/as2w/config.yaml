@@ -69,3 +69,32 @@ plugins:
     max_input_points: 20000
     max_map_points: 50000
     max_buffer_points: 200000
+  # 交通灯识别（YOLOv8n 官方权重检测 + HSV 颜色判定，无需训练）。
+  # **默认关闭。** 它消费 camera 卡片的 RGB 流，真机跑 YOLO（CPU 较慢，先核对帧率
+  # 并确认权重已预下载）；识别到红/黄/绿状态变化后经 traffic_light/audio 发布提醒
+  # 语音（画布连到 speaker）并在 traffic_light/event 发布事件（画布连到监控/Agent）。
+  traffic_light:
+    enabled: false
+    # YOLOv8n 官方 COCO 权重（检测 traffic light 类别）。首次运行自动下载，离线
+    # 机器人请预先下载后填绝对路径。
+    model_path: yolov8n.pt
+    device: cpu              # cpu | cuda | 0
+    conf: 0.35               # 交通灯检测置信度
+    imgsz: 640
+    rate_hz: 5               # 识别帧率上限（相机 12fps，只取最新帧）
+    # 红/黄/绿 HSV 判定阈值，见 Traffic_Light_Recognition/light_classifier.py
+    saturation_min: 90
+    value_min: 100
+    min_lit_fraction: 0.005
+    dominance_ratio: 1.5
+    confirm_frames: 2
+    cooldown_s: 3.0
+    # 播报短语（画布连线到 speaker 卡片 → 机器人发声）
+    texts:
+      red: 红灯，请等待
+      yellow: 黄灯，请注意
+      green: 绿灯，请通行
+    # 预录语音 WAV（16k 单声道 S16LE）；可省略，插件会自动发现 resource/*.wav
+    # red_wav_path: /work/Traffic_Light_Recognition/resource/traffic_light_red.wav
+    # yellow_wav_path: /work/Traffic_Light_Recognition/resource/traffic_light_yellow.wav
+    # green_wav_path: /work/Traffic_Light_Recognition/resource/traffic_light_green.wav

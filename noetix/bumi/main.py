@@ -191,6 +191,15 @@ class BumiDeviceBundle:
                     high_ctrl=high_ctrl))
                 print("[bundle] VisualOdometryPlugin loaded")
 
+        if plugins_cfg.get("fall_alarm", {}).get("enabled", False):
+            if camera_plugin is None:
+                print("[bundle] FallAlarmPlugin needs plugins.camera.enabled; skipped")
+            else:
+                from fall_alarm.plugin import FallAlarmPlugin
+                self._plugins.append(FallAlarmPlugin(
+                    plugins_cfg["fall_alarm"], namespace, executor))
+                print("[bundle] FallAlarmPlugin loaded")
+
         if plugins_cfg.get("motion_state", {}).get("enabled", False) and high_ctrl is not None:
             from device import MotionStatePlugin
             motion_state_plugin = MotionStatePlugin(
