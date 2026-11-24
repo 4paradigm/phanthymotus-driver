@@ -92,6 +92,7 @@ class LiveStreamPlugin:
         self._pcm_lock = threading.Lock()   # shared with the pacing thread, never held long
         self._pcm = bytearray()
         self._pcm_at = 0.0
+        self._generation = 0           # invalidates pending starts after stop/restart
         self._stream = None            # {"proc", "thread", "cancel", "log", "started_at", "error"}
         self._last_error = ""
 
@@ -175,11 +176,18 @@ class LiveStreamPlugin:
         # A running stream keeps its address; a new one applies on the next go_live.
         return {"state": "configured"}
 
+    def _reset_locked(self) -> int:
+        self._generation += 1
+        self._end_live_locked()
+        self._destroy_inputs_locked()
+        return self._generation
+
     def _subscribe(self, args: dict) -> dict:
         topics = list(args.get("input_topics") or [])
         if not topics and args.get("input_topic"):
             topics = [args["input_topic"]]
-        self._unsubscribe()
+        with self._lock:
+            generation = self._reset_locked()
         # Built outside the lock: resolving topic types may take a few seconds,
         # and a concurrent stop must not queue behind it.
         try:
@@ -187,7 +195,9 @@ class LiveStreamPlugin:
         except Exception as exc:
             return {"state": "error", "error": f"订阅输入失败：{exc}"}
         with self._lock:
-            self._destroy_inputs_locked()
+            if generation != self._generation:
+                inputs.node.destroy_node()
+                return {"state": "superseded", "message": "启动已被后续 start/stop 取消"}
             self._executor.add_node(inputs.node)
             self._inputs = inputs
         missing = [name for name, topic in (("摄像头", inputs.image_topic),
@@ -199,8 +209,7 @@ class LiveStreamPlugin:
 
     def _unsubscribe(self) -> dict:
         with self._lock:
-            self._end_live_locked()
-            self._destroy_inputs_locked()
+            self._reset_locked()
         return {"state": "idle"}
 
     def _go_live(self) -> dict:
