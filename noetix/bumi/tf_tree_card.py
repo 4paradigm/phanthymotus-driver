@@ -632,6 +632,10 @@ class TfTreePlugin:
                 "只发布 tf，不输出位姿数据、不驱动任何硬件、不发 odom→base_link。"
                 "下游求相对位姿请自行用 tf2 订阅 /tf，不要读本卡的 status 话题"
                 "（status 是树的健康度，不是位姿源）。"
+                "注意：ROS /tf 无法撤回已发消息；视觉目标过期(vision_ttl_ms)后本卡"
+                "停止重发，但下游 tf2 缓存仍可能保留最后一位姿。下游必须用带时间的"
+                "lookup_transform 并按返回 header stamp 校验新鲜度"
+                "(tf_tree_spec.transform_is_fresh)，勿用 Time() 取最新就当有效。"
             ),
             "inputSchema": {
                 "type": "object",
@@ -692,6 +696,9 @@ class TfTreePlugin:
                 topic_in[0]["topic"] = self._node._vision_topic
             info["topic_in"] = topic_in
             info["topic_out"] = self._topic_out()
+            # TF cannot be retracted: tell consumers the freshness window so
+            # they can validate the header stamp of a looked-up vision edge.
+            info["vision_ttl_ms"] = self._node._vision_ttl_ms
             return info
         return None
 

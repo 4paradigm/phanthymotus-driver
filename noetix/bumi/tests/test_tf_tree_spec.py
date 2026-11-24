@@ -228,6 +228,25 @@ def test_merge_vision_keeps_valid_payload_and_defaults_missing_fields():
     assert report["invalid_payload"] == 0
 
 
+# ── consumer-side freshness check ────────────────────────────────────────────
+
+
+def test_transform_is_fresh_rejects_stale_missing_future_and_nonfinite():
+    """A downstream TF lookup must be validated before treating it as a pose.
+
+    `/tf` cannot retract a published edge, so a cached transform can be stale;
+    the consumer-side check is what makes expiry a real, verifiable property.
+    """
+    assert spec.transform_is_fresh(9500, 10000, 500) is True   # 500 ms old
+    assert spec.transform_is_fresh(10_000, 10_000, 500) is True
+    assert spec.transform_is_fresh(9400, 10000, 500) is False  # > ttl
+    assert spec.transform_is_fresh(None, 10000, 500) is False
+    assert spec.transform_is_fresh(float("nan"), 10000, 500) is False
+    assert spec.transform_is_fresh(float("inf"), 10000, 500) is False
+    # Future-dated beyond skew is unusable (clock disagreement).
+    assert spec.transform_is_fresh(10_000 + 10_000, 10_000, 500) is False
+
+
 # ── status payload ───────────────────────────────────────────────────────────
 
 

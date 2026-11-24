@@ -484,6 +484,39 @@ def merge_vision(transforms, now_ms, ttl_ms):
     }
 
 
+# ── consumer-side freshness check ─────────────────────────────────────────────
+
+
+def transform_is_fresh(header_stamp_ms, now_ms, max_age_ms):
+    """Whether a TF transform's header stamp is still usable by a consumer.
+
+    ROS ``/tf`` has no retract message: once this card publishes a vision edge,
+    a ``tf2_ros`` buffer retains it for the consumer's cache duration even after
+    the card's ``vision_ttl_ms`` has passed and it stopped republishing. A
+    consumer using ``lookup_transform(target, source, Time())`` (latest) will
+    therefore keep getting a stale localization with no error. The fix is on the
+    consumer side: request the transform at a specific time and check the
+    returned header stamp with this function before trusting it.
+
+    Returns False for a missing, non-finite, future-dated, or too-old stamp —
+    exactly the cases that must not be treated as a live object pose. This is a
+    pure function (no rclpy/numpy) so downstream cards can use it offline too.
+    """
+    if header_stamp_ms is None:
+        return False
+    try:
+        stamp = float(header_stamp_ms)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if not math.isfinite(stamp):
+        return False
+    age = float(now_ms) - stamp
+    # Future-dated stamps are as unusable as stale ones: wall clocks disagree.
+    if age < -_STAMP_SKEW_MS or age > float(max_age_ms):
+        return False
+    return True
+
+
 # ── status payload ────────────────────────────────────────────────────────────
 
 

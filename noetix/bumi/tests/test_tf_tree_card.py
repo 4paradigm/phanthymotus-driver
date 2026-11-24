@@ -453,6 +453,8 @@ def test_info_reports_vision_input_contract(card_module):
     plugin = _make_card(card_module)
     info = plugin.dispatch("info", {})
     assert info["topic_in"] == [{"format": "data/json"}]
+    # Consumers need the freshness window to validate cached /tf transforms.
+    assert info["vision_ttl_ms"] == 500
 
     # Once a vision topic is attached, info reports the concrete path too.
     plugin.start()

@@ -684,6 +684,18 @@ Optionally attaches a vision card's `data/json` transform batch (the
 `input_topic` arg of `start`) as additional child frames. Transforms carry the
 sample's own timestamp and expire after `vision_ttl_ms`.
 
+> **Consumers must check freshness themselves.** ROS `/tf` has no retract
+> message: once a vision edge is published, a `tf2_ros` buffer keeps it for the
+> consumer's cache duration even after `vision_ttl_ms` has elapsed and this card
+> stopped republishing it. `vision_ttl_ms` governs **this card's publishing**,
+> not what a downstream cache still holds. A consumer doing
+> `lookup_transform(target, source, Time())` (latest available) can therefore
+> get a stale object pose with no error. Correct usage is to look up at a
+> specific time and validate the returned header stamp with the dependency-free
+> `tf_tree_spec.transform_is_fresh(header_stamp_ms, now_ms, vision_ttl_ms)`
+> helper (also exposed in `info` as `vision_ttl_ms`). Treat a failed check as
+> "target not currently localised", never as a live pose.
+
 **It drives nothing and is not a pose source.** Its only output topic,
 `/{ns}/tf_tree/status`, is a *health* report (frame counts, publish rate,
 joint-sample age, `degraded` reason). Downstream code that wants "pose of A
