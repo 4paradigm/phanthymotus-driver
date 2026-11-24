@@ -25,11 +25,11 @@
 scp -P 2222 ssh_user@robot_host:/path/to/video.mp4 .
 ```
 
-## 本地回归
+## 验证记录
 
-```text
-python -X utf8 -m pytest -q noetix/bumi/tests/test_bumi_av_recording.py noetix/bumi/tests/test_mic_card.py
-```
-
-将 FFmpeg 加入 PATH，使编码测试执行实际音视频封装与解码。
-专项测试使用合成秒表和声音脉冲，真机结果以现场样片为准。
+- Bumi 真机镜像 `release.261124.e02d43d` 已验证 10 秒和 30 秒有声录像。成片分别为
+  10.000 秒和 30.000 秒，包含 H.264 和 16 kHz AAC，两段均通过 FFmpeg 完整解码。
+  3 秒无声录像和取消清理也通过。冷启动时须等麦克风出流后再录制。
+- 提交 `4d00bacd` 的本地专项验证通过 34 项，包含省略 `include_audio` 时生成
+  音轨、显式传 `false` 时仅生成视频轨，以及合成秒表和声音脉冲的时间核对。
+- 新版 ARM64 镜像的画布默认选项、真人秒表数数和拍手的声画偏差待验收。
