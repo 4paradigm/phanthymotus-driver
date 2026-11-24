@@ -126,7 +126,7 @@ class SensorCard:
             return result
         if action in ("read", self.name):
             return self.payload()
-        raise ValueError(f"unsupported {self.name} action: {action}")
+        return None
 
     def publish_status(self):
         if self.kind == "imu":

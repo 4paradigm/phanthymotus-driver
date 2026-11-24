@@ -55,14 +55,16 @@ def test_sensor_exposes_only_canvas_lifecycle_actions(kind, name):
     assert set(actions) <= {"start", "stop", "info", "config"}
 
 
-def test_sensor_replies_with_framework_lifecycle_states():
+def test_sensor_dispatch_follows_framework_contract():
     card = object.__new__(SensorCard)
+    card.name = "imu"
     calls = []
     card.start = lambda: calls.append("start")
     card.stop = lambda: calls.append("stop")
 
     assert card.dispatch("start", {}) == {"state": "running"}
     assert card.dispatch("stop", {}) == {"state": "idle"}
+    assert card.dispatch("unknown", {}) is None
     assert calls == ["start", "stop"]
 
 
