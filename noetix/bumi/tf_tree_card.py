@@ -194,6 +194,12 @@ class _TfTreeNode(Node):
         if self._running:
             if input_topic:
                 self._subscribe_vision(input_topic)
+            else:
+                # A canvas rewire to "no input" must drop the previous source's
+                # transforms now, not let them linger for a TTL window.
+                self._teardown_vision()
+                self._clear_vision_state()
+                self._vision_topic = ""
             return
         self._stopped.clear()
         self._running = True
@@ -218,6 +224,7 @@ class _TfTreeNode(Node):
             self._thread.join(timeout=1.0)
         self._thread = None
         self._teardown_subs()
+        self._clear_vision_state()
 
     def reload_urdf(self) -> bool:
         """Re-parse and re-publish the static chain. Returns True on success."""
@@ -234,8 +241,23 @@ class _TfTreeNode(Node):
         self._joints_sub = self.create_subscription(
             String, self._joints_topic, self._on_joints, _JOINT_QOS)
 
+    def _clear_vision_state(self) -> None:
+        """Forget all vision edges when the input source goes away or changes.
+
+        Stale edges from a disconnected source would otherwise be broadcast by
+        the loop for up to ``vision_ttl_ms`` (or interleaved with a new source)
+        — attaching objects from a source the operator no longer wired in.
+        The next real batch repopulates the state; TTL still handles targets
+        that simply walk out of frame within one source.
+        """
+        with self._vision_lock:
+            self._vision.clear()
+            self._vision_parent.clear()
+            self._conflicting_children.clear()
+
     def _subscribe_vision(self, topic: str) -> None:
         self._teardown_vision()
+        self._clear_vision_state()
         self._vision_topic = topic
         self._vision_sub = self.create_subscription(
             String, topic, self._on_vision, _LATEST_QOS)

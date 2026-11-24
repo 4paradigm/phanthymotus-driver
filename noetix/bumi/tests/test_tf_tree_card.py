@@ -470,3 +470,60 @@ def test_dispatched_start_attaches_vision_topic_after_boot(card_module):
     assert result["state"] == "running"
     assert subscribed == ["/bumi_test/vision_tf/ar/transforms"]
     plugin.stop()
+
+
+def _seed_vision(node, child="vision_ar_1"):
+    node._vision[child] = {
+        "parent": "camera_optical_frame", "child": child,
+        "stamp_ms": 10_000, "translation": [0, 0, 1], "rotation": [0, 0, 0, 1],
+    }
+    node._vision_parent[child] = "camera_optical_frame"
+
+
+def test_rewiring_vision_source_clears_old_transforms(card_module):
+    """P1 regression: switching input topic must drop the old source's edges.
+
+    Otherwise objects from source A keep being broadcast (up to a TTL, or
+    alongside B) after the canvas rewires tf_tree to source B.
+    """
+    plugin = _make_card(card_module)
+    plugin.start()
+    node = plugin._node
+    _seed_vision(node)
+    assert node._vision
+
+    node.start("/bumi_test/vision_tf/other/transforms")  # running reconfigure
+    assert node._vision == {}
+    assert node._vision_parent == {}
+    assert node._conflicting_children == set()
+    assert node._vision_topic == "/bumi_test/vision_tf/other/transforms"
+    plugin.stop()
+
+
+def test_reconfigure_to_no_input_clears_vision(card_module):
+    """A canvas rewire to empty input must also forget the old source."""
+    plugin = _make_card(card_module)
+    plugin.start()
+    node = plugin._node
+    node.start("/bumi_test/vision_tf/ar/transforms")
+    _seed_vision(node)
+    assert node._vision
+
+    node.start("")  # running, no new topic
+    assert node._vision == {}
+    assert node._vision_topic == ""
+    plugin.stop()
+
+
+def test_stop_clears_vision_state(card_module):
+    """Stopping the card drops any tracked vision targets immediately."""
+    plugin = _make_card(card_module)
+    plugin.start()
+    node = plugin._node
+    node.start("/bumi_test/vision_tf/ar/transforms")
+    _seed_vision(node)
+    assert node._vision
+
+    plugin.stop()
+    assert node._vision == {}
+    assert node._vision_parent == {}
