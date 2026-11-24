@@ -838,6 +838,11 @@ class WeighEngine:
         left, right = self._arm_deg("left", now), self._arm_deg("right", now)
         if left is None or right is None:
             return {"sent": False, "reason": "no_fresh_joint_data"}
+        problem = self._servo_guard()
+        if problem:
+            # 有人在动作进行中恢复了 servo：关节归它管，不再补发冻结指令去抢。
+            self._log(f"[weigh] freeze skipped: {problem}")
+            return {"sent": False, "reason": "servo_active"}
         self._log(f"[weigh] freeze: holding right at {_fmt_deg(right)}, left at {_fmt_deg(left)}")
         r = self._call_arm({"action": "move_pos", "left_positions": [round(x, 2) for x in left],
                             "right_positions": [round(x, 2) for x in right],

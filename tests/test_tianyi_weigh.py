@@ -1120,3 +1120,14 @@ def test_plugin_prefix_and_marketplace_listing():
     assert weigh.WeighPlugin.PREFIX == "weigh"
     manifest = (BUNDLE / "driver.yaml").read_text(encoding="utf-8")
     assert re.search(r"^\s*- \{ name: weigh,\s+type: actuator \}\s*$", manifest, re.M)
+
+
+def test_timeout_freeze_is_skipped_when_servo_resumed(hanging):
+    servo = FakeServo(hanging, state="idle")
+    hanging.engine._servo_call = servo
+    hanging.arm_stuck = True                                       # 第一段永远到不了位 → 超时
+    hanging.events.append((hanging.t + 5.0, lambda: setattr(servo, "state", "running")))
+    res = hanging.engine.pose({})
+    assert res["code"] == "arrive_timeout", res
+    assert len(hanging.moves()) == 1                               # 只有第一段，没有冻结指令
+    assert res["steps"][-1]["freeze"] == {"sent": False, "reason": "servo_active"}
