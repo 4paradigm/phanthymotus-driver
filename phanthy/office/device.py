@@ -28,6 +28,7 @@ WINDOWS_PACKAGE = Path(__file__).resolve().parent / "windows"
 PACKAGE_VERSION = hashlib.sha256(b"".join(
     p.read_bytes() for p in sorted(WINDOWS_PACKAGE.iterdir()) if p.is_file())).hexdigest()[:12]
 _CONFIG_KEYS = ("host", "user", "password", "port", "page_url", "printer")
+_CONNECTION_KEYS = ("host", "user", "password", "port")
 
 
 def build_plugins(config: dict) -> list:
@@ -47,8 +48,18 @@ class VisitorBadgePlugin:
         self._printing = False
         self._installer: threading.Thread | None = None
         self._install_error: FrontDeskError | None = None
+        # The front desk's pages and printers, offered as choices in the card's
+        # settings; refreshed in the background from get_tool.
+        self._choices = {"pages": [], "printers": []}
+        self._choices_at = 0.0
+        self._discovery: threading.Thread | None = None
+        self._login_opened = False
 
     def get_tool(self) -> dict:
+        self._discover_in_background()
+        cfg = self._snapshot()
+        with self._lock:
+            pages, printers = list(self._choices["pages"]), list(self._choices["printers"])
         actions = {
             "start": ([], "启动"), "stop": ([], "停止"), "info": ([], "配置状态"), "config": (list(_CONFIG_KEYS), "保存配置"),
             "list": ([], "列出今天还没入场的访客（姓名、被访人、时间、手机尾号）"),
@@ -72,12 +83,20 @@ class VisitorBadgePlugin:
                 "password": {"type": "string", "title": "Windows 密码", "scope": "shared",
                              "format": "password", "x-sensitive": True},
                 "page_url": {"type": "string", "title": "访客列表网页", "scope": "shared",
-                             "description": "在前台 Edge 里打开访客列表后，复制地址栏的网址"},
+                             "oneOf": _choices([(p["url"], f"{p['title'] or '网页'} — {p['url']}") for p in pages],
+                                               cfg["page_url"]),
+                             "description": "保存前台电脑的 IP、用户名和密码后，前台会打开一个 Edge 窗口："
+                                            "在里面登录访客系统并打开访客列表，约一分钟后重新打开设置即可选择"},
                 "printer": {"type": "string", "title": "打印机", "scope": "shared",
-                            "description": "Windows 里的打印机名称；留空用默认打印机。status 会列出可选名称"},
+                            "oneOf": _choices([(p["name"], p["name"] + ("（系统默认）" if p["default"] else "")
+                                                + ("（离线）" if p["offline"] else "")) for p in printers],
+                                              cfg["printer"]),
+                            "description": "不选则用 Windows 默认打印机"},
                 "port": {"type": "integer", "title": "SSH 端口", "scope": "shared", "default": 22, "advanced": True},
             },
-            "required": ["host", "user", "password", "page_url"],
+            # The page is chosen from what the front desk reports, which needs
+            # the connection saved first, so it cannot block that save.
+            "required": ["host", "user", "password"],
         }
         return definition
 
@@ -92,7 +111,10 @@ class VisitorBadgePlugin:
             return {"state": "ready" if self._configured() else "unconfigured"}
         if action == "config":
             with self._lock:
+                before = [self._cfg[k] for k in _CONNECTION_KEYS]
                 self._cfg.update({k: args[k] for k in _CONFIG_KEYS if k in args})
+                if [self._cfg[k] for k in _CONNECTION_KEYS] != before:
+                    self._choices, self._choices_at, self._login_opened = {"pages": [], "printers": []}, 0.0, False
             return {"status": "ok", "adapter_ok": self._configured()}
         handler = {"list": self._list, "print": self._print, "status": self._status}.get(action)
         if handler is None:
@@ -105,7 +127,46 @@ class VisitorBadgePlugin:
     # ── helpers ──────────────────────────────────────────────────────────────
 
     def _configured(self) -> bool:
-        return all(self._cfg[k] for k in ("host", "user", "password", "page_url"))
+        return self._connected() and bool(self._cfg["page_url"])
+
+    def _connected(self) -> bool:
+        return all(self._cfg[k] for k in ("host", "user", "password"))
+
+    def _discover_in_background(self) -> None:
+        """Refresh the page and printer choices, at most every 30 s (5 min once a page shows up)."""
+        with self._lock:
+            interval = 300 if self._choices["pages"] else 30
+            if (not self._connected() or time.monotonic() - self._choices_at < interval
+                    or (self._discovery is not None and self._discovery.is_alive())):
+                return
+            self._choices_at = time.monotonic()
+            self._discovery = threading.Thread(target=self._discover, args=(dict(self._cfg),),
+                                               name="visitor_discover", daemon=True)
+            self._discovery.start()
+
+    def _discover(self, cfg: dict) -> None:
+        desk = self._desk(cfg)
+        try:
+            self._store_choices(cfg, printers=desk.printers())
+            try:
+                pages = desk.pages()
+            except FrontDeskError as exc:
+                if exc.code != "not_installed":
+                    raise
+                self._install(cfg, 0)   # raises `preparing`; a later refresh reads the pages
+                return
+            self._store_choices(cfg, pages=pages)
+            if not pages and not cfg["page_url"] and not self._login_opened:
+                # Nothing to choose yet: put the login window in front of the operator.
+                desk.job({"action": "login", "page_url": ""}, PACKAGE_VERSION, 20)
+                self._login_opened = True
+        except FrontDeskError as exc:
+            print(f"[visitor_badge] discovery: {exc.code}", flush=True)
+
+    def _store_choices(self, cfg: dict, **choices) -> None:
+        with self._lock:
+            if all(self._cfg[k] == cfg[k] for k in _CONNECTION_KEYS):   # not since reconfigured
+                self._choices.update(choices)
 
     def _desk(self, cfg: dict | None = None) -> FrontDesk:
         cfg = cfg or self._snapshot()
@@ -167,6 +228,8 @@ class VisitorBadgePlugin:
     # ── actions ──────────────────────────────────────────────────────────────
 
     def _list(self, args: dict) -> dict:
+        if not self._configured():
+            return {"status": "error", "code": "not_configured", "error": "请先在卡片设置里填好前台电脑并选择访客列表网页"}
         # Synchronous: must answer inside Agent Core's 60 s limit for an actuator.
         result = self._job(self._snapshot(), time.monotonic() + self._list_timeout_s, self._list_timeout_s,
                            action="list")
@@ -179,7 +242,7 @@ class VisitorBadgePlugin:
         if not name:
             return {"status": "error", "code": "bad_args", "error": "需要访客姓名 name"}
         if not self._configured():
-            return {"status": "error", "code": "not_configured", "error": "请先在卡片配置里填写前台电脑和访客网页"}
+            return {"status": "error", "code": "not_configured", "error": "请先在卡片设置里填好前台电脑并选择访客列表网页"}
         cfg = self._snapshot()   # a print keeps the settings it was accepted with
         with self._lock:
             if self._printing:
@@ -208,7 +271,25 @@ class VisitorBadgePlugin:
         return {"status": "printing", "action_id": action_id}
 
     def _status(self, args: dict) -> dict:
-        return {"configured": self._configured(), "printers": self._desk().printers()}
+        desk = self._desk()
+        try:
+            pages = desk.pages()
+        except FrontDeskError as exc:
+            if exc.code != "not_installed":
+                raise
+            pages = []
+        return {"configured": self._configured(), "printers": desk.printers(), "pages": pages}
+
+
+def _choices(options: list[tuple[str, str]], saved: str) -> list[dict]:
+    """oneOf for a setting chosen from what the front desk reports.
+
+    The saved value stays selectable when this round of discovery did not see it.
+    """
+    choices = [{"const": value, "title": title} for value, title in options]
+    if saved and saved not in (value for value, _ in options):
+        choices.append({"const": saved, "title": f"{saved}（当前设置，本次未找到）"})
+    return choices
 
 
 def _acp_complete(action_id: str, status: str, result: dict) -> None:

@@ -21,6 +21,8 @@ REMOTE_ROOT = "C:/ProgramData/VisitorBadge"
 UPLOAD = f"{REMOTE_ROOT}/upload"
 RUN_JOB = f"{REMOTE_ROOT}/app/run_job.ps1"
 VERSION_FILE = f"{REMOTE_ROOT}/app/version.txt"
+PYTHON = f"{REMOTE_ROOT}/venv/Scripts/python.exe"
+PROFILE = f"{REMOTE_ROOT}/app/data/edge-profile"   # worker.py's PROFILE
 RESULT_MARKER = "VISITOR_RESULT:"
 
 
@@ -132,6 +134,18 @@ class FrontDesk:
         out = self.powershell(f"& '{UPLOAD}/install.ps1' -Version '{version}'", timeout)
         if "VISITOR_INSTALL_OK" not in out:
             raise FrontDeskError("install_failed", "安装没有完成：" + " ".join(out.split())[-300:])
+
+    def pages(self) -> list[dict]:
+        """Pages recently opened in the dedicated Edge (visitor_site.recent_pages).
+
+        Raises not_installed before the first install, when there is no Edge
+        profile to read yet.
+        """
+        out = self.powershell(
+            f"if (-not (Test-Path -LiteralPath '{PYTHON}')) {{ 'VISITOR_NOT_INSTALLED'; exit 2 }}\n"
+            f"& '{PYTHON}' '{REMOTE_ROOT}/app/visitor_site.py' pages '{PROFILE}'")
+        lines = [line for line in out.splitlines() if line.startswith("VISITOR_PAGES:")]
+        return json.loads(lines[-1][len("VISITOR_PAGES:"):]) if lines else []
 
     def printers(self) -> list[dict]:
         out = self.powershell("[Console]::OutputEncoding=[Text.Encoding]::UTF8; "

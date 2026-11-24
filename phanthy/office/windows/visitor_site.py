@@ -14,8 +14,13 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import sqlite3
 import subprocess
+import sys
+import tempfile
 import time
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -228,6 +233,32 @@ def open_for_login(profile_dir: Path, url: str) -> None:
                      creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 
+def recent_pages(profile_dir: Path, limit: int = 10) -> list[dict]:
+    """Web pages recently opened in the dedicated Edge, newest first.
+
+    These are what the card offers for 访客列表网页: the operator logs in
+    there and opens the visitor list, then picks it. Read from a copy of the
+    profile's History database, which Edge keeps open while it runs.
+    """
+    history = profile_dir / "Default" / "History"
+    if not history.is_file():
+        return []
+    with tempfile.TemporaryDirectory() as tmp:
+        copy = Path(tmp) / "History"
+        shutil.copyfile(history, copy)
+        with closing(sqlite3.connect(copy)) as db:
+            rows = db.execute("SELECT url, title FROM urls ORDER BY last_visit_time DESC LIMIT 200").fetchall()
+    pages = []
+    for url, title in rows:
+        if urlsplit(url).scheme not in ("http", "https") or "login" in url.lower():
+            continue
+        if url not in (p["url"] for p in pages):
+            pages.append({"url": url, "title": title or ""})
+        if len(pages) == limit:
+            break
+    return pages
+
+
 class VisitorSite:
     def __init__(self, list_url: str, profile_dir: Path):
         parts = urlsplit(list_url)
@@ -415,3 +446,10 @@ class VisitorSite:
                 return status
             page.wait_for_timeout(1500)
         return status
+
+
+if __name__ == "__main__":
+    # `python visitor_site.py pages <profile>`: the driver lists pages over SSH,
+    # outside the desktop session; ASCII JSON, whatever the console code page.
+    if sys.argv[1:2] == ["pages"]:
+        print("VISITOR_PAGES:" + json.dumps(recent_pages(Path(sys.argv[2]))))
