@@ -96,7 +96,7 @@ class VisitorBadgePlugin:
                             "oneOf": _choices([(p["name"], p["name"] + ("（系统默认）" if p["default"] else "")
                                                 + ("（离线）" if p["offline"] else "")) for p in printers],
                                               cfg["printer"]),
-                            "description": "不选则用 Windows 默认打印机。" + detected},
+                            "description": "不选则用 Windows 默认打印机"},
                 "port": {"type": "integer", "title": "SSH 端口", "scope": "shared", "default": 22, "advanced": True},
             },
             # The page is chosen from what the front desk reports, which needs
