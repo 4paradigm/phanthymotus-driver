@@ -33,9 +33,9 @@ python3 -B -m rokae.helios_sensors.depth_socket \
 预先创建由运行用户和 `video` 组访问的 socket 目录，并将持有该组 GID 的 `HELIOS_DEPTH_SOCKET_GID` 传给 Compose。主机深度源只在 Driver 连接后采集，Driver 停流时释放相机。
 主机深度源使用与镜像同一提交的源码，并安装 NumPy，两个进程才会使用相同的采集设置。
 
-### 画布预览
+### 深度预览
 
-`camera_depth` 的 `info` 返回 `preview_topic`。Core 中「查看数据流」可优先使用该话题。已在 Helios 的 Core `release.261118.56edda4` 上验证预览选择。该版本需要在 Core 前端应用 [画布补丁](core-preview.patch)，补丁也已在 Phanthy Motus 源码 `d7dab1461` 上验证可应用。两种 Core 版本的第一输出均是原始毫米深度，已有卡片接线继续使用原话题。
+`camera_depth` 的 `info` 返回 `preview_topic`。应用 [Core 前端补丁](core-preview.patch) 后，画布的「查看数据流」优先打开 JPEG 预览，监控页也只订阅同一驱动成对发布的 JPEG 预览。原始毫米深度仍是卡片的第一输出，已有接线继续使用原话题。补丁已在 Helios 的 Core `release.261118.56edda4` 上验证，并可应用于 Phanthy Motus 源码 `d7dab1461`。
 
 ## 验证
 
