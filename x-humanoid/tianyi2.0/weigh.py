@@ -188,6 +188,10 @@ def _r(x, nd=4):
     return None if x is None else round(float(x), nd)
 
 
+class Cancelled(BaseException):
+    """卡片 stop 时取消进行中的动作。继承 BaseException，免得被各处的 except Exception 吞掉。"""
+
+
 class WeighEngine:
     """缓冲 + 稳定判据 + 去皮/称重/校准。线程安全；不依赖 ROS。
 
@@ -207,8 +211,9 @@ class WeighEngine:
         self._active_side = "right"
         self._clock = clock
         self._wall = wall
-        self._sleep = sleep
+        self._raw_sleep = sleep
         self._log = log
+        self._cancel = threading.Event()             # stop() 置位：不再下发任何手臂/手指指令
         self._lock = threading.Lock()
         self._force = {s: deque() for s in SIDES}    # (t, fx, fy, fz, tx, ty, tz)
         self._joints = {s: deque() for s in SIDES}   # (t, pos[7], speed[7], current[7], error_max)
@@ -760,7 +765,24 @@ class WeighEngine:
         rest = [float(x) for x in self.cfg["rest_deg"]]
         return self._mirror(rest) if side == "left" else rest
 
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    def clear_cancel(self) -> None:
+        self._cancel.clear()
+
+    def _check_cancel(self) -> None:
+        if self._cancel.is_set():
+            raise Cancelled()
+
+    def _sleep(self, dt: float) -> None:
+        """所有等待都经这里：取消后立即退出，不再进入下一步。"""
+        self._check_cancel()
+        self._raw_sleep(dt)
+        self._check_cancel()
+
     def _call_arm(self, args: dict):
+        self._check_cancel()
         if self._arm_call is None:
             return {"state": "error", "code": "arm_card_unavailable",
                     "error": "arm 卡未启用，pose/retract 不可用"}
@@ -850,6 +872,7 @@ class WeighEngine:
             return "hand_card_unavailable"
         try:
             if not self._hand_started:
+                self._check_cancel()
                 r = self._hand_call({"action": "start"})
                 if not isinstance(r, dict) or r.get("state") == "error" or r.get("error"):
                     self._log(f"[weigh] hand start failed: {_brief(r)}")
@@ -858,6 +881,7 @@ class WeighEngine:
                 self._sleep(self.cfg["arm_start_settle_s"])
             args = {"action": "set_fingers_raw", "side": side}
             args.update({k: max(0, min(100, int(v))) for k, v in fingers.items()})
+            self._check_cancel()
             r = self._hand_call(args)
         except Exception as exc:
             self._log(f"[weigh] hand {shape} raised {exc}")
@@ -899,6 +923,9 @@ class WeighEngine:
         now = self._clock()
         if any(self._arm_deg(s, now) is None for s in SIDES):
             return self._error("joint_data_unavailable", side, "没有新鲜的 /arm/status")
+        hand = str(args.get("hand") or cfg["default_hand"])
+        if hand != "keep" and hand not in cfg["hand_shapes"]:
+            return self._error("bad_hand", side, f"未知手型 {hand!r}（可选 {sorted(cfg['hand_shapes'])} 或 keep）")
         tol = cfg["arrive_tol_deg"]
         per_side, origins, poses = {}, {}, {}
         for s in sides:
@@ -939,17 +966,20 @@ class WeighEngine:
         for s in sides:
             self._tare[s] = None                         # 姿态或手型变了，旧零点作废
             self._last[s] = None
+        if hand != "keep":
+            # 手型没摆成（例如四指没立起来）就不算 pose 成功：不去皮、不切换当前手，
+            # 免得上层以为可以往掌心放东西。
+            problem = self._set_hand(hand, side)
+            if problem:
+                return self._error("hand_failed", side,
+                                   f"手臂已到托举姿态，但手型 {hand} 没有设置成功（{problem}）。"
+                                   f"不要往掌心放东西；修好 hand 卡后重新 pose，或用 retract side={side} 收回",
+                                   hand_problem=problem, arm_posed=True, steps=steps)
         self._active_side = side
-        out = {"state": "posed", "side": side, "experimental": True,
+        out = {"state": "posed", "side": side, "experimental": True, "hand": hand,
                "already_in_pose": not stages, "pose_deg": poses if len(sides) > 1 else poses[side],
                "steps": steps}
         warnings = self._common_warnings(side)
-        hand = str(args.get("hand") or cfg["default_hand"])
-        out["hand"] = hand
-        if hand != "keep":
-            w = self._set_hand(hand, side)
-            if w:
-                warnings.append(w)
         if args.get("tare", True) not in (False, "false", 0, "0"):
             self._sleep(cfg["pose_settle_s"])
             t = self.tare({"side": side, "duration_s": args.get("duration_s"),
@@ -1149,6 +1179,7 @@ class WeighPlugin:
         self._stop_event = None
         self._start_lock = threading.Lock()
         self._busy = threading.Lock()
+        self._worker = None
 
     # ── 卡片定义 ────────────────────────────────────────────────────────────
 
@@ -1301,6 +1332,13 @@ class WeighPlugin:
                   flush=True)
 
     def stop(self) -> None:
+        # 先取消进行中的动作并等它退出：之后不会再有手臂/手指指令，也不会在没有传感器数据时继续。
+        worker = self._worker
+        if worker is not None and worker.is_alive():
+            self._engine.cancel()
+            worker.join(timeout=5.0)
+            if worker.is_alive():
+                print("[weigh] stop: in-flight action did not exit within 5 s", flush=True)
         with self._start_lock:
             node, self._node = self._node, None
             if node is None:
@@ -1354,6 +1392,10 @@ class WeighPlugin:
     def _call_engine(self, action: str, args: dict) -> dict:
         try:
             return getattr(self._engine, action)(args)
+        except Cancelled:
+            print(f"[weigh] {action} cancelled by stop", flush=True)
+            return {"state": "cancelled", "code": "cancelled", "experimental": True,
+                    "error": "卡片已停止，动作被取消；手臂停在当前位置或上一段的目标位置"}
         except ValueError as exc:
             return {"state": "error", "code": "bad_arguments", "error": str(exc)}
         except Exception as exc:
@@ -1365,6 +1407,7 @@ class WeighPlugin:
         做完后经 ACP 回调完成状态和完整结果。同一时间只允许一个动作。"""
         if not self._busy.acquire(blocking=False):
             return {"state": "error", "code": "busy", "error": "本卡另一个动作正在进行"}
+        self._engine.clear_cancel()       # 持有 busy 说明上一个动作已退出
         action_id = f"weigh_{action}_{uuid4().hex[:8]}"
         done = threading.Event()
         lock = threading.Lock()
@@ -1381,7 +1424,7 @@ class WeighPlugin:
                 handed_off = job["async"]
             if not handed_off:
                 return
-            status = "error" if res.get("state") == "error" else "completed"
+            status = {"error": "error", "cancelled": "cancelled"}.get(res.get("state"), "completed")
             print(f"[weigh] {action} {action_id} {status} -> {_brief(res)} "
                   f"({time.monotonic() - t0:.1f}s)", flush=True)
             try:
@@ -1389,7 +1432,8 @@ class WeighPlugin:
             except Exception as exc:
                 print(f"[weigh] ACP callback failed for {action_id}: {exc}", flush=True)
 
-        threading.Thread(target=work, name=f"weigh-{action}", daemon=True).start()
+        self._worker = threading.Thread(target=work, name=f"weigh-{action}", daemon=True)
+        self._worker.start()
         if done.wait(self._sync_grace_s):
             return job["result"]
         with lock:

@@ -761,11 +761,14 @@ def test_pose_hand_keep_and_open(hanging):
     assert _fingers(raws[-1]) == OPEN
 
 
-def test_hand_failure_does_not_block_weighing(hanging):
+def test_hand_failure_fails_pose_without_tare(hanging):
     hanging.hand_reply = {"state": "error", "error": "hand fault"}
-    res = hanging.engine.pose({})
-    assert res["state"] == "posed" and "hand_start_failed" in res["warnings"]
-    assert res["tare"]["state"] == "tared"
+    res = hanging.engine.pose({"side": "left"})
+    assert res["state"] == "error" and res["code"] == "hand_failed", res
+    assert res["hand_problem"] == "hand_start_failed" and res["arm_posed"] is True
+    assert "tare" not in res and hanging.engine._tare["left"] is None
+    assert hanging.engine.read({})["active_side"] == "right"     # 不算成功的 pose
+    assert hanging.engine.weigh({"side": "left"})["code"] == "not_tared"
 
 
 def test_pose_without_hand_card(tmp_path):
@@ -774,7 +777,18 @@ def test_pose_without_hand_card(tmp_path):
     r.pose = [0.0] * 7
     r.warm()
     res = r.engine.pose({})
-    assert res["state"] == "posed" and res["warnings"] == ["hand_card_unavailable"]
+    assert res["code"] == "hand_failed" and res["hand_problem"] == "hand_card_unavailable"
+    r2 = Rig(tmp_path)                                            # hand=keep 不需要 hand 卡
+    r2.engine._hand_call = None
+    r2.pose = [0.0] * 7
+    r2.warm()
+    res = r2.engine.pose({"hand": "keep"})
+    assert res["state"] == "posed" and res["tare"]["state"] == "tared"
+
+
+def test_pose_rejects_unknown_hand_before_moving(hanging):
+    res = hanging.engine.pose({"hand": "fist"})
+    assert res["code"] == "bad_hand" and hanging.moves() == []
 
 
 def test_retract_opens_fingers_before_moving_arm(hanging):
@@ -911,8 +925,8 @@ def test_long_action_returns_action_id_then_completes(rig, tmp_path):
 
 def test_async_error_is_reported_with_error_status(rig, tmp_path):
     p, calls, fired = _async_plugin(rig, tmp_path)
+    rig.engine.pose({"hand": "keep"})
     rig.engine._hand_call = None
-    rig.engine.pose({})
     res = p.dispatch("retract", {})
     if "action_id" in res:                         # 慢机器上可能超过宽限期
         assert fired.wait(30)
@@ -986,3 +1000,35 @@ def test_retract_from_mid_with_stale_pose_tare_needs_confirmation(hanging):
     res = hanging.engine.retract({"confirm_empty": True})
     assert res["state"] == "retracted", res
     assert [m["right_positions"] for m in hanging.moves()[-1:]] == [REST]
+
+
+
+# ── stop 取消进行中的动作 ───────────────────────────────────────────────────
+
+def test_stop_cancels_pending_pose_and_sends_nothing_more(hanging, tmp_path):
+    p, calls, fired = _async_plugin(hanging, tmp_path)
+    p.stop = weigh.WeighPlugin.stop.__get__(p)     # 真的 stop（_async_plugin 只替换了 start）
+    entered = threading.Event()
+    release = threading.Event()
+    real_sleep = hanging.engine._raw_sleep
+
+    def slow_sleep(dt):                             # 第一段运动等待时卡住，模拟 pose 进行中
+        entered.set()
+        release.wait(0.05)
+        real_sleep(dt)
+    hanging.engine._raw_sleep = slow_sleep
+    res = p.dispatch("pose", {})
+    assert "action_id" in res
+    assert entered.wait(10)
+    n_arm, n_hand = len(hanging.arm_calls), len(hanging.hand_calls)
+    assert p.dispatch("stop", {}) == {"state": "idle"}
+    assert not p._worker.is_alive()                  # stop 等到动作退出
+    assert len(hanging.arm_calls) == n_arm and len(hanging.hand_calls) == n_hand
+    assert fired.wait(10)
+    assert calls[0][1] == "cancelled" and calls[0][2]["code"] == "cancelled"
+    assert hanging.engine._tare["right"] is None
+    hanging.engine._raw_sleep = real_sleep          # 之后的新动作不受上一次取消影响
+    hanging.warm(1)
+    p._sync_grace_s = 60
+    assert p.dispatch("read", {})["state"] == "ok"
+    assert p.dispatch("calibrate", {"scale": 1.05})["state"] == "calibrated"
