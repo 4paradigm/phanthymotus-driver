@@ -683,6 +683,14 @@ class TfTreePlugin:
             return {"state": "idle"}
         if action == "info":
             info = self._node.snapshot()
+            # The canvas treats runtime `info` topic declarations as
+            # authoritative for wiring. Without topic_in it cannot see this
+            # card's data/json vision input and drops the vision_tf -> tf_tree
+            # connection even though get_tool() advertises it statically.
+            topic_in = [{"format": "data/json"}]
+            if self._node._vision_topic:
+                topic_in[0]["topic"] = self._node._vision_topic
+            info["topic_in"] = topic_in
             info["topic_out"] = self._topic_out()
             return info
         return None

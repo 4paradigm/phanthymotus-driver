@@ -445,6 +445,25 @@ def test_tool_declares_no_pose_output(card_module):
     assert "info" in tool["inputSchema"]["properties"]["action"]["enum"]
 
 
+def test_info_reports_vision_input_contract(card_module):
+    """P1 regression: the canvas reads runtime `info`, not get_tool(), to wire
+    cards. A missing topic_in makes the vision_tf -> tf_tree link invisible and
+    the connection silently cannot be retained.
+    """
+    plugin = _make_card(card_module)
+    info = plugin.dispatch("info", {})
+    assert info["topic_in"] == [{"format": "data/json"}]
+
+    # Once a vision topic is attached, info reports the concrete path too.
+    plugin.start()
+    plugin.dispatch("start", {"input_topic": "/bumi_test/vision_tf/ar/transforms"})
+    info = plugin.dispatch("info", {})
+    assert info["topic_in"] == [
+        {"format": "data/json", "topic": "/bumi_test/vision_tf/ar/transforms"}]
+    assert info["topic_out"][0]["format"] == "data/json"
+    plugin.stop()
+
+
 def test_start_builds_tree_without_vision_topic(card_module):
     plugin = _make_card(card_module)
     plugin.start()  # what start_all() calls
