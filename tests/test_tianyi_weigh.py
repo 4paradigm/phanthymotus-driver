@@ -957,3 +957,32 @@ def test_engine_exception_becomes_error_completion(rig, tmp_path):
     assert fired.wait(30)
     assert calls[0][0] == res["action_id"] and calls[0][1] == "error"
     assert calls[0][2]["code"] == "internal_error"
+
+
+# ── retract 从中间姿态出发也要确认空掌 ─────────────────────────────────────
+
+def test_retract_from_mid_with_load_sends_nothing(hanging):
+    hanging.pose = list(MID)                       # 例如上一次 retract 停在了 palm_inward 之后
+    hanging.warm()
+    assert hanging.engine.tare({})["state"] == "tared"
+    hanging.mass = 0.3                             # 有人又把东西放回了手里
+    hanging.warm()
+    n_hand, n_arm = len(hanging.hand_calls), len(hanging.arm_calls)
+    res = hanging.engine.retract({})
+    assert res["code"] == "object_on_hand", res
+    assert len(hanging.hand_calls) == n_hand and len(hanging.arm_calls) == n_arm
+
+
+def test_retract_from_mid_with_stale_pose_tare_needs_confirmation(hanging):
+    hanging.engine.pose({})                        # 在托举姿态去皮
+    hanging.warm(1)
+    hanging.pose = list(MID)                       # 之后停在中间姿态：零点不再适用
+    hanging.arm_target = list(MID)
+    hanging.warm()
+    n_hand, n_arm = len(hanging.hand_calls), len(hanging.arm_calls)
+    res = hanging.engine.retract({})
+    assert res["code"] == "load_unknown" and "pose_changed_since_tare" in res["error"], res
+    assert len(hanging.hand_calls) == n_hand and len(hanging.arm_calls) == n_arm
+    res = hanging.engine.retract({"confirm_empty": True})
+    assert res["state"] == "retracted", res
+    assert [m["right_positions"] for m in hanging.moves()[-1:]] == [REST]

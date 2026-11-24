@@ -992,22 +992,29 @@ class WeighEngine:
                 return self._error("unknown_start_pose", side,
                                    f"{s} 臂不在托举姿态，出于安全不自动收回。请用 arm 卡操作",
                                    joints_deg=[_r(x, 2) for x in cur])
-            # 掌心朝上时转腕会让物体掉下去：已去皮时检查掌上读数
-            if self._within(cur, pose, tol):
-                tare = self._tare[s]
-                problem, _ = self._tare_problem(s)
-                if tare is not None and problem is None:
-                    live = self.analyze(s, cfg["block_s"], now)
-                    if live.get("F") is not None:
-                        load = _norm(_sub(live["F"][:3], tare["F"][:3])) / G / self.scale_info(s)["scale"]
-                        if load > cfg["retract_max_load_kg"]:
-                            return self._error("object_on_hand", side,
-                                               f"{s} 手掌上还有约 {load * 1000:.0f} g，先取走物体再收回",
-                                               load_kg=_r(load))
-                elif args.get("confirm_empty") not in (True, "true", 1, "1"):
-                    return self._error("load_unknown", side,
-                                       f"{s} 手没有有效的去皮，无法判断掌上是否有物体。"
-                                       "确认掌心已空后传 confirm_empty=true")
+            # 只要这只手臂要动，就先确认掌上是空的（托举姿态和中间姿态都一样）：
+            # 张开手指、转腕或放下手臂都可能让物体掉下去。去皮有效时看读数，否则要求确认。
+            # 零点只在去皮时的姿态下有意义：姿态变了（例如停在中间姿态）就不能靠读数判断。
+            tare = self._tare[s]
+            problem, _ = self._tare_problem(s)
+            if tare is not None and problem is None:
+                live = self.analyze(s, cfg["block_s"], now)
+                if live.get("F") is None or live.get("q") is None:
+                    return self._error("force_data_unavailable", side,
+                                       f"{s} 手没有新鲜的力数据，无法判断掌上是否有物体")
+                dev = math.degrees(max(abs(x - y) for x, y in zip(live["q"], tare["q"])))
+                if dev > cfg["joint_dev_deg"]:
+                    problem = "pose_changed_since_tare"
+            if tare is not None and problem is None:
+                load = _norm(_sub(live["F"][:3], tare["F"][:3])) / G / self.scale_info(s)["scale"]
+                if load > cfg["retract_max_load_kg"]:
+                    return self._error("object_on_hand", side,
+                                       f"{s} 手掌上还有约 {load * 1000:.0f} g，先取走物体再收回",
+                                       load_kg=_r(load))
+            elif args.get("confirm_empty") not in (True, "true", 1, "1"):
+                return self._error("load_unknown", side,
+                                   f"{s} 手没有有效的去皮（{problem or 'not_tared'}），无法判断掌上是否有物体。"
+                                   "确认掌心已空后传 confirm_empty=true")
         stages = self._merge_stages(("palm_inward", "lower_arm"), per_side)
         if not stages:
             return {"state": "retracted", "side": side, "already_retracted": True, "steps": []}
