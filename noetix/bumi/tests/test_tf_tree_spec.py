@@ -125,11 +125,12 @@ def test_fk_on_shipped_urdf_covers_all_21_revolute_joints():
     assert tree["root"] == "base_link"
     joints = [j for j in tree["joints"].values() if j["type"] == "revolute"]
     assert len(joints) == 21
-    # The shipped URDF declares the camera mount as two fixed joints. They must
-    # be parsed (and published on /tf_static) so vision targets hang off the
-    # body tree instead of floating; forward kinematics must place both links.
+    # The shipped URDF declares the head datum and camera mount as three fixed
+    # joints. They must be parsed (and published on /tf_static) so vision
+    # targets hang off the body tree instead of floating; FK must place them.
     fixed = [j for j in tree["joints"].values() if j["type"] == "fixed"]
-    assert {j["child"] for j in fixed} == {"camera_link", "camera_optical_frame"}
+    assert {j["child"] for j in fixed} == {
+        "head_center_link", "camera_link", "camera_optical_frame"}
     assert all(j["child"] in poses for j in joints)
     assert all(j["child"] in poses for j in fixed)
 

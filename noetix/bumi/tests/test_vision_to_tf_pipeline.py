@@ -74,18 +74,23 @@ def test_all_vision_tf_parent_choices_are_in_tf_tree_whitelist():
 def test_camera_fixed_chain_is_published_on_tf_static():
     """The camera mount added in the URDF is what connects vision to the body.
 
-    tf_tree reads those two fixed joints from the URDF and publishes them as the
-    static chain waist_yaw_link -> camera_link -> camera_optical_frame (the head
-    camera yaws with the waist, verified on-robot). Without them, vision target
-    edges would be a floating, disconnected tree.
+    tf_tree reads those three fixed joints from the URDF and publishes them as
+    the static chain waist_yaw_link -> head_center_link -> camera_link ->
+    camera_optical_frame (the head camera yaws with the waist, verified
+    on-robot). Without them, vision target edges would be a floating,
+    disconnected tree.
     """
     urdf = (BUMI / "resource" / "bumi_model.urdf").read_text(encoding="utf-8")
     tree = tspec.parse_urdf(urdf)
 
     fixed = {j["child"]: j for j in tree["joints"].values()
              if j["type"] == "fixed"}
-    assert set(fixed) == {"camera_link", "camera_optical_frame"}
-    assert fixed["camera_link"]["parent"] == "waist_yaw_link"
+    assert set(fixed) == {"head_center_link", "camera_link",
+                          "camera_optical_frame"}
+    assert fixed["head_center_link"]["parent"] == "waist_yaw_link"
+    assert fixed["camera_link"]["parent"] == "head_center_link"
+    assert fixed["camera_link"]["origin"][0] == pytest.approx(
+        [0.05, 0.035, 0.005], abs=1e-9)
     assert fixed["camera_optical_frame"]["parent"] == "camera_link"
     # Optical->body rotation must be the documented rpy (-pi/2, 0, -pi/2).
     rpy = fixed["camera_optical_frame"]["origin"][1]

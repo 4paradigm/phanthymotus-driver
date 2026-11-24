@@ -112,7 +112,7 @@ class _TfTreeNode(Node):
         self._rejected_bad_joints = 0
         self._stale_joint_samples = 0
         self._conflicting_parent = 0  # cumulative counter for the status topic
-        self._camera_extrinsic_assumed = False  # zero mount translation = unmeasured
+        self._camera_extrinsic_assumed = False  # zero mount translation = placeholder
 
         self._running = False
         self._generation = 0
@@ -144,9 +144,10 @@ class _TfTreeNode(Node):
             self._tree = None
             return
         # A zero camera-mount translation is a declared placeholder, not a
-        # measurement. Surface that as a machine-readable flag on the health
-        # topic so consumers do not mistake the published static transform for
-        # a calibrated extrinsic.
+        # measurement. The shipped URDF now carries the measured offset from
+        # head_center_link, so this flag is false; it still guards against a
+        # future regression to a zero placeholder. Surface it on the health
+        # topic so consumers never mistake that placeholder for a calibration.
         self._camera_extrinsic_assumed = False
         try:
             self._tree = spec.parse_urdf(text)

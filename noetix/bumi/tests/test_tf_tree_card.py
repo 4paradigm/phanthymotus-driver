@@ -232,10 +232,27 @@ def test_stale_joint_sample_stops_dynamic_stream(card_module):
         module.time.monotonic = original
 
 
-def test_zero_camera_mount_is_flagged_as_assumed(card_module):
-    """The shipped URDF uses a nominal zero camera translation; the node must
-    surface that so downstream never treats the static transform as measured."""
+def test_shipped_camera_mount_is_measured_not_flagged_as_assumed(card_module):
+    """The shipped URDF now carries the 2026-11-24 head-relative measurement."""
     plugin = _make_card(card_module)
+    node = plugin._node
+    assert node._camera_extrinsic_assumed is False
+    assert plugin.dispatch("info", {})["camera_extrinsic_assumed"] is False
+
+
+def test_zero_camera_mount_is_flagged_as_assumed(card_module, tmp_path):
+    """A future regression to a zero placeholder must still be surfaced."""
+    urdf = tmp_path / "zero_camera.urdf"
+    urdf.write_text("""<?xml version="1.0"?>
+    <robot name="test">
+      <link name="base_link"/><link name="camera_link"/>
+      <joint name="camera_mount_joint" type="fixed">
+        <parent link="base_link"/><child link="camera_link"/>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+      </joint>
+    </robot>
+    """, encoding="utf-8")
+    plugin = _make_card(card_module, urdf_path=str(urdf))
     node = plugin._node
     assert node._camera_extrinsic_assumed is True
     assert plugin.dispatch("info", {})["camera_extrinsic_assumed"] is True

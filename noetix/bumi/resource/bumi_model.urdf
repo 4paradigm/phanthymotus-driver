@@ -10,12 +10,19 @@
     </link>
 
     <!-- Camera mount. The Bumi camera sits in the head, which rotates with the
-         waist; the parent link is waist_yaw_link (confirmed on the robot:
-         turning the upper body makes the camera image follow). The mount
-         translation is still a nominal zero
-         (ASSUMED — not yet measured: it is the camera optical centre in parent
-         coordinates, not the centroid or housing face); re-measure it on the
-         robot; see README "Camera mount & frame convention".
+         waist; the head frame is a fixed child of waist_yaw_link (confirmed on
+         the robot: turning the upper body makes the camera image follow).
+
+         head_center_link is a DERIVED datum, not a measured joint: its origin is
+         the geometric centre of the head region of the vendor
+         waist_yaw_link.STL (vertices with z >= 0.24 m, bounding-box midpoint
+         [0.0055, 0.0000, 0.3089] in the waist_yaw_link frame). It exists so the
+         on-robot camera measurement can be expressed in the frame it was
+         measured against instead of being silently re-based to the waist.
+
+         camera_mount_joint xyz is MEASURED on 2026-11-24 (user measurement):
+         the optical centre is 5 cm forward, 3.5 cm left and 0.5 cm above the
+         head geometric centre, in body axes (x forward / y left / z up).
          The rpy below is the same rotation as config.yaml's
          calibration.camera_to_body.quaternion [-0.5, 0.5, -0.5, 0.5] (xyzw):
          changing one side without the other will fail
@@ -27,12 +34,20 @@
          same physical frames but are NOT auto-joined: a consumer that needs to
          cross between the URDF tree and the odometry tree must publish its own
          explicit identity link, never assume they coincide. -->
+    <!-- 头部几何中心（由厂商 waist_yaw_link.STL 头部包围盒推得，非实测关节） -->
+    <link name="head_center_link"/>
+    <joint name="head_center_joint" type="fixed">
+        <parent link="waist_yaw_link"/>
+        <child link="head_center_link"/>
+        <origin xyz="0.0055 0.0 0.3089" rpy="0 0 0"/>
+    </joint>
+
     <!-- 相机安装点：姿态与机体同向（x 前 / y 左 / z 上），原点在相机光心 -->
     <link name="camera_link"/>
     <joint name="camera_mount_joint" type="fixed">
-        <parent link="waist_yaw_link"/>
+        <parent link="head_center_link"/>
         <child link="camera_link"/>
-        <origin xyz="0.0 0.0 0.0" rpy="0 0 0"/>
+        <origin xyz="0.05 0.035 0.005" rpy="0 0 0"/>
     </joint>
 
     <!-- 光学系：视觉算法实际使用的坐标系（x 右 / y 下 / z 深） -->

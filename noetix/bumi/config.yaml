@@ -70,16 +70,17 @@ plugins:
     # Invalid values fall back to 10 Hz; the camera-side upper bound is 30 Hz.
     max_rate_hz: 10
     # Permanent body-axis convention for the standard level, forward-facing
-    # camera: robot x forward, y left, z up. This is an axis assumption, not a
-    # measured mount; translation is the camera origin in robot coordinates
-    # (zeros keeps the position origin at the camera). Replace the quaternion
-    # and translation with measured values if the camera is not level/forward.
+    # camera: robot x forward, y left, z up. The quaternion is still an axis
+    # assumption (not a measured mount), hence assumed: true. The translation
+    # IS measured (2026-11-24) and is the camera optical centre relative to the
+    # head geometric centre, which is the origin of `head_center_link` in the
+    # URDF: +5 cm forward (x), +3.5 cm left (y), +0.5 cm up (z).
     calibration:
       calibration_id: assumed-level-forward-optical-to-body
       fixed_mount: true
       assumed: true
       camera_to_body:
-        translation: [0.0, 0.0, 0.0]
+        translation: [0.05, 0.035, 0.005]
         quaternion: [-0.5, 0.5, -0.5, 0.5]
   motion_state:
     enabled: true

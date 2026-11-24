@@ -503,17 +503,18 @@ status and the ROS probe live in [VISUAL_ODOMETRY.md](VISUAL_ODOMETRY.md).
 
 ## Camera mount & frame convention
 
-`resource/bumi_model.urdf` declares two extra frames so that vision results can
-hang off the body tf tree instead of floating: `camera_link` (body axes, origin
-at the camera optical centre) and `camera_optical_frame` (optical axes), joined
-by two `fixed` joints hanging off `waist_yaw_link` (the head turns with the
-waist). They carry no `<inertial>` — empty links are valid URDF and this bundle
-does not run dynamics.
+`resource/bumi_model.urdf` declares three extra frames so that vision results can
+hang off the body tf tree instead of floating: `head_center_link` (the head
+geometric-centre datum), `camera_link` (body axes, origin at the camera optical
+centre) and `camera_optical_frame` (optical axes), joined by three `fixed` joints
+hanging off `waist_yaw_link` (the head turns with the waist). They carry no
+`<inertial>` — empty links are valid URDF and this bundle does not run dynamics.
 
 ### Where the camera is, and which parent link
 
-The camera sits in the head, which rotates with the waist. Its parent link is
-`waist_yaw_link`.
+The camera sits in the head, which rotates with the waist. Its immediate parent
+is `head_center_link`, which is itself fixed to `waist_yaw_link`; the full static
+chain is `waist_yaw_link -> head_center_link -> camera_link -> camera_optical_frame`.
 
 > **Verified on the robot (A5 acceptance).** Turning the upper body while the
 > robot is disabled makes the head — and therefore the camera image — follow,
@@ -525,15 +526,25 @@ The camera sits in the head, which rotates with the waist. Its parent link is
 
 ### Mount translation
 
-`camera_mount_joint`'s `xyz` is the camera optical centre in parent-link
-coordinates (metres), **not** the centroid or the housing face — depth back-
-projection originates at the optical centre, so a wrong value offsets every
-visual target by a constant. The current value is `0 0 0`.
+`head_center_link` is a fixed child of `waist_yaw_link` at
+`xyz = [0.0055, 0, 0.3089]` m. That datum is **DERIVED** from the vendor
+`waist_yaw_link.STL` head-region bounding box (vertices with `z >= 0.24 m`),
+not independently measured. It exists so the camera offset below uses the same
+origin as the on-robot measurement instead of being silently re-based to the
+waist axis.
 
-> **ASSUMED — not yet measured.** Measurement needs the robot standing on flat
-> ground; record `measured_on: "<date> / <who> / <site>"` in the URDF comment and
-> here when it is done. Until then it stays nominal and must not be presented as
-> measured.
+`camera_mount_joint`'s `xyz` is the camera optical centre relative to
+`head_center_link` (metres), **not** the centroid or the housing face — depth
+back-projection originates at the optical centre, so a wrong value offsets every
+visual target by a constant. Measured on 2026-11-24: `+0.05 m` forward (x),
+`+0.035 m` left (y) and `+0.005 m` up (z), i.e. `0.05 0.035 0.005`.
+
+> **MEASURED translation / ASSUMED rotation.** The translation above is the
+> on-robot measurement supplied for this task. The level-forward quaternion is
+> still an axis assumption, so `config.yaml` keeps `calibration.assumed: true`
+> and `visual_odometry` reports `pose_reference=body_axes`. If your consumer
+> needs a physically surveyed head-centre origin, replace the DERIVED
+> `head_center_joint` origin rather than the measured camera offset.
 
 ### Two frames, two input conventions
 
@@ -563,7 +574,7 @@ machine-specific or per-start prefixes, so they can never be hard-coded:
 | optical axes (x right / y down / z deep) | `camera_optical_frame` | `<hostname>_rgb_optical` | `visual_inputs.py` — `f'{self.namespace}_rgb_optical'` (hostname from `main.py`) |
 
 These two pairs are the **same physical frames under different names**, not two
-separate cameras. The URDF tree (`base_link → waist_yaw_link → camera_link →
+separate cameras. The URDF tree (`base_link → waist_yaw_link → head_center_link → camera_link →
 camera_optical_frame`) is published on `/tf_static` by the `tf_tree` card below,
 so a `lookup(base_link → camera_optical_frame)` now resolves. The odometry tree
 (`bumi_visual_<uuid>_base → <hostname>_rgb_optical`) is still estimator-private

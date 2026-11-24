@@ -4,8 +4,9 @@ Vision results are expressed in a camera optical frame (x right / y down / z
 forward) whose origin and attitude differ from the body tree rooted at
 `base_link` (x forward / y left / z up). This task adds two frames to
 `resource/bumi_model.urdf` — `camera_link` (body axes, origin at the optical
-centre) and `camera_optical_frame` (optical axes) — and locks them against the
-existing `calibration.camera_to_body` in `config.yaml`.
+centre) and `camera_optical_frame` (optical axes), plus the `head_center_link`
+datum they are measured against — and locks them against the existing
+`calibration.camera_to_body` in `config.yaml`.
 
 The whole point is that these two files must never drift: the URDF `rpy` is the
 same rotation as the config quaternion, and the URDF `xyz` is the same
@@ -109,14 +110,35 @@ def test_the_camera_chain_reaches_waist_yaw_link():
     links = [link for link, _ in chain]
     types = [typ for _, typ in chain]
 
-    # Both camera joints are fixed; the chain terminates at waist_yaw_link,
-    # which is a root in this motion-control URDF. The camera links come first.
-    assert links == ["camera_optical_frame", "camera_link", "waist_yaw_link"]
+    # All three camera/head joints are fixed; the chain terminates at
+    # waist_yaw_link, which is a root in this motion-control URDF.
+    assert links == ["camera_optical_frame", "camera_link",
+                     "head_center_link", "waist_yaw_link"]
+    # The chain walk continues one step past waist_yaw_link via its revolute
+    # joint to base_link; the camera/head segment itself is entirely fixed.
+    assert types[:3] == ["fixed", "fixed", "fixed"]
+    assert types[-1] == "revolute"
     assert joint_map["camera_optical_joint"].get("type") == "fixed"
     assert joint_map["camera_mount_joint"].get("type") == "fixed"
-    # On-robot A5 finding: the head camera yaws with the waist, so the mount
-    # parent must be waist_yaw_link, not base_link.
-    assert joint_map["camera_mount_joint"].find("parent").get("link") == "waist_yaw_link"
+    assert joint_map["head_center_joint"].get("type") == "fixed"
+    # The camera is measured relative to the head geometric centre, so its
+    # immediate parent must be head_center_link, not waist_yaw_link/base_link.
+    assert joint_map["camera_mount_joint"].find("parent").get("link") == "head_center_link"
+    # On-robot A5 finding: the head camera yaws with the waist, so the head
+    # datum must ultimately be fixed to waist_yaw_link, not base_link.
+    assert joint_map["head_center_joint"].find("parent").get("link") == "waist_yaw_link"
+
+
+def test_head_center_datum_matches_the_vendor_mesh_derivation():
+    """The head datum is derived, not measured; pin the derivation inputs."""
+    joint_map = _joint_map()
+    origin = joint_map["head_center_joint"].find("origin")
+    xyz = [float(v) for v in origin.get("xyz").split()]
+
+    # Midpoint of the vendor waist_yaw_link.STL head-region bounding box
+    # (vertices with z >= 0.24 m). If the mesh or the datum changes, this test
+    # forces the URDF comment and README to be updated together.
+    assert xyz == pytest.approx([0.0055, 0.0, 0.3089], abs=1e-6)
 
 
 # ── 3. the optical-frame rotation matches the calibration quaternion ──────────
@@ -164,10 +186,18 @@ def test_the_mount_translation_matches_the_calibration_translation():
         assert abs(got - want) < 1e-6
 
 
+def test_the_mount_translation_is_the_measured_head_relative_offset():
+    """2026-11-24 measurement: +5 cm forward, +3.5 cm left, +0.5 cm up."""
+    joint_map = _joint_map()
+    origin = joint_map["camera_mount_joint"].find("origin")
+    xyz = [float(v) for v in origin.get("xyz").split()]
+    assert xyz == pytest.approx([0.05, 0.035, 0.005], abs=1e-9)
+
+
 # ── 5. the camera frames carry no mass ────────────────────────────────────────
 
 def test_the_camera_link_carries_no_mass():
     link_map = {l.get("name"): l for l in _parse_urdf().findall("link")}
-    for name in ("camera_link", "camera_optical_frame"):
+    for name in ("head_center_link", "camera_link", "camera_optical_frame"):
         link = link_map[name]
         assert link.find("inertial") is None, f"{name} must not declare <inertial>"

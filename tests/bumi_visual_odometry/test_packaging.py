@@ -47,7 +47,8 @@ def test_card_and_plugin_config_are_in_sync():
     assert cal['fixed_mount'] is True
     assert cal['assumed'] is True
     assert cal['camera_to_body']['quaternion'] == [-0.5, 0.5, -0.5, 0.5]
-    assert cal['camera_to_body']['translation'] == [0.0, 0.0, 0.0]
+    # Measured 2026-11-24: camera optical centre relative to head centre.
+    assert cal['camera_to_body']['translation'] == [0.05, 0.035, 0.005]
     # The tool name lives in code; keep the driver card pointing at it.
     source = (BUMI/'visual_odometry.py').read_text()
     assert "'name': 'rgbd_visual_odometry'" in source
