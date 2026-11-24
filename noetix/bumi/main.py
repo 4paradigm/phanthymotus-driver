@@ -204,6 +204,12 @@ class BumiDeviceBundle:
                 plugins_cfg["vision_capture"], camera_plugin))
             print("[bundle] VisionCapturePlugin loaded")
 
+        if plugins_cfg.get("traffic_light", {}).get("enabled", False):
+            from common.traffic_light import TrafficLightPlugin
+            self._plugins.append(TrafficLightPlugin(
+                plugins_cfg["traffic_light"], namespace, executor))
+            print("[bundle] TrafficLightPlugin loaded")
+
     def start_all(self) -> None:
         failed = 0
         for i, p in enumerate(self._plugins):
