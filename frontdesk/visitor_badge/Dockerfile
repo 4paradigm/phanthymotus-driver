@@ -1,8 +1,12 @@
 ARG ROS_BASE_IMAGE=bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest
 FROM ${ROS_BASE_IMAGE}
+# The base image's apt mirror resolves only inside the Tencent VPC.
+ARG UBUNTU_MIRROR=http://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports
 
-RUN apt-get update && apt-get install -y --no-install-recommends openssh-client curl \
-    && rm -rf /var/lib/apt/lists/*
+RUN grep -RIl 'mirrors.tencentyun.com/ubuntu-ports' /etc/apt 2>/dev/null | \
+    xargs -r sed -i "s#http://mirrors.tencentyun.com/ubuntu-ports#${UBUNTU_MIRROR}#g" && \
+    apt-get update && apt-get install -y --no-install-recommends openssh-client curl && \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /work
 
