@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+from urllib.request import urlopen
 
 
 QUERY_PATH = "/smart-admin-api/visitInfo/page/query"
@@ -228,35 +229,55 @@ def open_for_login(profile_dir: Path, url: str) -> None:
     """
     if login_window_open(profile_dir):
         return
+    # A DevTools port, so the tabs open in it can be listed (open_pages). Port 0
+    # lets Edge pick a free one and write it to DevToolsActivePort; it listens
+    # on 127.0.0.1 only.
     subprocess.Popen(["cmd.exe", "/c", "start", "", "msedge", f"--user-data-dir={profile_dir}",
-                      "--no-first-run", url or "about:blank"],
+                      "--no-first-run", "--remote-debugging-port=0", url or "about:blank"],
                      creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 
-def recent_pages(profile_dir: Path, limit: int = 10) -> list[dict]:
-    """Web pages recently opened in the dedicated Edge, newest first.
+def _offerable(url: str) -> bool:
+    return urlsplit(url).scheme in ("http", "https") and "login" not in url.lower()
 
-    These are what the card offers for 访客列表网页: the operator logs in
-    there and opens the visitor list, then picks it. Read from a copy of the
-    profile's History database, which Edge keeps open while it runs.
+
+def open_pages(profile_dir: Path) -> list[dict]:
+    """Tabs open right now in the login window, read from its DevTools port.
+
+    Empty when that window is not open, or was opened without the port.
     """
-    history = profile_dir / "Default" / "History"
-    if not history.is_file():
+    try:
+        port = int((profile_dir / "DevToolsActivePort").read_text().split()[0])
+        with urlopen(f"http://127.0.0.1:{port}/json/list", timeout=3) as resp:
+            targets = json.load(resp)
+    except (OSError, ValueError, IndexError):
         return []
-    with tempfile.TemporaryDirectory() as tmp:
-        copy = Path(tmp) / "History"
-        shutil.copyfile(history, copy)
-        with closing(sqlite3.connect(copy)) as db:
-            rows = db.execute("SELECT url, title FROM urls ORDER BY last_visit_time DESC LIMIT 200").fetchall()
-    pages = []
+    return [{"url": t["url"], "title": t.get("title") or ""}
+            for t in targets if t.get("type") == "page" and _offerable(t.get("url", ""))]
+
+
+def recent_pages(profile_dir: Path, limit: int = 10) -> list[dict]:
+    """Pages to offer for 访客列表网页: the tabs open in the dedicated Edge now,
+    then the ones its history remembers.
+
+    The open tabs come first because history cannot be relied on: a list or
+    print closes the login window to take the profile over, Edge is killed if it
+    does not close in time, and visits it had not yet written are lost — on the
+    front desk the history held the first page opened and nothing after.
+    """
+    pages = open_pages(profile_dir)
+    history = profile_dir / "Default" / "History"
+    rows = []
+    if history.is_file():
+        with tempfile.TemporaryDirectory() as tmp:
+            copy = Path(tmp) / "History"
+            shutil.copyfile(history, copy)
+            with closing(sqlite3.connect(copy)) as db:
+                rows = db.execute("SELECT url, title FROM urls ORDER BY last_visit_time DESC LIMIT 200").fetchall()
     for url, title in rows:
-        if urlsplit(url).scheme not in ("http", "https") or "login" in url.lower():
-            continue
-        if url not in (p["url"] for p in pages):
+        if _offerable(url) and url not in (p["url"] for p in pages):
             pages.append({"url": url, "title": title or ""})
-        if len(pages) == limit:
-            break
-    return pages
+    return pages[:limit]
 
 
 class VisitorSite:

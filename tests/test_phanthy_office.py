@@ -179,6 +179,39 @@ def test_recent_pages_reads_the_edge_history_newest_first(tmp_path):
     assert visitor_site.recent_pages(tmp_path / "missing") == []
 
 
+def test_open_tabs_come_first_and_survive_a_history_that_lost_them(tmp_path):
+    # The front desk's history held only the first page: Edge was killed before
+    # writing the rest. The tabs open in the login window are read live instead.
+    import http.server
+    import json as _json
+
+    targets = [{"type": "page", "url": "https://visit.example/#/visitor/list", "title": "访客列表"},
+               {"type": "page", "url": "https://visit.example/#/login", "title": "登录"},
+               {"type": "service_worker", "url": "https://visit.example/sw.js"},
+               {"type": "page", "url": "edge://newtab/", "title": ""}]
+
+    class DevTools(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = _json.dumps(targets if self.path == "/json/list" else []).encode()
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), DevTools)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        (tmp_path / "DevToolsActivePort").write_text(f"{server.server_port}\n/devtools/browser/x\n")
+        assert visitor_site.recent_pages(tmp_path) == [
+            {"url": "https://visit.example/#/visitor/list", "title": "访客列表"}]
+    finally:
+        server.shutdown()
+    # Port file left behind by a closed window: nothing to read, no error.
+    assert visitor_site.open_pages(tmp_path) == []
+
+
 def test_config_reports_adapter_ok_once_the_connection_is_complete():
     plugin = device.VisitorBadgePlugin({})
     assert plugin.dispatch("config", {"host": "10.0.0.5"})["adapter_ok"] is False
