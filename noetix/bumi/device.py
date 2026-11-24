@@ -26,6 +26,7 @@ import subprocess
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime
 from typing import Any
@@ -219,11 +220,14 @@ class _BumiStateNode(Node):
         self._joints_topic  = f"/{namespace}/state/joints"
 
         self._imu_pub     = self.create_publisher(String, self._imu_topic,     _LOW_LAT_QOS)
+        self._visual_imu_pub = self.create_publisher(
+            String, f'/{namespace}/odometry_input/state_imu', _LOW_LAT_QOS)
         self._battery_pub = self.create_publisher(String, self._battery_topic, _LOW_LAT_QOS)
         self._joints_pub  = self.create_publisher(String, self._joints_topic,  _LOW_LAT_QOS)
 
         self._running = False
         self._imu_enabled = True
+        self._visual_imu_enabled = False
         self._imu_lock = threading.RLock()
         self._thread: threading.Thread | None = None
 
@@ -234,6 +238,10 @@ class _BumiStateNode(Node):
             self._imu_enabled = enabled
         finally:
             self._imu_lock.release()
+
+    def set_visual_imu_enabled(self, enabled):
+        with self._imu_lock:
+            self._visual_imu_enabled = enabled
 
     def start_polling(self):
         self._running = True
@@ -254,7 +262,7 @@ class _BumiStateNode(Node):
 
                 # IMU: 20 Hz
                 with self._imu_lock:
-                    if self._imu_enabled and now - last_imu_time >= self._IMU_INTERVAL:
+                    if (self._imu_enabled or self._visual_imu_enabled) and now - last_imu_time >= self._IMU_INTERVAL:
                         last_imu_time = now
                         imu = self._high_ctrl.get_imu_data()
                         # Timestamp the reading, not the consumer callback: the
@@ -268,7 +276,10 @@ class _BumiStateNode(Node):
                         }
                         msg = String()
                         msg.data = json.dumps(imu_data)
-                        self._imu_pub.publish(msg)
+                        if self._imu_enabled:
+                            self._imu_pub.publish(msg)
+                        if self._visual_imu_enabled:
+                            self._visual_imu_pub.publish(msg)
 
                 # Joints: 10 Hz
                 if now - last_joints_time >= self._JOINTS_INTERVAL:
@@ -363,6 +374,9 @@ class StatePlugin:
                 "inputSchema": {"type": "object", "properties": {}},
             },
         ]
+
+    def set_visual_imu_enabled(self, enabled):
+        self._node.set_visual_imu_enabled(enabled)
 
     def start(self) -> None:
         self._node.set_imu_enabled(True)
@@ -2468,7 +2482,8 @@ def _camera_subprocess(namespace: str):
     #
     # Sent over stdout because the parent already forwards it: no second pipe,
     # no file, and the line stays in `docker logs` where somebody debugging a
-    # wrong field of view will look first. See `camera_specs.INTRINSICS_MARKER`.
+    # wrong field of view will look first. Public declarations come from the
+    # normalized publisher rather than this diagnostic.
     try:
         import json as _json
         _streams = {}
@@ -2617,9 +2632,9 @@ def _camera_subprocess(namespace: str):
 
 
 class _CameraFrameNode(Node):
-    """Caches the existing color JPEG stream for persistent vision capture."""
+    """Caches JPEG frames from the shared camera for persistent vision capture."""
 
-    def __init__(self, color_topic: str):
+    def __init__(self, color_topic: str, capture_topic: str):
         super().__init__("bumi_camera_frame_cache")
         self._color_topic = color_topic
         self._condition = threading.Condition()
@@ -2631,8 +2646,8 @@ class _CameraFrameNode(Node):
             depth=1,
             durability=DurabilityPolicy.VOLATILE,
         )
-        self._sub = self.create_subscription(
-            CompressedImage, color_topic, self._on_frame, qos)
+        self.create_subscription(CompressedImage, color_topic, self._on_frame, qos)
+        self.create_subscription(CompressedImage, capture_topic, self._on_frame, qos)
 
     def _on_frame(self, msg: CompressedImage) -> None:
         received_at = datetime.now().astimezone()
@@ -2656,6 +2671,10 @@ class _CameraFrameNode(Node):
             self._latest = frame
             self._condition.notify_all()
 
+    def clear(self):
+        with self._condition:
+            self._latest = None
+
     def wait_for_frame(self, after_sequence=None, timeout_s=5.0):
         """Read a cached frame, or wait for a strictly later sequence."""
         deadline = time.monotonic() + max(0.0, timeout_s)
@@ -2663,7 +2682,7 @@ class _CameraFrameNode(Node):
             if after_sequence is None and self._latest is not None:
                 return dict(self._latest), self._sequence
             baseline = self._sequence if after_sequence is None else after_sequence
-            while self._sequence <= baseline:
+            while self._latest is None or self._sequence <= baseline:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return None, self._sequence
@@ -2680,14 +2699,15 @@ class CameraPlugin:
         self._color_topic = f"/{namespace}/camera/color"
         self._depth_topic = f"/{namespace}/camera/depth"
         self._proc: subprocess.Popen | None = None
-        self._frame_node = _CameraFrameNode(self._color_topic)
+        self._frame_node = _CameraFrameNode(self._color_topic, f'/{namespace}/camera/capture_color')
         executor.add_node(self._frame_node)
         self._cards = set()
+        self._capture_readers = 0
         self._lifecycle_lock = threading.RLock()
         self._control_condition = threading.Condition()
         self._control_generation = 0
-        self._activations = dict(camera=0, depth=0, imu=0)
-        self._stop_generations = dict(camera=0, depth=0, imu=0)
+        self._activations = dict(camera=0, depth=0, imu=0, visual_odometry=0, vision_capture=0)
+        self._stop_generations = dict.fromkeys(self._activations, 0)
         self._acked_generation = -1
         self._control_packet = None
         self._intrinsics_lock = threading.Lock()
@@ -2790,18 +2810,44 @@ class CameraPlugin:
         with self._lifecycle_lock:
             if name in self._cards and self.is_running():
                 return
+            new_owner = name not in self._cards
             self._cards.add(name)
             self._activations[name] += 1
-            with self._intrinsics_lock:
-                self._rgbd_status = dict(ready=False, camera_info=[], error="awaiting fresh calibrated capture")
-            self._publish_cards()
-            if not self.is_running():
-                self._stop_generations = dict(camera=0, depth=0, imu=0)
-                self._start_process()
+            if name in ('camera', 'depth', 'imu') or not self.is_running():
+                with self._intrinsics_lock:
+                    self._rgbd_status = dict(ready=False, camera_info=[], error="awaiting fresh calibrated capture")
+            try:
+                self._publish_cards()
+                if not self.is_running():
+                    self._stop_generations = dict.fromkeys(self._activations, 0)
+                    self._start_process()
+            except Exception:
+                if new_owner:
+                    self._cards.discard(name)
+                raise
 
+    @contextmanager
+    def capture_frames(self):
+        with self._lifecycle_lock:
+            if self._capture_readers == 0 and 'camera' not in self._cards:
+                self._frame_node.clear()
+            self.start_card('vision_capture')
+            self._capture_readers += 1
+        try:
+            yield
+        finally:
+            with self._lifecycle_lock:
+                self._capture_readers -= 1
+                if self._capture_readers == 0:
+                    try:
+                        self.stop_card('vision_capture')
+                    except (RuntimeError, TimeoutError) as error:
+                        print(f"[vision_capture] camera release did not complete: {error}", flush=True)
 
     def stop_card(self, name):
         with self._lifecycle_lock:
+            if name not in self._cards and not self._stop_pending(name):
+                return
             self._cards.discard(name)
             self._publish_cards()
             self._stop_generations[name] = self._control_generation
@@ -2813,6 +2859,7 @@ class CameraPlugin:
 
     def _start_process(self) -> None:
         import sys
+        self._frame_node.clear()
         with self._intrinsics_lock:
             self._rgbd_status = dict(ready=False, camera_info=[], error="awaiting calibrated capture")
         env = dict(os.environ, BUMI_CAMERA_CARDS=json.dumps(self._control_packet),
@@ -2881,7 +2928,11 @@ class CameraPlugin:
 
 
     def is_running(self) -> bool:
-        return self._proc is not None and self._proc.poll() is None
+        proc = self._proc
+        return proc is not None and proc.poll() is None
+
+    def color_is_running(self) -> bool:
+        return self.is_running() and bool(self._cards & {'camera', 'vision_capture'})
 
     def wait_for_color_frame(self, after_sequence=None, timeout_s=5.0):
         return self._frame_node.wait_for_frame(after_sequence, timeout_s)
@@ -3325,7 +3376,7 @@ class VisionCapturePlugin:
                                "description": "默认值为5秒（可填写1–30秒）"},
             }, "required": ["action"], "additionalProperties": False,
                 "x-action-params": {
-                    "start": {"params": [], "description": "检查相机 worker 是否就绪。"},
+                    "start": {"params": [], "description": "检查是否配置了可供拍摄的相机。"},
                     "capture_photo": {"params": [], "description": "拍摄并保存一张当前 RGB 照片。"},
                     "record_video": {"params": ["duration_s"], "description": "录制并保存 1–30 秒 RGB 视频，默认 5 秒。"},
                     "info": {"params": [], "description": "查看保存目录与相机状态。"},
@@ -3341,7 +3392,7 @@ class VisionCapturePlugin:
         return [self.get_tool()]
 
     def start(self):
-        return {"state": "ready" if self._camera_ready() else "error"}
+        return {"state": "ready" if self._worker is not None else "error"}
 
     def stop(self):
         # ``BumiDeviceBundle.stop_all`` calls this during SIGTERM/redeploy. Completing
@@ -3350,7 +3401,7 @@ class VisionCapturePlugin:
         return self._stop_recording()
 
     def _camera_ready(self):
-        return self._worker is not None and self._worker.is_running()
+        return self._worker is not None and self._worker.color_is_running()
 
     def _info(self):
         frame = None
@@ -3365,7 +3416,7 @@ class VisionCapturePlugin:
             active = ({key: self._active_recording.get(key) for key in
                        ("action_id", "state", "duration_s", "started_at", "path")}
                       if self._active_recording else None)
-        return {"ok": self._camera_ready(), "output_dir": str(self._output_dir),
+        return {"ok": frame is not None, "output_dir": str(self._output_dir),
                 "photos_dir": str(self._output_dir / "photos"),
                 "videos_dir": str(self._output_dir / "videos"), "fps": self._fps,
                 "max_duration_s": self._max_duration_s, "latest_frame_age_s": age,
@@ -3388,7 +3439,10 @@ class VisionCapturePlugin:
 
     def _capture_photo(self, args):
         try:
-            frame, _ = self._frame()
+            if self._worker is None:
+                raise RuntimeError("Bumi camera worker is unavailable")
+            with self._worker.capture_frames():
+                frame, _ = self._frame()
             directory = self._output_dir / "photos"
             directory.mkdir(parents=True, exist_ok=True)
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -3539,7 +3593,14 @@ class VisionCapturePlugin:
                     print(f"[vision_capture] could not remove partial video {path}: {exc}", flush=True)
 
     def _record_video_async(self, active, requested):
-        result = self._record_video(requested, active["cancel_event"], active)
+        try:
+            with self._worker.capture_frames():
+                result = self._record_video(requested, active["cancel_event"], active)
+        except Exception as exc:
+            if active["cancel_event"].is_set():
+                result = self._cancelled_result()
+            else:
+                result = {"ok": False, "code": "RECORD_FAILED", "message": str(exc)}
         if result.get("ok"):
             status = "completed"
         elif result.get("code") == "RECORD_CANCELLED":
@@ -3557,7 +3618,7 @@ class VisionCapturePlugin:
             return {"ok": False, "code": "INVALID_DURATION", "message": "duration_s must be an integer"}
         if not 1 <= requested <= self._max_duration_s:
             return {"ok": False, "code": "INVALID_DURATION", "message": f"duration_s must be between 1 and {self._max_duration_s}"}
-        if not self._camera_ready():
+        if self._worker is None:
             return {"ok": False, "code": "RECORD_FAILED", "message": "Bumi camera worker is unavailable"}
         with self._recording_lock:
             if self._active_recording:
@@ -3597,8 +3658,8 @@ class VisionCapturePlugin:
 
     def dispatch(self, action, args):
         if action == "start":
-            return {"state": "ready" if self._camera_ready() else "error",
-                    "message": "" if self._camera_ready() else "Bumi camera worker is unavailable"}
+            state = self.start()["state"]
+            return {"state": state, "message": "" if state == "ready" else "Bumi camera is not configured"}
         if action == "info":
             return self._info()
         if action == "capture_photo":

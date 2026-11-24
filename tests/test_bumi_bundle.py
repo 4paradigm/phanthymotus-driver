@@ -160,6 +160,26 @@ def test_bundle_lifecycle_and_dispatch_include_loco_servo(bundle_module):
     assert servo._running is False
 
 
+def test_bundle_stops_camera_after_visual_odom_release_times_out(bundle_module, capsys):
+    bundle = bundle_module.BumiDeviceBundle({}, "bumi_test", object(), None, None)
+    stopped = []
+
+    def stop_visual_odometry():
+        stopped.append("visual_odometry")
+        raise TimeoutError("camera card stop was not confirmed")
+
+    bundle._plugins = [
+        types.SimpleNamespace(stop=lambda: stopped.append("camera")),
+        types.SimpleNamespace(stop=stop_visual_odometry),
+        types.SimpleNamespace(stop=lambda: stopped.append("vision_capture")),
+    ]
+
+    bundle.stop_all()
+
+    assert stopped == ["vision_capture", "visual_odometry", "camera"]
+    assert "camera card stop was not confirmed" in capsys.readouterr().out
+
+
 def test_existing_bumi_plugin_loading_is_unchanged(bundle_module):
     config = _config()
     config["plugins"]["speaker"] = {"enabled": True}

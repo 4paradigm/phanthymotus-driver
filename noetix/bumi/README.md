@@ -233,7 +233,7 @@ the new card. State scopes, JSON snapshots, labels and interval logging are no
 longer supported. Historical files under `/opt/phanthy-motus/data/bumi/state-records`
 are left untouched.
 
-- `start`: check whether the camera process is ready (does not take a photo).
+- `start`: check whether a camera is configured (does not take a photo).
 - `capture_photo`: save one current RGB JPEG.
 - `record_video`: asynchronously save an RGB MP4/H.264 video; `duration_s` is
   an integer from 1 to 30, default 5 seconds.
@@ -241,11 +241,12 @@ are left untouched.
 - `stop`: cancel recording and remove the incomplete video. This is not
   “finish early and save”. It does not stop the existing camera sensor card.
 
-Bumi reuses its existing 640x480 JPEG topic `/<namespace>/camera/color`.
-A recent cached frame is used for a photo; if none is available or it is older
-than 3 seconds, capture waits for a fresh frame (up to 5 seconds per wait).
-Recording requests a strictly later frame sequence for each encoded frame.
-No second RealSense pipeline, depth capture, audio or state JSON is added.
+Photos and recordings hold the shared RealSense worker while they need frames.
+They use the existing 640x480 JPEG encoder. With the RGB card enabled they read
+`/<namespace>/camera/color`. With it disabled the same encoder feeds the private
+capture cache and the card's public topic remains idle. Capture waits up to 5
+seconds for a frame when the cache has no recent frame. Recording requests a
+strictly later frame sequence for each encoded frame.
 
 Default persistent output:
 
@@ -549,13 +550,11 @@ unsupported distortion models. No native RGB field is cropped.
 Depth normalization and compression happen once on the original depth topic.
 
 The output headers preserve separate source capture times through the existing
-clock mapping. A hardware clock uses one fixed arrival-derived offset; its
-source domain and offset are disclosed and `clock_mapping_verified` is false.
-No publication-time fallback is emitted on these computation topics. Nonzero
-source distortion, invalid calibration/scale, capture
-clock discontinuity or excessive skew makes the source unavailable with an
-error; the shared depth display pauses too, while native color remains available. No body mount is assumed, and
-neither physical accuracy nor hardware performance has been validated.
+clock mapping. A hardware clock uses a fixed arrival-derived offset with
+unverified accuracy. The public declarations carry numeric camera
+geometry. Nonzero source distortion, invalid calibration or scale, clock
+discontinuity, and excessive skew pause both outputs without substituting a
+publication timestamp.
 
 The IMU card keeps its body JSON display output `/NS/state/imu` and exposes
 `/NS/state/imu_calibrated` (`sensor/imu`) as its optional computation output.
@@ -585,7 +584,7 @@ accuracy acceptance of this adapter remain pending.
 
 ### Capture-time body-camera TF
 
-The paired RGB/depth declarations advertise the `/{namespace}/camera/rgbd/body_mount` sidecar automatically, without adding a second output to the depth card. Both camera declarations carry the same `vendor.body_mount`, which Perception discovers automatically. By default the camera node publishes the measured fixed transform `base_link <- {namespace}_rgb_optical`. For configurations without fixed translation, it looks up TF at the selected capture time. Both paths publish `motus.camera_mount/1` JSON before the matching images, using the later image's original integer timestamp (depth on a tie in double-precision seconds). `CAMERA_BODY_FRAME` overrides the body frame name.
+The paired RGB/depth declarations advertise the `/{namespace}/camera/rgbd/body_mount` sidecar automatically, without adding a second output to the depth card. Both camera declarations carry the same `vendor.body_mount`, which Perception discovers automatically. By default the camera node publishes the measured fixed transform `base_link <- {namespace}_rgb_optical`. For configurations without fixed translation, it looks up TF at the selected capture time. Both paths publish `motus.camera_mount/1` JSON before the matching images, once per distinct capture stamp of the published images. `CAMERA_BODY_FRAME` overrides the body frame name.
 
 `body_mount_status` exposes the selected frames and availability independently of RGB-D readiness. Missing TF packages, frames, capture-time transforms or publisher failures preserve video, RGB-D and IMU. The driver never substitutes SDK internal extrinsics, a URDF guess, identity or latest TF. The node remains in its existing ROS domain 42; installed TF domain, real optical calibration chain, timing and accuracy still require hardware acceptance. Bumi already includes `tf2_ros` through its existing RTAB-Map dependency; the build import guard now checks its Buffer and TransformListener APIs. No image was built or deployed for this change. Main odometry stays camera referenced; available evidence supports only a separately named derived body pose.
 
@@ -595,8 +594,8 @@ Perception's generic `rgbd_odometry` card supports the instance settings
 `imu_assisted=true`, `short_term_compensation=true`, `depth_geometry=true`.
 Full fusion requires both numeric sensor-origin translation vectors in
 `motus.imu/1`. Time/source/calibration labels do not restrict Perception modes.
-Bumi's current adapter reports fusion unavailable because it omits these
-translation fields; use attitude mode with all three compensation options off.
+The shipped Bumi preset supplies both measured translations. With a custom
+mount that omits either translation, use attitude assistance.
 The generic [IMU data standard](https://github.com/Nidhogg2002/phanthymotus/blob/feat/pointcloud-slam-offline-eval/perception/docs/rgbd-imu.md)
 documents units, axes, origins and time alignment as producer responsibilities. No extra SDK owner or
 robot-specific fusion algorithm is added.
@@ -609,64 +608,6 @@ and modeled position sigma limit0.10m; these are software/model thresholds,
 not measured robot accuracy. The producer is responsible for consistent clock and mount values.
 Only code/offline tests have been completed; hardware verification and
 deployment remain pending explicit user instruction.
-
-## Experimental fused leg/IMU/RGB-D odometry (`fused_odometry`)
-
-This is an **opt-in, read-only planar (x/y/yaw) sensor**, disabled by default.
-It does not replace the existing `rgbd_visual_odometry` card or send locomotion
-commands. Enable **both** `plugins.visual_odometry.enabled: true` and
-`plugins.fused_odometry.enabled: true` in `config.yaml`, then deploy the Bumi
-driver image. A live HighController connection is required.
-
-If a custom mount supplies rotation only, VO reports `body_axes` at the camera
-origin. In that case the planar body-origin filter cannot apply visual corrections:
-it continues leg/IMU prediction, reports `visual_result=body_reference_unavailable`,
-and explains the received reference in status `reason` and odometry `last_error`.
-Supply an actual body-reference pose to enable its visual corrections. A later
-usable body pose clears the error. This reference requirement belongs to the
-legacy planar filter; generic PR371 keeps its numeric-format input policy.
-
-* 40 Hz SDK joint and body-IMU reads drive the existing stance-foot kinematic
-  estimator (with cautious, direction-dependent slip scales). This estimator
-  has no vendor hardware timestamps and is not intrinsically slip-free.
-* A fixed-lag planar EKF consumes the unmodified
-  `/<namespace>/bumi_visual_odometry/state/odom` payload. Only fresh, valid,
-  body-frame RTAB-Map poses with enough inliers can correct it. The filter
-  applies corrections at their capture times and replays buffered leg steps.
-* RTAB-Map segment resets re-anchor the new visual segment to the **current
-  fused frame** so the externally visible odometry frame does not jump.
-* A visual-versus-leg residual is exposed as `slip_residual_m` and
-  `slip_suspected`; a suspected slip increases process noise. Slip
-  scale adaptation is slow and only attempted for high-inlier, near-axis
-  motion. This is a heuristic, not a calibrated foot-contact detector.
-* During white-wall/turning visual loss, estimated pose continues from
-  leg kinematics and IMU yaw, but status becomes **degraded** and covariance
-  increases. Without a fresh SDK sample, pose becomes null and status is
-  **lost**. Stopped means stopped, with no stale pose reuse.
-* The card does **not** implement depth ICP, independently observe motion
-  along a textureless wall, or provide 6-DoF inertial estimation. It does not
-  advertise `motus_slam/1` as a validated mapping odometry source.
-
-Outputs:
-
-| Topic | Format | Rate |
-| --- | --- | --- |
-| `/<namespace>/bumi_fused_odometry/status` | `data/json` | Up to 5 Hz; changes immediately |
-| `/<namespace>/bumi_fused_odometry/state/odom` | `state/odom` / `motus.odom/1` | 20 Hz |
-
-The odometry's `pose` is planar and explicitly marks
-`vendor.accuracy_validated=false`, `planar_only=true` and
-`drift=unbounded`; z/roll/pitch uncertainty is deliberately high.
-Do **not** feed it straight into production SLAM or autonomous motion until
-body mounting, SDK timing, slip, drift and dropout behavior are validated on
-the actual Bumi.
-
-Suggested on-robot verification: record straight forward/backward/lateral
-motion, corner turns, a flat white wall, a floor where the feet visibly slip,
-and stop/start of the visual card. Compare the fused and raw VO/leg positions
-against measured ground truth, verify topic QoS and latency, and inspect
-`slip_residual_m`, `visual_age_s` and covariance. Do not enable
-automatic motion control as part of this experiment.
 
 ### Shared-depth RGB pixel consumers
 
@@ -688,8 +629,7 @@ robot body. Gyro-only chassis odometry cannot replace the RGB-D pose input.
 Body IMU assistance is optional; connect `imu.body_imu`, which supplies the
 configured numeric rotation and explicit read-completion timestamps.
 
-The declarations retain source identity, capture epoch and mapping evidence.
-RGB/depth hardware time uses a fixed arrival-fitted offset; body IMU uses
+RGB/depth acquisition uses fixed arrival-fitted offsets for hardware time; body IMU uses
 host read-completion time. The image mapping has unknown accuracy and is
 explicitly unverified. It is
 not proof of synchronization with independent chassis or host clocks.

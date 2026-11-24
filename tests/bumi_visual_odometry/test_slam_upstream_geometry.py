@@ -5,7 +5,6 @@ from pathlib import Path
 
 from noetix.bumi.visual_odometry import VisualOdometryNode
 from noetix.bumi.visual_odometry_contract import CameraCalibration
-from noetix.bumi.camera_specs import declare
 
 
 ASSUMED = {
@@ -57,27 +56,3 @@ def test_measured_and_assumed_labels_produce_identical_numeric_geometry():
     no_frame = _node(measured)
     no_frame.frame_id = None
     assert no_frame.slam_extrinsic() is None
-
-
-def test_depth_camera_info_advertises_frame_without_clock_proof():
-    values = declare('depth', '/ubuntu/camera/depth', 'image/depth-zlib')
-    assert len(values) == 1
-    hint = values[0]['vendor']['slam_geometry']
-    assert hint['frame_id'] == 'ubuntu_rgb_optical'
-    assert not {'clock_id', 'clock_verified', 'clock_mapping'} & hint.keys()
-    assert hint['observation_model'] == 'pinhole'
-
-
-def test_depth_geometry_hint_survives_runtime_intrinsics_adoption():
-    runtime = {'depth': {
-        'width': 640, 'height': 480, 'fx': 505., 'fy': 506.,
-        'ppx': 320., 'ppy': 240., 'coeffs': [0.] * 5,
-        'model': 'none',
-    }}
-    declaration = declare('depth', '/ubuntu/camera/depth',
-                          'image/depth-zlib', runtime)[0]
-    assert declaration['source'] == 'derived-from-K'
-    hint = declaration['vendor']['slam_geometry']
-    assert hint['frame_id'] == 'ubuntu_rgb_optical'
-    assert 'clock_verified' not in hint
-    assert declaration['vendor']['realsense_distortion_model'] == 'none'

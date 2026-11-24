@@ -667,3 +667,28 @@ def test_output_topics_follow_the_bundle_namespace(executor):
     assert tool['topic_out'] == [
         {'topic': '/alpha'+module.STATUS_TOPIC, 'format': 'data/json'},
         {'topic': '/alpha'+module.OUTPUT_TOPIC, 'format': 'state/odom'}]
+
+
+def test_card_owns_camera_and_releases_it_on_partial_start(executor, monkeypatch):
+    camera_events = []
+    state_imu_events = []
+    camera = NS(start_card=lambda name: camera_events.append(('start', name)),
+                stop_card=lambda name: camera_events.append(('stop', name)))
+    instance = module.VisualOdometryPlugin({'imu_assisted': True, 'imu_source': 'state'},
+        'robot', executor, camera_plugin=camera, set_visual_imu_enabled=state_imu_events.append)
+
+    def failed_bind(namespace):
+        raise RuntimeError('offline bind failure')
+
+    monkeypatch.setattr(instance._node, 'bind_inputs', failed_bind)
+    with pytest.raises(RuntimeError, match='offline bind failure'):
+        instance.dispatch('start', {})
+    assert not instance._node.active
+    assert camera_events == [('start', 'visual_odometry'), ('stop', 'visual_odometry')]
+    assert state_imu_events == [True, False]
+
+    monkeypatch.setattr(instance._node, 'bind_inputs', lambda namespace: None)
+    instance.dispatch('start', {})
+    instance.dispatch('stop', {})
+    assert camera_events[-2:] == [('start', 'visual_odometry'), ('stop', 'visual_odometry')]
+    assert state_imu_events[-2:] == [True, False]

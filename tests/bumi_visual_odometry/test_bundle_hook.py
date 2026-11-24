@@ -633,7 +633,7 @@ def test_color_display_and_capture_share_one_calibrated_publisher_and_encoder(ca
     assert [m.header.frame_id for m in color] == ['robot_rgb_optical'] * 2
     assert [m.header.stamp.sec * 10**9 + m.header.stamp.nanosec for m in color] == [
         10_030_000_000, 10_060_000_000]
-    cache = device._CameraFrameNode('/robot/camera/color')
+    cache = device._CameraFrameNode('/robot/camera/color', '/robot/camera/capture_color')
     cache._on_frame(color[-1])
     saved, _ = cache.wait_for_frame(timeout_s=0)
     assert saved['topic'] == '/robot/camera/color'

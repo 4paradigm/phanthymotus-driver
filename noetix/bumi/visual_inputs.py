@@ -8,11 +8,9 @@ production down with it.
 from __future__ import annotations
 
 from array import array
-import hashlib
 import json
 import time
 import uuid
-import zlib
 
 try:  # imported as part of the noetix.bumi namespace in tests
     from .visual_odometry_contract import ClockMap, MAX_TRANSPORT_NS, finite
@@ -35,13 +33,11 @@ def camera_metadata(color, depth, *, epoch, depth_scale, received_ns):
 
 
 class CaptureTimeMapper:
-    """One mapping per camera process, shared by VO and the depth output."""
+    """Capture time mapping for the private legacy visual odometry streams."""
 
     def __init__(self, depth_scale):
         self.depth_scale = depth_scale
         self.epoch = uuid.uuid4().hex
-        # Stable for this capture subprocess; epoch changes on clock discontinuity.
-        self.source_generation = uuid.uuid4().hex
         self.clocks = [ClockMap(), ClockMap()]
         self.cached_key = self.cached_value = None
 
@@ -77,99 +73,6 @@ class CaptureTimeMapper:
                 self.epoch = uuid.uuid4().hex
                 self.cached_key = self.cached_value = None
             raise
-
-
-def depth_frame_metadata(capture, stamp_ns, frame_id, payload, source_generation):
-    """Correlate one capture-mapped depth frame with its exact zlib data bytes.
-
-    An arrival-offset clock is never certified by a plausible-looking offset.
-    Fallback frames have empty frame_id and intentionally get no sidecar.
-    """
-    if type(stamp_ns) is not int or stamp_ns <= 0 or not frame_id:
-        raise ValueError('only capture-mapped depth frames may have provenance')
-    return {
-        'schema': 'motus.slam_frame/1',
-        'stamp_ns': stamp_ns, 'frame_id': frame_id,
-        'data_sha256': hashlib.sha256(bytes(payload)).hexdigest(),
-    }
-
-
-class CaptureTimedDepthPublisher:
-    """The depth card's single output: capture-timed 640x480 uint16 mm zlib.
-
-    The canvas, navi and the point-cloud computation all read this one topic.
-    It is published on every aligned frame (30 Hz), not gated on subscribers
-    and not throttled: it is the card's media output, and a viewer opening late
-    must not change what the rest of the robot receives.
-
-    Frames whose capture time cannot be mapped are still published, with the
-    arrival stamp and an empty ``frame_id``. Display/navi decode them normally,
-    while a consumer that requires proven capture time (the point-cloud
-    computation) skips them instead of mistaking publication time for
-    measurement time. The SDK ``depth_scale`` is applied here so the payload is
-    the declared uint16 millimetre contract on every camera, not only on the
-    usual 1 mm scale.
-    """
-
-    def __init__(self, publisher, namespace, time_mapper, *, metadata_publisher=None):
-        from sensor_msgs.msg import CompressedImage
-        self.CompressedImage = CompressedImage
-        self.namespace = namespace
-        self.time_mapper = time_mapper
-        self.publisher = publisher
-        self.metadata_publisher = metadata_publisher
-        self._metadata_failures = 0
-        if metadata_publisher is not None:
-            from std_msgs.msg import String
-            self.String = String
-
-    def publish(self, source_frames, aligned_frames, *, fallback_stamp_ns=None):
-        """Publish one aligned depth frame; True when it carried capture time."""
-        import numpy as np
-        depth = aligned_frames.get_depth_frame()
-        if depth is None:
-            return False
-        pixels = np.asanyarray(depth.get_data())
-        if pixels.shape != (480, 640):
-            raise ValueError('compressed depth requires a 640x480 pixel grid')
-        mapped, frame_id = False, ''
-        stamp_ns = fallback_stamp_ns
-        source_color = source_frames.get_color_frame()
-        source_depth = source_frames.get_depth_frame()
-        if source_color is not None and source_depth is not None:
-            try:
-                meta, stamps = self.time_mapper.sample(source_color, source_depth)
-                stamp_ns, frame_id, mapped = stamps[1], f'{self.namespace}_rgb_optical', True
-            except Exception:                                  # noqa: BLE001
-                # Media first: a broken clock mapping must not drop a depth
-                # frame the display/navi path can still use.
-                mapped = False
-        if stamp_ns is None:
-            raise ValueError('arrival stamp required for the depth fallback')
-        millimetres = np.rint(pixels.astype(np.float64) * (self.time_mapper.depth_scale * 1000.))
-        millimetres[(millimetres < 1) | (millimetres > 65535) | ~np.isfinite(millimetres)] = 0
-        msg = self.CompressedImage()
-        msg.header.stamp.sec, msg.header.stamp.nanosec = divmod(int(stamp_ns), 10**9)
-        msg.header.frame_id = frame_id
-        msg.format = '16UC1; compressedDepth zlib'
-        msg.data = array('B', zlib.compress(millimetres.astype('<u2').tobytes(), 1))
-        self.publisher.publish(msg)
-        # Evidence is about the exact compressed frame transmitted above, not
-        # its raw Z16 predecessor. No sidecar is emitted for arrival-time fallback.
-        if mapped and self.metadata_publisher is not None:
-            try:
-                packet = depth_frame_metadata(
-                    meta, int(stamp_ns), frame_id, msg.data,
-                    self.time_mapper.source_generation)
-                self.metadata_publisher.publish(
-                    self.String(data=json.dumps(packet, allow_nan=False)))
-                self._metadata_failures = 0
-            except Exception as error:
-                self._metadata_failures += 1
-                if self._metadata_failures in (1, 100):
-                    print('[camera] depth provenance publish failed: ' +
-                          str(error)[:200], flush=True)
-        return mapped
 
 
 class RawCameraPublisher:

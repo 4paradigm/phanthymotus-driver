@@ -224,7 +224,7 @@ def estimate(msg, segment, frame_id):
 class VisualOdometryNode:
     """Quality state machine and process supervisor for one visual estimator."""
 
-    def __init__(self, namespace, config=None, high_ctrl=None):
+    def __init__(self, namespace, config=None, high_ctrl=None, *, state_imu_topic=None):
         from rclpy.node import Node
         from rclpy.qos import qos_profile_sensor_data
         from std_msgs.msg import String
@@ -242,6 +242,7 @@ class VisualOdometryNode:
         if self.imu_assisted and requested_source == 'controller' and high_ctrl is None:
             requested_source = 'state'
         self.imu_source = requested_source
+        self.state_imu_topic = state_imu_topic
         self.imu_reader = None
         self.imu_reader_stop = None
         self.imu_reader_signature = None
@@ -540,7 +541,7 @@ class VisualOdometryNode:
                 Imu, root+'/imu', self.qos)
             self.segment_pubs.append(self.body_imu_pub)
             if self.imu_source == 'state':
-                self._subscribe(String, f'/{namespace}/state/imu',
+                self._subscribe(String, self.state_imu_topic or f'/{namespace}/state/imu',
                                 self.body_imu, self.input_subs)
             else:
                 self._start_controller_imu()
@@ -1003,9 +1004,15 @@ class VisualOdometryPlugin:
 
     PREFIX = 'visual_odometry'
 
-    def __init__(self, plugin_config, namespace, executor, high_ctrl=None):
+    def __init__(self, plugin_config, namespace, executor, high_ctrl=None, *,
+                 camera_plugin=None, set_visual_imu_enabled=None):
         self._namespace = namespace
-        self._node = VisualOdometryNode(namespace, plugin_config, high_ctrl=high_ctrl)
+        self._camera = camera_plugin
+        self._set_visual_imu_enabled = set_visual_imu_enabled
+        self._node = VisualOdometryNode(
+            namespace, plugin_config, high_ctrl=high_ctrl,
+            state_imu_topic=(f'/{namespace}/odometry_input/state_imu'
+                             if set_visual_imu_enabled is not None else None))
         executor.add_node(self._node.node)
 
     def get_tools(self) -> list:
@@ -1035,21 +1042,39 @@ class VisualOdometryPlugin:
                           {'topic': self._node.output, 'format': 'state/odom'}],
         }]
 
-    def start(self) -> None:
-        self._node.start()
+    def start(self):
+        node = self._node
+        with node.lock:
+            try:
+                if self._camera is not None:
+                    self._camera.start_card('visual_odometry')
+                if node.imu_assisted and node.imu_source == 'state' and self._set_visual_imu_enabled is not None:
+                    self._set_visual_imu_enabled(True)
+                return node.start()
+            except Exception:
+                self.stop()
+                raise
 
-    def stop(self) -> None:
-        self._node.stop()
+    def stop(self):
+        node = self._node
+        with node.lock:
+            try:
+                return node.stop()
+            finally:
+                if node.imu_assisted and node.imu_source == 'state' and self._set_visual_imu_enabled is not None:
+                    self._set_visual_imu_enabled(False)
+                if self._camera is not None:
+                    self._camera.stop_card('visual_odometry')
 
     def dispatch(self, action, args) -> dict | None:
         node = self._node
         with node.lock:
             if action == 'start':
-                return node.start()
+                return self.start()
             if action == 'stop':
-                return node.stop()
+                return self.stop()
             if action == 'reset':
-                return node.reset()
+                return node.reset() if node.active else self.start()
             if action == 'config':
                 return node.configure(args)
             if action in ('info', 'rgbd_visual_odometry'):

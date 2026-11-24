@@ -1,9 +1,8 @@
 """What Bumi reports about its own motion — `motus.odom/1`, as pure functions.
 
-Separate from `device.py` for the same reason `camera_specs.py` is: that module
-imports `rclpy`, so anything inside it can only be exercised on a robot. What
-lives here is the part where a mistake would be silent — which axes this robot
-claims to measure, and what an unmeasured axis is reported as.
+Kept separate from the ROS-dependent `device.py` so the odometry contract can
+be tested without the runtime. This module defines which axes Bumi measures
+and how it reports unmeasured axes.
 
 ── the one rule this file is here to hold ───────────────────────────────────
 

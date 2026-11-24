@@ -143,7 +143,9 @@ HighController body IMU directly at 20–50 Hz and republishes changed samples a
 `sensor_msgs/Imu` on the segment-private `/<segment>/imu` topic. RTAB-Map waits
 for this orientation prior and uses it for rotation only; acceleration is not
 integrated into position. `imu_source: state` is the fallback that consumes
-StatePlugin's `/state/imu` JSON; `controller` is the shipped default. The camera
+the StatePlugin's private IMU feed from the same SDK samples as its public
+`/state/imu` JSON. The private feed stays available when the IMU card stops.
+`controller` is the shipped default. The camera
 stays on its normal video-only `pyrealsense2` path, so no custom RSUSB SDK,
 camera-mount TF or Madgwick child is started.
 

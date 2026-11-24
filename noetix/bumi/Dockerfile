@@ -148,7 +148,6 @@ COPY imu_distance_control.py /work/imu_distance_control.py
 COPY leg_odometry.py /work/leg_odometry.py
 COPY leg_odometry_source.py /work/leg_odometry_source.py
 COPY leg_odometry_sensor.py /work/leg_odometry_sensor.py
-COPY camera_specs.py /work/camera_specs.py
 COPY rgbd_camera.py /work/rgbd_camera.py
 COPY body_imu.py /work/body_imu.py
 COPY visual_inputs.py /work/visual_inputs.py

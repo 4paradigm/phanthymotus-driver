@@ -160,7 +160,8 @@ def test_repeated_capture_is_rejected_without_receipt_time_substitution(source):
     publisher.publish(pair)
     with pytest.raises(ValueError, match='clock reset'):
         publisher.publish(pair)
-    assert all(len(v) == 1 for v in messages.values())
+    assert len(messages['/robot/camera/color']) == len(messages['/robot/camera/depth']) == 1
+    assert not messages['/robot/camera/capture_color']
 
 
 def test_bad_depth_scale_is_rejected_before_any_pair_is_published(monkeypatch):
@@ -701,18 +702,16 @@ def test_invalid_source_timestamp_never_seeds_shared_clock(source, bad):
     assert not any(messages.values())
 
 
-def test_failed_pair_does_not_partially_commit_clock_or_enable_imu(source):
+def test_failed_pair_does_not_partially_commit_clocks(source):
     publisher, messages, _ = source
     pair = frames()
     pair.get_depth_frame().get_timestamp = lambda: 1040.
     with pytest.raises(ValueError, match='skew'):
         publisher.publish(pair)
     assert all(c.offset is None for c in publisher.clocks)
-    with pytest.raises(ValueError, match='unavailable'):
-        publisher.motion_stamp(1005., 'hardware_clock')
     assert not any(messages.values())
     publisher.publish(frames())
-    assert publisher.motion_stamp(1005., 'hardware_clock') == 10_005_000_000
+    assert all(c.offset == 9_000_000_000 for c in publisher.clocks)
 
 
 def test_rejected_second_stream_preserves_both_accepted_clocks(source):
@@ -725,7 +724,7 @@ def test_rejected_second_stream_preserves_both_accepted_clocks(source):
         publisher.publish(pair)
     assert [c.previous for c in publisher.clocks] == previous
     publisher.publish(frames(ms=1020.))
-    assert publisher.motion_stamp(1025., 'hardware_clock') == 10_025_000_000
+    assert [c.previous for c in publisher.clocks] == [1_020_000_000, 1_030_000_000]
 
 
 def test_capture_domain_change_retires_mapping_even_after_card_toggle(source):
@@ -736,19 +735,18 @@ def test_capture_domain_change_retires_mapping_even_after_card_toggle(source):
     publisher.set_enabled(set())
     publisher.set_enabled({'camera', 'depth', 'imu'})
     with pytest.raises(ValueError, match='restart'):
-        publisher.motion_stamp(1030., 'hardware_clock')
+        publisher.publish(frames(ms=1030.))
 
 
-def test_clock_reset_cannot_silently_recover_old_epoch_or_feed_imu(source):
+def test_clock_reset_cannot_silently_recover_old_epoch(source):
     publisher, messages, _ = source
     publisher.publish(frames())
     with pytest.raises(ValueError, match='clock reset'):
         publisher.publish(frames(ms=900.))
     with pytest.raises(ValueError, match='restart'):
-        publisher.motion_stamp(1005., 'hardware_clock')
-    with pytest.raises(ValueError, match='restart'):
         publisher.publish(frames(ms=1030.))
-    assert all(len(rows) == 1 for rows in messages.values())
+    assert len(messages['/robot/camera/color']) == len(messages['/robot/camera/depth']) == 1
+    assert not messages['/robot/camera/capture_color']
 
 
 def test_camera_declarations_omit_source_clock_and_accuracy_claims(source):

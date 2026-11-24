@@ -23,14 +23,16 @@ def parent_control(device):
     parent._color_topic, parent._depth_topic = '/robot/camera/color', '/robot/camera/depth'
     parent._intrinsics = {}
     parent._rgbd_status = dict(ready=False, camera_info=[], error='awaiting calibrated capture')
-    parent._stop_generations = dict(camera=0, depth=0, imu=0)
     parent._cards = {'camera', 'depth'}
+    parent._capture_readers = 0
+    parent._frame_node = NS(clear=lambda: None)
     parent._proc = NS(poll=lambda: None)
     parent._lifecycle_lock = threading.RLock()
     parent._intrinsics_lock = threading.Lock()
     parent._control_condition = threading.Condition()
     parent._control_generation = 0
-    parent._activations = dict(camera=0, depth=0, imu=0)
+    parent._activations = dict(camera=0, depth=0, imu=0, visual_odometry=0, vision_capture=0)
+    parent._stop_generations = dict.fromkeys(parent._activations, 0)
     parent._acked_generation = -1
     parent._control_packet = None
     return parent
@@ -220,6 +222,7 @@ def test_body_imu_stop_waits_for_its_inflight_json_publish(monkeypatch):
     device = _fixture._load_device(monkeypatch)
     node = device._BumiStateNode.__new__(device._BumiStateNode)
     node._imu_enabled = node._running = True
+    node._visual_imu_enabled = False
     node.get_logger = lambda: NS(warn=lambda message: None)
     node._imu_lock = threading.RLock()
     node.get_clock = lambda: NS(now=lambda: NS(nanoseconds=10_000_000_000))
@@ -333,3 +336,130 @@ def test_imu_info_remains_stopping_until_camera_stop_is_confirmed_or_owner_exits
     parent._proc = NS(poll=lambda: None)
     parent._cards_applied(NS(data=json.dumps(parent._control_packet)))
     assert state.dispatch('info', {'_tool_name': 'imu'})['state'] == 'idle'
+
+
+def test_media_capture_gets_fresh_jpeg_without_enabling_public_camera(capture, monkeypatch):
+    device, state = capture
+    monkeypatch.setenv('BUMI_CAMERA_CARDS', json.dumps(dict(
+        generation=0, enabled=['vision_capture'],
+        activations=dict(camera=0, depth=0, imu=0, vision_capture=1))))
+    state.frame_limit = 2
+
+    device._camera_subprocess('robot')
+
+    assert not state.published.get('/robot/camera/color')
+    assert not state.published.get('/robot/camera/depth')
+    assert len(state.published['/robot/camera/capture_color']) == 2
+    assert bytes(state.published['/robot/camera/capture_color'][0].data) == b'JPEG'
+
+
+def test_media_switches_to_private_jpeg_when_rgb_card_stops(capture, monkeypatch):
+    device, state = capture
+    activations = dict(camera=1, depth=1, imu=0, vision_capture=1)
+    monkeypatch.setenv('BUMI_CAMERA_CARDS', json.dumps(dict(
+        generation=0, enabled=['camera', 'depth', 'vision_capture'], activations=activations)))
+    state.frame_limit = 3
+
+    def stop_rgb(node):
+        if state.iterations == 1:
+            packet = dict(generation=1, enabled=['depth', 'vision_capture'], activations=activations)
+            node.subscriptions['/robot/camera/cards_enabled'](NS(data=json.dumps(packet)))
+
+    state.on_spin = stop_rgb
+    device._camera_subprocess('robot')
+
+    assert len(state.published['/robot/camera/color']) == 1
+    assert len(state.published['/robot/camera/depth']) == 3
+    assert len(state.published['/robot/camera/capture_color']) == 2
+    assert state.jpeg_encodes == 3
+
+
+def test_visual_and_capture_owners_keep_camera_alive_until_last_release(monkeypatch):
+    device = _fixture._load_device(monkeypatch)
+    parent = parent_control(device)
+    events = []
+    parent._proc.terminate = lambda: events.append('stop')
+    parent._proc.wait = lambda timeout: None
+    parent._cards_pub = NS(publish=parent._cards_applied)
+    parent._start_process = lambda: (
+        events.append('start'), setattr(parent, '_proc', NS(
+            poll=lambda: None, terminate=lambda: events.append('stop'), wait=lambda timeout: None)))
+    parent.start_card('visual_odometry')
+    parent.stop_card('camera')
+    parent.stop_card('depth')
+    assert parent.is_running()
+    with parent.capture_frames(), parent.capture_frames():
+        parent.stop_card('visual_odometry')
+        assert parent.is_running()
+    assert not parent.is_running()
+    assert events == ['stop']
+    parent.start_card('visual_odometry')
+    assert parent.is_running()
+    assert events == ['stop', 'start']
+
+
+def test_capture_lease_rolls_back_on_worker_start_failure(monkeypatch):
+    device = _fixture._load_device(monkeypatch)
+    parent = parent_control(device)
+    parent._cards.clear()
+    parent._proc = None
+    parent._cards_pub = NS(publish=parent._cards_applied)
+
+    def fail_start():
+        raise OSError('offline spawn failure')
+
+    parent._start_process = fail_start
+    with pytest.raises(OSError, match='offline spawn failure'), parent.capture_frames():
+        pytest.fail('capture entered without a worker')
+    assert not parent._cards and not parent._capture_readers
+
+
+def test_camera_restart_discards_previous_worker_frame_before_spawning(monkeypatch):
+    device = _fixture._load_device(monkeypatch)
+    parent = parent_control(device)
+    cache = NS(frame=b'old JPEG')
+    parent._frame_node = NS(clear=lambda: setattr(cache, 'frame', None))
+
+    def fail_start(*args, **kwargs):
+        assert cache.frame is None
+        raise OSError('offline spawn failure')
+
+    monkeypatch.setattr(device.subprocess, 'Popen', fail_start)
+    with pytest.raises(OSError, match='offline spawn failure'):
+        parent._start_process()
+
+
+def test_vision_capture_start_does_not_require_a_first_frame(monkeypatch, tmp_path):
+    device = _fixture._load_device(monkeypatch)
+    worker = NS(color_is_running=lambda: True, wait_for_color_frame=lambda *args: (None, 0))
+    plugin = device.VisionCapturePlugin({'output_dir': tmp_path}, worker)
+    assert plugin.dispatch('start', {})['state'] == 'ready'
+    assert plugin.dispatch('info', {})['ok'] is False
+
+
+def test_visual_imu_reads_once_when_public_card_is_stopped(monkeypatch):
+    device = _fixture._load_device(monkeypatch)
+    node = device._BumiStateNode.__new__(device._BumiStateNode)
+    node._running, node._imu_enabled = True, False
+    node._visual_imu_enabled = False
+    node._imu_lock = threading.RLock()
+    node.get_logger = lambda: NS(warn=lambda message: None)
+    node.get_clock = lambda: NS(now=lambda: NS(nanoseconds=10_000_000_000))
+    public, private, reads = [], [], []
+    node._imu_pub = NS(publish=public.append)
+    node._visual_imu_pub = NS(publish=private.append)
+
+    def imu_data():
+        reads.append(True)
+        return NS(ori=[0., 0., 0., 1.], angular_vel=[0.] * 3, linear_acc=[0.] * 3)
+
+    def stop_polling():
+        node._running = False
+        raise RuntimeError('offline poll finished')
+
+    node._high_ctrl = NS(get_imu_data=imu_data, get_joint_state=stop_polling)
+    node.set_visual_imu_enabled(True)
+    node._poll_loop()
+
+    assert len(reads) == len(private) == 1
+    assert not public

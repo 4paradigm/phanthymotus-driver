@@ -121,6 +121,8 @@ class RgbdCameraPublisher:
         self.pubs = {kind: node.create_publisher(CompressedImage, topic, qos)
                      for kind, topic in (('color', f'/{namespace}/camera/color'),
                                          ('depth', f'/{namespace}/camera/depth'))}
+        self.capture_pub = node.create_publisher(
+            CompressedImage, f'/{namespace}/camera/capture_color', qos)
         self.enabled = {'camera', 'depth', 'imu'}
         self.clocks = [ClockMap(), ClockMap()]
         self._clock_lock = threading.Lock()
@@ -154,22 +156,6 @@ class RgbdCameraPublisher:
             self.enabled = cards
             self.last_emit = None
             self.ready = False
-
-    def motion_stamp(self, source_ms, domain):
-        # Reuse the image clock's established offset; motion must never fit its
-        # own arrival offset, even before the first valid RGB-D publication.
-        with self._clock_lock:
-            if self._clock_error:
-                raise ValueError(self._clock_error)
-            clock = self.clocks[0]
-            if clock.offset is None:
-                raise ValueError('RGB-D capture clock mapping unavailable')
-            if domain != clock.domain:
-                raise ValueError('motion and RGB-D capture clock domains differ')
-            stamp = int(source_ms * 1e6) + clock.offset
-            if not -50_000_000 <= time.time_ns() - stamp <= 500_000_000:
-                raise ValueError('stale or future motion capture time')
-            return stamp
 
     def _capture_stamps(self, sources, domains, received):
         with self._clock_lock:
@@ -262,13 +248,17 @@ class RgbdCameraPublisher:
         mount_stamps = set()
         for kind, stamp, payload, fmt in zip(('color', 'depth'), stamps, encoded,
                                             ('jpeg', '16UC1; compressedDepth zlib')):
-            if ('camera' if kind == 'color' else 'depth') not in self.enabled:
+            if ('camera' if kind == 'color' else 'depth') in self.enabled:
+                publisher = self.pubs[kind]
+            elif kind == 'color' and 'vision_capture' in self.enabled:
+                publisher = self.capture_pub
+            else:
                 continue
             msg = self.Message()
             msg.header.stamp.sec, msg.header.stamp.nanosec = divmod(stamp, 10**9)
             msg.header.frame_id = self.frame_id
             msg.format, msg.data = fmt, array('B', payload)
-            messages.append((kind, msg))
+            messages.append((publisher, msg))
             mount_stamps.add(stamp)
         # Vision can use either RGB-D header, and point clouds keep the depth header.
         self.mount_error = None
@@ -277,8 +267,8 @@ class RgbdCameraPublisher:
                 self.body_mount.publish(stamp)
             except Exception as error:
                 self.mount_error = str(error)
-        for kind, msg in messages:
-            self.pubs[kind].publish(msg)
+        for publisher, msg in messages:
+            publisher.publish(msg)
         self.last_emit = now
         self.last_error = None
         mount_status = self.body_mount.status()

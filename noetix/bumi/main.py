@@ -193,7 +193,9 @@ class BumiDeviceBundle:
                 from visual_odometry import VisualOdometryPlugin
                 self._plugins.append(VisualOdometryPlugin(
                     plugins_cfg["visual_odometry"], namespace, executor,
-                    high_ctrl=high_ctrl))
+                    high_ctrl=high_ctrl, camera_plugin=camera_plugin,
+                    set_visual_imu_enabled=(state_plugin.set_visual_imu_enabled
+                                            if state_plugin is not None else None)))
                 print("[bundle] VisualOdometryPlugin loaded")
 
         # Independent leg kinematics: visual correction is a Perception concern.
@@ -238,9 +240,17 @@ class BumiDeviceBundle:
 
     def stop_all(self) -> None:
         # Stop media consumers before tearing down the camera producer.
+        failed = 0
         for p in reversed(self._plugins):
-            p.stop()
-        print("[bundle] All plugins stopped")
+            try:
+                p.stop()
+            except Exception as error:
+                failed += 1
+                print(f"[bundle] Plugin {type(p).__name__} stop() FAILED: {error}", flush=True)
+        if failed:
+            print(f"[bundle] {len(self._plugins) - failed}/{len(self._plugins)} plugins stopped", flush=True)
+        else:
+            print("[bundle] All plugins stopped", flush=True)
 
     def get_all_tools(self) -> list:
         tools = []
