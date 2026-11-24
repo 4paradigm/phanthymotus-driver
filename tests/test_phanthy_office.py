@@ -311,6 +311,19 @@ def test_ssh_failures_become_actionable_codes(stderr, code):
     assert frontdesk._explain(stderr).code == code
 
 
+def test_a_marker_on_stdout_wins_over_powershell_noise_on_stderr(monkeypatch, tmp_path):
+    # Seen on the front desk: a not-installed check exits 2 with its marker on
+    # stdout while PowerShell writes a CLIXML progress record to stderr.
+    desk = frontdesk.FrontDesk("10.0.0.5", "desk", "pw", known_hosts=str(tmp_path / "known_hosts"))
+    done = frontdesk.subprocess.CompletedProcess(
+        [], 2, stdout=b"VISITOR_NOT_INSTALLED\r\n",
+        stderr=b'#< CLIXML <Objs Version="1.1.0.1"><Obj S="progress" RefId="0"></Obj></Objs>')
+    monkeypatch.setattr(frontdesk.subprocess, "run", lambda *a, **k: done)
+    with pytest.raises(frontdesk.FrontDeskError) as exc:
+        desk.pages()
+    assert exc.value.code == "not_installed"
+
+
 def test_worker_stays_while_the_login_window_is_open(monkeypatch, tmp_path):
     # Edge started from the scheduled task dies with it, so the worker must
     # not exit while the operator is still logging in.

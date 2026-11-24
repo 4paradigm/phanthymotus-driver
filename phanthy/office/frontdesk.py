@@ -97,12 +97,18 @@ class FrontDesk:
             except subprocess.TimeoutExpired:
                 raise FrontDeskError("timeout", "前台电脑响应超时") from None
         if done.returncode:
-            raise _explain(_text(done.stderr or done.stdout))
+            # Both streams: a marker such as VISITOR_NOT_INSTALLED is on stdout
+            # while PowerShell may still have written something to stderr.
+            raise _explain(_text(done.stderr + b" " + done.stdout))
         return done.stdout
 
     def powershell(self, script: str, timeout: float = 20) -> str:
         # Encoded, so neither cmd.exe nor PowerShell as the remote default shell
         # gets to reinterpret the quoting.
+        # No progress records: over SSH PowerShell writes them to stderr as
+        # CLIXML ("preparing modules for first use"), which buried the real
+        # outcome of a failed command.
+        script = "$ProgressPreference = 'SilentlyContinue'\n" + script
         encoded = base64.b64encode(script.encode("utf-16le")).decode()
         out = self._run(["ssh", "-T", "-p", str(self.port), *self._options(), self.target,
                          f"powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {encoded}"],
