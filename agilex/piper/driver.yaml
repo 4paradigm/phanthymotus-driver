@@ -14,5 +14,4 @@ cards:
   - { name: joints, type: sensor }
   - { name: piper_camera_live, type: sensor }
   - { name: piper_photo, type: actuator }
-  - { name: piper_vision_pick_and_drop, type: sensor }
   - { name: model, type: resource }

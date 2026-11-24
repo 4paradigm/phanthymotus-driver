@@ -34,7 +34,7 @@ COPY intent_control.py intent_motion.py intent_monitor.py intent_teaching.py /wo
 COPY unified_control.py user_motion.py path_capability.py preset.py /work/agilex/piper/
 COPY completion.py /work/agilex/piper/
 COPY camera_live.py camera_worker.py camera_owner.py /work/agilex/piper/
-COPY vision_pick.py vision_rgbd.py vision_kinematics.py /work/agilex/piper/
+COPY vision_pick.py vision_rgbd.py vision_kinematics.py vision_transfer.py /work/agilex/piper/
 COPY resource/ /work/agilex/piper/resource/
 COPY deploy/ /deploy/
 ENV PYTHONPATH=/work PYTHONUNBUFFERED=1 RCUTILS_COLORIZED_OUTPUT=0 \

@@ -2,6 +2,8 @@ mcp_port: 15741
 name: "PiPER 单臂与 D435"
 ros_namespace: ""
 can_interface: can0
+# Select v3 for a PiPER with V3 firmware, including S-V1.9-0.
+sdk_protocol: v2
 data_dir: /opt/phanthy-motus/data/piper
 async_actions: true
 # Deployment may narrow these limits; SDK limits always apply as well.
@@ -45,9 +47,12 @@ camera:
 vision_pick:
   enabled: false
   camera_topic_base: /camera_f
-  # Set joint_state_topic for a wrist camera and provide a camera-to-link6 calibration.
+  # Wrist calibration uses link6 and the shared CAN feedback by default.
+  # An optional JointState topic overrides this feedback source.
   joint_state_topic: null
   calibration: null
+  # Pick/drop geometry, gripper contact profile, and speed for the installed workcell.
+  transfer: null
 ros:
   robot_domain_id: 42
   core_domain_id: 42

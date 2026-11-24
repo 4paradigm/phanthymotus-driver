@@ -35,6 +35,8 @@ def configuration_digest(config):
     values = {k: v for k, v in intent.items() if k != 'point_to_point_acceptance'}
     for key in ('joint_limits_deg', 'gripper_limits_mm', 'can_interface'):
         values[key] = config.get(key)
+    if config.get('sdk_protocol', 'v2') != 'v2':
+        values['sdk_protocol'] = config['sdk_protocol']
     return hashlib.sha256(json.dumps(values, sort_keys=True, allow_nan=False).encode()).hexdigest()
 
 

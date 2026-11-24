@@ -7,7 +7,7 @@ import urllib.request
 
 def call(endpoint, action, **params):
     body = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-            "params": {"name": "piper_vision_pick_and_drop", "arguments": {"action": action, **params}}}
+            "params": {"name": "visio_pick_and_drop", "arguments": {"action": action, **params}}}
     request = urllib.request.Request(endpoint, data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(request, timeout=5) as response:

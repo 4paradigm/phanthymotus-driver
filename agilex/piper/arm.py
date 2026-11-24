@@ -35,7 +35,8 @@ class GripperState:
 
 
 class PiperDriver:
-    _sdk_type = None
+    _sdk_types = {}
+
     def __init__(self, can_name="can0"):
         self.can_name = can_name
         self.arm = None
@@ -44,13 +45,19 @@ class PiperDriver:
         self.joint_limits_deg = None
         self.gripper_limits_mm = (0., 70.)
         self.can_transport = "socketcan"
+        self.sdk_protocol = "v2"
         self.usb_index = 0
         self.last_transport_diagnostics = {}
 
     def connect(self):
-        from piper_sdk import C_PiperInterface_V2
+        if self.sdk_protocol == "v2":
+            from piper_sdk import C_PiperInterface_V2 as sdk_interface
+        elif self.sdk_protocol == "v3":
+            from piper_sdk import C_PiperInterface_V3 as sdk_interface
+        else:
+            raise ValueError("sdk_protocol must be v2 or v3")
 
-        class ObservedInterface(C_PiperInterface_V2):
+        class ObservedInterface(sdk_interface):
             # SDK aggregate timestamps can hide one stale joint/motor frame.
             def __init__(self, *args, **kwargs):
                 if not hasattr(self, "frame_times"):
@@ -60,16 +67,15 @@ class PiperDriver:
                 super().__init__(*args, **kwargs)
 
             def ParseCANFrame(self, frame):
-                result = super().ParseCANFrame(frame)
-                if frame is not None:
-                    with self.frame_lock:
+                with self.frame_lock:
+                    result = super().ParseCANFrame(frame)
+                    if frame is not None:
                         self.frame_times[frame.arbitration_id] = time.time()
                         self.frame_counts[frame.arbitration_id] = self.frame_counts.get(frame.arbitration_id,0)+1
                 return result
 
-        if PiperDriver._sdk_type is None:
-            PiperDriver._sdk_type = ObservedInterface
-        self.arm = PiperDriver._sdk_type(self.can_name, judge_flag=False,can_auto_init=self.can_transport == "socketcan")
+        interface = PiperDriver._sdk_types.setdefault(sdk_interface, ObservedInterface)
+        self.arm = interface(self.can_name, judge_flag=False, can_auto_init=self.can_transport == "socketcan")
         receiver = getattr(self.arm, "_can_deal_th", None)
         if receiver is not None and receiver.is_alive():
             self.arm = None
@@ -134,6 +140,20 @@ class PiperDriver:
     def get_state(self):
         """Return fresh feedback, without sending a movement command."""
         return self._raw_state()[1]
+
+    def read_joint_feedback(self):
+        """Return six cached angles and the earliest/latest joint-frame times in nanoseconds."""
+        arm = self.arm
+        if arm is None:
+            raise RuntimeError("PiPER joint feedback is unavailable")
+        with arm.frame_lock:
+            stamps = [arm.frame_times.get(frame, 0.0) for frame in (0x2A5, 0x2A6, 0x2A7)]
+            now = time.time()
+            if not all(0 <= now - stamp <= .5 for stamp in stamps):
+                raise RuntimeError("PiPER joint feedback is missing or stale")
+            joints = arm.GetArmJointMsgs().joint_state
+            degrees = tuple(getattr(joints, f"joint_{i}") / 1000 for i in range(1, 7))
+        return degrees, round(min(stamps) * 1e9), round(max(stamps) * 1e9)
 
     def firmware(self, query=False):
         """Only explicit query sends an information request, never a control frame."""
@@ -590,21 +610,27 @@ class PiperDriver:
             self._gripper_command(grip.width_mm, torque)
         return self.get_gripper()
 
-    def move_gripper(self, width, torque=.5):
+    def move_gripper(self, width, torque=.5, *, at_target=None):
+        submitted_at = time.time()
         self._gripper_command(width, torque)
         deadline = time.monotonic() + 5
         near_since = None
+        last_feedback = submitted_at
         try:
             while time.monotonic() < deadline:
                 self._check_cancelled()
                 grip = self.get_gripper()
                 self._gripper_command(width, torque)
-                if grip.enabled and abs(grip.width_mm-width) <= .5:
+                matched = (abs(grip.width_mm-width) <= .5 if at_target is None
+                           else grip.feedback_time > submitted_at and at_target(grip))
+                fresh_sample = at_target is None or grip.feedback_time > last_feedback
+                if grip.enabled and matched and fresh_sample:
+                    last_feedback = grip.feedback_time
                     if near_since is None:
                         near_since = time.monotonic()
                     elif time.monotonic()-near_since >= .5:
                         return grip
-                else:
+                elif not grip.enabled or not matched:
                     near_since = None
                 time.sleep(.05)
             raise RuntimeError("夹爪未确认到位；可能接触物体，请检查状态")

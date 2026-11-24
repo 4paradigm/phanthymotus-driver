@@ -389,6 +389,9 @@ class UnifiedControlPlugin(IntentControlPlugin):
                 raise RuntimeError(public_error(exc)) from exc
 
     def stop_motion(self):
+        vision_stop = self.request_stop("visio_pick_and_drop", only_if_active=True)
+        if vision_stop is not None:
+            return vision_stop
         result = super().stop_motion()
         if result['operation_stopping']:
             return result

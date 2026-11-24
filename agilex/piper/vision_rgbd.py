@@ -71,11 +71,12 @@ def camera_point(depth, info, xy):
 
 
 class ObservationSource:
-    def __init__(self, ros2, config, rgb_output, model=None):
+    def __init__(self, ros2, config, rgb_output, model=None, *, joint_feedback=None):
         self.ros2 = ros2
         self.base_topic = config.get("camera_topic_base", "/camera_f").rstrip("/")
         self.rgb_output = rgb_output
         self.joint_topic = config.get("joint_state_topic")
+        self.joint_feedback = joint_feedback
         self.model = model
         self.lock = RLock()
         self.rgb = deque(maxlen=8)
@@ -115,6 +116,8 @@ class ObservationSource:
                 if self.joint_topic:
                     robot.create_subscription(JointState, self.joint_topic,
                                               lambda msg: self.receive_joints(robot, msg), qos)
+                elif self.joint_feedback is not None:
+                    robot.create_timer(.02, lambda: self.read_native_joints(robot))
                 for executor, node in self.nodes:
                     executor.add_node(node)
             except BaseException:
@@ -174,23 +177,34 @@ class ObservationSource:
         by_name = dict(zip(msg.name, msg.position))
         if any(name not in by_name for name in JOINT_NAMES):
             return
-        degrees = np.rad2deg([by_name[name] for name in JOINT_NAMES])
         stamp = stamp_ns(msg)
-        if stamp <= 0 or not np.isfinite(degrees).all():
+        self.remember_joints(node, np.rad2deg([by_name[name] for name in JOINT_NAMES]), stamp, stamp)
+
+    def read_native_joints(self, node):
+        try:
+            sample = self.joint_feedback()
+        except (OSError, RuntimeError):
+            return
+        if sample is not None:
+            self.remember_joints(node, *sample)
+
+    def remember_joints(self, node, degrees, first_ns, last_ns):
+        degrees = np.asarray(degrees, dtype=float)
+        if not 0 < first_ns <= last_ns or degrees.shape != (6,) or not np.isfinite(degrees).all():
             return
         with self.lock:
             if any(node is active for _, active in self.nodes) and (
-                    not self.joints or stamp > self.joints[-1][0]):
-                self.joints.append((stamp, degrees))
+                    not self.joints or last_ns > self.joints[-1][1]):
+                self.joints.append((first_ns, last_ns, degrees))
 
     @staticmethod
     def stationary_angles(joints, rgb_stamp, depth_stamp):
         begin, end = sorted((rgb_stamp, depth_stamp))
-        before = max((i for i, (stamp, _) in enumerate(joints) if stamp < begin), default=-1)
-        after = next((i for i, (stamp, _) in enumerate(joints) if stamp > end), None)
-        if before < 0 or after is None or joints[after][0] - joints[before][0] > MAX_JOINT_BRACKET_NS:
+        before = max((i for i, (_, last_ns, _) in enumerate(joints) if last_ns < begin), default=-1)
+        after = next((i for i, (first_ns, _, _) in enumerate(joints) if first_ns > end), None)
+        if before < 0 or after is None or joints[after][1] - joints[before][0] > MAX_JOINT_BRACKET_NS:
             return None
-        samples = np.asarray([angles for _, angles in joints[before:after + 1]])
+        samples = np.asarray([angles for _, _, angles in joints[before:after + 1]])
         if float(np.max(np.ptp(samples, axis=0))) > STATIONARY_TOLERANCE_DEG:
             return None
         return (samples[0] + samples[-1]) / 2
@@ -203,7 +217,9 @@ class ObservationSource:
                     "depth_fresh": any(0 <= now - stamp_ns(msg) <= MAX_AGE_NS for msg in self.depth),
                     "camera_info_received": self.info is not None, "objects_topic": self.rgb_output + "/objects",
                     "joint_state_topic": self.joint_topic,
-                    "joints_fresh": any(0 <= now - stamp <= MAX_AGE_NS for stamp, _ in self.joints)}
+                    "joint_feedback_source": "can" if self.joint_feedback is not None else (
+                        "ros" if self.joint_topic else None),
+                    "joints_fresh": any(last <= now <= first + MAX_AGE_NS for first, last, _ in self.joints)}
 
     def snapshot(self):
         import cv2
@@ -213,7 +229,7 @@ class ObservationSource:
             rgb = [msg for msg in self.rgb if 0 <= now - stamp_ns(msg) <= MAX_AGE_NS]
             depth = [msg for msg in self.depth if 0 <= now - stamp_ns(msg) <= MAX_AGE_NS]
             info, detection = self.info, self.detection
-            joints = [(stamp, angles) for stamp, angles in self.joints if 0 <= now - stamp <= MAX_AGE_NS]
+            joints = [sample for sample in self.joints if sample[1] <= now <= sample[0] + MAX_AGE_NS]
         if not info or not rgb or not depth:
             raise ValueError("等待有效的 RGB、对齐深度和 CameraInfo")
         pairs = [(color, distance) for color in rgb for distance in depth
@@ -250,4 +266,5 @@ class ObservationSource:
                   "depth_stamp_ns": depth_stamp, "objects": objects}
         if angles is not None:
             result["base_from_link6_mm"] = self.model.base_from_link6_mm(angles)
+            result["joint_degrees"] = angles.tolist()
         return result
