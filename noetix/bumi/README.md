@@ -270,7 +270,7 @@ Configuration is under `plugins.vision_capture`: `output_dir`, `fps`
 (output fps, default/max 15), and `max_duration_s` (default/max 30). The existing
 Dockerfile installs FFmpeg and copies the recording module with the driver source.
 The recorder uses host timestamps for software synchronization and exposes the
-file path only after encoding. See [stopwatch and counting acceptance](AV_RECORDING.md).
+file path only after encoding.
 
 ## New cards
 
