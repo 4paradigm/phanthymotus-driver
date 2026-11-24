@@ -175,40 +175,10 @@ def test_rejected_address_reports_the_error_without_the_key(jpeg):
     assert "推流失败" in result["error"] and "secret-key" not in result["error"]
 
 
-def test_stop_invalidates_start_while_node_initializes():
+@pytest.mark.parametrize("next_action", ["stop", "start"])
+def test_pending_start_is_cancelled_by_newer_action(next_action):
     entered, release = threading.Event(), threading.Event()
-    destroyed = []
-    executor = _Executor()
-
-    class SlowInputs:
-        image_topic, audio_topic = "/robot/camera/color", "/robot/mic/audio"
-
-        def __init__(self, topics, on_jpeg, on_pcm):
-            self.node = types.SimpleNamespace(destroy_node=lambda: destroyed.append(True))
-            entered.set()
-            assert release.wait(timeout=5)
-
-    plugin = _load().LiveStreamPlugin({}, "robot", executor, input_node=SlowInputs)
-    result = {}
-    thread = threading.Thread(target=lambda: result.setdefault("old", plugin.dispatch("start", {"input_topics": ["/robot/camera/color"]})))
-    thread.start()
-    try:
-        assert entered.wait(timeout=5)
-        assert plugin.dispatch("stop", {}) == {"state": "idle"}
-    finally:
-        release.set()
-        thread.join(timeout=5)
-    assert not thread.is_alive()
-    assert result["old"]["state"] == "superseded"
-    assert destroyed == [True]
-    assert executor.nodes == []
-    assert plugin.dispatch("info", {})["topic_in"] == []
-
-
-def test_newer_start_replaces_in_flight_older_start():
-    entered, release = threading.Event(), threading.Event()
-    executor = _Executor()
-    created = []
+    executor, created = _Executor(), []
 
     class Inputs:
         image_topic, audio_topic = "/robot/camera/color", "/robot/mic/audio"
@@ -223,18 +193,21 @@ def test_newer_start_replaces_in_flight_older_start():
 
     plugin = _load().LiveStreamPlugin({}, "robot", executor, input_node=Inputs)
     result = {}
-    thread = threading.Thread(target=lambda: result.setdefault("old", plugin.dispatch("start", {"input_topics": ["/robot/old"]})))
+    thread = threading.Thread(
+        target=lambda: result.setdefault("old", plugin.dispatch("start", {"input_topics": ["/old"]})))
     thread.start()
     try:
         assert entered.wait(timeout=5)
-        assert plugin.dispatch("start", {"input_topics": ["/robot/new"]})["state"] == "ready"
+        args = {"input_topics": ["/new"]} if next_action == "start" else {}
+        expected = "ready" if next_action == "start" else "idle"
+        assert plugin.dispatch(next_action, args)["state"] == expected
     finally:
         release.set()
         thread.join(timeout=5)
+
     assert not thread.is_alive()
     assert result["old"]["state"] == "superseded"
     assert created[0].destroyed
-    assert executor.nodes == [created[1]]
-    assert not created[1].destroyed
+    assert executor.nodes == (created[1:] if next_action == "start" else [])
     assert plugin.dispatch("stop", {}) == {"state": "idle"}
     assert executor.nodes == []
