@@ -4,7 +4,9 @@ Wire the pose output of a calibrated vision card such as ArUco to `vision_tf` (l
 
 ## Mount the camera in the robot model
 
-The bundled 21-joint V3 model ends at the elbows and omits the D435i RGB optical centre. Measure the pose of that optical centre in a known URDF link (for a torso-mounted camera, generally `waist_yaw_link`). The mount's axes are forward, left and up. Supply its measured translation in metres and installation roll, pitch and yaw in radians in the driver configuration. The tree adds a fixed mount link and a second fixed joint with RPY `[-π/2, 0, -π/2]` to `bumi_camera_color_optical`. A target 1 m directly in front of a level camera therefore lies 1 m along mount +X. The transform from optical coordinates to mount coordinates is `[z, -x, -y]`. Leave the ArUco translation and rotation in the optical frame.
+The default `camera_mount` places the D435i RGB optical centre 5 cm forward, 3.5 cm left and 0.5 cm above the head centre. In the [vendor V3 model](https://noetix-docs.oss-cn-beijing.aliyuncs.com/bumi/Bumi_URDF.zip), the front and rear head shells are part of `waist_yaw_link.STL`. The midpoint of their combined axis-aligned bounds gives an estimated head centre of `[0.0055, 0.0001, 0.3054]` m in that link. Adding the camera offset gives `[0.0555, 0.0351, 0.3104]` m. The default assumes a level, forward-facing camera with the image upright. For a different installation, set the measured translation in metres and roll, pitch and yaw in radians in `plugins.tf_tree.camera_mount`.
+
+The mount's axes are forward, left and up. The tree adds a fixed mount link and a second fixed joint with RPY `[-π/2, 0, -π/2]` to `bumi_camera_color_optical`. A target 1 m directly in front of a level camera therefore lies 1 m along mount +X. The transform from optical coordinates to mount coordinates is `[z, -x, -y]`. Leave the ArUco translation and rotation in the optical frame.
 
 An alternative to direct measurement is to record at least four well-spread marker-centre positions, each measured both in optical coordinates and in the selected robot link's axes, with the camera rigidly mounted. Use metre units on both sides. In `pairs.json` each entry has `optical_m` and `link_m`, each containing three numbers. An independent ruler, fixture, or surveyed touch point must supply the link-side positions.
 
@@ -16,7 +18,7 @@ Here 5 mm is an example of a chosen residual limit. Copy the returned `camera_mo
 
 - `camera_mount` contains `parent`, `xyz_m` and `rpy_rad`. If omitted, robot-only operation is available and connecting vision reports the missing calibration.
 - To query a palm or fingertip, add its measured fixed transform to `hand_frames` using `name`, `parent` (e.g. `l_elbow_pitch_link`), `xyz_m` and `rpy_rad`. A physical tool centre requires its actual offset. Existing robot link frames can be queried directly.
-- A deployment with a complete calibrated URDF can supply its file in `urdf_path` and list its existing optical link names under `optical_frames`. Set `plugins.vision_tf.bumi_optical_frame` to its RGB optical link when using the Bumi camera. Published robot frame names carry the driver namespace, as in `my_bumi/l_hand`.
+- A deployment with a complete calibrated URDF can supply its file in `urdf_path`, set `camera_mount: null` to use the model's own mount, and list its existing optical link names under `optical_frames`. Set `plugins.vision_tf.bumi_optical_frame` to its RGB optical link when using the Bumi camera. Published robot frame names carry the driver namespace, as in `my_bumi/l_hand`.
 
 ## Vision inputs and boundaries
 

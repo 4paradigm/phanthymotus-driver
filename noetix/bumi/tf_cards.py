@@ -190,11 +190,15 @@ class _TransformCard:
     def get_tool(self):
         desc = ("将 Bumi URDF、实时关节及左侧可选视觉 TF 合成 /tf 和 /tf_static。用 tf2 查询手与目标。"
                 if self.tree else "把相机光学坐标系中的米制定位结果转换为 TFMessage JSON，保留图像时间及每个目标身份。")
+        properties = {
+            "action": {"type": "string", "enum": ["info", "start", "stop"]},
+            "input_topic": {"type": "string"},
+            "input_topics": {"type": "array", "items": {"type": "string"}},
+        }
+        if not self.tree:
+            properties["instance_id"] = {"type": "string"}
         return {"name": self.PREFIX, "type": "processor", "multiInstance": not self.tree, "description": desc,
-                "inputSchema": {"type": "object", "required": ["action"], "properties": {
-                    "action": {"type": "string", "enum": ["info", "start", "stop"]},
-                    "input_topic": {"type": "string"}, "input_topics": {"type": "array", "items": {"type": "string"}},
-                    "instance_id": {"type": "string"}}},
+                "inputSchema": {"type": "object", "required": ["action"], "properties": properties},
                 "topic_in": [_port("", "TransformStamped JSON" if self.tree else "Metric camera poses")],
                 "topic_out": [] if self.tree else [_port("", "TFMessage JSON")]}
 
