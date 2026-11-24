@@ -454,12 +454,12 @@ def test_rated_currents_match_device():
         assert table[mid] == amps
 
 
-def test_bundle_registers_weigh_opt_in():
+def test_bundle_registers_weigh_enabled_by_default():
     main = (BUNDLE / "main.py").read_text(encoding="utf-8")
     assert "from weigh import WeighPlugin" in main
     cfg = (BUNDLE / "config.yaml").read_text(encoding="utf-8")
     block = re.search(r"^  weigh:\n((?:    .*\n|\s*\n)+)", cfg, re.M).group(1)
-    assert re.search(r"^    enabled: false", block, re.M)
+    assert re.search(r"^    enabled: true", block, re.M)
     docker = (BUNDLE / "Dockerfile").read_text(encoding="utf-8")
     assert re.search(r"^COPY .*\bweigh\.py\b.* /work/$", docker, re.M)
 

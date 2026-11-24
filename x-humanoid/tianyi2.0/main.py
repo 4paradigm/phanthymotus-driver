@@ -471,7 +471,8 @@ class TianyiDeviceBundle:
             print("[bundle] HealthCheckPlugin loaded (health_check)")
 
         if plugins_cfg.get("weigh", {}).get("enabled", False):
-            # Wrist force/torque weighing card (experimental, opt-in).
+            # Wrist force/torque weighing card (experimental; on by default, moves
+            # the arms only on an explicit pose/retract).
             # It must never take the rest of the driver down with it.
             try:
                 from weigh import WeighPlugin

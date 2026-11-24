@@ -155,8 +155,9 @@ plugins:
     enabled: true
   weigh:
     # 手掌托举称重（实验性）。pose/retract 经 arm、hand 卡移动所选手臂和手指（需两卡启用），其余动作只读。
-    # 默认关闭。流程：pose（自动去皮）→ 放物体 → weigh → 取走 → retract。
-    enabled: false
+    # 默认开启：不调用时只订阅、不动；只有显式调用 pose/retract 才会移动手臂和手指。
+    # 流程：pose（自动去皮）→ 放物体 → weigh → 取走 → retract。
+    enabled: true
     sides: [left, right]    # 可用的手；调用时 side=left / right / both（两手相加）
     state_file: /opt/phanthy-motus/data/tianyi-weigh.json   # 比例系数持久化
     load_limit_kg: null     # 不设固定重量上限，由 current_ratio_max 判定
