@@ -530,6 +530,18 @@ def test_starting_is_refused_while_loco_is_driving():
     assert "stop_move" in result["message"]
 
 
+def test_start_rechecks_chassis_after_initial_conflict_check():
+    loco = FakeLoco()
+    card = _card(loco=loco)
+    card._executor = object()
+    checks = iter(["", "chassis reserved"])
+    card._chassis_conflict = lambda: next(checks)
+    result = card.dispatch("start", {"input_topic": "/nav/cmd"})
+    assert result["state"] == "error"
+    assert result["message"] == "chassis reserved"
+    assert card._running is False
+
+
 def test_the_card_registers_itself_with_loco_so_it_can_be_preempted():
     loco = FakeLoco()
     card = _card(loco=loco)

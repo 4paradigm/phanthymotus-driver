@@ -4,11 +4,84 @@
 #include <pybind11/stl.h>
 
 #include "highcontroller.h"
+#include "Robot_status.hpp"
+#include <dds/dds.hpp>
+#include <chrono>
+#include <mutex>
 
 namespace py = pybind11;
 using namespace noetix;
 
+// A separate, read-only reader: HighController::get_mode() does not expose
+// when its cached value was received. Times here are local receipt times, not
+// timestamps supplied by the robot.
+class RobotStatusObserver : public dds::sub::NoOpDataReaderListener<RobotStatus::StatusData> {
+        using Clock = std::chrono::steady_clock;
+        std::mutex mutex_;
+        uint64_t sequence_ = 0;
+        int mode_ = -1;
+        Clock::time_point received_{};
+        dds::domain::DomainParticipant participant_;
+        dds::topic::Topic<RobotStatus::StatusData> topic_;
+        dds::sub::Subscriber subscriber_;
+        dds::sub::DataReader<RobotStatus::StatusData> reader_;
+
+      public:
+        RobotStatusObserver()
+            : participant_(0), topic_(participant_, "Robot_Status_Topic"),
+              subscriber_(participant_), reader_(subscriber_, topic_) {
+                reader_.listener(this, dds::core::status::StatusMask::data_available());
+        }
+
+        ~RobotStatusObserver() {
+                try {
+                        reader_.listener(nullptr, dds::core::status::StatusMask::none());
+                        reader_.close();
+                } catch (...) { }
+        }
+
+        void on_data_available(dds::sub::DataReader<RobotStatus::StatusData>& reader) override {
+                try {
+                        const auto arrival = Clock::now();
+                        for (const auto& sample : reader.take()) {
+                                if (!sample.info().valid()) continue;
+                                std::lock_guard<std::mutex> lock(mutex_);
+                                mode_ = sample.data().workmode();
+                                received_ = arrival;
+                                ++sequence_;
+                        }
+                } catch (...) { /* Missing feedback is handled by the caller. */ }
+        }
+
+        py::dict snapshot() {
+                std::lock_guard<std::mutex> lock(mutex_);
+                py::dict result;
+                result["sequence"] = sequence_;
+                if (sequence_ == 0) {
+                        result["workmode"] = py::none();
+                        result["age_ms"] = py::none();
+                        result["received_ns"] = py::none();
+                } else {
+                        result["workmode"] = mode_;
+                        result["age_ms"] = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            Clock::now() - received_).count();
+                        result["received_ns"] = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            received_.time_since_epoch()).count();
+                }
+                return result;
+        }
+
+        int64_t mark() {
+                return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    Clock::now().time_since_epoch()).count();
+        }
+};
+
 PYBIND11_MODULE(highcontrol_py, m) {
+        py::class_<RobotStatusObserver>(m, "RobotStatusObserver")
+            .def(py::init<>())
+            .def("snapshot", &RobotStatusObserver::snapshot)
+            .def("mark", &RobotStatusObserver::mark);
         // RobotBmsData
         py::class_<RobotBmsData>(m, "RobotBmsData")
             .def(py::init<>())

@@ -370,9 +370,67 @@ navi 流水线时仍保留 `dry_run: true`，用于核对视觉控制方向。�
 
 ## Direct action cards
 
-The former `switch_mode` tool is split into three user-facing cards. Internal
-`enable`, `ready` and `walk` transitions are completed automatically and are no
-longer exposed as user choices:
+### Exit disabled mode: `motor_enable`
+
+`motor_enable` is a standalone actuator plugin, controlled by
+`plugins.motor_enable.enabled`, which is enabled by default. The manifest lists
+available cards but a disabled plugin is not registered. It does not require
+`loco` or any other card to be enabled. Internally the bundle supplies a shared
+chassis owner to coordinate the existing HighController connection. A read-only
+DDS reader subscribes to `Robot_Status_Topic` through the existing SDK binding.
+This card and the additional subscription have not been validated on hardware.
+
+- `start` / `stop` are lifecycle actions and never toggle motor power. `stop`
+  cancels an accepted enable if observed by its final pre-publication check, or
+  cancels pending observation. A stop concurrent with or after publication may
+  arrive too late to prevent START and cannot retract a delivered command.
+  Cancellation does not prove the robot's physical state.
+- `status` is visible in the action selector and reads workmode and whether an
+  earlier enable attempt remains uncertain; `info` provides the same result for
+  the platform. They report the most recently received status, its local receipt
+  age in milliseconds, a receipt counter, and `recent`, `stale` or `unavailable`.
+  `recent` means a sample was received within one second, not that its contents
+  carry a verified robot-side timestamp or that updates will continue.
+- `enable(confirm=true)` requires safe face-up placement on a flat, non-slip
+  surface, free joints and a clear movement area. Enabling can move joints to
+  zero; it does not stand the robot up or start walking.
+- From disabled (30), `enable` requires a recent status and checks it again
+  immediately before sending START once, then refreshes DEFAULT about
+  every 10 ms while waiting up to 4 seconds for enabled (0), cancellation, or
+  another mode, following the vendor example's command cadence. This
+  cadence has not been validated on hardware. If already enabled, it sends nothing.
+  Protection (26) and other modes are refused. Active chassis actions are
+  refused; the streaming servo is paused and shared publishing is serialized.
+- A timeout reports `ENABLE_TIMEOUT` and leaves the START outcome unconfirmed.
+  Further START attempts through this card and automatic action preparation are
+  blocked; persistent mode 30 and `confirm=true` do not authorize a retry.
+  Cancellation and SDK errors also retain the guard. Observing the target mode
+  clears it without publishing; `status` and `info` leave it set while a body
+  action is in flight. Only a locally received, recent target observation after
+  the START call can clear this card's guard; a cached value from before the
+  call cannot. This does not establish source freshness, causation or physical
+  settling. Inspect the robot and control link and follow a recovery
+  procedure confirmed by the vendor. Restarting the driver clears the in-memory
+  guard; it is not a recovery action and must not be used to blindly retry.
+
+The vendor [Bumi documentation](https://web.noetixrobotics.com/docs/) defines
+START as a toggle: outside mode 30 it **disables** the robot. The driver checks
+the received mode immediately before sending, but there is no verified source
+timestamp or atomic compare-and-enable API. A timed-out START may
+take effect later: retrying against stale mode 30 can disable an enabled robot.
+Inspect the robot and its state before deciding to retry. Do not operate the App
+or another SDK controller concurrently: the shared owner coordinates only this
+bundle. Inspect the robot and state after an unconfirmed attempt. `completed` means enabled mode was
+observed, not that physical joint motion has finished. Firmware protection is
+not bypassed. Hardware validation is still required for the installed firmware.
+The card logs the START attempt, observed mode, timeout, and DEFAULT count for
+diagnosis. Observing a mode change after the call does not establish that START
+was delivered or caused the change. The SDK provides no delivery acknowledgement
+or verified source timestamp.
+
+The former `switch_mode` tool is split into direct action cards. The following
+three cards complete their required `enable`, `ready` and `walk` transitions
+automatically:
 
 - `stand_up_lie_prone`: `stand_up` from a face-up lying pose, or `lie_prone`
   from a stable standing pose into the prone storage posture;
