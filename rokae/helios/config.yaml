@@ -1,5 +1,5 @@
 mcp_port: 15747
-name: 珞石 Helios-2.1 状态
+name: ROKAE Helios-2.1
 ros_namespace: rokae_helios
 state_url: ws://192.168.0.161:8888/ws
 battery_state_url: ws://192.168.0.100/ws/AGVInfo
