@@ -204,6 +204,15 @@ class BumiDeviceBundle:
                 plugins_cfg["vision_capture"], camera_plugin))
             print("[bundle] VisionCapturePlugin loaded")
 
+        if plugins_cfg.get("scene_graph", {}).get("enabled", False):
+            # 场景图：VOP 开放词表检测 + Bumi RGB/深度 -> 场景图 + 证据截图。
+            # 输出话题与完整流水线的 object_memory / object_locator 兼容。
+            from scene_graph_card import SceneGraphPlugin
+            self._plugins.append(SceneGraphPlugin(
+                plugins_cfg["scene_graph"], namespace, executor,
+                camera_plugin=camera_plugin))
+            print("[bundle] SceneGraphPlugin loaded")
+
     def start_all(self) -> None:
         failed = 0
         for i, p in enumerate(self._plugins):
