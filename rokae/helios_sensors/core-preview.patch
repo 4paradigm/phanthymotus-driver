@@ -1,0 +1,12 @@
+diff --git a/agent-core/web/js/canvas.js b/agent-core/web/js/canvas.js
+--- a/agent-core/web/js/canvas.js
++++ b/agent-core/web/js/canvas.js
+@@ -2608,5 +2608,7 @@ async function _openTopicDetailFor(el, mcpId, cachedTopicOut) {
+       });
+       const parsed = _parseMcpCallResult(await resp.json());
+-      const liveTopic = parsed?.topic_out?.find(t => t && t.topic);
++      const liveTopics = parsed?.topic_out || [];
++      const liveTopic = liveTopics.find(t => t?.topic && t.topic === parsed?.preview_topic)
++        || liveTopics.find(t => t && t.topic);
+       if (liveTopic) {
+         showTopicDetail(liveTopic.topic, liveTopic.format || '', mcpId);

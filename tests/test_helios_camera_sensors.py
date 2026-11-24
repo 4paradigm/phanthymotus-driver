@@ -3,9 +3,12 @@ import struct
 import threading
 import time
 import zlib
+from io import BytesIO
 
 import pytest
+from PIL import Image
 
+from rokae.helios_sensors.depth_preview import depth_preview_jpeg
 from rokae.helios_sensors.main import SensorCard
 from rokae.helios_sensors.orbbec import HEIGHT, WIDTH, encode_depth
 from rokae.helios_sensors.orientation import OrientationFilter
@@ -15,6 +18,21 @@ def test_depth_encodes_millimetres_and_preserves_invalid_pixels():
     native = struct.pack("<4H", 0, 2000, 65535, 10) * (WIDTH * HEIGHT // 4)
     assert zlib.decompress(encode_depth(native, 1)) == native
     assert zlib.decompress(encode_depth(native, 0.5))[:8] == struct.pack("<4H", 0, 1000, 32768, 5)
+
+
+def test_depth_preview_keeps_raw_output_and_encodes_a_smaller_image():
+    native = struct.pack("<H", 1700) * (WIDTH * HEIGHT)
+    raw = encode_depth(native, 1.0)
+    with Image.open(BytesIO(depth_preview_jpeg(raw))) as preview:
+        assert preview.size == (WIDTH // 2, HEIGHT // 2)
+        assert preview.format == "JPEG"
+    assert zlib.decompress(raw) == native
+
+
+@pytest.mark.parametrize("frame", [b"invalid zlib", zlib.compress(b"incomplete frame")])
+def test_invalid_depth_preview_input_is_recoverable(frame):
+    with pytest.raises(ValueError):
+        depth_preview_jpeg(frame)
 
 
 @pytest.mark.parametrize("bad_layout", [True, False], ids=["short-frame", "invalid-scale"])
@@ -28,6 +46,7 @@ def test_depth_rejects_invalid_frames(bad_layout):
 def test_stale_imu_unsets_measurements():
     card = object.__new__(SensorCard)
     card.kind, card.serial = "imu", "test"
+    card.preview_topic = None
     card.lock, card.stop_capture = threading.RLock(), threading.Event()
     card.thread, card.topic, card.count = object(), {}, 1
     card.frame_id, card.device_stamp, card.error = "test_frame", 123, None
@@ -49,9 +68,11 @@ def test_stale_imu_unsets_measurements():
 def test_sensor_exposes_only_canvas_lifecycle_actions(kind, name):
     card = object.__new__(SensorCard)
     card.kind, card.name, card.topic = kind, name, {"topic": "/test/source", "format": "data/json"}
+    card.preview_topic = {"topic": "/test/source/preview", "format": "image/jpeg"} if kind == "depth" else None
     tool = card.get_tool()
     actions = tool["inputSchema"]["properties"]["action"]["enum"]
     assert tool["type"] == "sensor"
+    assert tool["topic_out"][0] == card.topic
     assert set(actions) <= {"start", "stop", "info", "config"}
 
 
@@ -71,6 +92,7 @@ def test_sensor_dispatch_follows_framework_contract():
 def test_sensor_retries_when_camera_frames_time_out(monkeypatch):
     card = object.__new__(SensorCard)
     card.kind, card.serial = "imu", "test"
+    card.preview_topic = None
     card.lock, card.stop_capture = threading.RLock(), threading.Event()
     card.thread, card.topic, card.count = object(), {}, 1
     card.frame_id, card.device_stamp, card.error = "test_frame", 123, None

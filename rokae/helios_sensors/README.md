@@ -5,7 +5,8 @@
 | 卡片 | 格式 | 数据 |
 |---|---|---|
 | `imu` | `/rokae_helios/state/imu` · `data/json` | 同步采样的三轴加速度 m/s²、角速度 rad/s 和估算姿态四元数 XYZW。采集 50 Hz，发布约 10 Hz |
-| `camera_depth` | `/rokae_helios/camera/depth` · `image/depth-zlib` | 原生 640×480、5 fps 深度图。用 SDK 每帧比例换算成毫米，保留无效像素的零值 |
+| `camera_depth` | `/rokae_helios/camera/depth` · `image/depth-zlib` | 原生 640×480、30 fps 深度图。用 SDK 每帧比例换算成毫米，保留无效像素的零值 |
+| `camera_depth` 预览 | `/rokae_helios/camera/depth/preview` · `image/jpeg` | 320×240 彩色预览与原始深度使用同一帧。支持 `preview_topic` 的 Core 画布在查看数据流时打开该预览 |
 
 IMU 加速度和角速度使用传感器坐标系。姿态是从传感器坐标系旋转到重力对齐的局部坐标系的单位四元数。陀螺仪按设备时间积分，加速度幅值接近 1g 时参与倾角修正。初始化需连续约 0.3 秒满足低角速率和加速度幅值条件。初始化航向作为偏航零点，偏航随时间可能漂移，持续线加速度也可能影响倾角。数据间隔超过 0.25 秒后重新初始化，准备期间四元数留空。`orientation_source` 和 `orientation_reference` 标明数据来源及参考系。
 
@@ -30,6 +31,11 @@ python3 -B -m rokae.helios_sensors.depth_socket \
 ```
 
 预先创建由运行用户和 `video` 组访问的 socket 目录，并将持有该组 GID 的 `HELIOS_DEPTH_SOCKET_GID` 传给 Compose。主机深度源只在 Driver 连接后采集，Driver 停流时释放相机。
+主机深度源使用与镜像同一提交的源码，并安装 NumPy，两个进程才会使用相同的采集设置。
+
+### 画布预览
+
+`camera_depth` 的 `info` 返回 `preview_topic`。Core 中「查看数据流」可优先使用该话题。以第一个输出作为预览的 Core 版本，可在 Phanthy Motus 仓库根目录应用 [画布补丁](core-preview.patch)，随 Core 前端一起部署。两种 Core 版本的第一输出均是原始毫米深度，已有卡片接线继续使用原话题。
 
 ## 验证
 

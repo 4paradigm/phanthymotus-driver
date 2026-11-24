@@ -1,8 +1,8 @@
 """Capture Gemini 335Lg sensor frames with the machine's Orbbec SDK 2.9.3."""
 
-from array import array
 from contextlib import ExitStack
 import ctypes as C
+from functools import lru_cache
 import math
 import os
 import queue
@@ -11,12 +11,14 @@ import time
 import zlib
 from pathlib import Path
 
+import numpy as np
+
 from common import logsafe
 
 from .orientation import OrientationFilter
 
 
-WIDTH, HEIGHT, DEPTH_FPS, IMU_HZ = 640, 480, 5, 50
+WIDTH, HEIGHT, DEPTH_FPS, IMU_HZ = 640, 480, 30, 50
 DEPTH_FORMAT = "16UC1; compressedDepth zlib"
 # Orbbec SDK 2.9.3 ObTypes.h.
 SENSOR_DEPTH, SENSOR_ACCEL, SENSOR_GYRO = 3, 4, 5
@@ -114,14 +116,19 @@ def encode_depth(raw, scale_mm):
     if len(raw) != WIDTH * HEIGHT * 2 or not math.isfinite(scale_mm) or not 0 < scale_mm <= 100:
         raise ValueError("invalid native depth frame or scale")
     if scale_mm != 1.0 or sys.byteorder != "little":
-        pixels = array("H", raw)
+        pixels = np.frombuffer(raw, dtype=np.uint16)
         if scale_mm != 1.0:
-            pixels = array("H", (min(65535, max(1, round(value * scale_mm))) if value else 0
-                                 for value in pixels))
-        if sys.byteorder != "little":
-            pixels.byteswap()
-        raw = pixels.tobytes()
+            pixels = depth_scale_table(scale_mm)[pixels]
+        raw = pixels.astype("<u2", copy=False).tobytes()
     return zlib.compress(raw, 1)
+
+
+@lru_cache(maxsize=4)
+def depth_scale_table(scale_mm):
+    values = np.rint(np.arange(65536, dtype=np.float64) * scale_mm)
+    np.clip(values, 1, 65535, out=values)
+    values[0] = 0
+    return values.astype("<u2")
 
 
 def get_intrinsic(sdk, profile):
@@ -226,13 +233,14 @@ def capture(kind, directory, serial, stop, output):
                     if not frame_set:
                         continue
                     sdk.own(frames, frame_set, "delete_frame")
+                    captured = time.monotonic()
                     sample = read(frames, frame_set)
                     if sample is None or sample[0] <= previous:
                         continue
                     previous, data = sample
                     deadline = time.monotonic() + 6
                     try:
-                        output.put_nowait(("frame", time.monotonic(), previous, data, geometry))
+                        output.put_nowait(("frame", captured, previous, data, geometry))
                     except queue.Full:
                         pass
     except (OSError, RuntimeError, ValueError) as exc:

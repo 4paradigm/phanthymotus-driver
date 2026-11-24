@@ -16,6 +16,7 @@ from common import logsafe
 from common.camera_info import build as camera_info
 from common.vendor_runtime import DriverBundle, make_handler, start_registration, tool
 
+from .depth_preview import depth_preview_jpeg
 from .depth_socket import from_depth_socket
 from .orbbec import DEPTH_FORMAT, DEPTH_FPS, HEIGHT, IMU_HZ, WIDTH, capture
 
@@ -24,6 +25,7 @@ DRIVER_ID = "rokae-helios-sensors-driver"
 DRIVER_NAME = "珞石 Helios-2.1 相机传感器"
 DEFAULT_PORT = 15750
 DEPTH_HINT = "image/depth-zlib"
+DEPTH_MAX_FRAME_AGE = .2
 IMU_FIELDS = {**{f"accel_{axis}_m_s2": None for axis in "xyz"},
               **{f"gyro_{axis}_rad_s": None for axis in "xyz"},
               **{f"orientation_{axis}": None for axis in "xyzw"},
@@ -33,7 +35,7 @@ IMU_FIELDS = {**{f"accel_{axis}_m_s2": None for axis in "xyz"},
 
 class SensorCard:
     def __init__(self, kind, serial, directory, node, namespace, frame_id, depth_socket=""):
-        from rclpy.qos import qos_profile_sensor_data
+        from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
         from sensor_msgs.msg import CompressedImage
         from std_msgs.msg import String
 
@@ -45,6 +47,12 @@ class SensorCard:
         self.topic = {"topic": topic, "format": "data/json" if kind == "imu" else DEPTH_HINT}
         self.message_type = String if kind == "imu" else CompressedImage
         self.publisher = node.create_publisher(self.message_type, topic, qos_profile_sensor_data)
+        self.preview_topic = None
+        if kind == "depth":
+            self.preview_topic = {"topic": f"{topic}/preview", "format": "image/jpeg"}
+            self.preview = node.create_publisher(
+                CompressedImage, self.preview_topic["topic"],
+                QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT))
         self.lock = threading.RLock()
         self.thread = None
         self.stop_capture = threading.Event()
@@ -67,13 +75,16 @@ class SensorCard:
             description = (
                 "Helios 相机深度。读取 Gemini 335Lg 原生深度图，"
                 f"分辨率 {WIDTH}×{HEIGHT}，{DEPTH_FPS} 帧/秒，每个像素的深度单位为毫米。"
-                "图中颜色表示距离，像素值 0 表示无有效测量。"
+                "彩色 JPEG 用于低带宽预览，毫米深度数据中的 0 表示无有效测量。"
                 "深度图采用相机光学坐标系，内参缺失时留空。"
             )
         return tool(self.name, "sensor", description,
                     {"type": "object", "properties": {
                         "action": {"type": "string", "enum": ["start", "stop", "info"]}}},
-                    topic_out=[self.topic])
+                    topic_out=self.output_topics())
+
+    def output_topics(self):
+        return [self.topic, self.preview_topic] if self.preview_topic else [self.topic]
 
     def payload(self):
         with self.lock:
@@ -93,7 +104,7 @@ class SensorCard:
                       "age_ms": None if age is None else round(age * 1000),
                       "device_stamp_us": self.device_stamp if state == "online" else None,
                       "timestamp_ms": int(time.time() * 1000),
-                      "error": self.error, "topic_out": [self.topic]}
+                      "error": self.error, "topic_out": self.output_topics()}
             if self.kind == "imu":
                 result.update(IMU_FIELDS)
                 if state == "online":
@@ -118,6 +129,7 @@ class SensorCard:
             with self.lock:
                 result = {**self.get_tool(), **self.payload()}
                 if self.kind == "depth":
+                    result["preview_topic"] = self.preview_topic["topic"]
                     result["camera_info"] = [camera_info(
                         topic=self.topic["topic"], id="rokae/helios-2.1/gemini335lg-depth",
                         format=DEPTH_HINT, width=WIDTH, height=HEIGHT,
@@ -162,7 +174,8 @@ class SensorCard:
 
     def publish_frame(self, received, stamp, data, geometry):
         with self.lock:
-            if self.stop_capture.is_set() or time.monotonic() - received >= 1:
+            frame_age_limit = DEPTH_MAX_FRAME_AGE if self.kind == "depth" else 1
+            if self.stop_capture.is_set() or time.monotonic() - received >= frame_age_limit:
                 return
             self.received, self.device_stamp = received, stamp
             self.count += 1
@@ -186,6 +199,11 @@ class SensorCard:
                 msg.format = DEPTH_FORMAT
                 msg.data = array("B", data)
                 self.publisher.publish(msg)
+                jpeg = self.message_type()
+                jpeg.header = msg.header
+                jpeg.format = "jpeg"
+                jpeg.data = array("B", depth_preview_jpeg(data))
+                self.preview.publish(jpeg)
 
     def run_capture(self):
         child_stop = self.worker_context.Event()

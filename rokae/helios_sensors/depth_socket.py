@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import multiprocessing as mp
 import os
 from pathlib import Path
@@ -38,13 +39,19 @@ def from_depth_socket(path, stop, output):
                     if not 0 < meta_size <= MAX_METADATA or frame_size > MAX_FRAME:
                         raise ValueError("invalid depth socket message length")
                     metadata = json.loads(stream.read(meta_size))
+                    if not isinstance(metadata, dict):
+                        raise ValueError("invalid depth socket metadata")
                     payload = stream.read(frame_size)
                     if not stamp:
                         raise RuntimeError(str(metadata.get("error", "host depth capture failed"))[:300])
                     if not frame_size or len(payload) != frame_size:
                         raise OSError("incomplete depth frame")
+                    now = time.monotonic()
+                    received = metadata.get("captured_monotonic", now)
+                    if not isinstance(received, (int, float)) or not math.isfinite(received) or not 0 <= received <= now:
+                        raise ValueError("invalid depth capture timestamp")
                     try:
-                        output.put_nowait(("frame", time.monotonic(), stamp, payload, metadata.get("K")))
+                        output.put_nowait(("frame", received, stamp, payload, metadata.get("K")))
                     except queue.Full:
                         pass
     except (OSError, RuntimeError, ValueError) as exc:
@@ -75,8 +82,8 @@ class DepthConnection(BaseRequestHandler):
                 if item[0] == "error":
                     stamp, meta, payload = 0, {"error": item[1]}, b""
                 else:
-                    _, _, stamp, payload, intrinsic = item
-                    meta = {"K": intrinsic}
+                    _, captured, stamp, payload, intrinsic = item
+                    meta = {"K": intrinsic, "captured_monotonic": captured}
                 metadata = json.dumps(meta, allow_nan=False).encode("utf-8")
                 self.request.sendall(HEADER.pack(stamp, len(metadata), len(payload)) + metadata + payload)
                 if not stamp:
