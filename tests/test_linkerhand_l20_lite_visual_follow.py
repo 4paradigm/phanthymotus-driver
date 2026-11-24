@@ -329,7 +329,10 @@ def test_thumb_is_fully_independent_of_four_fingers():
     p2._streams['card1']['last_command_monotonic'] = 0.0
     assert p2.accept(payload) is True, p2._rejects[-3:]
     t2 = p2._streams['card1']['target']
-    assert t2[0] < 100 and t2[1] < 100 and t2[9] < 200, \
+    # Thumb must move away from open on all three joints. With the travel
+    # limit (thumb_travel=0.6) it stops short of the collision pose, so do
+    # not assert full extension here -- just that it bent noticeably.
+    assert t2[0] < 160 and t2[1] < 160 and t2[9] < 230, \
         f"thumb curl must bend thumb, got {t2[0]},{t2[1]},{t2[9]}"
 
 def test_speed_is_capped_at_verified_max_and_thumb_is_geared_down():
@@ -542,3 +545,40 @@ def test_resume_exposes_confirm_motion_param_to_canvas():
     prop = schema.get("properties", {}).get("confirm_motion", {})
     assert prop.get("type") == "boolean"
     assert prop.get("const") is None, "const hides the field; must be editable"
+
+
+def test_thumb_travel_limits_all_three_joints_without_touching_fingers():
+    """thumb_travel shrinks the thumb's endpoint but leaves four fingers intact."""
+    import visual_follow as vf
+    full = {n: 1.0 for n in vf.FLEXION_JOINTS}
+    t_full = vf.target_from_flexions(full, OPEN, FIST, thumb_root_fist=0,
+                                     thumb_override=1.0, thumb_travel=1.0)
+    t_half = vf.target_from_flexions(full, OPEN, FIST, thumb_root_fist=0,
+                                     thumb_override=1.0, thumb_travel=0.5)
+    # Thumb joints are pulled back toward open when travel is reduced.
+    for i in (0, 1, 9):
+        assert t_half[i] > t_full[i], (i, t_half[i], t_full[i])
+    # Four fingers are byte-identical regardless of thumb_travel.
+    for i in (2, 3, 4, 5, 6, 7, 8):
+        assert t_half[i] == t_full[i], (i, t_half[i], t_full[i])
+    # travel=0 -> no thumb motion at all.
+    t_zero = vf.target_from_flexions(full, OPEN, FIST, thumb_root_fist=0,
+                                     thumb_override=1.0, thumb_travel=0.0)
+    assert t_zero[0] == OPEN[0] and t_zero[1] == OPEN[1] and t_zero[9] == OPEN[9]
+
+
+def test_sway_roll_travel_are_independent_and_spare_fingers():
+    """Sway/roll can be limited more than root to avoid thumb-index overlap."""
+    import visual_follow as vf
+    full = {n: 1.0 for n in vf.FLEXION_JOINTS}
+    base = dict(thumb_root_fist=0, thumb_override=1.0, thumb_travel=0.6)
+    # Same root travel, but smaller sway/roll -> thumb rolls/sweeps less.
+    t_a = vf.target_from_flexions(full, OPEN, FIST, **base,
+                                  thumb_sway_travel=0.5, thumb_roll_travel=0.4)
+    t_b = vf.target_from_flexions(full, OPEN, FIST, **base,
+                                  thumb_sway_travel=0.3, thumb_roll_travel=0.2)
+    assert t_a[0] == t_b[0], "root must not change"
+    assert t_b[1] > t_a[1], "smaller sway travel -> sway pulled toward open"
+    assert t_b[9] > t_a[9], "smaller roll travel -> roll pulled toward open"
+    for i in (2, 3, 4, 5, 6, 7, 8):
+        assert t_a[i] == t_b[i], "four fingers must be untouched"

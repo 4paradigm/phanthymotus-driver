@@ -204,7 +204,10 @@ def thumb_opposition_from_landmarks(landmarks, *,
 def target_from_flexions(flexions: dict, open_pose: list, fist_pose: list,
                          gamma: float = 1.0, gear_flexions: dict | None = None,
                          thumb_root_fist: int | None = None,
-                         thumb_override: float | None = None) -> list:
+                         thumb_override: float | None = None,
+                         thumb_travel: float = 1.0,
+                         thumb_sway_travel: float | None = None,
+                         thumb_roll_travel: float | None = None) -> list:
     """Map five 0..1 curls onto a full raw 10-joint target.
 
     Interpolating between the operator-calibrated poses keeps this card from
@@ -214,6 +217,17 @@ def target_from_flexions(flexions: dict, open_pose: list, fist_pose: list,
     if not isinstance(flexions, dict):
         raise ValueError("flexions must be an object")
     target = list(open_pose)
+    # thumb_travel in 0..1 shrinks the three thumb joints' travel so the
+    # thumb never reaches the pose that collides with the fingers/palm.
+    # 1.0 = original full range; 0.0 = no motion. Only the thumb is affected.
+    travel = max(0.0, min(1.0, float(thumb_travel)))
+    # Sway/roll can be limited independently of root. If not set they follow
+    # `travel`, so existing configs keep their behaviour.
+    sway_travel = (travel if thumb_sway_travel is None
+                   else max(0.0, min(1.0, float(thumb_sway_travel))))
+    roll_travel = (travel if thumb_roll_travel is None
+                   else max(0.0, min(1.0, float(thumb_roll_travel))))
+
     gear = gear_flexions if gear_flexions is not None else flexions
     # Thumb is driven ONLY by its OWN vision curl -- fully independent of
     # the four fingers. A four-finger grasp with the thumb held out (thumbs-up)
@@ -246,8 +260,10 @@ def target_from_flexions(flexions: dict, open_pose: list, fist_pose: list,
         low, high = open_pose[index], fist_pose[index]
         # Only the thumb BEND motor gets an independent fist-end override.
         # Four fingers and the sway/roll gear keep the calibrated values.
-        if name == "thumb" and index == 0 and thumb_root_fist is not None:
-            high = thumb_root_fist
+        if name == "thumb" and index == 0:
+            # Root fist endpoint, pulled back toward open by `travel`.
+            fist_end = thumb_root_fist if thumb_root_fist is not None else high
+            high = low + travel * (fist_end - low)
         # gamma < 1 pushes mid/low curls toward the fist end, so the
         # proximal (first) finger joint actually bends instead of hovering
         # halfway. Endpoints stay exact: 0 -> open, 1 -> fist.
@@ -261,10 +277,12 @@ def target_from_flexions(flexions: dict, open_pose: list, fist_pose: list,
     # The thumb gear must use LIVE flexion, not the deadband-frozen copy:
     # thumb curl changes are small, so the per-finger deadband would freeze
     # it after the first step and the gear would move once then stop.
+    sway_end = open_pose[1] + sway_travel * (THUMB_OPPOSE_SWAY - open_pose[1])
+    roll_end = open_pose[9] + roll_travel * (THUMB_OPPOSE_ROLL - open_pose[9])
     target[1] = max(0, min(255, round(
-        open_pose[1] + thumb_weight * (THUMB_OPPOSE_SWAY - open_pose[1]))))
+        open_pose[1] + thumb_weight * (sway_end - open_pose[1]))))
     target[9] = max(0, min(255, round(
-        open_pose[9] + thumb_weight * (THUMB_OPPOSE_ROLL - open_pose[9]))))
+        open_pose[9] + thumb_weight * (roll_end - open_pose[9]))))
     return target
 
 
@@ -354,6 +372,20 @@ class VisualFollowPlugin:
         self.thumb_gain = float(config.get("thumb_gain", 1.0))
         if not 1.0 <= self.thumb_gain <= 10.0:
             raise ValueError("hand_visual_follow.thumb_gain must be in 1..10")
+        # Thumb travel limit: shrink the three thumb joints' range to avoid
+        # colliding with the other fingers. 1.0 = full range, 0.6 = 60%.
+        self.thumb_travel = float(config.get("thumb_travel", 0.6))
+        if not 0.0 <= self.thumb_travel <= 1.0:
+            raise ValueError("hand_visual_follow.thumb_travel must be in 0..1")
+        # Independent sway/roll limits: smaller = less across-palm sweep / less
+        # roll, so the thumb tip rests against the index tip (OK) instead of
+        # folding on top of it. None -> follow thumb_travel.
+        self.thumb_sway_travel = config.get("thumb_sway_travel", None)
+        self.thumb_roll_travel = config.get("thumb_roll_travel", None)
+        for key, value in (("thumb_sway_travel", self.thumb_sway_travel),
+                           ("thumb_roll_travel", self.thumb_roll_travel)):
+            if value is not None and not 0.0 <= float(value) <= 1.0:
+                raise ValueError(f"hand_visual_follow.{key} must be in 0..1")
         # Four finger-root joints (index/middle/ring/pinky) get their own gain:
         # whole-frame RTMPose under-reports their curl just as it does the
         # thumb, and without this the proximal joints barely bend.
@@ -648,6 +680,9 @@ class VisualFollowPlugin:
                     "message": "已订阅并待命，手未通电；确认安全后执行 resume 开始跟随",
                     "max_hz": self.max_hz, "watchdog_ms": self.watchdog_ms,
                     "max_step": self.max_step, "thumb_gain": self.thumb_gain,
+                    "thumb_travel": self.thumb_travel,
+                    "thumb_sway_travel": self.thumb_sway_travel,
+                    "thumb_roll_travel": self.thumb_roll_travel,
                     "angle_deadband_deg": self.angle_deadband_deg,
                     "speed_ratio": self.speed_ratio,
                     "flexion_gain": self.flexion_gain,
@@ -814,7 +849,10 @@ class VisualFollowPlugin:
                         gamma=self.flexion_gamma,
                         gear_flexions=live_for_gear,
                         thumb_root_fist=self.thumb_root_fist,
-                        thumb_override=thumb_override)
+                        thumb_override=thumb_override,
+                        thumb_travel=self.thumb_travel,
+                        thumb_sway_travel=self.thumb_sway_travel,
+                        thumb_roll_travel=self.thumb_roll_travel)
                 except ValueError as error:
                     self._reject(str(error))
                     continue
