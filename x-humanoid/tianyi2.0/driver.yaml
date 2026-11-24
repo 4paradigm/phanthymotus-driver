@@ -6,7 +6,7 @@ hardware_model: "tianyi2.0"
 image_name: tianyi2
 port: 15707
 mcp_url: "http://localhost:15707/mcp"
-description: "天轶2.0 Pro — 35DOF 人形机器人 (轮式底盘 + 双臂 + 灵巧手 + 头部 + 导航 + 腕部 USB RGB/深度相机)"
+description: "天轶2.0 Pro — 35DOF 人形机器人 (轮式底盘 + 双臂 + 灵巧手 + 头部 + 导航 + 腕部 USB RGB/深度相机)；支持范式+群消息上报，通过预先配置的 Webhook 和目标群 ID 发送文字及 PNG/JPEG 图片。"
 build_context_extras:
   - ../../common
 # Cards this bundle exposes, for resource-center's driver marketplace listing.
