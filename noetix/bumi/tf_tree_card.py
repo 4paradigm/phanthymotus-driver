@@ -109,6 +109,7 @@ class _TfTreeNode(Node):
         self._expired_vision = 0
         self._stale_joint_samples = 0
         self._conflicting_parent = 0  # cumulative counter for the status topic
+        self._camera_extrinsic_assumed = False  # zero mount translation = unmeasured
 
         self._running = False
         self._generation = 0
@@ -139,8 +140,19 @@ class _TfTreeNode(Node):
             self._parse_error = f"cannot read URDF {self._urdf_path}: {exc}"
             self._tree = None
             return
+        # A zero camera-mount translation is a declared placeholder, not a
+        # measurement. Surface that as a machine-readable flag on the health
+        # topic so consumers do not mistake the published static transform for
+        # a calibrated extrinsic.
+        self._camera_extrinsic_assumed = False
         try:
             self._tree = spec.parse_urdf(text)
+            camera_joint = next(
+                (j for j in self._tree["joints"].values()
+                 if j["child"] == "camera_link"), None)
+            if camera_joint is not None:
+                xyz = camera_joint["origin"][0]
+                self._camera_extrinsic_assumed = all(abs(v) < 1e-12 for v in xyz)
         except ValueError as exc:
             self._parse_error = str(exc)
             self._tree = None
@@ -510,6 +522,7 @@ class _TfTreeNode(Node):
             conflicting_parent=conflicting,
             degraded=self._degraded(),
             last_error=self._parse_error or "",
+            camera_extrinsic_assumed=self._camera_extrinsic_assumed,
         )
         message = String()
         message.data = json.dumps(payload, ensure_ascii=False)
@@ -531,6 +544,7 @@ class _TfTreeNode(Node):
             "tf_hz": round(self._tf_hz, 1),
             "last_joint_age_ms": int((age * 1000) if age is not None else -1),
             "vision_targets": vision_targets,
+            "camera_extrinsic_assumed": self._camera_extrinsic_assumed,
             "degraded": self._degraded(),
             "last_error": self._parse_error or "",
         }

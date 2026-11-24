@@ -175,6 +175,23 @@ def test_merge_vision_treats_missing_stamp_as_fresh():
     assert report["expired"] == 0
 
 
+def test_merge_vision_rejects_far_future_stamp():
+    """P1 regression: a clock-skewed/malformed future stamp must not stay live
+    until wall time catches up, nor be broadcast as a future tf2 stamp."""
+    live, report = spec.merge_vision(
+        [_vision_entry(child="future", stamp_ms=10000 + 3_600_000)],
+        10000, 500)
+    assert live == []
+    assert report["expired"] == 1
+
+
+def test_merge_vision_accepts_small_future_skew():
+    live, report = spec.merge_vision(
+        [_vision_entry(child="skew", stamp_ms=10000 + 400)], 10000, 500)
+    assert [e["child"] for e in live] == ["skew"]
+    assert report["expired"] == 0
+
+
 # ── status payload ───────────────────────────────────────────────────────────
 
 

@@ -232,6 +232,15 @@ def test_stale_joint_sample_stops_dynamic_stream(card_module):
         module.time.monotonic = original
 
 
+def test_zero_camera_mount_is_flagged_as_assumed(card_module):
+    """The shipped URDF uses a nominal zero camera translation; the node must
+    surface that so downstream never treats the static transform as measured."""
+    plugin = _make_card(card_module)
+    node = plugin._node
+    assert node._camera_extrinsic_assumed is True
+    assert plugin.dispatch("info", {})["camera_extrinsic_assumed"] is True
+
+
 def test_already_stale_joint_sample_is_rejected(card_module):
     """P1 regression: a joint sample whose producer stamp is already older than
     max_joint_age_s when read must not be published as a fresh pose."""

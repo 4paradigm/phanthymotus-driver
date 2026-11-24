@@ -367,6 +367,11 @@ _KNOWN_PARENTS = frozenset(("camera_optical_frame", "camera_link", "base_link"))
 # separator and a leading digit is invalid. Reject, don't rewrite.
 _INVALID_CHILD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+# Clock skew tolerance between the vision producer and the TF node. A stamp
+# further in the future than this is rejected, never broadcast as a future
+# transform (tf2 lookups would fail and the entry would outlive its TTL).
+_STAMP_SKEW_MS = 5000.0
+
 
 def merge_vision(transforms, now_ms, ttl_ms):
     """Split an incoming vision batch into live transforms and rejected ones.
@@ -401,7 +406,23 @@ def merge_vision(transforms, now_ms, ttl_ms):
             # No stamp at all: treat as fresh (the receiver stamped it) rather
             # than silently ageing it out on the first cycle.
             stamp_ms = now_ms
-        if now_ms - float(stamp_ms) > ttl_ms:
+        else:
+            try:
+                stamp_ms = float(stamp_ms)
+            except (TypeError, ValueError, OverflowError):
+                expired += 1
+                continue
+            if not math.isfinite(stamp_ms):
+                expired += 1
+                continue
+            # A future-dated stamp would stay "live" until wall time catches up
+            # and would be published as a future ROS stamp that tf2 cannot use.
+            # Allow a small clock-skew margin, then reject rather than clamp —
+            # clamping would silently rewrite the observation's own time.
+            if stamp_ms - now_ms > _STAMP_SKEW_MS:
+                expired += 1
+                continue
+        if now_ms - stamp_ms > ttl_ms:
             expired += 1
             continue
         live.append(entry)
@@ -419,7 +440,8 @@ def merge_vision(transforms, now_ms, ttl_ms):
 def status_payload(*, state, stamp_ms, root_frame, link_count, dynamic_frames,
                    static_frames, tf_hz, last_joint_age_ms, joints_stale,
                    vision_targets, rejected_unknown_parent, expired_vision,
-                   conflicting_parent, degraded, last_error):
+                   conflicting_parent, degraded, last_error,
+                   camera_extrinsic_assumed=False):
     """Build the flat `data/json` status payload.
 
     Every value is a top-level scalar, because the dashboard renders a nested
@@ -442,6 +464,9 @@ def status_payload(*, state, stamp_ms, root_frame, link_count, dynamic_frames,
         "rejected_unknown_parent": int(rejected_unknown_parent),
         "expired_vision": int(expired_vision),
         "conflicting_parent": int(conflicting_parent),
+        # True when the URDF camera mount translation is still the nominal
+        # zero placeholder: every vision target below it carries this offset.
+        "camera_extrinsic_assumed": bool(camera_extrinsic_assumed),
         "degraded": degraded or "",
         "last_error": last_error or "",
     }
