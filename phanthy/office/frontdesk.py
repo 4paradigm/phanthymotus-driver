@@ -147,14 +147,15 @@ class FrontDesk:
         if "VISITOR_INSTALL_OK" not in out:
             raise FrontDeskError("install_failed", "安装没有完成：" + " ".join(out.split())[-300:])
 
-    def pages(self) -> list[dict]:
-        """Pages recently opened in the dedicated Edge (visitor_site.recent_pages).
+    def pages(self, version: str) -> list[dict]:
+        """Pages open or recently opened in the dedicated Edge (visitor_site.recent_pages).
 
-        Raises not_installed before the first install, when there is no Edge
-        profile to read yet.
+        Raises not_installed when the front desk lacks this version, as job()
+        does — otherwise a fix to the page lookup never reaches it.
         """
         out = self.powershell(
-            f"if (-not (Test-Path -LiteralPath '{PYTHON}')) {{ 'VISITOR_NOT_INSTALLED'; exit 2 }}\n"
+            f"$v = Get-Content -Raw -LiteralPath '{VERSION_FILE}' -ErrorAction SilentlyContinue\n"
+            f"if (-not $v -or $v.Trim() -ne '{version}') {{ 'VISITOR_NOT_INSTALLED'; exit 2 }}\n"
             f"& '{PYTHON}' '{REMOTE_ROOT}/app/visitor_site.py' pages '{PROFILE}'")
         lines = [line for line in out.splitlines() if line.startswith("VISITOR_PAGES:")]
         return json.loads(lines[-1][len("VISITOR_PAGES:"):]) if lines else []

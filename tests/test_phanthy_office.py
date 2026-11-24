@@ -87,7 +87,7 @@ def _form(plugin):
 
 def _front_desk(monkeypatch, printers, pages):
     monkeypatch.setattr(frontdesk.FrontDesk, "printers", lambda self: printers)
-    monkeypatch.setattr(frontdesk.FrontDesk, "pages", lambda self: pages)
+    monkeypatch.setattr(frontdesk.FrontDesk, "pages", lambda self, version: pages)
 
 
 def test_nothing_reaches_the_front_desk_until_detect_is_run(plugin, monkeypatch):
@@ -110,7 +110,7 @@ def test_page_and_printer_are_chosen_from_what_detect_found(plugin, monkeypatch)
         {"const": "https://visit.example/#/visitor/list", "title": "访客列表 — https://visit.example/#/visitor/list"},
         {"const": CONFIG["page_url"], "title": f"{CONFIG['page_url']}（当前设置，本次未找到）"}]
     assert "找到 2 台打印机、1 个网页" in note
-    assert plugin.calls == []   # pages exist: no login window
+    assert plugin.calls == [{"action": "login", "page_url": ""}]   # the window to change the page in
 
     plugin.dispatch("config", {"host": "10.0.0.6"})
     choices, note = _form(plugin)
@@ -123,7 +123,7 @@ def test_detect_installs_first_then_opens_the_login_window(plugin, monkeypatch):
     monkeypatch.setattr(frontdesk.FrontDesk, "printers", lambda self: [])
     monkeypatch.setattr(frontdesk.FrontDesk, "install", lambda self, *a, **k: installed.wait(5))
 
-    def pages(self):
+    def pages(self, version):
         if not installed.is_set():
             raise frontdesk.FrontDeskError("not_installed", "")
         return []
@@ -361,7 +361,7 @@ def test_a_marker_on_stdout_wins_over_powershell_noise_on_stderr(monkeypatch, tm
         stderr=b'#< CLIXML <Objs Version="1.1.0.1"><Obj S="progress" RefId="0"></Obj></Objs>')
     monkeypatch.setattr(frontdesk.subprocess, "run", lambda *a, **k: done)
     with pytest.raises(frontdesk.FrontDeskError) as exc:
-        desk.pages()
+        desk.pages("v1")
     assert exc.value.code == "not_installed"
 
 

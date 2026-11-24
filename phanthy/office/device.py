@@ -259,17 +259,18 @@ class VisitorBadgePlugin:
         try:
             printers = desk.printers()
             try:
-                pages = desk.pages()
+                pages = desk.pages(PACKAGE_VERSION)
             except FrontDeskError as exc:
                 if exc.code != "not_installed":
                     raise
                 self._install(cfg, 0)   # raises `preparing` while it runs
-                pages = desk.pages()
+                pages = desk.pages(PACKAGE_VERSION)
+            # The window to pick a page in; left alone when already open.
+            desk.job({"action": "login", "page_url": ""}, PACKAGE_VERSION, 20)
             if pages:
-                message = f"已连接，找到 {len(printers)} 台打印机、{len(pages)} 个网页：停止项目，约一分钟后打开卡片设置选择"
+                message = (f"已连接，找到 {len(printers)} 台打印机、{len(pages)} 个网页：停止项目，约一分钟后打开卡片设置选择。"
+                           "要换网页，就在前台电脑的专用 Edge 里打开它，再检测一次")
             else:
-                # Nothing to choose yet: put the login window in front of the operator.
-                desk.job({"action": "login", "page_url": ""}, PACKAGE_VERSION, 20)
                 message = (f"已连接，找到 {len(printers)} 台打印机。已在前台电脑打开 Edge："
                            "请在里面登录访客系统并打开访客列表，然后再执行一次检测")
             ok = True
