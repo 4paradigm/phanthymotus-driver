@@ -14,6 +14,8 @@ import math
 import random
 import re
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -413,7 +415,8 @@ def test_tool_schema(tmp_path):
     for spec in schema["x-action-params"].values():
         assert set(spec["params"]) <= set(schema["properties"])
     assert schema["x-resource"] == ["arm_l", "arm_r", "hand_l", "hand_r"]
-    assert "x-completion" not in schema
+    assert schema["x-completion"]["actions"] == ["pose", "retract", "tare", "weigh", "calibrate"]
+    assert 60 < schema["x-completion"]["timeout"] <= 180
     assert schema["properties"]["side"]["enum"] == ["right", "left", "both"]
     assert "side" in schema["x-action-params"]["pose"]["params"]
     assert "side" in schema["x-action-params"]["retract"]["params"]
@@ -698,6 +701,7 @@ def test_dispatch_logs_one_summary_line_per_call(rig, capsys, tmp_path):
     p = weigh.WeighPlugin({"state_file": str(tmp_path / "w.json")}, "ns", _FakeRos2())
     p.start = lambda: None
     p._engine = rig.engine
+    p._sync_grace_s = 60          # 假时钟跑得快：让这些调用都在宽限期内同步返回
     p.dispatch("tare", {"_tool_name": "weigh"})
     rig.mass = 0.59
     rig.warm()
@@ -853,3 +857,103 @@ def test_schema_side_has_no_fixed_default(tmp_path):
     p = weigh.WeighPlugin({"state_file": str(tmp_path / "w.json")}, "ns", _FakeRos2())
     side = p.get_tool()["inputSchema"]["properties"]["side"]
     assert "default" not in side and "pose" in side["description"]
+
+
+# ── retract：张不开手指就不动手臂 ───────────────────────────────────────────
+
+@pytest.mark.parametrize("break_hand", ["rejected", "unavailable"])
+def test_retract_aborts_when_fingers_fail_to_open(hanging, break_hand):
+    hanging.engine.pose({})
+    hanging.warm(1)
+    n = len(hanging.moves())
+    if break_hand == "rejected":
+        hanging.hand_reply = {"state": "error", "error": "hand fault"}
+    else:
+        hanging.engine._hand_call = None
+    res = hanging.engine.retract({})
+    assert res["state"] == "error" and res["code"] == "hand_open_failed", res
+    assert len(hanging.moves()) == n            # 没有任何 move_pos
+    assert hanging.engine._tare["right"] is not None   # 状态不变，修好手后可以再 retract
+
+
+# ── ACP：长动作先返回 action_id，做完回调 ───────────────────────────────────
+
+def _async_plugin(rig, tmp_path, grace=0.0):
+    calls, fired = [], threading.Event()
+
+    def notify(action_id, status, result, tool):
+        calls.append((action_id, status, result, tool))
+        fired.set()
+    p = weigh.WeighPlugin({"state_file": str(tmp_path / "w.json")}, "ns", _FakeRos2(),
+                          acp_notify=notify)
+    p.start = lambda: None
+    p._engine = rig.engine
+    p._sync_grace_s = grace
+    return p, calls, fired
+
+
+def test_long_action_returns_action_id_then_completes(rig, tmp_path):
+    p, calls, fired = _async_plugin(rig, tmp_path)
+    rig.engine.tare({})
+    rig.mass = 0.59
+    rig.warm()
+    res = p.dispatch("weigh", {})
+    assert res["state"] == "weighing" and res["action_id"].startswith("weigh_weigh_"), res
+    assert fired.wait(30)
+    action_id, status, result, tool = calls[0]
+    assert action_id == res["action_id"] and status == "completed" and tool == "weigh"
+    assert result["action"] == "weigh" and result["valid"]
+    assert result["mass_kg"] == pytest.approx(0.59, abs=0.005)
+    assert len(calls) == 1
+    assert p._busy.acquire(blocking=False)        # 完成前已释放
+    p._busy.release()
+
+
+def test_async_error_is_reported_with_error_status(rig, tmp_path):
+    p, calls, fired = _async_plugin(rig, tmp_path)
+    rig.engine._hand_call = None
+    rig.engine.pose({})
+    res = p.dispatch("retract", {})
+    if "action_id" in res:                         # 慢机器上可能超过宽限期
+        assert fired.wait(30)
+        assert calls[0][1] == "error" and calls[0][2]["code"] == "hand_open_failed"
+    else:
+        assert res["code"] == "hand_open_failed"
+
+
+def test_quick_result_stays_synchronous_without_callback(rig, tmp_path):
+    p, calls, fired = _async_plugin(rig, tmp_path, grace=30)
+    res = p.dispatch("weigh", {})                  # 未去皮：立即失败
+    assert res["code"] == "not_tared" and "action_id" not in res
+    res = p.dispatch("calibrate", {"scale": 1.05})
+    assert res["state"] == "calibrated" and "action_id" not in res
+    time.sleep(0.05)
+    assert calls == []
+
+
+def test_busy_while_async_action_runs(rig, tmp_path):
+    p, calls, fired = _async_plugin(rig, tmp_path)
+    gate = threading.Event()
+    real = rig.engine.tare
+    rig.engine.tare = lambda args: (gate.wait(10), real(args))[1]
+    res = p.dispatch("tare", {})
+    assert "action_id" in res
+    assert p.dispatch("weigh", {})["code"] == "busy"
+    assert p.dispatch("read", {})["state"] == "ok"   # read 不受影响
+    gate.set()
+    assert fired.wait(30) and calls[0][1] == "completed"
+
+
+def test_engine_exception_becomes_error_completion(rig, tmp_path):
+    p, calls, fired = _async_plugin(rig, tmp_path)
+    gate = threading.Event()
+
+    def boom(args):
+        gate.wait(10)
+        raise RuntimeError("kaput")
+    rig.engine.weigh = boom
+    res = p.dispatch("weigh", {})
+    gate.set()
+    assert fired.wait(30)
+    assert calls[0][0] == res["action_id"] and calls[0][1] == "error"
+    assert calls[0][2]["code"] == "internal_error"

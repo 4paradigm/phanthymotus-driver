@@ -1,4 +1,4 @@
-"""x-humanoid/tianyi2.0/weigh.py — 天轶2.0 腕部六维力托举称重卡（实验性，只读）。
+"""x-humanoid/tianyi2.0/weigh.py — 天轶2.0 腕部六维力托举称重卡（实验性）。
 
 用法（上层 Skill / 大模型）：
   0. ``pose`` 选择 left / right / both；后续省略 ``side`` 的动作沿用最近一次成功的 pose；
@@ -8,7 +8,10 @@
   3. 放上物体后调用 ``weigh``，得到重量；
   4. ``calibrate`` 设定比例系数：放已知重量物体实测（known_mass_kg），或直接写入（scale）；
   5. ``read`` 不阻塞，返回去皮状态、上一次结果和实时读数；
-  6. ``retract``：称完收回手臂（掌心上还有物体时拒绝，避免掉落）。
+  6. ``retract``：称完收回手臂（掌心上还有物体时拒绝，避免掉落；张不开手指时不动手臂）。
+
+pose / retract / tare / weigh / calibrate 超过约 0.5 s 时走 ACP：先返回 ``action_id``，
+做完后把完整结果 POST 到 Agent Core 的 /api/acp/complete（见 README_dev.md § ACP）。
 
 只有 ``pose`` / ``retract`` 会让手臂和手指运动，而且不自己发指令：经 bundle 调用 arm 卡的
 ``move_pos``（复用它的急停/故障/限位预检、电流上限和运动反馈）和 hand 卡的 ``set_fingers_raw``。其余动作只订阅 ``/arm_6dof_{side}``（WrenchStamped，约 100 Hz）
@@ -37,6 +40,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
+from uuid import uuid4
 
 G = 9.81
 
@@ -1007,8 +1011,14 @@ class WeighEngine:
         stages = self._merge_stages(("palm_inward", "lower_arm"), per_side)
         if not stages:
             return {"state": "retracted", "side": side, "already_retracted": True, "steps": []}
-        # 先张开手指（四指立起时转腕可能卡到东西），再动手臂
-        hand_warning = self._set_hand("open", side)
+        # 先张开手指（四指立起时转腕可能卡到东西），再动手臂。张不开就不动手臂：
+        # 手指还立着时转腕会碰到或甩掉掌上的东西。
+        hand_problem = self._set_hand("open", side)
+        if hand_problem:
+            return self._error("hand_open_failed", side,
+                               f"张开手指失败（{hand_problem}），手臂没有动。"
+                               "请先用 hand 卡张开手指，再调用 retract",
+                               hand_problem=hand_problem)
         bad = self._ensure_arm_started()
         if bad is not None:
             return self._error("arm_start_failed", side, (bad or {}).get("error"), arm_result=bad)
@@ -1022,10 +1032,7 @@ class WeighEngine:
             self._tare[s] = None
             self._last[s] = None
             self._origin.pop(s, None)
-        out = {"state": "retracted", "side": side, "experimental": True, "steps": steps}
-        if hand_warning:
-            out["warnings"] = [hand_warning]
-        return out
+        return {"state": "retracted", "side": side, "experimental": True, "steps": steps}
 
     # ── read ──
 
@@ -1099,11 +1106,32 @@ class WeighEngine:
 _RELIABLE_DEPTH = 10
 
 
+# 会等待物理运动或稳定窗口的动作（> 3 s）走 ACP：先返回 action_id，做完再回调 Agent Core。
+# 在 SYNC_GRACE_S 内就结束的调用（参数错误、未去皮、手动设定比例系数……）仍同步返回，
+# 不带 action_id，Agent Core 也就不登记 pending。
+ASYNC_ACTIONS = ("pose", "retract", "tare", "weigh", "calibrate")
+RUNNING_STATE = {"pose": "posing", "retract": "retracting", "tare": "taring",
+                 "weigh": "weighing", "calibrate": "calibrating"}
+# 最坏情况：两段运动各约 13 s + 起臂/手指约 3 s + 去皮最多 45 s ≈ 75 s，留余量。
+COMPLETION_TIMEOUT_S = 120
+SYNC_GRACE_S = 0.5
+
+
+def _default_acp_notify(action_id: str, status: str, result: dict, tool: str = "") -> None:
+    """用 bundle 里通用的 ACP 回调（device._acp_notify）。延迟导入，保持本模块不依赖 ROS。"""
+    from device import _acp_notify
+    _acp_notify(action_id, status, result, tool)
+
+
 class WeighPlugin:
     """腕部六维力称重卡。自己不创建任何发布者；pose/retract 经 arm 卡下发运动。"""
 
-    def __init__(self, plugin_config: dict, namespace: str, ros2, arm_call=None, hand_call=None):
-        """arm_call(args) → dict：由 bundle 提供，等同于对 arm 卡调用 tools/call。"""
+    def __init__(self, plugin_config: dict, namespace: str, ros2, arm_call=None, hand_call=None,
+                 acp_notify=None):
+        """arm_call(args) → dict：由 bundle 提供，等同于对 arm 卡调用 tools/call。
+        acp_notify(action_id, status, result, tool)：异步动作完成时回调 Agent Core。"""
+        self._acp_notify = acp_notify or _default_acp_notify
+        self._sync_grace_s = SYNC_GRACE_S
         self._ns = namespace
         self._ros2 = ros2
         self._engine = WeighEngine(plugin_config, arm_call=arm_call, hand_call=hand_call)
@@ -1139,6 +1167,8 @@ class WeighPlugin:
                 + (f"上限 {cfg['load_limit_kg']} kg；" if cfg["load_limit_kg"] else
                    f"上限由腕部电流决定（超过额定 {int(cfg['current_ratio_max'] * 100)}% 判无效，估计掌心约 2 kg，未实测）；")
                 + "结果带 valid 标记，valid=false 时不要使用 mass_kg。不能替代电子秤计量。"
+                "pose/retract/tare/weigh/calibrate 需要较长时间时先返回 action_id，"
+                "完成后结果（含 mass_kg、valid 等）随完成通知送达，也可以再用 read 查看 last_result。"
             ),
             "inputSchema": {
                 "type": "object",
@@ -1189,6 +1219,7 @@ class WeighPlugin:
                 },
                 # 与 arm / arm_gesture / hand 同一通道：pose/retract 经 arm 卡驱动双臂指令（未选中的手臂保持原位）、
                 # 经 hand 卡设手型；tare/weigh 也要等手臂和手指上的其他动作做完。
+                "x-completion": {"actions": list(ASYNC_ACTIONS), "timeout": COMPLETION_TIMEOUT_S},
                 "x-resource": ["arm_l", "arm_r", "hand_l", "hand_r"],
             },
         }
@@ -1308,30 +1339,56 @@ class WeighPlugin:
         t0 = time.monotonic()
         if action in ("pose", "retract"):
             print(f"[weigh] {action} called args={args}", flush=True)
-        result = self._run(action, args)
+        result = self._engine.read(args) if action == "read" else self._start_job(action, args, t0)
         print(f"[weigh] {action} args={args} -> {_brief(result)} ({time.monotonic() - t0:.1f}s)",
               flush=True)
         return result
 
-    def _run(self, action: str, args: dict) -> dict:
-        if action == "read":
-            return self._engine.read(args)
-        if not self._busy.acquire(blocking=False):
-            return {"state": "error", "code": "busy", "error": "本卡另一个动作正在进行"}
+    def _call_engine(self, action: str, args: dict) -> dict:
         try:
-            if action == "pose":
-                return self._engine.pose(args)
-            if action == "retract":
-                return self._engine.retract(args)
-            if action == "tare":
-                return self._engine.tare(args)
-            if action == "weigh":
-                return self._engine.weigh(args)
-            return self._engine.calibrate(args)
+            return getattr(self._engine, action)(args)
         except ValueError as exc:
             return {"state": "error", "code": "bad_arguments", "error": str(exc)}
         except Exception as exc:
             print(f"[weigh] {action} raised {type(exc).__name__}: {exc}", flush=True)
-            raise
-        finally:
-            self._busy.release()
+            return {"state": "error", "code": "internal_error", "error": f"{type(exc).__name__}: {exc}"}
+
+    def _start_job(self, action: str, args: dict, t0: float) -> dict:
+        """在工作线程里执行一个动作。SYNC_GRACE_S 内结束就同步返回结果；否则返回 action_id，
+        做完后经 ACP 回调完成状态和完整结果。同一时间只允许一个动作。"""
+        if not self._busy.acquire(blocking=False):
+            return {"state": "error", "code": "busy", "error": "本卡另一个动作正在进行"}
+        action_id = f"weigh_{action}_{uuid4().hex[:8]}"
+        done = threading.Event()
+        lock = threading.Lock()
+        job = {"result": None, "async": False}
+
+        def work():
+            try:
+                res = self._call_engine(action, args)
+            finally:
+                self._busy.release()      # 先释放，Agent Core 收到完成后的下一次调用不会撞上 busy
+            with lock:
+                job["result"] = res
+                done.set()
+                handed_off = job["async"]
+            if not handed_off:
+                return
+            status = "error" if res.get("state") == "error" else "completed"
+            print(f"[weigh] {action} {action_id} {status} -> {_brief(res)} "
+                  f"({time.monotonic() - t0:.1f}s)", flush=True)
+            try:
+                self._acp_notify(action_id, status, {"action": action, **res}, "weigh")
+            except Exception as exc:
+                print(f"[weigh] ACP callback failed for {action_id}: {exc}", flush=True)
+
+        threading.Thread(target=work, name=f"weigh-{action}", daemon=True).start()
+        if done.wait(self._sync_grace_s):
+            return job["result"]
+        with lock:
+            if done.is_set():
+                return job["result"]
+            job["async"] = True
+        return {"state": RUNNING_STATE[action], "action_id": action_id,
+                "side": self._engine._side_arg(args), "experimental": True,
+                "message": "动作在后台进行，完成后会收到结果；也可以之后用 read 查看 last_result"}
