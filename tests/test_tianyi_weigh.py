@@ -516,10 +516,20 @@ def test_pose_when_already_posed_does_not_move(rig):
     assert res["tare"]["state"] == "tared"
 
 
-def test_pose_without_tare(hanging):
-    res = hanging.engine.pose({"tare": False})
-    assert res["state"] == "posed" and "tare" not in res
+def test_pose_fails_when_automatic_tare_fails(hanging):
+    hanging.noise = 1.0                            # 掌心上有东西在晃：去皮不稳定
+    res = hanging.engine.pose({"timeout_s": 5})
+    assert res["state"] == "error" and res["code"] == "tare_failed", res
+    assert res["arm_posed"] is True and res["tare"]["state"] == "error"
     assert hanging.engine._tare["right"] is None
+    assert hanging.engine.weigh({})["code"] == "not_tared"
+
+
+def test_pose_has_no_tare_switch(tmp_path):
+    p = weigh.WeighPlugin({"state_file": str(tmp_path / "w.json")}, "ns", _FakeRos2())
+    schema = p.get_tool()["inputSchema"]
+    assert "tare" not in schema["properties"]
+    assert "tare" not in schema["x-action-params"]["pose"]["params"]
 
 
 def test_pose_refuses_unknown_start_pose(hanging):
@@ -702,19 +712,20 @@ def test_dispatch_logs_one_summary_line_per_call(rig, capsys, tmp_path):
     p.start = lambda: None
     p._engine = rig.engine
     p._sync_grace_s = 60          # 假时钟跑得快：让这些调用都在宽限期内同步返回
-    p.dispatch("tare", {"_tool_name": "weigh"})
+    p.dispatch("tare", {"side": "right", "_tool_name": "weigh"})
     rig.mass = 0.59
     rig.warm()
-    res = p.dispatch("weigh", {})
-    p.dispatch("read", {})
-    p.dispatch("calibrate", {"scale": 2})
+    res = p.dispatch("weigh", {"side": "right"})
+    p.dispatch("read", {"side": "right"})
+    p.dispatch("calibrate", {"side": "right", "scale": 2})
     out = capsys.readouterr().out
     lines = [l for l in out.splitlines() if l.startswith("[weigh] ")]
-    assert any(l.startswith("[weigh] tare args={} -> state=tared") for l in lines)
-    w = [l for l in lines if l.startswith("[weigh] weigh args={} -> ")]
+    assert any(l.startswith("[weigh] tare args={'side': 'right'} -> state=tared") for l in lines)
+    w = [l for l in lines if l.startswith("[weigh] weigh args={'side': 'right'} -> ")]
     assert w and f"mass_g={res['mass_g']}" in w[0] and "valid=True" in w[0]
-    assert any(l.startswith("[weigh] read args={} -> state=ok") for l in lines)
-    assert any("calibrate args={'scale': 2} -> state=error code=scale_out_of_range" in l for l in lines)
+    assert any(l.startswith("[weigh] read args={'side': 'right'} -> state=ok") for l in lines)
+    assert any("calibrate args={'side': 'right', 'scale': 2} -> state=error code=scale_out_of_range" in l
+               for l in lines)
     assert "_tool_name" not in out
 
 
@@ -767,7 +778,6 @@ def test_hand_failure_fails_pose_without_tare(hanging):
     assert res["state"] == "error" and res["code"] == "hand_failed", res
     assert res["hand_problem"] == "hand_start_failed" and res["arm_posed"] is True
     assert "tare" not in res and hanging.engine._tare["left"] is None
-    assert hanging.engine.read({})["active_side"] == "right"     # 不算成功的 pose
     assert hanging.engine.weigh({"side": "left"})["code"] == "not_tared"
 
 
@@ -820,57 +830,32 @@ def test_schema_has_hand_param(tmp_path):
     assert "hand" in schema["x-action-params"]["pose"]["params"]
 
 
-# ── 会话当前手（active_side）────────────────────────────────────────────────
+# ── side 必填：卡片不替调用方记"当前手" ──────────────────────────────────────
 
-def test_active_side_defaults_to_right(rig):
-    r = rig.engine.read({})
-    assert r["side"] == "right" and r["active_side"] == "right"
-
-
-def test_omitted_side_follows_last_successful_pose(hanging):
-    assert hanging.engine.pose({"side": "left"})["state"] == "posed"
-    r = hanging.engine.read({})
-    assert r["side"] == "left" and r["active_side"] == "left"
-    hanging.mass_left = 0.3
-    hanging.warm()
-    w = hanging.engine.weigh({})
-    assert w["side"] == "left" and w["valid"] and w["mass_kg"] == pytest.approx(0.3, abs=0.005)
-    hanging.mass_left = 0.0
-    hanging.warm(1)
-    n = len(hanging.moves())
-    right_before = list(hanging.pose)
-    res = hanging.engine.retract({})
-    assert res["state"] == "retracted" and res["side"] == "left", res
-    assert all(m["right_positions"] == right_before for m in hanging.moves()[n:])
+@pytest.mark.parametrize("action", ["pose", "tare", "weigh", "calibrate", "read", "retract"])
+def test_side_is_required_at_the_mcp_boundary(rig, tmp_path, action):
+    p, calls, fired = _async_plugin(rig, tmp_path)
+    n = len(rig.arm_calls) + len(rig.hand_calls)
+    res = p.dispatch(action, {})
+    assert res["state"] == "error" and res["code"] == "side_required"
+    assert len(rig.arm_calls) + len(rig.hand_calls) == n and calls == []
 
 
-def test_explicit_side_overrides_only_one_call(hanging):
-    hanging.engine.pose({"side": "left"})
-    assert hanging.engine.read({"side": "right"})["side"] == "right"
-    r = hanging.engine.read({})
-    assert r["side"] == "left" and r["active_side"] == "left"
+def test_one_callers_pose_does_not_select_the_hand_for_another(hanging, tmp_path):
+    p, calls, fired = _async_plugin(hanging, tmp_path, grace=60)
+    assert p.dispatch("pose", {"side": "left"})["state"] == "posed"      # 调用方 A
+    n = len(hanging.arm_calls)
+    assert p.dispatch("retract", {})["code"] == "side_required"          # 调用方 B 没写 side
+    assert len(hanging.arm_calls) == n
+    r = p.dispatch("read", {"side": "right"})
+    assert r["side"] == "right" and "active_side" not in r
 
 
-def test_omitted_side_after_both_pose_sums_hands(hanging):
-    hanging.engine.pose({"side": "both"})
-    hanging.mass, hanging.mass_left = 0.6, 0.25
-    hanging.warm()
-    w = hanging.engine.weigh({})
-    assert w["side"] == "both" and w["mass_kg"] == pytest.approx(0.85, abs=0.008)
-    assert hanging.engine.read({})["active_side"] == "both"
-
-
-def test_failed_pose_keeps_previous_active_side(hanging):
-    hanging.events.append((hanging.t + 2.5, lambda: setattr(hanging, "left_error", 5)))
-    res = hanging.engine.pose({"side": "left"})
-    assert res["state"] == "error" and res["code"] == "joint_error"
-    assert hanging.engine.read({})["active_side"] == "right"
-
-
-def test_schema_side_has_no_fixed_default(tmp_path):
+def test_schema_requires_side(tmp_path):
     p = weigh.WeighPlugin({"state_file": str(tmp_path / "w.json")}, "ns", _FakeRos2())
-    side = p.get_tool()["inputSchema"]["properties"]["side"]
-    assert "default" not in side and "pose" in side["description"]
+    schema = p.get_tool()["inputSchema"]
+    assert schema["required"] == ["action", "side"]
+    assert "default" not in schema["properties"]["side"]
 
 
 # ── retract：张不开手指就不动手臂 ───────────────────────────────────────────
@@ -911,7 +896,7 @@ def test_long_action_returns_action_id_then_completes(rig, tmp_path):
     rig.engine.tare({})
     rig.mass = 0.59
     rig.warm()
-    res = p.dispatch("weigh", {})
+    res = p.dispatch("weigh", {"side": "right"})
     assert res["state"] == "weighing" and res["action_id"].startswith("weigh_weigh_"), res
     assert fired.wait(30)
     action_id, status, result, tool = calls[0]
@@ -927,7 +912,7 @@ def test_async_error_is_reported_with_error_status(rig, tmp_path):
     p, calls, fired = _async_plugin(rig, tmp_path)
     rig.engine.pose({"hand": "keep"})
     rig.engine._hand_call = None
-    res = p.dispatch("retract", {})
+    res = p.dispatch("retract", {"side": "right"})
     if "action_id" in res:                         # 慢机器上可能超过宽限期
         assert fired.wait(30)
         assert calls[0][1] == "error" and calls[0][2]["code"] == "hand_open_failed"
@@ -937,9 +922,9 @@ def test_async_error_is_reported_with_error_status(rig, tmp_path):
 
 def test_quick_result_stays_synchronous_without_callback(rig, tmp_path):
     p, calls, fired = _async_plugin(rig, tmp_path, grace=30)
-    res = p.dispatch("weigh", {})                  # 未去皮：立即失败
+    res = p.dispatch("weigh", {"side": "right"})                  # 未去皮：立即失败
     assert res["code"] == "not_tared" and "action_id" not in res
-    res = p.dispatch("calibrate", {"scale": 1.05})
+    res = p.dispatch("calibrate", {"side": "right", "scale": 1.05})
     assert res["state"] == "calibrated" and "action_id" not in res
     time.sleep(0.05)
     assert calls == []
@@ -950,10 +935,10 @@ def test_busy_while_async_action_runs(rig, tmp_path):
     gate = threading.Event()
     real = rig.engine.tare
     rig.engine.tare = lambda args: (gate.wait(10), real(args))[1]
-    res = p.dispatch("tare", {})
+    res = p.dispatch("tare", {"side": "right"})
     assert "action_id" in res
-    assert p.dispatch("weigh", {})["code"] == "busy"
-    assert p.dispatch("read", {})["state"] == "ok"   # read 不受影响
+    assert p.dispatch("weigh", {"side": "right"})["code"] == "busy"
+    assert p.dispatch("read", {"side": "right"})["state"] == "ok"   # read 不受影响
     gate.set()
     assert fired.wait(30) and calls[0][1] == "completed"
 
@@ -966,7 +951,7 @@ def test_engine_exception_becomes_error_completion(rig, tmp_path):
         gate.wait(10)
         raise RuntimeError("kaput")
     rig.engine.weigh = boom
-    res = p.dispatch("weigh", {})
+    res = p.dispatch("weigh", {"side": "right"})
     gate.set()
     assert fired.wait(30)
     assert calls[0][0] == res["action_id"] and calls[0][1] == "error"
@@ -1017,7 +1002,7 @@ def test_stop_cancels_pending_pose_and_sends_nothing_more(hanging, tmp_path):
         release.wait(0.05)
         real_sleep(dt)
     hanging.engine._raw_sleep = slow_sleep
-    res = p.dispatch("pose", {})
+    res = p.dispatch("pose", {"side": "right"})
     assert "action_id" in res
     assert entered.wait(10)
     n_arm, n_hand = len(hanging.arm_calls), len(hanging.hand_calls)
@@ -1030,5 +1015,5 @@ def test_stop_cancels_pending_pose_and_sends_nothing_more(hanging, tmp_path):
     hanging.engine._raw_sleep = real_sleep          # 之后的新动作不受上一次取消影响
     hanging.warm(1)
     p._sync_grace_s = 60
-    assert p.dispatch("read", {})["state"] == "ok"
-    assert p.dispatch("calibrate", {"scale": 1.05})["state"] == "calibrated"
+    assert p.dispatch("read", {"side": "right"})["state"] == "ok"
+    assert p.dispatch("calibrate", {"side": "right", "scale": 1.05})["state"] == "calibrated"

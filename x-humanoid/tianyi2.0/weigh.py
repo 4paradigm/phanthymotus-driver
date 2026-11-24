@@ -1,9 +1,9 @@
 """x-humanoid/tianyi2.0/weigh.py — 天轶2.0 腕部六维力托举称重卡（实验性）。
 
 用法（上层 Skill / 大模型）：
-  0. ``pose`` 选择 left / right / both；后续省略 ``side`` 的动作沿用最近一次成功的 pose；
+  0. 每个动作都必须填写 ``side``（left / right / both），并与 pose 时一致；
   1. ``pose``：把手臂摆到托举姿态（掌心朝上），再把四指立起围住掌心（``hand=cup``），
-     然后默认自动 ``tare``（掌心须空着）；
+     然后自动 ``tare``（必做；掌心须空着，去皮失败则 pose 失败）；
   2. 也可以分开调用 ``tare`` 去皮；
   3. 放上物体后调用 ``weigh``，得到重量；
   4. ``calibrate`` 设定比例系数：放已知重量物体实测（known_mass_kg），或直接写入（scale）；
@@ -205,10 +205,6 @@ class WeighEngine:
         cfg.update(config or {})
         cfg["sides"] = [s for s in SIDES if s in (cfg.get("sides") or SIDES)] or ["right"]
         self.cfg = cfg
-        # The last successful pose selects the session hand. Actions that omit
-        # side then stay on that hand, while an explicit side remains an
-        # intentional one-call override.
-        self._active_side = "right"
         self._clock = clock
         self._wall = wall
         self._raw_sleep = sleep
@@ -429,10 +425,12 @@ class WeighEngine:
             raise ValueError(f"side {side!r} is not enabled (enabled: {self.cfg['sides']})")
         return sides
 
-    def _side_arg(self, args: dict) -> str:
-        """Resolve an omitted side to the hand selected by the last pose."""
+    @staticmethod
+    def _side_arg(args: dict) -> str:
+        """引擎内部缺省为 right。经 MCP 的调用在 WeighPlugin.dispatch 处就要求显式填写 side：
+        卡片被多个调用方共用，不能保存一只"当前手"去替调用方做选择。"""
         value = (args or {}).get("side")
-        return self._active_side if value in (None, "") else str(value)
+        return "right" if value in (None, "") else str(value)
 
     def _wait_stable_multi(self, sides, duration, timeout, extra_fatal=()):
         """轮询直到所有手的窗口都稳定、遇到致命问题或超时。返回 ({side: analysis}, waited_s, timed_out)。
@@ -975,18 +973,21 @@ class WeighEngine:
                                    f"手臂已到托举姿态，但手型 {hand} 没有设置成功（{problem}）。"
                                    f"不要往掌心放东西；修好 hand 卡后重新 pose，或用 retract side={side} 收回",
                                    hand_problem=problem, arm_posed=True, steps=steps)
-        self._active_side = side
         out = {"state": "posed", "side": side, "experimental": True, "hand": hand,
                "already_in_pose": not stages, "pose_deg": poses if len(sides) > 1 else poses[side],
                "steps": steps}
         warnings = self._common_warnings(side)
-        if args.get("tare", True) not in (False, "false", 0, "0"):
-            self._sleep(cfg["pose_settle_s"])
-            t = self.tare({"side": side, "duration_s": args.get("duration_s"),
-                           "timeout_s": args.get("timeout_s")})
-            out["tare"] = t
-            if t.get("state") != "tared":
-                warnings.append("pose_ok_but_tare_failed")
+        # pose 总是去皮：这是"掌心是空的"这一前提唯一的检查点，不提供跳过的开关。
+        # 去皮失败就不算 pose 成功，免得之后在有东西的掌心上补一次去皮。
+        self._sleep(cfg["pose_settle_s"])
+        t = self.tare({"side": side, "duration_s": args.get("duration_s"),
+                       "timeout_s": args.get("timeout_s")})
+        out["tare"] = t
+        if t.get("state") != "tared":
+            return self._error("tare_failed", side,
+                               "手臂和手指已到托举姿态，但去皮没有成功（掌心须空着、手臂静止）。"
+                               "不要往掌心放东西；确认掌心为空后重新 pose，或 retract",
+                               arm_posed=True, hand=hand, tare=t, steps=steps)
         if warnings:
             out["warnings"] = warnings
         return out
@@ -1078,7 +1079,7 @@ class WeighEngine:
         tare = self._tare[side]
         problem, age = self._tare_problem(side)
         sc = self.scale_info(side)
-        out = {"state": "ok", "side": side, "active_side": self._active_side, "experimental": True,
+        out = {"state": "ok", "side": side, "experimental": True,
                "tared": tare is not None, "tare_valid": tare is not None and problem is None,
                "tare_age_s": _r(age, 1), "tared_at": _iso(tare["wall"]) if tare else None,
                **{k: (_r(v) if isinstance(v, float) else v) for k, v in sc.items()},
@@ -1107,7 +1108,7 @@ class WeighEngine:
         per = {s: self._read_one(s, now) for s in sides}
         if len(sides) == 1:
             return per[side]
-        out = {"state": "ok", "side": "both", "active_side": self._active_side, "experimental": True,
+        out = {"state": "ok", "side": "both", "experimental": True,
                "tared": all(p["tared"] for p in per.values()),
                "tare_valid": all(p["tare_valid"] for p in per.values()),
                "last_result": self._last["both"], "per_side": per,
@@ -1199,8 +1200,7 @@ class WeighPlugin:
                 "流程：pose 把手臂摆到托举姿态（掌心朝上、四指立起围住掌心）并自动去皮——调用前手臂须垂下、"
                 "掌心空着、周围无人无物；然后请人把物体放到掌心，调用 weigh 得到重量；称完先取走物体，"
                 "再 retract（先张开手指再收回手臂）。只有 pose/retract 会移动手臂和手指，其余动作只读。"
-                "成功执行 pose 后，后续省略 side 的 tare、weigh、read、calibrate、retract 会沿用该手；"
-                "显式填写 side 只覆盖当前一次调用。手臂或手型变了必须重新 tare。"
+                "每次调用都必须填写 side，并与 pose 时一致。手臂或手型变了必须重新 tare。"
                 f"适用约 {cfg['resolution_kg']} kg 以上的静止物体，"
                 + (f"上限 {cfg['load_limit_kg']} kg；" if cfg["load_limit_kg"] else
                    f"上限由腕部电流决定（超过额定 {int(cfg['current_ratio_max'] * 100)}% 判无效，估计掌心约 2 kg，未实测）；")
@@ -1217,8 +1217,8 @@ class WeighPlugin:
                                               "calibrate=设定比例系数 read=查看状态 retract=收回手臂"},
                     "side": {"type": "string",
                              "enum": list(self._sides) + (["both"] if len(self._sides) == 2 else []),
-                             "description": "用哪只手：left / right / both（两手结果相加）。"
-                                            "pose 成功后省略此参数会沿用最近一次 pose 的手，初始为 right"},
+                             "description": "用哪只手：left / right / both（两手结果相加）。必填，"
+                                            "pose 之后的各个动作要用同一个值"},
                     "duration_s": window,
                     "timeout_s": timeout,
                     "known_mass_kg": {"type": "number", "minimum": cfg["min_calibration_kg"],
@@ -1229,14 +1229,12 @@ class WeighPlugin:
                     "hand": {"type": "string", "enum": ["cup", "open", "keep"], "default": "cup",
                              "description": "pose 的手型：cup=四指立起围住掌心（默认，物体放得稳）"
                                             " open=手指摊开 keep=不动手指"},
-                    "tare": {"type": "boolean", "default": True,
-                             "description": "pose 到位后是否自动去皮（掌心须空着），默认 true"},
                     "confirm_empty": {"type": "boolean", "default": False,
                                       "description": "retract：没有有效去皮、无法检测掌上物体时，确认掌心已空"},
                 },
-                "required": ["action"],
+                "required": ["action", "side"],
                 "x-action-params": {
-                    "pose": {"params": ["side", "hand", "tare", "duration_s", "timeout_s"],
+                    "pose": {"params": ["side", "hand", "duration_s", "timeout_s"],
                              "description": "移动手臂到托举姿态（先抬前臂、再转腕让掌心朝上，约 12 秒；both 两臂同时动），"
                                             "再把四指立起围住掌心（hand=cup，默认），然后自动去皮。"
                                             "只能从手臂垂下或已在托举姿态时调用；"
@@ -1377,6 +1375,11 @@ class WeighPlugin:
             return {"state": "ready" if self._node is not None else "idle", "sides": list(self._sides)}
         if action not in ("pose", "tare", "weigh", "calibrate", "read", "retract"):
             return {"error": f"unknown action: {action}"}
+        if args.get("side") in (None, ""):
+            result = {"state": "error", "code": "side_required", "experimental": True,
+                      "error": "必须填写 side（left / right / both），并与 pose 时一致"}
+            print(f"[weigh] {action} args={args} -> {_brief(result)}", flush=True)
+            return result
         try:
             self.start()   # 卡片未 start 也能直接调用：首次调用时订阅
         except Exception as exc:
