@@ -233,4 +233,9 @@ def build_plugins(config, namespace, ros2):
     from agilex.piper.camera_live import add_camera_live
 
     plugins = add_intent_monitor([UnifiedControlPlugin(config, namespace, ros2)], config, ros2, joints_card=True)
-    return add_camera_live(plugins, config, ros2, sensor_card=True)
+    plugins = add_camera_live(plugins, config, ros2, sensor_card=True)
+    if config.get("vision_pick", {}).get("enabled") is True:
+        from agilex.piper.vision_pick import PiperVisionPick
+
+        plugins.append(PiperVisionPick(config, namespace, ros2))
+    return plugins

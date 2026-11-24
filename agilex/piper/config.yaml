@@ -42,6 +42,12 @@ camera:
   device: ""
   warmup_seconds: 3
   min_contrast: 8
+vision_pick:
+  enabled: false
+  camera_topic_base: /camera_f
+  # Set joint_state_topic for a wrist camera and provide a camera-to-link6 calibration.
+  joint_state_topic: null
+  calibration: null
 ros:
   robot_domain_id: 42
   core_domain_id: 42
