@@ -338,6 +338,66 @@ def test_a_superseded_publish_thread_publishes_nothing(monkeypatch):
     assert published == []
 
 
+# ── non-finite numbers never become a transform ──────────────────────────────
+
+@pytest.mark.parametrize("bad_value", ["NaN", "Infinity", "-Infinity"])
+def test_non_finite_position_is_rejected_not_emitted(bad_value):
+    raw = '{"marker_id": 1, "position": [' + bad_value + ', 0, 0], "orientation": [0,0,0,1]}'
+    batch = spec.transforms_from_json(
+        json.loads(raw), _cfg(), receive_ms=1000, targets={})
+    assert batch["transforms"] == []
+    assert batch["rejected"] == 1
+
+
+@pytest.mark.parametrize("bad_value", ["NaN", "Infinity", "-Infinity"])
+def test_non_finite_quaternion_is_rejected_not_emitted(bad_value):
+    raw = '{"marker_id": 1, "position": [1,2,3], "orientation": [' + bad_value + ',0,0,1]}'
+    batch = spec.transforms_from_json(
+        json.loads(raw), _cfg(), receive_ms=1000, targets={})
+    assert batch["transforms"] == []
+    assert batch["rejected"] == 1
+
+
+def test_non_finite_confidence_is_rejected():
+    batch = spec.transforms_from_json(
+        {"marker_id": 1, "position": [1, 2, 3], "orientation": [0, 0, 0, 1],
+         "confidence": float("nan")},
+        _cfg(), receive_ms=1000, targets={})
+    assert batch["transforms"] == []
+    assert batch["rejected"] == 1
+
+
+def test_non_finite_stamp_falls_back_to_receive_time():
+    batch = spec.transforms_from_json(
+        {"marker_id": 1, "position": [1, 2, 3], "orientation": [0, 0, 0, 1],
+         "stamp_ms": float("inf")},
+        _cfg(), receive_ms=1000, targets={})
+    assert len(batch["transforms"]) == 1
+    assert batch["transforms"][0]["stamp_ms"] == 1000.0
+
+
+def test_non_finite_pixel_depth_is_rejected():
+    cfg = _cfg(adapter="pixel_depth")
+    batch = spec.transforms_from_json(
+        {"id": 1, "u": float("nan"), "v": 100, "depth_m": 2.0},
+        cfg, receive_ms=1000, targets={})
+    assert batch["transforms"] == []
+    assert batch["rejected"] == 1
+
+
+def test_no_output_contains_a_non_finite_number():
+    """Belt and braces: whatever the input, serialised output stays valid JSON."""
+    for raw in (
+        {"marker_id": 1, "position": [float("inf"), 0, 0], "orientation": [0, 0, 0, 1]},
+        {"marker_id": 2, "position": [1, 2, 3], "orientation": [float("nan"), 0, 0, 1]},
+        {"marker_id": 3, "position": [1, 2, 3], "orientation": [0, 0, 0, 1],
+         "confidence": float("inf")},
+    ):
+        batch = spec.transforms_from_json(raw, _cfg(), receive_ms=1000, targets={})
+        text = json.dumps(spec.build_payload(_cfg(), batch), allow_nan=False)
+        assert "NaN" not in text and "Infinity" not in text
+
+
 # ── Dockerfile COPY guard: a missing COPY means import fails in the image ───
 
 def test_the_spec_and_card_modules_reach_the_image():

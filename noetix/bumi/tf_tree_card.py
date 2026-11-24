@@ -165,7 +165,15 @@ class _TfTreeNode(Node):
         return (len(self._tree["links"]), dynamic, static)
 
     def start(self, input_topic: str) -> None:
+        # The tree is enabled by default and starts at boot with no vision
+        # topic (start_all -> plugin.start -> start("")). Later the canvas
+        # dispatches start with the resolved input_topic. An already-running
+        # tree must therefore reconfigure its vision subscription rather than
+        # no-op — otherwise the advertised vision_tf -> tf_tree link never
+        # actually subscribes, and no vision edge is ever published.
         if self._running:
+            if input_topic:
+                self._subscribe_vision(input_topic)
             return
         self._stopped.clear()
         self._running = True

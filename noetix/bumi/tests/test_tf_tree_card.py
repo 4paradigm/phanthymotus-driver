@@ -311,3 +311,23 @@ def test_start_builds_tree_without_vision_topic(card_module):
     plugin.start()  # what start_all() calls
     assert plugin._node.running
     assert plugin._node._vision == {}
+
+
+def test_dispatched_start_attaches_vision_topic_after_boot(card_module):
+    """P1 regression: tf_tree is on by default, so boot start() runs first.
+    A later canvas dispatch("start", {input_topic}) must still subscribe to the
+    vision topic; an early `if self._running: return` silently drops the wiring.
+    """
+    plugin = _make_card(card_module)
+    plugin.start()  # start_all(): no vision topic yet
+    assert plugin._node.running
+
+    subscribed = []
+    original = plugin._node._subscribe_vision
+    plugin._node._subscribe_vision = lambda topic: (
+        subscribed.append(topic), original(topic))[1]
+
+    result = plugin.dispatch("start", {"input_topic": "/bumi_test/vision_tf/ar/transforms"})
+    assert result["state"] == "running"
+    assert subscribed == ["/bumi_test/vision_tf/ar/transforms"]
+    plugin.stop()

@@ -84,9 +84,11 @@ def _qconj(q):
 
 
 def _qnorm(q):
+    if not _finite(*q):
+        raise ValueError("non-finite quaternion")
     n = math.sqrt(sum(v * v for v in q))
-    if n <= 1e-12:
-        raise ValueError("zero-length quaternion")
+    if n <= 1e-12 or not math.isfinite(n):
+        raise ValueError("zero-length or non-finite quaternion")
     return tuple(v / n for v in q)
 
 
@@ -120,7 +122,11 @@ def camera_to_body_quaternion(q):
 def rodrigues_to_quaternion(rvec):
     """Rodrigues rotation vector (radians) -> xyzw quaternion."""
     x, y, z = (float(v) for v in rvec)
+    if not _finite(x, y, z):
+        raise ValueError("non-finite rotation vector")
     angle = math.sqrt(x * x + y * y + z * z)
+    if not math.isfinite(angle):
+        raise ValueError("rotation vector magnitude overflow")
     if angle <= 1e-12:
         return (0.0, 0.0, 0.0, 1.0)
     half = angle / 2.0
@@ -138,6 +144,13 @@ def invert_transform(translation, rotation):
 
 # ── field parsing (no guessing) ──────────────────────────────────────────────
 
+def _finite(*values) -> bool:
+    """Reject NaN/inf: json.dumps emits them as non-standard tokens and TF
+    consumers cannot use such transforms. A bad number is a rejected target,
+    never a plausible-looking edge."""
+    return all(math.isfinite(float(v)) for v in values)
+
+
 def _as_vec3(value, aliases=()):
     """Accept ``[x,y,z]`` or ``{x,y,z}``; return None if absent/unparseable."""
     if value is None:
@@ -147,12 +160,14 @@ def _as_vec3(value, aliases=()):
             for name in ("x", "y", "z"):
                 if name not in value:
                     return None
-            return (float(value["x"]), float(value["y"]), float(value["z"]))
-        if isinstance(value, (list, tuple)) and len(value) >= 3:
-            return (float(value[0]), float(value[1]), float(value[2]))
-    except (TypeError, ValueError):
+            out = (float(value["x"]), float(value["y"]), float(value["z"]))
+        elif isinstance(value, (list, tuple)) and len(value) >= 3:
+            out = (float(value[0]), float(value[1]), float(value[2]))
+        else:
+            return None
+    except (TypeError, ValueError, OverflowError):
         return None
-    return None
+    return out if _finite(*out) else None
 
 
 def _as_quat(value, aliases=()):
@@ -160,13 +175,15 @@ def _as_quat(value, aliases=()):
         return None
     try:
         if isinstance(value, dict) and all(k in value for k in ("x", "y", "z", "w")):
-            return (float(value["x"]), float(value["y"]),
-                    float(value["z"]), float(value["w"]))
-        if isinstance(value, (list, tuple)) and len(value) >= 4:
-            return tuple(float(v) for v in value[:4])
-    except (TypeError, ValueError):
+            out = (float(value["x"]), float(value["y"]),
+                   float(value["z"]), float(value["w"]))
+        elif isinstance(value, (list, tuple)) and len(value) >= 4:
+            out = tuple(float(v) for v in value[:4])
+        else:
+            return None
+    except (TypeError, ValueError, OverflowError):
         return None
-    return None
+    return out if _finite(*out) else None
 
 
 def _get(obj, *names, default=None):
@@ -195,8 +212,10 @@ def _stamp_ms(obj, receive_ms):
     raw = _get(obj, "stamp_ms", "timestamp_ms")
     if raw is not None:
         try:
-            return float(raw)
-        except (TypeError, ValueError):
+            value = float(raw)
+            if math.isfinite(value):
+                return value
+        except (TypeError, ValueError, OverflowError):
             pass
     header = _get(obj, "header")
     if isinstance(header, dict):
@@ -205,14 +224,19 @@ def _stamp_ms(obj, receive_ms):
             sec = stamp.get("sec", stamp.get("s"))
             nanosec = stamp.get("nanosec", stamp.get("nsec"))
             if sec is not None:
-                return float(sec) * 1000.0 + float(nanosec or 0) / 1e6
+                value = float(sec) * 1000.0 + float(nanosec or 0) / 1e6
+                if math.isfinite(value):
+                    return value
         elif stamp is not None:
             # A bare number: seconds if small, milliseconds otherwise.
             try:
                 value = float(stamp)
-                return value * 1000.0 if abs(value) < 1e8 else value
-            except (TypeError, ValueError):
+                if math.isfinite(value):
+                    return value * 1000.0 if abs(value) < 1e8 else value
+            except (TypeError, ValueError, OverflowError):
                 pass
+    # Non-finite or absent observation stamp: fall back to receive time rather
+    # than emit a NaN timestamp the TF tree would reject.
     return float(receive_ms)
 
 
@@ -269,15 +293,22 @@ def adapt_pixel_depth(obj, units="m", *, focal_px, width, height):
         return None, None, "pixel_depth needs u, v and depth_m"
     try:
         u, v, depth = float(u), float(v), float(depth)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None, None, "u/v/depth_m must be numbers"
+    if not _finite(u, v, depth):
+        return None, None, "u/v/depth_m must be finite numbers"
     if depth <= 0.0 or focal_px <= 0.0:
         return None, None, "depth_m and focal_px must be positive"
     intrinsics = _get(obj, "intrinsics", default={}) or {}
-    fx = float(_get(intrinsics, "fx", default=focal_px))
-    fy = float(_get(intrinsics, "fy", default=focal_px))
-    cx = float(_get(intrinsics, "cx", default=width / 2.0))
-    cy = float(_get(intrinsics, "cy", default=height / 2.0))
+    try:
+        fx = float(_get(intrinsics, "fx", default=focal_px))
+        fy = float(_get(intrinsics, "fy", default=focal_px))
+        cx = float(_get(intrinsics, "cx", default=width / 2.0))
+        cy = float(_get(intrinsics, "cy", default=height / 2.0))
+    except (TypeError, ValueError, OverflowError):
+        return None, None, "intrinsics must be numbers"
+    if not _finite(fx, fy, cx, cy) or fx <= 0.0 or fy <= 0.0:
+        return None, None, "intrinsics must be finite with positive focal lengths"
     # Ideal pinhole, optical axes (x right, y down, z depth).  No distortion
     # correction: the caller must supply rectified pixels.
     pos = ((u - cx) * depth / fx, (v - cy) * depth / fy, depth)
@@ -408,13 +439,29 @@ def transforms_from_json(raw, cfg, *, receive_ms, targets):
         kind = cfg["adapter"]
         kw = dict(focal_px=cfg["focal_px"], width=cfg["image_width"],
                   height=cfg["image_height"])
-        pos, rot, err = adapter_fn(obj, cfg["units"], **kw)
+        try:
+            pos, rot, err = adapter_fn(obj, cfg["units"], **kw)
+        except (ValueError, OverflowError) as exc:
+            # e.g. an overflowing quaternion norm: reject this target, never
+            # let one bad object abort the whole batch.
+            rejected += 1
+            last_error = f"{kind}: {exc}"
+            continue
         if err is not None:
             rejected += 1
             last_error = f"{kind}: {err}"
             continue
 
-        confidence = float(_get(obj, "confidence", "score", "prob", default=1.0))
+        try:
+            confidence = float(_get(obj, "confidence", "score", "prob", default=1.0))
+        except (TypeError, ValueError, OverflowError):
+            rejected += 1
+            last_error = "confidence must be a number"
+            continue
+        if not math.isfinite(confidence):
+            rejected += 1
+            last_error = "confidence must be finite"
+            continue
         if confidence < cfg["min_confidence"]:
             continue
 
