@@ -368,6 +368,42 @@ navi 流水线时仍保留 `dry_run: true`，用于核对视觉控制方向。�
 `footprint` 的出错方向是单边的（以为自己更宽只是多减速，以为更窄就是把肩膀送进
 门框），所以默认值刻意偏宽；死区不是，所以它宁可声明成估计值也不写零。
 
+### `waist_sway` — 腰部巡视摆动（实验性）
+
+调用式卡片，与 `loco.move` 同型：**没有部署期配置**，三个参数都在画布上调
+`start` 时给出——`duration_s`（来回转身持续时间，秒，0=持续到 stop，到时自动
+收尾）、`amplitude_deg`（转身幅度，单侧 5–60 度，默认 20，首周期从 0 渐入）、
+`speed`（快慢两档：slow=慢，约 8 秒一个来回；medium=中，约 4 秒一个来回）。
+`confirm` 在**运行时**校验：start 不带 `confirm=true` 时卡片静默停止，**不发出
+任何关节指令**（`info` 的 `preempted_by=confirm_missing` 可查，不报错）；智能控制
+（Agent）调用自动携带布尔 true，画布手动表单不保证传递该字段。运行期间站立静止时摆动，`loco` / `loco_relative_move` /
+`loco_servo` 行走期间继续发送；`semantic_action`、`action_recording`、
+`stand_up_lie_prone` 或保护/摔倒等占用腰部的动作一旦出现，自动停止并释放腰部
+（`info` 的 `preempted_by` 记录原因）。再次 `start` 会先收尾当前摆动再按新参数
+重启。
+
+为什么必须是低层：高层 `publish_cmd` 没有腰部通道，行走与上身动画在固件里是互斥
+的 workmode；唯一执行面是 `LowController.set_joint`（21 关节全量）。实现复用官方
+`example_policy_walk.cpp` 的站立保持（固定角表 + kp=10/kd=0.5，500 Hz），在腰关节
+上叠加慢正弦，接手时从实测姿态 1 s 混入。映射通过 `getJointsIndex` 解析，腰应为
+电机 20；解析失败或两个关节名映射到同一硬件索引时拒绝发流，启动时读不到完整
+21 关节有效位姿也拒绝发流（零角表是官方的*躺平*姿态，会把站立机器人折倒，
+任何"缺测"都不得合成指令位姿）。
+
+**三个固件未知数**（控制器闭源，任何示例都没有混用过高低两层）：
+
+1. 站在行走模式里的机器人能否被低层流接管；
+2. 行走期间并发 `set_joint` 的仲裁——按关节合并是预期效果；"高层赢"表现为腰部
+   停转、行走正常；"低层赢"表现为机器人保持站立、底盘命令失效。两个端点都不
+   摔机，交替仲裁才会；
+3. 停流后 WALK 边沿能否恢复高层。
+
+`info` 为此提供观测面：`waist_tracking`（底盘空闲时腰是否真的跟着指令转，不跟超
+0.5 s 自动停流报错）、`remaining_s`（定时摆动剩余时间）、`cmds_sent`、
+`last_restore`（恢复走了哪些模式边）、当前 workmode。
+
+首次真机请小幅度、慢档、有人看护、App 急停可用。
+
 ## Direct action cards
 
 The former `switch_mode` tool is split into three user-facing cards. Internal
