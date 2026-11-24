@@ -337,7 +337,6 @@ class VisualOdometryNode:
         self.maps = None
         self.optics = None
         self.frame_id = None
-        self.broadcaster = None
         self.visual_pending = OrderedDict()
         self.diagnostic_pending = OrderedDict()
         self.diagnostic_started = False
@@ -502,7 +501,6 @@ class VisualOdometryNode:
         self.result_subs = []
         self.segment_pubs = []
         self.frame_id = None
-        self.broadcaster = None
         self.maps = None
         self.optics = None
         self.estimate = None
@@ -688,8 +686,6 @@ class VisualOdometryNode:
         from geometry_msgs.msg import TransformStamped
         from tf2_ros import StaticTransformBroadcaster
         root = '/'+self.segment
-        self.rgbd_pub = self.node.create_publisher(RGBDImage, root+'/rgbd_image', self.qos)
-        self.segment_pubs = [self.rgbd_pub]
         # RTAB-Map wants a base frame distinct from the image frame and a TF to
         # it. With no measured mount the transform is identity, so the base frame
         # coincides with the optical frame rather than pretending to be a body point.
@@ -705,17 +701,31 @@ class VisualOdometryNode:
         transform.transform.rotation.y = quaternion[1]
         transform.transform.rotation.z = quaternion[2]
         transform.transform.rotation.w = quaternion[3]
-        self.broadcaster = StaticTransformBroadcaster(self.node)
-        transforms = [transform]
-        self.broadcaster.sendTransform(transforms)
-        self._subscribe(Odometry, root+'/visual',
-                        lambda msg: self.odometry(msg), self.result_subs)
-        self._subscribe(OdomInfo, root+'/diagnostic', self.diagnostic, self.result_subs)
-        if self.imu_assisted:
-            self.children.start(self.segment, self.base_frame(),
-                                imu_topic=root+'/imu')
-        else:
-            self.children.start(self.segment, self.base_frame())
+        rgbd_pub = self.node.create_publisher(RGBDImage, root+'/rgbd_image', self.qos)
+        publishers = [rgbd_pub]
+        subscriptions = []
+        try:
+            broadcaster = StaticTransformBroadcaster(self.node)
+            # The node owns this transient-local publisher until it is destroyed.
+            publishers.append(broadcaster.pub_tf)
+            broadcaster.sendTransform([transform])
+            self._subscribe(Odometry, root+'/visual',
+                            lambda msg: self.odometry(msg), subscriptions)
+            self._subscribe(OdomInfo, root+'/diagnostic', self.diagnostic, subscriptions)
+            if self.imu_assisted:
+                self.children.start(self.segment, self.base_frame(),
+                                    imu_topic=root+'/imu')
+            else:
+                self.children.start(self.segment, self.base_frame())
+        except Exception:
+            for sub in subscriptions:
+                self.node.destroy_subscription(sub)
+            for pub in publishers:
+                self.node.destroy_publisher(pub)
+            raise
+        self.rgbd_pub = rgbd_pub
+        self.segment_pubs.extend(publishers)
+        self.result_subs.extend(subscriptions)
 
     def _start_controller_imu(self):
         if self.high_ctrl is None:

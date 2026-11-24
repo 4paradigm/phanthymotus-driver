@@ -41,26 +41,37 @@ def executor(monkeypatch):
         def __init__(self, *args):
             self.messages = []
             self.topics = {}
+            self.publishers = []
+            self.subscriptions = []
             self.timers = []
             self.time = 10**10
             self.removed = []
             self.destroyed = False
 
         def get_clock(self):
-            return NS(now=lambda: NS(nanoseconds=self.time))
+            return NS(now=lambda: NS(nanoseconds=self.time, to_msg=lambda: self.time))
 
         def create_publisher(self, cls, topic, qos):
             messages = self.messages if topic.endswith(module.OUTPUT_TOPIC) else []
             self.topics[topic] = messages
-            return NS(publish=messages.append)
+            publisher = NS(topic=topic, messages=messages, publish=messages.append)
+            self.publishers.append(publisher)
+            return publisher
+
+        def create_subscription(self, cls, topic, callback, qos):
+            subscription = NS(topic=topic)
+            self.subscriptions.append(subscription)
+            return subscription
 
         def create_timer(self, *args):
             self.timers.append(args)
 
         def destroy_subscription(self, sub):
+            self.subscriptions.remove(sub)
             self.removed.append(sub)
 
         def destroy_publisher(self, pub):
+            self.publishers.remove(pub)
             self.removed.append(pub)
 
         def destroy_node(self):
@@ -95,6 +106,42 @@ def plugin(executor, monkeypatch):
                         lambda self, namespace: setattr(self, 'bound', namespace))
     instance = module.VisualOdometryPlugin({}, 'robot', executor)
     return instance
+
+
+@pytest.fixture
+def launch_estimator(plugin, monkeypatch):
+    def transform():
+        return NS(header=NS(), transform=NS(translation=NS(), rotation=NS()))
+
+    class StaticTransformBroadcaster:
+        def __init__(self, node):
+            self.pub_tf = node.create_publisher(object, '/tf_static', None)
+
+        def sendTransform(self, transforms):
+            self.pub_tf.publish(transforms)
+
+    for name, fake in (
+            ('nav_msgs.msg', NS(Odometry=object)),
+            ('rtabmap_msgs.msg', NS(OdomInfo=object, RGBDImage=object)),
+            ('geometry_msgs.msg', NS(TransformStamped=transform)),
+            ('tf2_ros', NS(StaticTransformBroadcaster=StaticTransformBroadcaster))):
+        monkeypatch.setitem(sys.modules, name, fake)
+
+    node = plugin._node
+    monkeypatch.setattr(node.children, 'start', lambda *args, **kwargs: None)
+    plugin.dispatch('start', {})
+
+    def launch():
+        node.frame_id = 'ubuntu_rgb_optical'
+        node.launch()
+
+    return launch
+
+
+def static_tf_parents(node):
+    return [tf.header.frame_id for publisher in node.node.publishers
+            if publisher.topic == '/tf_static' for transforms in publisher.messages
+            for tf in transforms if tf.child_frame_id == 'ubuntu_rgb_optical']
 
 
 def last(plugin):
@@ -152,6 +199,44 @@ def test_reset_moves_to_a_new_segment_and_reports_the_old_one_lost(plugin):
     samples = [json.loads(m.data) for m in plugin._node.node.messages]
     assert any(s['vendor']['segment_id'] == segment and s['vendor']['status'] == 'lost'
                for s in samples)
+
+
+@pytest.mark.parametrize('action', ['stop', 'reset', 'recover'])
+def test_segment_teardown_removes_the_retained_static_tf(plugin, launch_estimator, action):
+    node = plugin._node
+    launch_estimator()
+    initial_parent = node.base_frame()
+    assert static_tf_parents(node) == [initial_parent]
+    if action == 'recover':
+        node.request_restart('camera input restarted')
+        node.tick()
+    else:
+        plugin.dispatch(action, {})
+    assert static_tf_parents(node) == []
+    if action == 'stop':
+        plugin.dispatch('start', {})
+    launch_estimator()
+    assert node.base_frame() != initial_parent
+    assert static_tf_parents(node) == [node.base_frame()]
+
+
+def test_estimator_launch_failure_releases_the_partial_segment_endpoints(
+        plugin, launch_estimator, monkeypatch):
+    node = plugin._node
+    publishers_before = list(node.node.publishers)
+
+    def fail_start(*args, **kwargs):
+        assert static_tf_parents(node) == [node.base_frame()]
+        raise OSError('estimator executable missing')
+
+    with monkeypatch.context() as patch:
+        patch.setattr(node.children, 'start', fail_start)
+        with pytest.raises(OSError, match='estimator executable missing'):
+            launch_estimator()
+    assert node.node.publishers == publishers_before
+    assert node.node.subscriptions == []
+    launch_estimator()
+    assert static_tf_parents(node) == [node.base_frame()]
 
 
 def test_measured_mount_only_changes_the_pose_reference(plugin):
