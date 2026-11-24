@@ -124,7 +124,8 @@ plugins:
     # 死区：手指转角变化不到这个值就忽略。太大（如 10 度）会连正常弯曲
     # 都过滤掉，导致近节指骨弯不下去；3 度足够滤掉抖动。范围 0..45。
     angle_deadband_deg: 4
-    watchdog_ms: 600
+    # 展览会场景：手暂时离开时保持姿势，5000ms(代码上限)后仍无人再松手。
+    watchdog_ms: 5000
     max_obs_age_ms: 500
     require_handedness: true
     # 与上面的 hand 卡标定保持一致；这些值只适用于已确认的这对硬件。
