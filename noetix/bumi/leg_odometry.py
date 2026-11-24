@@ -10,8 +10,8 @@ body moved by
 
 where p is the foot position in the body frame and R maps the body frame to
 the world using the SDK orientation quaternion. The foot whose implied delta is
-smallest is the stance foot; when both are similar the body is in double
-support and the deltas are averaged.
+smallest is the legacy locomotion default. The independent odometry source
+uses gravity-relative kinematic cues and agreement of the two velocity vectors.
 
 This is a kinematic estimate, not a measurement: foot roll/slip, the sole
 contact point (modelled as the ankle-roll origin projected onto the sole at
@@ -76,14 +76,24 @@ CONTACT_BLEND_M = 0.004
 LEG_SLIP_SCALE = {'forward': 1.7, 'backward': 1.85, 'left': 4.4, 'right': 5.5}
 DISTANCE_SLIP_SCALE = LEG_SLIP_SCALE['forward']
 
-# The largest plausible body step per sample at ~50 Hz (1.0 m/s). A larger
-# implied step is a contact/kinematics discontinuity, not body motion.
+# The fixed locomotion step limit (1.0 m/s at 50 Hz).
 MAX_STEP_M = 0.02
 # Two implied steps this close are treated as double support and averaged.
 DOUBLE_SUPPORT_M = 0.01
 # ...but only when they also point the same way: equal lengths with opposite
 # directions would average to zero and silently drop a real step.
 DOUBLE_SUPPORT_COS = 0.5
+
+# On approximately level ground a foot this far above its partner at either
+# endpoint cannot establish a planted-foot constraint over the whole interval.
+MAX_SUPPORT_HEIGHT_M = .03
+MAX_INTERVAL_S = 0.1
+
+
+def interval_too_long(start_s, end_s):
+    # The deadline sum can round one ULP below an independently sampled exact
+    # endpoint, e.g. 0.570 s + 100 ms versus 0.670 s.
+    return end_s > math.nextafter(start_s + MAX_INTERVAL_S, math.inf)
 
 
 def _axis_rotation(axis, angle):
@@ -170,12 +180,29 @@ def foot_position(angles, chain):
 
 
 class LegOdometry:
-    """Integrate body displacement from successive foot positions."""
+    """Integrate body displacement from successive foot positions.
 
-    def __init__(self, slip_scale=None):
+    ``max_step_velocity_m_s`` scales the candidate step limit by elapsed time.
+    The default uses the fixed step limit tuned for locomotion. With
+    ``contact_confidence=True``, support follows gravity-relative foot geometry
+    and rejected samples leave the previous accepted endpoint intact.
+    """
+
+    def __init__(self, slip_scale=None, *, max_step_velocity_m_s=None, contact_confidence=False):
         self.slip_scale = DISTANCE_SLIP_SCALE if slip_scale is None else float(slip_scale)
         if not math.isfinite(self.slip_scale) or self.slip_scale <= 0:
             raise ValueError('leg slip scale must be positive and finite')
+        self._contact_confidence = contact_confidence
+        self._support_foot = None
+        self.residual_speed = 0.0     # disagreement of implied world velocities, m/s
+        self.support_ambiguity = 0.0  # heuristic in [0, 1], not a force measurement
+        self.support_switched = False
+        self._max_step_velocity_m_s = None
+        if max_step_velocity_m_s is not None:
+            max_step_velocity_m_s = float(max_step_velocity_m_s)
+            if not math.isfinite(max_step_velocity_m_s) or max_step_velocity_m_s <= 0:
+                raise ValueError('leg step velocity limit must be positive and finite')
+            self._max_step_velocity_m_s = max_step_velocity_m_s
         self.position = [0.0, 0.0, 0.0]
         self.velocity = [0.0, 0.0, 0.0]
         self.samples = 0
@@ -206,6 +233,7 @@ class LegOdometry:
         self.position = [0.0, 0.0, 0.0]
         self.velocity = [0.0, 0.0, 0.0]
         self._last_step = None
+        self._support_foot = None
         self._feet = None
         self._rotation = None
         self._time = None
@@ -230,6 +258,77 @@ class LegOdometry:
                 foot_position(values[split:], LEG_CHAINS['right'])]
         self.observe_feet(feet, rotation, now)
 
+    def _legacy_delta(self, deltas, lengths, plausible):
+        both_zero = lengths[0] <= 1e-9 and lengths[1] <= 1e-9
+        cos_directions = None
+        if lengths[0] > 1e-9 and lengths[1] > 1e-9:
+            cos_directions = (sum(deltas[0][i]*deltas[1][i] for i in range(3))
+                              / (lengths[0]*lengths[1]))
+        directions_agree = (both_zero or (cos_directions is not None
+                                          and cos_directions >= DOUBLE_SUPPORT_COS))
+        self.double_support = (len(plausible) == 2
+                               and abs(lengths[0]-lengths[1]) <= DOUBLE_SUPPORT_M
+                               and directions_agree)
+        if not plausible:
+            return None
+        if self.double_support:
+            delta = [(deltas[0][i]+deltas[1][i])/2 for i in range(3)]
+        elif (len(plausible) == 2 and not directions_agree
+              and self._last_step is not None):
+            # Opposite implied steps must not average to zero: pick
+            # the foot that continues the previous body motion.
+            def _alignment(index):
+                length = lengths[index]
+                if length <= 1e-9:
+                    return -1.0
+                last = math.hypot(*self._last_step)
+                if last <= 1e-9:
+                    return 0.0
+                return sum(deltas[index][i]*self._last_step[i]
+                           for i in range(3))/(length*last)
+            best = max(plausible, key=_alignment)
+            delta = deltas[best]
+        else:
+            best = min(plausible, key=lambda index: lengths[index])
+            delta = deltas[best]
+        return delta
+
+    def _contact_delta(self, deltas, lengths, plausible, world_feet, dt):
+        # Compare velocities so a fixed physical trajectory has the same score
+        # at different read rates. The residual includes all vector components.
+        self.residual_speed = math.dist(*deltas) / dt
+        heights = [foot[2] for foot in world_feet]
+        starts = [height + delta[2] for height, delta in zip(heights, deltas)]
+        elevation = [max(heights[i] - min(heights), starts[i] - min(starts)) for i in (0, 1)]
+        plausible = [i for i in plausible if elevation[i] <= MAX_SUPPORT_HEIGHT_M]
+        speeds = [length / dt for length in lengths]
+        # An absolute noise allowance (m/s) plus a relative term for movement.
+        # The relative cap prevents equally small, opposing vectors from
+        # looking like strong agreement solely because both are near zero.
+        tolerance = min(0.02 + 0.20 * min(speeds), 0.5 * max(speeds))
+        self.double_support = (len(plausible) == 2 and self.residual_speed <= tolerance
+                               and max(elevation) <= .01)
+        self.support_switched = False
+        if self.double_support:
+            self.support_ambiguity = 0.0
+            return [(left + right) / 2 for left, right in zip(*deltas)]
+        if not plausible:
+            self.support_ambiguity = 1.0
+            return None
+
+        # Dimensionless ranking. One centimetre of elevation or 0.1 m/s
+        # vertical motion each weighs as much as 1 m/s of total motion. A
+        # small hysteresis breaks near ties without assuming a body heading.
+        scores = [(elevation[i] / .01 + abs(deltas[i][2]) / (dt * .1)
+                   + speeds[i] - (.08 if i == self._support_foot else 0.0))
+                  for i in (0, 1)]
+        foot = min(plausible, key=scores.__getitem__)
+        margin = max(0.0, scores[1 - foot] - scores[foot])
+        self.support_ambiguity = 1.0 / (1.0 + margin)
+        self.support_switched = self._support_foot is not None and foot != self._support_foot
+        self._support_foot = foot
+        return deltas[foot]
+
     def observe_feet(self, feet, rotation, now):
         """One already-computed (left, right) body-frame foot sample."""
         if len(feet) != 2:
@@ -240,48 +339,27 @@ class LegOdometry:
         rotation = [[float(v) for v in row] for row in rotation]
         if self._feet is not None:
             dt = now-self._time
-            if not math.isfinite(dt) or not 0 < dt <= 0.1:
+            too_late = (interval_too_long(self._time, now) if self._contact_confidence
+                        else dt > MAX_INTERVAL_S)
+            if not math.isfinite(dt) or dt <= 0 or too_late:
                 raise ValueError('leg odometry sampling interval invalid or longer than 0.1 s')
+            world_feet = [_apply(rotation, foot) for foot in feet]
             deltas = []
-            for previous, current in zip(self._feet, feet):
+            for previous, end in zip(self._feet, world_feet):
                 start = _apply(self._rotation, previous)
-                end = _apply(rotation, current)
                 deltas.append([start[i]-end[i] for i in range(3)])
             lengths = [math.hypot(*delta) for delta in deltas]
-            limit = MAX_STEP_M/max(1.0, self.slip_scale)
+            max_step = MAX_STEP_M
+            if self._max_step_velocity_m_s is not None:
+                max_step = self._max_step_velocity_m_s * dt
+            limit = max_step / max(1.0, self.slip_scale)
             plausible = [index for index in (0, 1) if lengths[index] <= limit]
             self.foot_gap = feet[0][0]-feet[1][0]
-            both_zero = lengths[0] <= 1e-9 and lengths[1] <= 1e-9
-            cos_directions = None
-            if lengths[0] > 1e-9 and lengths[1] > 1e-9:
-                cos_directions = (sum(deltas[0][i]*deltas[1][i] for i in range(3))
-                                  / (lengths[0]*lengths[1]))
-            directions_agree = (both_zero or (cos_directions is not None
-                                              and cos_directions >= DOUBLE_SUPPORT_COS))
-            self.double_support = (len(plausible) == 2
-                                   and abs(lengths[0]-lengths[1]) <= DOUBLE_SUPPORT_M
-                                   and directions_agree)
-            if plausible:
-                if self.double_support:
-                    delta = [(deltas[0][i]+deltas[1][i])/2 for i in range(3)]
-                elif (len(plausible) == 2 and not directions_agree
-                      and self._last_step is not None):
-                    # Opposite implied steps must not average to zero: pick
-                    # the foot that continues the previous body motion.
-                    def _alignment(index):
-                        length = lengths[index]
-                        if length <= 1e-9:
-                            return -1.0
-                        last = math.hypot(*self._last_step)
-                        if last <= 1e-9:
-                            return 0.0
-                        return sum(deltas[index][i]*self._last_step[i]
-                                   for i in range(3))/(length*last)
-                    best = max(plausible, key=_alignment)
-                    delta = deltas[best]
-                else:
-                    best = min(plausible, key=lambda index: lengths[index])
-                    delta = deltas[best]
+            if self._contact_confidence:
+                delta = self._contact_delta(deltas, lengths, plausible, world_feet, dt)
+            else:
+                delta = self._legacy_delta(deltas, lengths, plausible)
+            if delta is not None:
                 delta = [value*self.slip_scale for value in delta]
                 self.position = [self.position[i]+delta[i] for i in range(3)]
                 self._last_step = list(delta)
@@ -289,6 +367,10 @@ class LegOdometry:
                 self.stance_samples += 1
             else:
                 self.velocity = [0.0, 0.0, 0.0]
+                if self._contact_confidence:
+                    # A spike cannot become the next interval's starting foot.
+                    self.samples += 1
+                    return
         self.feet = feet
         self._feet, self._rotation, self._time = feet, rotation, now
         self.samples += 1

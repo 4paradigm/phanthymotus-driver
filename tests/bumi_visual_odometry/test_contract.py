@@ -10,14 +10,42 @@ from types import SimpleNamespace as NS
 import numpy as np
 import pytest
 
+from common.spatial_slam import validate_input_port
 from noetix.bumi.visual_odometry_contract import (CameraCalibration, ClockMap, Health,
-                                    camera_to_body, finite, make_sample, quat_matrix)
+                                    camera_to_body, finite, make_sample, quat_matrix,
+                                    slam_input_declaration)
 from noetix.bumi.visual_odometry import estimate, mount_transform, parameter_file
 
 
 def calibration():
     return dict(calibration_id='fixture', fixed_mount=True,
                 camera_to_body=dict(translation=[0.4, 0, 0.2], quaternion=[0, 0, 0, 1]))
+
+
+@pytest.mark.parametrize('rotation_only', [False, True])
+def test_shipped_mount_reports_body_origin_with_confirmed_translation(rotation_only):
+    from pathlib import Path
+    import yaml
+    from noetix.bumi.rgbd_camera import fixed_body_mount
+    from noetix.bumi.visual_odometry import VisualOdometryNode
+    config = yaml.safe_load((Path(__file__).resolve().parents[2] /
+                             'noetix/bumi/config.yaml').read_text())
+    node = object.__new__(VisualOdometryNode)
+    preset = config['plugins']['visual_odometry']['calibration']
+    if rotation_only:
+        preset['camera_to_body'].pop('translation', None)
+    node.calibration = CameraCalibration(preset)
+    node.namespace, node.segment, node.frame_id = 'robot', 'segment', 'robot_rgb_optical'
+    assert node.pose_reference() == ('body_axes' if rotation_only else 'body')
+    mount = node.slam_extrinsic()
+    assert not {'calibrated', 'assumed', 'source', 'version'} & mount.keys()
+    assert np.asarray(mount['matrix']).shape == (4, 4)
+    assert [row[3] for row in mount['matrix']] == [0., 0., 0., 1.]
+    capture_mount = fixed_body_mount(preset)
+    if rotation_only:
+        assert capture_mount is None
+    else:
+        np.testing.assert_allclose(capture_mount, mount['matrix'], atol=1e-12)
 
 
 def test_finite_rejects_nan_and_wrong_size():
@@ -27,16 +55,16 @@ def test_finite_rejects_nan_and_wrong_size():
             finite(bad, 3)
 
 
-def test_calibration_requires_a_measured_fixed_mount_only():
+def test_calibration_requires_numeric_static_geometry_only():
     with pytest.raises(ValueError):
         CameraCalibration({})
     c = CameraCalibration(calibration())
     assert c.id == 'fixture'
-    for key in ('camera_to_body', 'fixed_mount'):
-        data = calibration()
-        data.pop(key)
-        with pytest.raises(ValueError):
-            CameraCalibration(data)
+    data = calibration()
+    data.pop('camera_to_body')
+    with pytest.raises(ValueError):
+        CameraCalibration(data)
+    CameraCalibration({'camera_to_body': calibration()['camera_to_body']})
     bad = calibration()
     bad['fixed_mount'] = False
     with pytest.raises(ValueError):
@@ -123,7 +151,7 @@ def test_sample_never_invents_a_twist_or_a_pose_without_tracking():
     assert sample['pose'] is None
     assert sample['vendor']['source'] == 'rtabmap_rgbd_odometry'
     assert sample['vendor']['pose_reference'] == 'rgb_optical'
-    assert sample['vendor']['accuracy_validated'] is False
+    assert 'accuracy_validated' not in sample['vendor']
     assert sample['vendor']['status'] == 'initializing'
 
 
@@ -231,3 +259,58 @@ def test_one_point_eight_hz_capture_does_not_trip_the_camera_watchdog():
     quality = health.status(4*556_000_000)
     assert quality['status'] == 'tracking'
     assert quality['input_age_ms']['camera'] < 1000
+
+
+def test_slam_metadata_distinguishes_pose_time_from_publication_time():
+    health = healthy()
+    pose = dict(position=[1, 2, 3], quaternion=[0, 0, 0, 1],
+                frame_id='s_odom', child_frame_id='opt', covariance=[0.]*36)
+    sample = make_sample(health, 1_100_000_000, dict(stamp_ns=1_090_000_000, pose=pose))
+    assert sample['vendor']['motus_slam'] == {
+        'status': 'tracking', 'segment_id': 's',
+        'stamp_ns': 1_090_000_000,
+    }
+    assert sample['stamp_ms'] == 1090
+    lost = make_sample(health, 900_000_000_000, None)
+    assert lost['vendor']['motus_slam']['status'] == 'lost'
+    assert lost['vendor']['motus_slam']['stamp_ns'] is None
+    assert lost['pose'] is None
+
+
+def test_slam_input_declaration_only_contains_port_and_pose_geometry():
+    sample = make_sample(Health('s', None, started_ns=0), 100, None)
+    sample['vendor']['motus_slam'].update(
+        source_id='noetix/bumi/camera_color',
+        clock_mapping='shared_camera_mapper', clock_verified=False)
+    declaration = slam_input_declaration(
+        '/bumi/vo/odom', sample, fallback_child='s_base',
+        pose_reference='rgb_optical', extrinsic=None)
+    assert declaration['topic'] == '/bumi/vo/odom'
+    assert declaration['format'] == 'state/odom'
+    assert declaration['schema'] == 'motus.slam_input/1'
+    assert not {'clock', 'clock_id', 'reference_point', 'stamp_source', 'source_id'} & declaration.keys()
+    assert validate_input_port(declaration) is declaration
+    assert declaration['child_frame_id'] == 's_base'
+    assert declaration['segment_id'] == 's'
+    assert 'extrinsic' not in declaration
+
+
+def test_slam_input_declaration_retains_measured_pose_child_and_mount_evidence():
+    sample = make_sample(healthy(), 1_100_000_000, {
+        'stamp_ns': 1_090_000_000,
+        'pose': {'frame_id': 's_odom', 'child_frame_id': 's_base',
+                 'position': [0., 0., 0.], 'quaternion': [0., 0., 0., 1.]}})
+    sample['vendor']['motus_slam'].update(
+        source_id='noetix/bumi/camera_color',
+        clock_mapping='shared_camera_mapper', clock_verified=False)
+    mount = {'parent_frame': 's_base', 'child_frame': 'rgb',
+             'matrix': [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
+             'source': 'test_measurement', 'version': '1', 'calibrated': True}
+    declaration = slam_input_declaration(
+        '/vo', sample, fallback_child='not_the_pose_frame',
+        pose_reference='body', extrinsic=mount)
+    assert declaration['child_frame_id'] == 's_base'
+    assert declaration['segment_id'] == 's'
+    assert declaration['frame_id'] == 's_odom'
+    assert declaration['extrinsic'] == mount
+    assert not {'clock', 'clock_id', 'stamp_source', 'source_id'} & declaration.keys()

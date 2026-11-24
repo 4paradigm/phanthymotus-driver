@@ -61,8 +61,9 @@ def raw_ros(monkeypatch):
             self.data = data
     messages = {}
     node = NS(create_publisher=lambda cls, topic, qos: NS(
-        publish=messages.setdefault(topic, []).append))
-    monkeypatch.setitem(sys.modules, 'sensor_msgs.msg', NS(Image=Image, CameraInfo=Image))
+        publish=messages.setdefault(topic, []).append,
+        get_subscription_count=lambda: 1))
+    monkeypatch.setitem(sys.modules, 'sensor_msgs.msg', NS(Image=Image, CameraInfo=Image, CompressedImage=Image))
     monkeypatch.setitem(sys.modules, 'std_msgs.msg', NS(String=String))
     return messages, node
 

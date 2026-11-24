@@ -161,6 +161,18 @@ def test_measured_slip_scale_is_applied_by_default():
                                                abs=1e-9)
 
 
+def test_default_estimator_keeps_fixed_step_limit_after_slip_correction():
+    estimator = module.LegOdometry()
+    feet = stand_feet()
+    estimator.observe_feet(feet, IDENTITY, 0.0)
+    # A 15 mm raw step becomes 25.5 mm after the default slip correction.
+    estimator.observe_feet([[foot[0]-0.015, foot[1], foot[2]] for foot in feet],
+                           IDENTITY, 0.075)
+    assert estimator.stance_samples == 0
+    assert estimator.position == [0.0, 0.0, 0.0]
+    assert estimator.velocity == [0.0, 0.0, 0.0]
+
+
 def test_opposite_support_steps_do_not_cancel():
     estimator = module.LegOdometry(slip_scale=1.0)
     feet = stand_feet()

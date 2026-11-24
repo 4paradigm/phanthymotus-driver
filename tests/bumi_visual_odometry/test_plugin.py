@@ -41,26 +41,37 @@ def executor(monkeypatch):
         def __init__(self, *args):
             self.messages = []
             self.topics = {}
+            self.publishers = []
+            self.subscriptions = []
             self.timers = []
             self.time = 10**10
             self.removed = []
             self.destroyed = False
 
         def get_clock(self):
-            return NS(now=lambda: NS(nanoseconds=self.time))
+            return NS(now=lambda: NS(nanoseconds=self.time, to_msg=lambda: self.time))
 
         def create_publisher(self, cls, topic, qos):
             messages = self.messages if topic.endswith(module.OUTPUT_TOPIC) else []
             self.topics[topic] = messages
-            return NS(publish=messages.append)
+            publisher = NS(topic=topic, messages=messages, publish=messages.append)
+            self.publishers.append(publisher)
+            return publisher
+
+        def create_subscription(self, cls, topic, callback, qos):
+            subscription = NS(topic=topic)
+            self.subscriptions.append(subscription)
+            return subscription
 
         def create_timer(self, *args):
             self.timers.append(args)
 
         def destroy_subscription(self, sub):
+            self.subscriptions.remove(sub)
             self.removed.append(sub)
 
         def destroy_publisher(self, pub):
+            self.publishers.remove(pub)
             self.removed.append(pub)
 
         def destroy_node(self):
@@ -97,6 +108,42 @@ def plugin(executor, monkeypatch):
     return instance
 
 
+@pytest.fixture
+def launch_estimator(plugin, monkeypatch):
+    def transform():
+        return NS(header=NS(), transform=NS(translation=NS(), rotation=NS()))
+
+    class StaticTransformBroadcaster:
+        def __init__(self, node):
+            self.pub_tf = node.create_publisher(object, '/tf_static', None)
+
+        def sendTransform(self, transforms):
+            self.pub_tf.publish(transforms)
+
+    for name, fake in (
+            ('nav_msgs.msg', NS(Odometry=object)),
+            ('rtabmap_msgs.msg', NS(OdomInfo=object, RGBDImage=object)),
+            ('geometry_msgs.msg', NS(TransformStamped=transform)),
+            ('tf2_ros', NS(StaticTransformBroadcaster=StaticTransformBroadcaster))):
+        monkeypatch.setitem(sys.modules, name, fake)
+
+    node = plugin._node
+    monkeypatch.setattr(node.children, 'start', lambda *args, **kwargs: None)
+    plugin.dispatch('start', {})
+
+    def launch():
+        node.frame_id = 'ubuntu_rgb_optical'
+        node.launch()
+
+    return launch
+
+
+def static_tf_parents(node):
+    return [tf.header.frame_id for publisher in node.node.publishers
+            if publisher.topic == '/tf_static' for transforms in publisher.messages
+            for tf in transforms if tf.child_frame_id == 'ubuntu_rgb_optical']
+
+
 def last(plugin):
     return json.loads(plugin._node.node.messages[-1].data)
 
@@ -107,6 +154,9 @@ def test_card_is_a_read_only_sensor_on_its_own_topic(plugin):
     tool = tools[0]
     assert tool['name'] == 'rgbd_visual_odometry'
     assert tool['type'] == 'sensor' and tool['multiInstance'] is False
+    # Both pre-existing outputs must stay declared: the concise status summary
+    # first, then the full odometry sample. Saved canvas layouts reference these
+    # ports by index, so dropping one is not an additive change.
     assert tool['topic_out'] == [
         {'topic': '/robot/bumi_visual_odometry/status', 'format': 'data/json'},
         {'topic': '/robot/bumi_visual_odometry/state/odom', 'format': 'state/odom'}]
@@ -115,6 +165,7 @@ def test_card_is_a_read_only_sensor_on_its_own_topic(plugin):
     assert 'x-action-params' not in tool['inputSchema']
     assert 'configSchema' not in tool
     assert 'no IMU/EKF/fusion' in tool['description']
+    assert '/robot/bumi_visual_odometry/status' in tool['description']
 
 
 def test_start_binds_the_bundle_namespace_and_waits_for_inputs(plugin, executor):
@@ -150,10 +201,48 @@ def test_reset_moves_to_a_new_segment_and_reports_the_old_one_lost(plugin):
                for s in samples)
 
 
+@pytest.mark.parametrize('action', ['stop', 'reset', 'recover'])
+def test_segment_teardown_removes_the_retained_static_tf(plugin, launch_estimator, action):
+    node = plugin._node
+    launch_estimator()
+    initial_parent = node.base_frame()
+    assert static_tf_parents(node) == [initial_parent]
+    if action == 'recover':
+        node.request_restart('camera input restarted')
+        node.tick()
+    else:
+        plugin.dispatch(action, {})
+    assert static_tf_parents(node) == []
+    if action == 'stop':
+        plugin.dispatch('start', {})
+    launch_estimator()
+    assert node.base_frame() != initial_parent
+    assert static_tf_parents(node) == [node.base_frame()]
+
+
+def test_estimator_launch_failure_releases_the_partial_segment_endpoints(
+        plugin, launch_estimator, monkeypatch):
+    node = plugin._node
+    publishers_before = list(node.node.publishers)
+
+    def fail_start(*args, **kwargs):
+        assert static_tf_parents(node) == [node.base_frame()]
+        raise OSError('estimator executable missing')
+
+    with monkeypatch.context() as patch:
+        patch.setattr(node.children, 'start', fail_start)
+        with pytest.raises(OSError, match='estimator executable missing'):
+            launch_estimator()
+    assert node.node.publishers == publishers_before
+    assert node.node.subscriptions == []
+    launch_estimator()
+    assert static_tf_parents(node) == [node.base_frame()]
+
+
 def test_measured_mount_only_changes_the_pose_reference(plugin):
     result = plugin.dispatch('config', {'calibration': calibration()})
     assert result['pose_reference'] == 'body'
-    assert result['calibration_id'] == 'fixture'
+    assert 'calibration_id' not in result
     assert last(plugin)['vendor']['pose_reference'] == 'body'
 
 
@@ -168,7 +257,8 @@ def test_info_is_the_default_action(plugin):
     result = plugin.dispatch('rgbd_visual_odometry', {})
     assert result['state'] == 'idle'
     assert result['namespace'] == 'robot'
-    assert result['odom_interface']['provides'] == []
+    assert 'odom_interface' not in result
+    assert result['input_metadata'][0]['format'] == 'state/odom'
     assert plugin.dispatch('info', {})['state'] == 'idle'
 
 
@@ -194,20 +284,20 @@ def tracking(plugin):
 
 
 def summary(node):
-    return json.loads(node.node.topics['/robot/bumi_visual_odometry/status'][-1].data)
+    return json.loads(node.node.messages[-1].data)['vendor']
 
 
-def test_summary_is_small_and_measures_segment_displacement_without_changing_odom(plugin):
+def test_odom_carries_segment_displacement_with_a_status_companion(plugin):
     node = tracking(plugin)
     node.publish()
-    assert summary(node) == dict(status='tracking', turn_angle_deg=None,
-                                displacement_m=0., position_m=[1., 2., 3.],
-                                pose_reference='rgb_optical', age_ms=0., reason=None)
+    assert summary(node)['status'] == 'tracking'
+    assert summary(node)['displacement_m'] == 0.
+    status = json.loads(node.node.topics['/robot/bumi_visual_odometry/status'][-1].data)
+    assert status['status'] == 'tracking'
+    assert status['displacement_m'] == 0.
     node.estimate['pose']['position'] = [1., 2., 5.123456]
-    node.last_summary_ns = None
     node.publish()
-    assert summary(node)['displacement_m'] == 2.123
-    assert summary(node)['position_m'] == [1., 2., 5.123]
+    assert summary(node)['displacement_m'] == pytest.approx(2.123456)
     assert last(plugin)['pose']['position'] == [1., 2., 5.123456]
     assert last(plugin)['pose']['covariance'] == [0.]*36
     assert last(plugin)['vendor']['visual_diagnostic']['inliers'] == 20
@@ -230,19 +320,17 @@ def test_turn_angle_is_relative_to_the_first_imu_sample(plugin, monkeypatch):
     node.body_imu_pub = NS(publish=lambda msg: None)
     node._publish_body_imu([0., 0., 0., 1.], [0., 0., 0.], [0., 0., 0.],
                            node.now(), 'read_completion')
-    node.last_summary_ns = None
     node.publish()
     assert summary(node)['turn_angle_deg'] == 0.
     node.node.time += 100_000_000
     node._publish_body_imu([0., 0., math.sin(math.pi/4), math.cos(math.pi/4)],
                            [0., 0., 0.], [0., 0., 0.],
                            node.now(), 'read_completion')
-    node.last_summary_ns = None
     node.publish()
-    assert summary(node)['turn_angle_deg'] == 90.
+    assert summary(node)['turn_angle_deg'] == pytest.approx(90.)
 
 
-def test_summary_throttle_keeps_the_twenty_hz_odom_and_immediate_lost_transition(
+def test_both_outputs_keep_twenty_hz_odom_and_immediate_lost_transition(
         plugin, monkeypatch):
     node = tracking(plugin)
     clock = [0]
@@ -251,18 +339,22 @@ def test_summary_throttle_keeps_the_twenty_hz_odom_and_immediate_lost_transition
         clock[0] = i*50_000_000
         node.publish()
     assert len(node.node.messages) == 20
-    assert len(node.node.topics['/robot/bumi_visual_odometry/status']) == 5
+    statuses = node.node.topics['/robot/bumi_visual_odometry/status']
+    # 20 odometry samples over 1 s, but the same tracking state is summarised
+    # at the legacy 200 ms cadence: t=0, 200, 400, 600, 800 ms.
+    assert len(statuses) == 5
     assert node.node.timers[0][0] == .05
     # Lose freshness after the one-second camera watchdog: do not wait for 5 Hz.
     clock[0] = 1_450_000_000
     node.node.time += 1_000_000_001
     node.tick()
-    assert len(node.node.topics['/robot/bumi_visual_odometry/status']) == 6
     assert summary(node)['status'] == 'lost'
-    assert summary(node)['position_m'] is None
     assert summary(node)['displacement_m'] is None
-    assert summary(node)['age_ms'] == 1000.
     assert last(plugin)['pose'] is None
+    lost = json.loads(statuses[-1].data)
+    assert lost['status'] == 'lost'
+    assert lost['position_m'] is None
+    assert lost['reason']
 
 
 def test_stop_and_reset_do_not_display_a_previous_segment_pose(plugin):
@@ -270,7 +362,7 @@ def test_stop_and_reset_do_not_display_a_previous_segment_pose(plugin):
     node.publish()
     plugin.dispatch('stop', {})
     assert summary(node)['status'] == 'initializing'
-    assert summary(node)['position_m'] is None
+    assert summary(node)['motus_slam']['status'] == 'initializing'
     assert summary(node)['displacement_m'] is None
     plugin.dispatch('start', {})
     tracking(plugin)
@@ -279,15 +371,86 @@ def test_stop_and_reset_do_not_display_a_previous_segment_pose(plugin):
     assert summary(node)['reason'] is None
 
 
+def test_preflight_info_is_side_effect_free_and_normal_info_remains_compatible(plugin):
+    node = tracking(plugin)
+    before_odom = len(node.node.messages)
+    before_status = len(node.node.topics[node.status_topic])
+    before_origin = node.summary_origin
+    snapshot = plugin.dispatch('info', {'read_only': True})
+    assert snapshot['sample']['vendor']['status'] == 'tracking'
+    assert 'clock' not in snapshot['input_metadata'][0]
+    assert len(node.node.messages) == before_odom
+    assert len(node.node.topics[node.status_topic]) == before_status
+    assert node.summary_origin == before_origin
+
+    legacy = plugin.dispatch('info', {})
+    assert len(node.node.messages) == before_odom + 1
+    assert legacy['sample'] == last(plugin)
+    assert node.summary_origin == [1., 2., 3.]
+
+
 def test_info_keeps_full_sample_and_exposes_it_in_canvas_details(plugin):
     node = tracking(plugin)
     result = plugin.dispatch('info', {})
-    assert result['topic_out'][0]['format'] == 'data/json'
+    assert [port['format'] for port in result['topic_out']] == ['data/json', 'state/odom']
     assert result['odom_topic'] == '/robot'+module.OUTPUT_TOPIC
     assert result['sample'] == last(plugin)
     assert result['quality']['visual_diagnostic']['inliers'] == 20
     assert '"covariance"' in result['description']
     assert '"visual_diagnostic"' in result['description']
+
+
+def test_card_declares_and_publishes_both_status_and_odometry_ports(plugin, monkeypatch):
+    """Regression for the non-additive removal: both pre-existing ports stay.
+
+    The card contract must keep declaring the ``data/json`` status summary next
+    to ``state/odom`` and must publish both across the lifecycle, with the
+    legacy summary payload and coherent SLAM/status values. Canvas layouts and
+    ROS subscribers already depend on the status port, so removing it cannot be
+    called additive.
+    """
+    node = plugin._node
+    status_topic = '/robot/bumi_visual_odometry/status'
+    odom_topic = '/robot/bumi_visual_odometry/state/odom'
+
+    # 1) Declared: get_tools and info() agree, status port first.
+    for ports in (plugin.get_tools()[0]['topic_out'],
+                  plugin.dispatch('info', {})['topic_out']):
+        assert [(p['topic'], p['format']) for p in ports] == [
+            (status_topic, 'data/json'), (odom_topic, 'state/odom')]
+    statuses = node.node.topics[status_topic]
+    assert json.loads(statuses[-1].data)['status'] == 'initializing'
+
+    # 2) Published while tracking, with the unchanged legacy summary shape.
+    clock = [10**12]
+    monkeypatch.setattr(module.time, 'monotonic_ns', lambda: clock[0])
+    tracking(plugin)
+    sample = node.publish()
+    summary_msg = json.loads(statuses[-1].data)
+    assert set(summary_msg) == {'status', 'turn_angle_deg', 'displacement_m',
+                                'position_m', 'pose_reference', 'age_ms', 'reason'}
+    assert summary_msg['status'] == sample['vendor']['status'] == \
+        sample['vendor']['motus_slam']['status'] == 'tracking'
+    assert summary_msg['pose_reference'] == sample['vendor']['pose_reference']
+    assert summary_msg['position_m'] == [1., 2., 3.]
+    assert summary_msg['displacement_m'] == 0.
+
+    # 3) A state transition publishes immediately; steady state is throttled.
+    clock[0] += 50_000_000
+    node.publish()
+    assert json.loads(statuses[-1].data)['status'] == 'tracking'
+    node.health.fault('camera stopped')
+    node.publish()
+    lost = json.loads(statuses[-1].data)
+    assert lost['status'] == 'lost'
+    assert last(plugin)['vendor']['motus_slam']['status'] == 'lost'
+
+    # 4) Stopping reports initializing in both the summary and SLAM metadata.
+    node.health = module.Health(node.segment, None, node.now())
+    plugin.dispatch('stop', {})
+    stopped = json.loads(statuses[-1].data)
+    assert stopped['status'] == 'initializing'
+    assert last(plugin)['vendor']['motus_slam']['status'] == 'initializing'
 
 
 # ── recoverable faults: one bad sample must not kill the segment ─────────────
@@ -327,6 +490,19 @@ def test_a_single_pose_glitch_is_dropped_not_latched(plugin):
     assert node.health.reason is None
     assert node.estimate['pose']['position'] == [.002, 0., 0.]
     assert node.jump_count == 0
+
+
+def test_rejected_pose_keeps_accepted_capture_stamp(plugin):
+    plugin._node.node.time += 123_456  # Capture precision must survive publication.
+    node = tracking(plugin)
+    node.calibration = module.CameraCalibration(calibration())
+    accepted_ns = node.estimate['stamp_ns']
+    assert node.publish()['vendor']['visual_stamp_ns'] == accepted_ns
+    feed(node, [10., 2., 3.])  # Paired diagnostics, but an impossible pose jump.
+    sample = node.publish()
+    assert sample['vendor']['status'] == 'tracking'
+    assert sample['pose']['position'] == [1., 2., 3.]
+    assert sample['vendor']['visual_stamp_ns'] == accepted_ns
 
 
 def test_persistent_pose_reset_requests_a_new_segment(plugin):
@@ -491,3 +667,28 @@ def test_output_topics_follow_the_bundle_namespace(executor):
     assert tool['topic_out'] == [
         {'topic': '/alpha'+module.STATUS_TOPIC, 'format': 'data/json'},
         {'topic': '/alpha'+module.OUTPUT_TOPIC, 'format': 'state/odom'}]
+
+
+def test_card_owns_camera_and_releases_it_on_partial_start(executor, monkeypatch):
+    camera_events = []
+    state_imu_events = []
+    camera = NS(start_card=lambda name: camera_events.append(('start', name)),
+                stop_card=lambda name: camera_events.append(('stop', name)))
+    instance = module.VisualOdometryPlugin({'imu_assisted': True, 'imu_source': 'state'},
+        'robot', executor, camera_plugin=camera, set_visual_imu_enabled=state_imu_events.append)
+
+    def failed_bind(namespace):
+        raise RuntimeError('offline bind failure')
+
+    monkeypatch.setattr(instance._node, 'bind_inputs', failed_bind)
+    with pytest.raises(RuntimeError, match='offline bind failure'):
+        instance.dispatch('start', {})
+    assert not instance._node.active
+    assert camera_events == [('start', 'visual_odometry'), ('stop', 'visual_odometry')]
+    assert state_imu_events == [True, False]
+
+    monkeypatch.setattr(instance._node, 'bind_inputs', lambda namespace: None)
+    instance.dispatch('start', {})
+    instance.dispatch('stop', {})
+    assert camera_events[-2:] == [('start', 'visual_odometry'), ('stop', 'visual_odometry')]
+    assert state_imu_events[-2:] == [True, False]
