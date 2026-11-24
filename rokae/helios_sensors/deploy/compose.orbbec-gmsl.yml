@@ -1,0 +1,17 @@
+# Use after the generated deployment file. Discover the devices on the host
+# and map only the nodes owned by the two configured Gemini cameras.
+services:
+  rokae-helios-sensors:
+    volumes:
+      - ${HELIOS_ORBBEC_SDK_HOST_DIR:?set the installed Orbbec SDK 2.9.3 directory}:/opt/orbbec-sdk:ro
+      # The SDK initializes libusb and udev even for GMSL. These mounts let it
+      # enumerate devices. The cgroup grants I/O only to the V4L2 nodes below.
+      - /dev/bus/usb:/dev/bus/usb:ro
+      - /run/udev:/run/udev:ro
+    devices:
+      - ${HELIOS_ORBBEC_IMU_COLOR_DEV:?set the IMU camera color device}:${HELIOS_ORBBEC_IMU_COLOR_DEV}:rw
+      - ${HELIOS_ORBBEC_IMU_DEPTH_DEV:?set the IMU camera depth device}:${HELIOS_ORBBEC_IMU_DEPTH_DEV}:rw
+      - ${HELIOS_ORBBEC_IMU_SUBDEV:?set the IMU camera depth subdevice}:${HELIOS_ORBBEC_IMU_SUBDEV}:rw
+      - ${HELIOS_ORBBEC_DEPTH_COLOR_DEV:?set the depth camera color device}:${HELIOS_ORBBEC_DEPTH_COLOR_DEV}:rw
+      - ${HELIOS_ORBBEC_DEPTH_DEPTH_DEV:?set the depth camera depth device}:${HELIOS_ORBBEC_DEPTH_DEPTH_DEV}:rw
+      - ${HELIOS_ORBBEC_DEPTH_SUBDEV:?set the depth camera depth subdevice}:${HELIOS_ORBBEC_DEPTH_SUBDEV}:rw

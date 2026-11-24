@@ -1,0 +1,9 @@
+# Apply after the GMSL overlay when the depth camera captures only on the host.
+services:
+  rokae-helios-sensors:
+    group_add:
+      - "${HELIOS_DEPTH_SOCKET_GID:?set the host group ID of the depth socket}"
+    volumes:
+      - ${HELIOS_DEPTH_SOCKET_DIR:?set the host depth socket directory}:/run/helios-depth:ro
+    environment:
+      HELIOS_ORBBEC_DEPTH_SOCKET: /run/helios-depth/depth.sock

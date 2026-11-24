@@ -1,0 +1,30 @@
+rokae-helios-sensors:
+  image: __IMAGE__
+  container_name: embodied-rokae-helios-sensors
+  network_mode: host
+  ipc: host
+  init: true
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  tmpfs:
+    - /tmp:rw,nosuid,nodev,size=32m
+  volumes:
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+  environment:
+    ROS_DOMAIN_ID: "42"
+    RMW_IMPLEMENTATION: rmw_fastrtps_cpp
+    FASTRTPS_DEFAULT_PROFILES_FILE: /opt/phanthy-motus/dds-local.xml
+    ROS_LOG_DIR: /tmp/ros-log
+    AGENT_CORE_URL: ${HELIOS_AGENT_CORE_URL:-https://127.0.0.1:15678}
+    HELIOS_ORBBEC_IMU_SERIAL: ${HELIOS_ORBBEC_IMU_SERIAL:-}
+    HELIOS_ORBBEC_DEPTH_SERIAL: ${HELIOS_ORBBEC_DEPTH_SERIAL:-}
+    HELIOS_ORBBEC_IMU_FRAME_ID: ${HELIOS_ORBBEC_IMU_FRAME_ID:-helios_gemini_imu_frame}
+    HELIOS_ORBBEC_DEPTH_FRAME_ID: ${HELIOS_ORBBEC_DEPTH_FRAME_ID:-helios_gemini_depth_optical_frame}
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  stop_grace_period: 10s
+  restart: unless-stopped

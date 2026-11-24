@@ -1,0 +1,4 @@
+# Use for an existing non-host-network Core to share both MCP and DDS loopback.
+services:
+  rokae-helios-sensors:
+    network_mode: "container:${HELIOS_CORE_CONTAINER:?set the active Core container name}"

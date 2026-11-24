@@ -1,0 +1,14 @@
+id: rokae-helios-sensors-driver
+name: 珞石 Helios-2.1 相机传感器
+category: driver
+hardware_provider: rokae
+hardware_model: helios-2.1
+image_name: rokae-helios-sensors
+port: 15750
+mcp_url: http://localhost:15750/mcp
+description: Read-only Gemini 335Lg IMU and native depth from the on-robot Orbbec SDK
+build_context_extras:
+  - ../../common
+cards:
+  - {name: imu, type: sensor}
+  - {name: camera_depth, type: sensor}
