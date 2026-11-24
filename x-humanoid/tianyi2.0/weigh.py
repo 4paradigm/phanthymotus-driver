@@ -1224,6 +1224,8 @@ def _default_acp_notify(action_id: str, status: str, result: dict, tool: str = "
 class WeighPlugin:
     """腕部六维力称重卡。自己不创建任何发布者；pose/retract 经 arm 卡下发运动。"""
 
+    PREFIX = "weigh"
+
     def __init__(self, plugin_config: dict, namespace: str, ros2, arm_call=None, hand_call=None,
                  acp_notify=None, servo_call=None):
         """arm_call(args) → dict：由 bundle 提供，等同于对 arm 卡调用 tools/call。

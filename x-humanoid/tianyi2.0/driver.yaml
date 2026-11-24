@@ -10,8 +10,10 @@ description: "天轶2.0 Pro — 35DOF 人形机器人 (轮式底盘 + 双臂 + �
 build_context_extras:
   - ../../common
 # Cards this bundle exposes, for resource-center's driver marketplace listing.
-# Kept in sync by hand with config.yaml's `plugins.*.enabled` (all plugins are
-# currently enabled) — joints_bridge is a standalone ROS process with no MCP
+# Kept in sync by hand with the plugins main.py can register. All of them are
+# enabled in config.yaml except the opt-in experimental `weigh` card
+# (`plugins.weigh.enabled: false`), which is listed so an image that enables it
+# is discoverable — joints_bridge is a standalone ROS process with no MCP
 # tool of its own, and ext_devices.py's ExtCameraPlugin is dead code (never
 # registered in main.py, no `ext_camera` key in config.yaml) so it is excluded.
 cards:
@@ -52,3 +54,4 @@ cards:
   - { name: ext_mic,            type: sensor }
   - { name: light,              type: actuator }
   - { name: vision_capture,     type: actuator }
+  - { name: weigh,              type: actuator }

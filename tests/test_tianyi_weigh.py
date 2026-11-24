@@ -1114,3 +1114,9 @@ def test_stop_with_stuck_worker_defers_teardown_and_blocks_new_actions(hanging, 
     # 只有卡住的那一条 move_pos 最终送达；取消之后没有第二段，也没有冻结指令
     assert [c["action"] for c in hanging.arm_calls[n:]] == ["move_pos"]
     assert not [c for c in hanging.hand_calls if c["action"] == "set_fingers_raw"]
+
+
+def test_plugin_prefix_and_marketplace_listing():
+    assert weigh.WeighPlugin.PREFIX == "weigh"
+    manifest = (BUNDLE / "driver.yaml").read_text(encoding="utf-8")
+    assert re.search(r"^\s*- \{ name: weigh,\s+type: actuator \}\s*$", manifest, re.M)
