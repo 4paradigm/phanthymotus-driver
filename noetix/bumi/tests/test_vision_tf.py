@@ -6,6 +6,7 @@ a vision-to-tf converter produce plausible but wrong transforms.
 
 from __future__ import annotations
 
+import json
 import math
 import sys
 import types
@@ -267,6 +268,57 @@ def test_start_without_an_input_topic_reports_idle_not_running(monkeypatch):
                                  "bumi_test", _FakeExecutor())
     result = plugin.dispatch("start", {})
     assert result == {"state": "idle", "degraded": "no_input_topic"}
+    plugin.stop()
+
+
+def test_one_message_then_silent_does_not_republish_forever(monkeypatch):
+    """P1 regression: a silent source must not replay one sample forever, and
+    its target must expire after ttl_ms measured from the real observation.
+    """
+    card = _load_card(monkeypatch)
+    plugin = card.VisionTfPlugin(
+        {"enabled": True, "source_name": "ar", "adapter": "pose", "ttl_ms": 200},
+        "bumi_test", _FakeExecutor())
+
+    published = []
+    plugin._pub.publish = lambda msg: published.append(json.loads(msg.data))
+
+    # A controllable clock (seconds). One message arrives at t=0.
+    now = [0.0]
+    monkeypatch.setattr(card.time, "time", lambda: now[0])
+
+    result = plugin.dispatch("start", {"input_topic": "/bumi_test/ar/poses"})
+    assert result["state"] == "running"
+    token = plugin._run_token
+
+    # Simulate exactly one callback delivering one AR pose.
+    payload = json.dumps(
+        {"marker_id": 3, "position": [1, 2, 3], "orientation": [0, 0, 0, 1]})
+    with plugin._frame_lock:
+        plugin._latest_raw = payload
+        plugin._latest_at = 0.0
+        plugin._seq += 1
+
+    # First tick converts it -> one publish with the target.
+    plugin._tick(token)
+    assert len(published) == 1
+    assert [t["child"] for t in published[-1]["transforms"]] == ["vision_ar_3"]
+
+    # Many silent ticks inside the TTL -> no republish of the stale transform.
+    for _ in range(20):
+        now[0] = 0.05  # 50 ms later, well within ttl_ms=200
+        plugin._tick(token)
+    assert len(published) == 1, "silent source replayed a stale transform"
+
+    # Past the TTL -> one dropped event fires, then silence stays silent.
+    now[0] = 0.30  # 300 ms > 200 ms TTL
+    plugin._tick(token)
+    assert len(published) == 2
+    assert "vision_ar_3" in published[-1]["dropped"]
+    assert published[-1]["transforms"] == []
+    plugin._tick(token)
+    assert len(published) == 2, "expired target kept emitting dropped events"
+    assert plugin._targets == {}
     plugin.stop()
 
 

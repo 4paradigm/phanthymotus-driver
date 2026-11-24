@@ -511,13 +511,16 @@ are valid URDF and this bundle does not run dynamics.
 
 ### Where the camera is, and which parent link
 
-The camera sits above the waist. Its parent link is `base_link`.
+The camera sits in the head, which rotates with the waist. Its parent link is
+`waist_yaw_link`.
 
-> **ASSUMED — not yet verified on the robot.** The deciding test is: stand the
-> robot, yaw `waist_yaw` 30°, and watch whether the camera image follows. If it
-> follows, the parent must be `waist_yaw_link` (the whole tree is wrong on a turn
-> otherwise); if it does not, `base_link` is correct. This has not been run, so
-> `base_link` is recorded as an assumption, not a measurement.
+> **Verified on the robot (A5 acceptance).** Turning the upper body while the
+> robot is disabled makes the head — and therefore the camera image — follow,
+> matching the official parts diagram (camera in the head bezel). The upstream
+> URDF grouping the head into the `base_link.STL` mesh is a motion-control
+> modelling simplification, not the physical mount. Parenting the camera to
+> `base_link` would hold the frames still while the head turns, injecting a
+> systematic error into every downstream vision-to-tf result.
 
 ### Mount translation
 
@@ -559,23 +562,16 @@ machine-specific or per-start prefixes, so they can never be hard-coded:
 | optical axes (x right / y down / z deep) | `camera_optical_frame` | `<hostname>_rgb_optical` | `visual_inputs.py` — `f'{self.namespace}_rgb_optical'` (hostname from `main.py`) |
 
 These two pairs are the **same physical frames under different names**, not two
-separate cameras. Today the URDF tree (`base_link → camera_link →
-camera_optical_frame`) and the odometry tree (`bumi_visual_<uuid>_base →
-<hostname>_rgb_optical`) are **two disconnected trees** — a
-`lookup(base_link → <hostname>_rgb_optical)` reports `not connected`.
-
-Connecting them is **not part of this change**: this change only declares the
-frames in the URDF asset. The only broadcaster in this bundle today is
-`visual_odometry.py`, which publishes the estimator-private
-`bumi_visual_<uuid>_base → <hostname>_rgb_optical` pair; nothing yet publishes
-the `base_link → camera_link → camera_optical_frame` static chain onto
-`/tf_static`. Until that broadcaster exists, `lookup(base_link →
-camera_optical_frame)` reports `not connected` by design, not by accident. A
-future consumer that publishes that chain (or runs a correctly configured
-`robot_state_publisher`) must link the two trees explicitly — e.g. a
-`camera_link → bumi_visual_*_base` identity link — rather than assume they
-coincide, and must not hard-code a parent frame in place of the `frame_id`
-already carried by the input image header.
+separate cameras. The URDF tree (`base_link → waist_yaw_link → camera_link →
+camera_optical_frame`) is published on `/tf_static` by the `tf_tree` card below,
+so a `lookup(base_link → camera_optical_frame)` now resolves. The odometry tree
+(`bumi_visual_<uuid>_base → <hostname>_rgb_optical`) is still estimator-private
+and broadcast separately by `visual_odometry.py`; the two trees remain
+**disconnected** — a `lookup(base_link → <hostname>_rgb_optical)` reports
+`not connected`. Any consumer that needs both must link them explicitly (e.g.
+a `camera_link → bumi_visual_*_base` identity link) rather than assume the
+same-physical name pairs coincide automatically, and must not hard-code a parent
+frame in place of the `frame_id` already carried by the input image header.
 
 ## `vision_tf` card — turn a vision localisation into a tf transform
 

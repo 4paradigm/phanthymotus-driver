@@ -363,7 +363,8 @@ def validate_config(cfg):
                pose_direction=direction, units=units, ttl_ms=ttl_ms,
                min_confidence=min_confidence, focal_px=focal_px,
                publish_rate_hz=rate, image_width=width, image_height=height,
-               source_name=source, child_prefix=str(cfg.get("child_prefix", "vision")))
+               source_name=source)
+    cfg.pop("child_prefix", None)  # never a real knob; child name is vision_<source>_<id>
     return cfg
 
 

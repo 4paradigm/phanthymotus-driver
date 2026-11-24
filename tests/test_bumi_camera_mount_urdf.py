@@ -100,19 +100,23 @@ def test_urdf_still_declares_exactly_the_21_revolute_joints():
     assert revolute == sorted(expected)
 
 
-# ── 2. the camera chain reaches base_link through fixed joints only ───────────
+# ── 2. the camera hangs off the waist through fixed joints only ──────────────
 
-def test_the_camera_chain_reaches_base_link():
+def test_the_camera_chain_reaches_waist_yaw_link():
     joint_map = _joint_map()
     chain = _parent_chain("camera_optical_frame", joint_map)
 
     links = [link for link, _ in chain]
     types = [typ for _, typ in chain]
 
-    assert links == ["camera_optical_frame", "camera_link"]
-    assert set(types) == {"fixed"}
-    # The camera_link's parent is base_link, the tree root.
-    assert joint_map["camera_mount_joint"].find("parent").get("link") == "base_link"
+    # Both camera joints are fixed; the chain terminates at waist_yaw_link,
+    # which is a root in this motion-control URDF. The camera links come first.
+    assert links == ["camera_optical_frame", "camera_link", "waist_yaw_link"]
+    assert joint_map["camera_optical_joint"].get("type") == "fixed"
+    assert joint_map["camera_mount_joint"].get("type") == "fixed"
+    # On-robot A5 finding: the head camera yaws with the waist, so the mount
+    # parent must be waist_yaw_link, not base_link.
+    assert joint_map["camera_mount_joint"].find("parent").get("link") == "waist_yaw_link"
 
 
 # ── 3. the optical-frame rotation matches the calibration quaternion ──────────

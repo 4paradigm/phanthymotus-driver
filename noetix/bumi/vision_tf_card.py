@@ -60,6 +60,11 @@ class VisionTfPlugin:
         self._frame_lock = threading.Lock()
         self._latest_raw = None
         self._latest_at = 0.0
+        # Monotonic callback sequence. A single received message must be
+        # converted exactly once — re-feeding it on every worker tick refreshes
+        # each target's last-seen time and makes its TTL never expire.
+        self._seq = 0
+        self._converted_seq = -1
         # child frame -> last-seen monotonic ms, for TTL dropping.
         self._targets = {}
 
@@ -151,11 +156,13 @@ class VisionTfPlugin:
         self._stop_event = threading.Event()
         self._last_error = None
         self._targets.clear()
+        self._converted_seq = -1
 
         def _on_json(msg: String):
             with self._frame_lock:
                 self._latest_raw = msg.data
                 self._latest_at = time.time() * 1000.0
+                self._seq += 1
 
         self._sub = self._node.create_subscription(
             String, input_topic, _on_json, _LATEST_QOS)
@@ -230,43 +237,71 @@ class VisionTfPlugin:
 
     # ── Worker ───────────────────────────────────────────────────────────────
 
+    def _tick(self, run_token) -> None:
+        """Process at most one new sample, or sweep TTL on a silent source.
+
+        Kept separate from the scheduling loop so offline tests can drive it
+        deterministically (and pin the single-message-then-silent behaviour).
+        """
+        with self._frame_lock:
+            raw = self._latest_raw
+            received_at = self._latest_at
+            seq = self._seq
+
+        # Only convert a message the first time we see its sequence. Feeding
+        # the same raw back every tick would refresh every target's last-seen
+        # stamp and keep a stale transform alive forever.
+        is_new = raw is not None and seq != self._converted_seq
+        now_ms = time.time() * 1000.0
+
+        try:
+            if is_new:
+                parsed = json.loads(raw)
+                self._received += 1
+                batch = spec.transforms_from_json(
+                    parsed, self._config, receive_ms=received_at,
+                    targets=self._targets)
+                self._converted_seq = seq
+                self._accepted += len(batch["transforms"])
+                self._rejected += batch["rejected"]
+                if batch["last_error"]:
+                    self._last_error = batch["last_error"]
+            else:
+                # No new sample. Pass an empty batch so transforms_from_json
+                # only runs its TTL sweep against the wall clock — targets
+                # whose last real observation aged out move to `dropped`.
+                batch = spec.transforms_from_json(
+                    [], self._config, receive_ms=now_ms,
+                    targets=self._targets)
+
+            payload = spec.build_payload(self._config, batch)
+            if payload["transforms"]:
+                self._degraded = ""
+            elif not self._targets:
+                # No live targets left: either we never got a sample or the
+                # last one aged out. Both mean the input is not producing.
+                self._degraded = "input_stale"
+
+            # Publish on a fresh sample, or when targets expire (a dropped
+            # event tells downstream the vision target just disappeared).
+            # Never replay a stale transform on a silent source.
+            should_publish = is_new or bool(payload["dropped"])
+            if should_publish and run_token is self._run_token:
+                msg = String()
+                msg.data = json.dumps(payload, ensure_ascii=False)
+                self._pub.publish(msg)
+                self._last_payload = payload
+        except Exception as exc:  # a bad frame is not fatal to the worker
+            self._rejected += 1
+            self._last_error = f"{type(exc).__name__}: {exc}"
+            if self._last_payload is None or self._received <= 1:
+                self._node.get_logger().warning(
+                    f"vision_tf bad frame: {self._last_error}")
+
     def _worker_loop(self, generation: int, run_token) -> None:
         interval = 1.0 / self._config["publish_rate_hz"]
         while (not self._stop_event.is_set()
                and generation == self._generation
                and run_token is self._run_token):
-            with self._frame_lock:
-                raw = self._latest_raw
-                received_at = self._latest_at
-            if raw is None:
-                if self._status == "running":
-                    self._degraded = "input_stale"
-                self._stop_event.wait(0.05)
-                continue
-
-            try:
-                parsed = json.loads(raw)
-                self._received += 1
-                batch = spec.transforms_from_json(
-                    parsed, self._config, receive_ms=received_at, targets=self._targets)
-                self._accepted += len(batch["transforms"])
-                self._rejected += batch["rejected"]
-                if batch["last_error"]:
-                    self._last_error = batch["last_error"]
-                payload = spec.build_payload(self._config, batch)
-                if payload["transforms"]:
-                    self._degraded = ""
-                # Publish only while this run is still current.
-                if run_token is self._run_token:
-                    msg = String()
-                    msg.data = json.dumps(payload, ensure_ascii=False)
-                    self._pub.publish(msg)
-                    self._last_payload = payload
-            except Exception as exc:  # a bad frame is not fatal to the worker
-                self._rejected += 1
-                self._last_error = f"{type(exc).__name__}: {exc}"
-                if self._last_payload is None or self._received <= 1:
-                    self._node.get_logger().warning(
-                        f"vision_tf bad frame: {self._last_error}")
-
+            self._tick(run_token)
             self._stop_event.wait(interval)
