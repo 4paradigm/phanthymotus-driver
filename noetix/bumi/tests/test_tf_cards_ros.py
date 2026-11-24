@@ -67,8 +67,15 @@ def test_real_tf2_hand_to_marker(monkeypatch):
     joints = {name:0.0 for name in names}
     outcomes = []
     try:
+        default_topic = cv.dispatch("info", wire)["topic_out"][0]["topic"]
+        cv.dispatch("config", {"instance_id": "left", "output_instance_id": "左相机"})
         rhs = cv.dispatch("info",wire)["topic_out"][0]["topic"]
+        assert rhs != default_topic
         assert rhs == cv.dispatch("start",wire)["topic_out"][0]["topic"]
+        assert cv.dispatch("info", {"instance_id": "left"})["state"] == "running"
+        cv.dispatch("config", {"instance_id": "right", "output_instance_id": "左相机"})
+        with pytest.raises(ValueError, match="already using"):
+            cv.dispatch("start", dict(wire, instance_id="right"))
         with pytest.raises(ValueError,match="measured"):
             bare.dispatch("start",{"input_topic":rhs})
         assert tree.dispatch("start",{"input_topic":rhs})["topic_out"] == []
@@ -116,6 +123,9 @@ def test_real_tf2_hand_to_marker(monkeypatch):
             np.testing.assert_allclose(np.eye(3)+2*q.w*cross+2*cross@cross,expected[:3,:3],atol=1e-6)
             outcomes.append(got.tolist())
         assert np.linalg.norm(np.subtract(*outcomes)) > .03
+        assert cv.dispatch("stop", {"instance_id": "left"})["state"] == "idle"
+        cv.dispatch("config", {"instance_id": "left", "output_instance_id": ""})
+        assert cv.dispatch("info", wire)["topic_out"][0]["topic"] == default_topic
         print("tf2 hand-to-marker metres for elbow 0, 0.5 rad:", json.dumps(outcomes))
     finally:
         bare.stop()

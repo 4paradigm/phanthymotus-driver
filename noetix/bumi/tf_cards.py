@@ -185,6 +185,8 @@ class _TransformCard:
         self.ns = component(namespace)
         self.executor = executor
         self.nodes = {}
+        # Nodes keep their canvas IDs so info and stop still reach a renamed output.
+        self.output_ids = {}
         self.lock = threading.RLock()
 
     def get_tool(self):
@@ -195,8 +197,6 @@ class _TransformCard:
             "input_topic": {"type": "string"},
             "input_topics": {"type": "array", "items": {"type": "string"}},
         }
-        if not self.tree:
-            properties["instance_id"] = {"type": "string"}
         return {"name": self.PREFIX, "type": "processor", "multiInstance": not self.tree, "description": desc,
                 "inputSchema": {"type": "object", "required": ["action"], "properties": properties},
                 "topic_in": [_port("", "TransformStamped JSON" if self.tree else "Metric camera poses")],
@@ -223,6 +223,7 @@ class _TransformCard:
         if not isinstance(key, str):
             raise ValueError("Expected a string instance_id")
         with self.lock:
+            output_id = self.output_ids.get(key, key)
             if action == "stop":
                 if not self.tree and not topics and not args.get("instance_id"):
                     self.stop()
@@ -231,6 +232,9 @@ class _TransformCard:
             elif action == "start":
                 if not self.tree and len(topics) != 1:
                     raise ValueError("Wire exactly one metric vision source")
+                if not self.tree and any(other != key and self.output_ids.get(other, other) == output_id
+                                         for other in self.nodes):
+                    raise ValueError("Another vision_tf card is already using this instance_id")
                 entry = self.nodes.get(key)
                 dead = entry and self.tree and entry[1].process.poll() is not None
                 if self.tree and entry and not dead and entry[0] != topics:
@@ -240,7 +244,7 @@ class _TransformCard:
                     if dead:
                         self._remove(key)
                     node = (TreeNode(self.ns, topics, self.config) if self.tree else
-                            VisionNode(self.ns, key, topics, self.config))
+                            VisionNode(self.ns, output_id, topics, self.config))
                     try:
                         self.executor.add_node(node)
                     except Exception:
@@ -255,7 +259,7 @@ class _TransformCard:
             active_topics = entry[0] if entry else topics
             result = {"state": "running" if entry else "idle", "topic_in": [
                 _port(t, "TFMessage JSON" if self.tree else "Metric camera poses") for t in active_topics or ("",)],
-                "topic_out": [] if self.tree else [_port(_output(self.ns, key) if active_topics or args.get("instance_id") else "",
+                "topic_out": [] if self.tree else [_port(_output(self.ns, output_id) if active_topics or args.get("instance_id") else "",
                                                          "TFMessage JSON")]}
             if entry and entry[1].input_errors:
                 result["input_errors"] = entry[1].input_errors.copy()
@@ -268,6 +272,32 @@ class _TransformCard:
 
 class VisionTfPlugin(_TransformCard):
     PREFIX = "vision_tf"
+
+    def get_tool(self):
+        tool = super().get_tool()
+        tool["inputSchema"]["properties"]["action"]["enum"].append("config")
+        tool["configSchema"] = {"type": "object", "properties": {
+            "output_instance_id": {"type": "string", "title": "instance_id", "scope": "instance",
+                                   "default": "", "description": "用于区分视觉 TF 输出话题。留空使用画布卡片 ID。"}
+        }}
+        return tool
+
+    def dispatch(self, action, args):
+        if action != "config":
+            return super().dispatch(action, args)
+        card_id = args.get("instance_id")
+        value = args.get("output_instance_id")
+        if not isinstance(card_id, str) or not card_id or not isinstance(value, str):
+            raise ValueError("Expected a card instance_id and a string output_instance_id")
+        value = value.strip()
+        with self.lock:
+            if card_id in self.nodes and (value or card_id) != self.output_ids.get(card_id, card_id):
+                raise ValueError("Stop vision_tf before changing its instance_id")
+            if value:
+                self.output_ids[card_id] = value
+            else:
+                self.output_ids.pop(card_id, None)
+        return {"output_instance_id": value}
 
 
 class TfTreePlugin(_TransformCard):
