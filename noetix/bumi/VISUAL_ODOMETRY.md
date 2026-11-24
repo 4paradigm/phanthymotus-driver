@@ -228,8 +228,8 @@ camera_info directly. The original body IMU display port remains data/json;
 use `imu.body_imu` (`/NS/state/imu_calibrated`, `sensor/imu`) for computation.
 It uses HighController body gyro/acceleration and the configured fixed mounting
 rotation, with explicit unverified SDK read-completion timestamps. No RealSense
-motion streams are requested. The shipped preset enables attitude assistance.
-Supply both measured `body_imu_translation` vectors to enable full fusion input.
+motion streams are requested. The shipped preset includes both operator-confirmed
+`body_imu_translation` vectors for full fusion input.
 
 Tests in `tests/test_bumi_rgbd_adapter.py`, `tests/test_bumi_camera_imu.py` and
 `tests/bumi_visual_odometry/test_bundle_hook.py` exercise scale, geometry,

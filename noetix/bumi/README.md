@@ -568,9 +568,8 @@ The configured fixed camera-to-body rotation in
 in the RGB optical frame. Raw angular velocity and acceleration remain in body
 axes and the generic consumer applies the declared rotation once. A usable
 numeric fixed rotation is required; an `assumed` label does not block it.
-For full fusion, supply measured `body_imu_translation.gyro` and
-`body_imu_translation.accel` in RGB optical metres. The shipped preset supplies
-rotation assistance.
+The shipped preset includes the operator-confirmed `body_imu_translation.gyro`
+and `body_imu_translation.accel` in RGB optical metres for full fusion input.
 
 Packets use `motus.imu/1` over `std_msgs/String` with
 `stamp_source: read_completion`. The SDK does not

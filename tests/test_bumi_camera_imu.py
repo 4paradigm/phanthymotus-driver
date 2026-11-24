@@ -48,8 +48,8 @@ def test_capture_uses_body_imu_without_discovering_or_enabling_camera_motion(cap
     assert len(imu_threads) == 1 and imu_threads[0] is not threading.current_thread()
     assert state.imu_node.destroyed and not imu_threads[0].is_alive()
     assert packet['angular_velocity']==[1.,2.,3.]
-    assert 'camera_from_gyro_translation' not in packet
-    assert 'camera_from_accel_translation' not in packet
+    assert packet['camera_from_gyro_translation'] == mount['body_imu_translation']['gyro']
+    assert packet['camera_from_accel_translation'] == mount['body_imu_translation']['accel']
     assert probes==[]
     assert {args[0] for args in state.streams}=={'color','depth'}
     assert '/robot/camera/rgbd/imu' not in state.publisher_topics

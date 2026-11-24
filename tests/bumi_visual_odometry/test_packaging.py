@@ -45,7 +45,7 @@ def test_card_and_plugin_config_are_in_sync():
     assert not {'calibration_id', 'fixed_mount', 'assumed', 'calibrated'} & cal.keys()
     assert cal['camera_to_body']['quaternion'] == [-0.5, 0.5, -0.5, 0.5]
     assert cal['camera_to_body']['translation'] == [0.0, 0.0, 0.0]
-    assert 'body_imu_translation' not in cal
+    assert cal['body_imu_translation'] == {'gyro': [0., 0., 0.], 'accel': [0., 0., 0.]}
     # The tool name lives in code; keep the driver card pointing at it.
     source = (BUMI/'visual_odometry.py').read_text()
     assert "'name': 'rgbd_visual_odometry'" in source

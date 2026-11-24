@@ -40,10 +40,10 @@ second SDK owner or RealSense motion profile is used.
 `BodyImuSource` preserves body angular velocity and acceleration, inverts the
 configured fixed camera-to-body rotation, and publishes that rotation in both
 sensor-to-camera fields. The shipped rotation defines a level-forward axis
-convention. For full fusion, supply measured `body_imu_translation.gyro` and
-`body_imu_translation.accel` in RGB optical metres. The adapter publishes the
-lever arms only when both are supplied, and `imu_status.fusion` reflects their
-availability and input freshness.
+convention. The Bumi preset includes the operator-confirmed gyro and accel
+lever arms in RGB optical metres. The adapter publishes the lever arms only
+when both are supplied, and `imu_status.fusion` reflects their availability
+and input freshness.
 
 The SDK supplies no acquisition timestamp. Packets carry the host reading time
 unchanged with `stamp_source=read_completion` and an unverified

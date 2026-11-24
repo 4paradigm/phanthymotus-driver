@@ -48,15 +48,15 @@ def test_body_packet_keeps_raw_axes_and_read_time_and_inverts_fixed_camera_mount
     assert imu.status(1_500_000_001)['state'] == 'unavailable'
 
 
-def test_shipped_body_imu_uses_rotation_only_until_lever_arms_are_supplied():
+def test_shipped_body_imu_publishes_the_measured_lever_arms():
     mount = yaml.safe_load((ROOT/'noetix/bumi/config.yaml').read_text())[
         'plugins']['visual_odometry']['calibration']
     imu = source(mount)
     packet = imu.accept(reading(), 1_010_000_000)
-    assert 'camera_from_gyro_translation' not in packet
-    assert 'camera_from_accel_translation' not in packet
+    assert packet['camera_from_gyro_translation'] == [0., 0., 0.]
+    assert packet['camera_from_accel_translation'] == [0., 0., 0.]
     assert imu.status(1_010_000_000)['state'] == 'ready'
-    assert imu.status(1_010_000_000)['fusion']['state'] == 'unavailable'
+    assert imu.status(1_010_000_000)['fusion']['state'] == 'ready'
 
 
 @pytest.mark.parametrize('change', [
