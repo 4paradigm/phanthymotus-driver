@@ -19,6 +19,8 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(DRIVER))
 
 from common.vendor_runtime import DriverBundle, load_config  # noqa: E402
+from lite_tactile import FINGER_NAMES  # noqa: E402
+from modbus_client import TACTILE_CELL_COUNT  # noqa: E402
 from modbus_device import build_plugins  # noqa: E402
 from visual_follow import (VisualFollowPlugin, clamp_step,  # noqa: E402
                            target_from_flexions)
@@ -203,11 +205,20 @@ def test_watchdog_releases_torque_then_auto_resumes_on_fresh_data():
     plugin.dispatch("resume", {"instance_id": "card1", "confirm_motion": True})
     assert plugin.accept(sample()) is True
     stream = plugin._streams["card1"]
-    stream["last_data_monotonic"] = time.monotonic() - 2.0
-    plugin._on_watchdog()
-    assert "card1" in plugin._streams          # subscription kept alive
-    assert stream["starved"] is True
-    assert client.torques[-1] == [0] * 10      # torque released while silent
+    # Watchdog silence is now owned by the shared ControlSink; advance its
+    # monotonic clock past the configured window instead of poking the old
+    # stream field. The wall clock stays real so fresh-data checks still pass.
+    sink = stream["sink"]
+    real_clock = sink._clock
+    fake = {"now": real_clock() + plugin.watchdog_ms + 1000}
+    sink._clock = lambda: fake["now"]
+    try:
+        plugin._on_watchdog()
+        assert "card1" in plugin._streams      # subscription kept alive
+        assert stream["starved"] is True
+        assert client.torques[-1] == [0] * 10  # torque released while silent
+    finally:
+        sink._clock = real_clock
     # Fresh valid data re-energizes and resumes (canvas has no re-confirm UI).
     stream["last_command_monotonic"] = 0.0
     curl = dict(sample()["flexions"]); curl["index"] = 1.0
@@ -591,3 +602,146 @@ def test_input_declares_control_hand_flex_format():
     tin = definition.get('topic_in', [])
     assert any(t.get('format') == 'control/hand_flex' for t in tin), tin
     assert not any(t.get('format') == 'data/json' for t in tin)
+
+
+# ── tactile read path (regression: deleted MultiHandPlugin.read_tactile) ────
+
+class FakeTactileClient:
+    """Modbus stand-in that answers one 96-cell read per fingertip."""
+
+    def __init__(self):
+        self.reads = []
+
+    def read_fingertip(self, finger, settle_s=0.03, *, deadline=None):
+        self.reads.append(finger)
+        return [FINGER_NAMES.index(finger) + 1] * TACTILE_CELL_COUNT
+
+
+class FakeTactileConnection:
+    def __init__(self, client, config):
+        self._client = client
+        self.port = config.get("serial_port", "/dev/fake")
+        self.side = config.get("side", "right")
+        self.closed = False
+
+    def get(self, side=None):
+        return self._client
+
+    def detect_sides(self, **_kwargs):
+        return [self.side]
+
+    def close(self):
+        self.closed = True
+
+
+def build_tactile_plugins(monkeypatch, tmp_path, *, client=None, sides=("right",)):
+    """Build hand + tactile cards with a fake RS-485 descriptor."""
+    import modbus_device as md
+
+    port = tmp_path / "fake-rs485"
+    port.write_text("")
+    client = client or FakeTactileClient()
+    cfg = {
+        "side": "right",
+        "serial_port": str(port),
+        "plugins": {
+            "hand": {
+                "enabled": True,
+                "open_pose": OPEN, "fist_pose": FIST,
+                "left_open_pose": OPEN, "left_fist_pose": FIST,
+            },
+            "hand_tactile": {"enabled": True},
+        },
+    }
+    hand, tactile = build_plugins(cfg, "", None)
+
+    def connection(conf):
+        made = FakeTactileConnection(client, conf)
+        if made.side not in sides:
+            made.detect_sides = lambda **_kwargs: []
+        return made
+
+    monkeypatch.setattr(md, "L20LiteConnection", connection)
+    hand._ports = lambda: [str(port)]
+    return hand, tactile, client, str(port)
+
+
+def test_tactile_card_reads_through_multi_hand_plugin(monkeypatch, tmp_path):
+    """The tactile card must reach read_tactile on MultiHandPlugin.
+
+    This is the exact call site that raised AttributeError after the
+    multi-instance refactor deleted MultiHandPlugin.read_tactile.
+    """
+    hand, tactile, client, port = build_tactile_plugins(monkeypatch, tmp_path)
+    assert tactile.hand is hand
+    assert hasattr(hand, "read_tactile")
+
+    data = tactile._read_tactile_snapshot("right")
+    assert data["state"] == "ok", data["errors"]
+    assert data["serial_port"] == port
+    assert data["scalar_valid"] is True
+    assert all(value is not None for value in data["touch_scalar"].values())
+    assert all(len(cells) == TACTILE_CELL_COUNT
+               for cells in data["touch_cells"].values())
+    assert client.reads == FINGER_NAMES           # one select+read per finger
+    assert hand._tactile_ports["right"] == port   # discovered port cached
+
+    # Direct calls use the same contract and keep the cached port.
+    read_port, results = hand.read_tactile("right", FINGER_NAMES,
+                                           budget_s=1.0, settle_s=0.0)
+    assert read_port == port
+    assert set(results) == set(FINGER_NAMES)
+    assert all(isinstance(value, tuple) and len(value) == 2
+               for value in results.values())
+    assert client.reads == FINGER_NAMES * 2
+
+
+def test_tactile_discovery_retry_and_cancel(monkeypatch, tmp_path):
+    """A missing port is probed at most once per 2 s; cancel aborts a read."""
+    hand, _, client, _ = build_tactile_plugins(monkeypatch, tmp_path, sides=())
+    for _ in range(2):
+        with pytest.raises(ValueError, match="未连接"):
+            hand.read_tactile("right", FINGER_NAMES, budget_s=0.5, settle_s=0.0)
+    assert hand._tactile_retry_at["right"] > time.monotonic()
+    assert client.reads == []
+
+    hand, _, client, port = build_tactile_plugins(monkeypatch, tmp_path)
+    hand._tactile_ports["right"] = port
+    cancel = threading.Event()
+    cancel.set()
+    with pytest.raises(InterruptedError):
+        hand.read_tactile("right", FINGER_NAMES, budget_s=1.0, settle_s=0.0,
+                          cancel=cancel)
+    assert client.reads == []
+
+
+def test_shared_control_sink_owns_admission():
+    """accept() must route through the shared ControlSink, not a private chain.
+
+    A malformed control envelope (bad schema/mode/dof or stale stamp) must be
+    dropped by the sink before any valve/motor write, exactly as every other
+    motus.control/1 servo path does.
+    """
+    from common.control import parse_descriptor
+    import visual_follow as vf
+
+    # The card's descriptor is a valid shared-control descriptor.
+    desc = parse_descriptor(vf.FLEX_DESCRIPTOR)
+    assert desc.dof == 5
+
+    plugin = make_plugin()
+    client = start_with_fake_client(plugin)
+    plugin.dispatch("resume", {"instance_id": "card1", "confirm_motion": True})
+    stream = plugin._streams["card1"]
+    sink = stream["sink"]
+    assert sink is not None and sink.descriptor.dof == 5
+
+    before = len(client.writes)
+    # Stale envelope: the sink's freshness check must drop it.
+    stale = sample()
+    stale["stamp_ms"] = int(time.time() * 1000) - 60_000
+    stale["obs_stamp_ms"] = stale["stamp_ms"]
+    assert plugin.accept(stale) is False
+    assert len(client.writes) == before
+    # The stream's own seq counter advanced only on admitted frames.
+    assert stream["sink_seq"] >= 1

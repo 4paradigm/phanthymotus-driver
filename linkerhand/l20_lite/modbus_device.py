@@ -12,7 +12,8 @@ import urllib.request
 from uuid import uuid4
 
 from common.vendor_runtime import action_schema, tool
-from modbus_client import JOINT_COUNT, L20LiteModbusClient, _bytes
+from modbus_client import (JOINT_COUNT, L20LiteModbusClient,
+                           ModbusResponseTimeout, _bytes, _remaining_time)
 
 JOINT_NAMES = [
     "thumb_root", "thumb_sway", "index_root", "middle_root", "ring_root",
@@ -86,7 +87,7 @@ class L20LiteConnection:
                 )
             return self._client
 
-    def detect_sides(self) -> list[str]:
+    def detect_sides(self, *, deadline: float | None = None) -> list[str]:
         """Probe only the two known slave IDs using read-only position frames."""
         with self._lock:
             client = self._client
@@ -96,8 +97,10 @@ class L20LiteConnection:
         try:
             for side in ("right", "left"):
                 try:
-                    client.probe_positions(side)
+                    client.probe_positions(side, deadline=deadline)
                 except TimeoutError:
+                    if deadline is not None:
+                        _remaining_time(deadline)
                     continue
                 found.append(side)
         except Exception:
@@ -551,6 +554,10 @@ class MultiHandPlugin:
         # Serial discovery and motion never overlap. Two cards may be queued,
         # but no second controller may open/probe a moving RS-485 port.
         self._bus_lock = threading.RLock()
+        # Tactile polls reuse a confirmed port; a missing port is retried at
+        # most once per 2 s so discovery does not run at poll_hz.
+        self._tactile_ports: dict[str, str] = {}
+        self._tactile_retry_at: dict[str, float] = {}
         self._bindings: dict[str, str] = {}
         self._controllers: dict[str, HandPlugin] = {}
         self._stopped_instances: set[str] = set()
@@ -606,18 +613,20 @@ class MultiHandPlugin:
                 ports.append(path)
         return ports
 
-    def _discover(self) -> dict[str, str]:
+    def _discover(self, *, deadline: float | None = None) -> dict[str, str]:
         """Read only: side -> serial path. Duplicate side is never guessed."""
         with self._bus_lock:
             found: dict[str, str] = {}
             for port in self._ports():
+                if deadline is not None:
+                    _remaining_time(deadline)
                 existing = next((controller.connection for controller in
                                  [self._legacy, *self._controllers.values()]
                                  if controller.connection._client is not None
                                  and os.path.realpath(controller.connection.port) == port), None)
                 connection = existing or L20LiteConnection({**self.config, "serial_port": port})
                 try:
-                    sides = connection.detect_sides()
+                    sides = connection.detect_sides(deadline=deadline)
                 except (OSError, TimeoutError):
                     sides = []
                 finally:
@@ -647,6 +656,73 @@ class MultiHandPlugin:
             controller = HandPlugin(connection, single_config, motion_lock=self._bus_lock)
             self._controllers[instance_id] = controller
             return controller
+
+    def _acquire_bus(self, deadline: float) -> None:
+        if not self._bus_lock.acquire(timeout=_remaining_time(deadline)):
+            raise TimeoutError("RS485 总线正被运动卡片占用")
+
+    def read_tactile(self, side: str, fingers, *, budget_s: float, settle_s: float,
+                     cancel: threading.Event | None = None) -> tuple[str, dict]:
+        """Read fingertip cells within budget_s, one finger per bus-lock hold.
+
+        Returns (serial_port, {finger: (cells, monotonic_time) or Exception}).
+        Motion and teach cards interleave between fingers; a move that holds
+        the bus past the budget leaves the remaining fingers as TimeoutError.
+        """
+        deadline = time.monotonic() + budget_s
+        port = self._tactile_ports.get(side)
+        if port is None or not os.path.exists(port):
+            missing = f"{'左手' if side == 'left' else '右手'}未连接"
+            if time.monotonic() < self._tactile_retry_at.get(side, 0.0):
+                raise ValueError(missing)
+            # Discovery probes every port; never let it overlap a motion.
+            self._acquire_bus(deadline)
+            try:
+                port = self._discover(deadline=deadline).get(side)
+                _remaining_time(deadline)
+            finally:
+                self._bus_lock.release()
+            if port is None:
+                self._tactile_retry_at[side] = time.monotonic() + 2.0
+                raise ValueError(missing)
+            self._tactile_ports[side] = port
+        # The board-specific controller owns its own descriptor; a tactile
+        # read uses a dedicated one so stop()/rebind of a card cannot close it.
+        connection = L20LiteConnection({**self.config, "side": side, "serial_port": port})
+        results: dict = {}
+        try:
+            for finger in fingers:
+                if cancel is not None and cancel.is_set():
+                    raise InterruptedError("触觉采集已停止")
+                try:
+                    self._acquire_bus(deadline)
+                except TimeoutError as exc:
+                    results[finger] = exc
+                    continue
+                try:
+                    cells = connection.get().read_fingertip(finger, settle_s, deadline=deadline)
+                    results[finger] = (cells, time.monotonic())
+                except (TimeoutError, ValueError, RuntimeError) as exc:
+                    results[finger] = exc
+                except OSError:
+                    connection.close()
+                    raise
+                finally:
+                    self._bus_lock.release()
+                # Let a waiting motion take the bus before the next finger.
+                time.sleep(min(0.002, max(0.0, deadline - time.monotonic())))
+        except OSError:
+            self._tactile_ports.pop(side, None)
+            raise
+        finally:
+            connection.close()
+        if (results and all(isinstance(value, Exception) for value in results.values())
+                and any(isinstance(value, (ModbusResponseTimeout, ValueError, RuntimeError))
+                        for value in results.values())):
+            # No valid reply confirmed this port. An exhausted round budget
+            # or a busy bus alone says nothing about the adapter.
+            self._tactile_ports.pop(side, None)
+        return port, results
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         instance_id = args.get("instance_id") or ""

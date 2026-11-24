@@ -41,12 +41,43 @@ import math
 import threading
 import time
 
+from common.control import ControlSink, Verdict, parse_descriptor
 from common.vendor_runtime import action_schema, tool
 from modbus_client import JOINT_COUNT
 from modbus_device import (L20LiteConnection, SPEED_RATIOS, _named,
                            confirm_motion_ok)
 
 PREFIX = "hand_visual_follow"
+
+# The shared control contract for the five normalized finger curls. The card
+# consumes `values` = (thumb, index, middle, ring, pinky) in 0..1 and maps them
+# onto raw 0..255 joint positions after the sink's admission checks. Every
+# safety gate that is common to all motus.control/1 servo paths — contract,
+# freshness, source arbitration, step clamp, hard limits, watchdog, abort —
+# lives in common/control.ControlSink; this card keeps only the vendor mapping,
+# motion gating and torque release.
+FLEX_DESCRIPTOR = {
+    "control_interface": "motus.control/1",
+    "mode": "joint_position",
+    "dof": 5,
+    "joint_names": ["thumb", "index", "middle", "ring", "pinky"],
+    "units": {"angle": "normalized"},
+    "limits": {
+        "lower": [0.0, 0.0, 0.0, 0.0, 0.0],
+        "upper": [1.0, 1.0, 1.0, 1.0, 1.0],
+        # Curvature changes slowly; a whole-range jump in one 10 Hz step is
+        # never legitimate. The sink clamps rather than rejects it.
+        "max_delta_per_step": [1.0, 1.0, 1.0, 1.0, 1.0],
+    },
+    "rate": {
+        "max_hz": 20,
+        "expected_hz": 10,
+        "watchdog_ms": 5000,
+        "max_obs_age_ms": 500,
+    },
+    "force_torque": None,
+}
+FLEX_SOURCE = f"mcp__driver__{PREFIX}"
 
 # L20 Lite raw joint order (see modbus_device.JOINT_NAMES). Only the five
 # flexion joints are driven; sway and thumb roll stay at their calibrated
@@ -412,6 +443,13 @@ class VisualFollowPlugin:
         self.max_obs_age_ms = int(config.get("max_obs_age_ms", 500))
         if not 50 <= self.max_obs_age_ms <= 5000:
             raise ValueError("hand_visual_follow.max_obs_age_ms must be in 50..5000")
+        # The shared sink's timing must match this card's configured window;
+        # a hard-coded descriptor would make the watchdog fire at the wrong
+        # time (and silently ignore the operator's exhibition setting).
+        self._descriptor = dict(FLEX_DESCRIPTOR)
+        self._descriptor["rate"] = dict(FLEX_DESCRIPTOR["rate"],
+                                        watchdog_ms=self.watchdog_ms,
+                                        max_obs_age_ms=self.max_obs_age_ms)
         self.require_handedness = bool(config.get("require_handedness", True))
 
         self._calibration = {}
@@ -606,6 +644,13 @@ class VisualFollowPlugin:
                 "detected_sides": list(found),
                 "detected_count": len(found),
                 "topic": self._subscribed_topic,
+                # The canvas treats info() as authoritative after wiring; it
+                # must see the bound input topic to confirm/preserve the link.
+                "topic_in": ([{"format": "control/hand_flex",
+                               "topic": self._subscribed_topic}]
+                             if self._subscribed_topic else []),
+                "control_stream": stream.get("sink").stats()
+                if stream.get("sink") is not None else None,
                 "calibrated_sides": list(self._calibration),
                 "last_target": stream.get("target"),
                 "last_flexions": stream.get("flexions"),
@@ -668,9 +713,21 @@ class VisualFollowPlugin:
                     "last_data_monotonic": time.monotonic(),
                     "last_command_monotonic": 0.0, "last_command_ms": 0,
                     "commands": 0,
+                    "sink_seq": 0,           # control message sequence per stream
+                    "sink": None,            # shared-admission ControlSink (created below)
                 }
                 self._last_error = ""
                 self._rejects.clear()
+                # Shared admission chain for this stream. Apply only records the
+                # admitted values; the actual vendor mapping (which needs
+                # landmarks + per-side calibration) stays in accept().
+                stream = self._streams[instance_id]
+                stream["sink"] = ControlSink(
+                    self._descriptor,
+                    lambda values, gripper, iid=instance_id: self._record_admitted(iid, values),
+                    on_watchdog=lambda iid=instance_id: self._sink_watchdog(iid),
+                    on_abort=lambda iid=instance_id: self._sink_abort(iid),
+                )
             try:
                 self._subscribe(topic)
             except Exception as error:       # noqa: BLE001
@@ -715,7 +772,11 @@ class VisualFollowPlugin:
         node = Node("l20_lite_visual_follow", context=self._ros2.ctx_core)
         node.create_subscription(String, topic, self._on_message, qos)
         # A watchdog needs its own heartbeat: silence produces no callbacks.
-        node.create_timer(self.watchdog_ms / 2000.0, self._on_watchdog)
+        # Tick the shared sinks often enough that a watchdog release is not
+        # delayed by a large fraction of the timeout window (a 5 s exhibition
+        # watchdog must not wait 2.5 s extra). The sink itself decides when
+        # silence has actually lasted long enough.
+        node.create_timer(0.5, self._on_watchdog)
         self._ros2.executor_core.add_node(node)
         self._node = node
         self._subscribed_topic = topic
@@ -734,184 +795,249 @@ class VisualFollowPlugin:
             return
         self.accept(payload)
 
-    def accept(self, payload: dict) -> bool:
-        """Admit one motus.hand/1 sample. ROS-free, so it is directly testable.
+    def _record_admitted(self, instance_id: str, values, gripper=None):
+        """ControlSink.apply callback: stash the admitted (clamped) curls.
 
+        The vendor mapping needs per-side calibration and the raw landmark
+        geometry, which the shared control contract does not carry. So the
+        sink only decides *whether* this sample is admissible and clamps the
+        five curls; `accept()` picks them up and does the card-specific work.
+        """
+        with self._lock:
+            stream = self._streams.get(instance_id)
+            if stream is not None:
+                stream["admitted"] = tuple(float(v) for v in values)
+
+    def _sink_watchdog(self, instance_id: str):
+        """Shared watchdog fired: release torque and mark this stream starved."""
+        self._release(instance_id)
+        with self._lock:
+            stream = self._streams.get(instance_id)
+            if stream is not None:
+                stream["starved"] = True
+            self._last_error = (
+                f"手部视觉数据超过 {self.watchdog_ms} ms 未更新，已释放力矩")
+        self._reject("control watchdog")
+
+    def _sink_abort(self, instance_id: str):
+        """Shared abort (force-torque / escalation): stop everything."""
+        self._sink_watchdog(instance_id)
+        self._stop_streams()
+
+    def _apply_flexions(self, instance_id: str, stream: dict, payload: dict,
+                        values, now: float, now_ms: int) -> bool:
+        """Card-specific work after the shared sink admitted this sample.
+
+        `values` are the five admitted (clamped) curls from ControlSink. All
+        vendor mapping, thumb opposition, deadband and the raw-position write
+        stay here; the shared chain owns admission/timing/arbitration/limits.
         Returns True only when a position command was actually written.
+        """
+        # Use the values admitted (and possibly clamped) by the shared sink,
+        # not the raw payload — the sink's hard-limit/step decisions must reach
+        # the motors, otherwise its admission would be cosmetic.
+        side = stream["side"]
+        flexions = {name: float(v) for name, v in
+                    zip(("thumb", "index", "middle", "ring", "pinky"), values)}
+        for name in FLEXION_JOINTS:
+            gain = self.thumb_gain if name == "thumb" else self.flexion_gain
+            if gain != 1.0 and name in flexions:
+                raw = flexions[name]
+                try:
+                    flexions[name] = min(1.0, max(0.0,
+                        float(raw) * gain))
+                except (TypeError, ValueError):
+                    pass    # target_from_flexions reports the bad value
+        flexions = normalized_grasp(
+            flexions, self.fist_reference, self.synergy_weight)
+        # Live (pre-deadband) values for the thumb gear only.
+        live_for_gear = dict(flexions)
+        # Deadband: ignore small finger jitter. Compare against the
+        # last pose that ACTUALLY moved the hand, not the previous
+        # frame — otherwise a slow continuous bend never accumulates
+        # past the threshold and the hand would never move.
+        # flexion = (pi-angle)/pi, so 10 deg == 10/180 flexion units.
+        if self.deadband > 0:
+            accepted = stream.get("accepted_flexions")
+            if accepted is None:
+                stream["accepted_flexions"] = dict(flexions)
+            else:
+                # Per-finger deadband: only a finger that moved past
+                # its own threshold gets updated. Fingers still inside
+                # the deadband keep their previous accepted value, so
+                # their micro-jitter never reaches the motor. This is
+                # what makes single-finger control precise.
+                merged = dict(accepted)
+                for name in FLEXION_JOINTS:
+                    if name not in flexions:
+                        return False
+                    new_value = float(flexions[name])
+                    old_value = float(accepted.get(name, new_value))
+                    if abs(new_value - old_value) >= self.deadband:
+                        merged[name] = new_value
+                if merged == accepted:
+                    self._reject("deadband")
+                    return False
+                flexions = merged
+                stream["accepted_flexions"] = dict(merged)
+        # Thumb opposition from in-hand geometry (landmarks), fully
+        # independent of the four fingers. Opt-out via config.
+        thumb_override = None
+        if self.thumb_from_landmarks:
+            raw_lm = payload.get("landmarks")
+            if raw_lm:
+                w = thumb_opposition_from_landmarks(raw_lm)
+                if self.thumb_adaptive:
+                    w, lo, hi = adaptive_weight(
+                        w, stream.get("thumb_w_lo"),
+                        stream.get("thumb_w_hi"))
+                    stream["thumb_w_lo"] = lo
+                    stream["thumb_w_hi"] = hi
+                else:
+                    w = max(0.0, min(1.0,
+                        w * self.thumb_gain + self.thumb_bias))
+                thumb_override = w
+        try:
+            target = target_from_flexions(
+                flexions, *self._calibration[side],
+                gamma=self.flexion_gamma,
+                gear_flexions=live_for_gear,
+                thumb_root_fist=self.thumb_root_fist,
+                thumb_override=thumb_override,
+                thumb_travel=self.thumb_travel,
+                thumb_sway_travel=self.thumb_sway_travel,
+                thumb_roll_travel=self.thumb_roll_travel)
+        except ValueError as error:
+            self._reject(str(error))
+            return False
+
+        try:
+            with self.hand._bus_lock:
+                connection = self._connections.get(instance_id)
+                if connection is None:
+                    self._reject("connection missing")
+                    return False
+                client = connection.get()
+                current = client.get_positions()
+                if len(current) != JOINT_COUNT:
+                    self._reject(f"device returned {len(current)} positions")
+                    return False
+                command = clamp_step(current, target, self.max_step)
+                client.set_positions(command)
+                wrote = True
+        except Exception as error:       # noqa: BLE001
+            with self._lock:
+                self._last_error = f"{type(error).__name__}: {error}"
+            self._release(instance_id)
+            self._stop_streams()
+            self._reject(f"write failed: {error}")
+            return False
+
+
+        with self._lock:
+            stream.update({
+        "target": target,
+        "flexions": dict(payload.get("flexions") or {}),
+        "last_data_monotonic": now,
+        "last_command_monotonic": now,
+        "last_command_ms": now_ms,
+        "commands": stream.get("commands", 0) + 1,
+            })
+        return wrote
+
+    def accept(self, payload: dict) -> bool:
+        """Admit one control/hand_flex sample via the shared ControlSink.
+
+        ROS-free and directly testable. Returns True only when a position
+        command was actually written.
         """
         with self._lock:
             streams = dict(self._streams)
         if not streams:
             return False
-        wrote = False
         if not isinstance(payload, dict) or payload.get("schema") != "motus.hand/1":
             self._reject("payload is not motus.hand/1")
             return False
-
-        now = time.monotonic()
-        with self._lock:
-            for instance_id, stream in streams.items():
-                if stream.get("paused"):
-                    continue
-                side = stream["side"]
-                handedness = str(payload.get("handedness") or "").lower()
-                if self.require_handedness and handedness and handedness != side:
-                    self._reject(f"handedness {handedness} does not match {side}")
-                    continue
-                now_ms = int(time.time() * 1000)
-                obs_ms = int(payload.get("obs_stamp_ms") or payload.get("stamp_ms") or now_ms)
-                age = now_ms - obs_ms
-                if age < -1000 or age > self.max_obs_age_ms:
-                    self._reject(f"observation age {age} ms exceeds {self.max_obs_age_ms} ms")
-                    continue
-                # The watchdog asks "is fresh data still arriving?", not "did we
-                # write a joint on this frame?". Throttled/rejected frames are
-                # still fresh samples; not counting them made a 10 Hz source
-                # look silent whenever its phase missed the 10 Hz write window,
-                # releasing torque after ~10 s of otherwise healthy tracking.
-                stream["last_data_monotonic"] = now
-                if stream.get("starved"):
-                    # Fresh data returned after a watchdog release: resume
-                    # safely. The canvas cannot ask a human to re-confirm in
-                    # mid-stream (no param UI), and a brief vision hiccup
-                    # must not leave the hand permanently dead. Torque is
-                    # re-enabled only on fresh, schema-valid data; `stop` and
-                    # `pause` remain the immediate emergency stops.
-                    self._energize(instance_id)
-                    stream["starved"] = False
-                    with self._lock:
-                        self._last_error = ""
-                if now - stream["last_command_monotonic"] < 1.0 / self.max_hz:
-                    self._reject("throttled")
-                    continue
-                flexions = dict(payload.get("flexions") or {})
-                for name in FLEXION_JOINTS:
-                    gain = self.thumb_gain if name == "thumb" else self.flexion_gain
-                    if gain != 1.0 and name in flexions:
-                        raw = flexions[name]
-                        try:
-                            flexions[name] = min(1.0, max(0.0,
-                                float(raw) * gain))
-                        except (TypeError, ValueError):
-                            pass    # target_from_flexions reports the bad value
-                flexions = normalized_grasp(
-                    flexions, self.fist_reference, self.synergy_weight)
-                # Live (pre-deadband) values for the thumb gear only.
-                live_for_gear = dict(flexions)
-                # Deadband: ignore small finger jitter. Compare against the
-                # last pose that ACTUALLY moved the hand, not the previous
-                # frame — otherwise a slow continuous bend never accumulates
-                # past the threshold and the hand would never move.
-                # flexion = (pi-angle)/pi, so 10 deg == 10/180 flexion units.
-                if self.deadband > 0:
-                    accepted = stream.get("accepted_flexions")
-                    if accepted is None:
-                        stream["accepted_flexions"] = dict(flexions)
-                    else:
-                        # Per-finger deadband: only a finger that moved past
-                        # its own threshold gets updated. Fingers still inside
-                        # the deadband keep their previous accepted value, so
-                        # their micro-jitter never reaches the motor. This is
-                        # what makes single-finger control precise.
-                        merged = dict(accepted)
-                        for name in FLEXION_JOINTS:
-                            if name not in flexions:
-                                continue
-                            new_value = float(flexions[name])
-                            old_value = float(accepted.get(name, new_value))
-                            if abs(new_value - old_value) >= self.deadband:
-                                merged[name] = new_value
-                        if merged == accepted:
-                            self._reject("deadband")
-                            continue
-                        flexions = merged
-                        stream["accepted_flexions"] = dict(merged)
-                # Thumb opposition from in-hand geometry (landmarks), fully
-                # independent of the four fingers. Opt-out via config.
-                thumb_override = None
-                if self.thumb_from_landmarks:
-                    raw_lm = payload.get("landmarks")
-                    if raw_lm:
-                        w = thumb_opposition_from_landmarks(raw_lm)
-                        if self.thumb_adaptive:
-                            w, lo, hi = adaptive_weight(
-                                w, stream.get("thumb_w_lo"),
-                                stream.get("thumb_w_hi"))
-                            stream["thumb_w_lo"] = lo
-                            stream["thumb_w_hi"] = hi
-                        else:
-                            w = max(0.0, min(1.0,
-                                w * self.thumb_gain + self.thumb_bias))
-                        thumb_override = w
-                try:
-                    target = target_from_flexions(
-                        flexions, *self._calibration[side],
-                        gamma=self.flexion_gamma,
-                        gear_flexions=live_for_gear,
-                        thumb_root_fist=self.thumb_root_fist,
-                        thumb_override=thumb_override,
-                        thumb_travel=self.thumb_travel,
-                        thumb_sway_travel=self.thumb_sway_travel,
-                        thumb_roll_travel=self.thumb_roll_travel)
-                except ValueError as error:
-                    self._reject(str(error))
-                    continue
-
-                try:
-                    with self.hand._bus_lock:
-                        connection = self._connections.get(instance_id)
-                        if connection is None:
-                            self._reject("connection missing")
-                            continue
-                        client = connection.get()
-                        current = client.get_positions()
-                        if len(current) != JOINT_COUNT:
-                            self._reject(f"device returned {len(current)} positions")
-                            continue
-                        command = clamp_step(current, target, self.max_step)
-                        client.set_positions(command)
-                        wrote = True
-                except Exception as error:       # noqa: BLE001
-                    with self._lock:
-                        self._last_error = f"{type(error).__name__}: {error}"
-                    self._release(instance_id)
-                    self._stop_streams()
-                    self._reject(f"write failed: {error}")
-                    return False
-
-                stream.update({
-                    "target": target,
-                    "flexions": dict(payload.get("flexions") or {}),
-                    "last_data_monotonic": now,
-                    "last_command_monotonic": now,
-                    "last_command_ms": now_ms,
-                    "commands": stream.get("commands", 0) + 1,
-                })
+        flexions_in = payload.get("flexions") or {}
+        if not isinstance(flexions_in, dict):
+            self._reject("flexions must be an object")
+            return False
+        # The five curls in descriptor order. ControlSink enforces 0..1 hard
+        # limits, step bounds, source arbitration and freshness on these.
+        values = [flexions_in.get(n, 0.0) for n in
+                  ("thumb", "index", "middle", "ring", "pinky")]
+        handedness = str(payload.get("handedness") or "").lower()
+        obs_ms = int(payload.get("obs_stamp_ms") or payload.get("stamp_ms") or 0)
+        stamp_ms = int(payload.get("stamp_ms") or obs_ms)
+        wrote = False
+        for instance_id, stream in streams.items():
+            if stream.get("paused"):
+                continue
+            if self.require_handedness and handedness and handedness != stream["side"]:
+                self._reject(f"handedness {handedness} does not match {stream['side']}")
+                continue
+            sink = stream.get("sink")
+            if sink is None:
+                self._reject("control sink not initialized")
+                continue
+            stream["sink_seq"] = stream.get("sink_seq", 0) + 1
+            # Standard motus.control/1 envelope the shared sink expects.
+            message = {
+                "schema": "motus.control/1",
+                "mode": "joint_position",
+                "dof": 5,
+                "values": values,
+                "source": FLEX_SOURCE,
+                "priority": 50,
+                "seq": stream["sink_seq"],
+                "stamp_ms": stamp_ms,
+                "obs_stamp_ms": obs_ms if obs_ms > 0 else None,
+                "ttl_ms": max(200, self.watchdog_ms),
+            }
+            outcome = sink.submit(message)
+            if not outcome.applied:
+                self._reject(f"control sink: {outcome.verdict.value} {outcome.reason}")
+                continue
+            admitted = stream.get("admitted")
+            if admitted is None:
+                continue
+            now = time.monotonic()
+            now_ms = int(time.time() * 1000)
+            # Fresh data that passed the shared chain ended a watchdog hold.
+            if stream.get("starved"):
+                self._energize(instance_id)
+                stream["starved"] = False
+                with self._lock:
+                    self._last_error = ""
+            if outcome.verdict.value == "clamped":
+                self._reject("control sink clamped curl values")
+            if now - stream["last_command_monotonic"] < 1.0 / self.max_hz:
+                self._reject("throttled")
+                continue
+            if self._apply_flexions(instance_id, stream, payload,
+                                    admitted, now, now_ms):
+                wrote = True
         return wrote
 
     def _on_watchdog(self):
-        """Silence releases torque but keeps the subscription alive.
+        """Drive each stream's shared sink timer.
 
-        We must not keep a hand energized with no fresh data, so on timeout we
-        release torque and mark the stream starved. When data returns we do
-        NOT re-energize on our own: a person must re-confirm the workspace is
-        safe with an explicit confirmed `resume`. `stop` ends the stream.
+        Freshness, watchdog silence, stand-down escalation and force-torque
+        abort are all owned by common/control.ControlSink. Its on_watchdog /
+        on_abort callbacks release torque and mark the stream starved, so the
+        only thing this timer must do is tick every live sink. Paused streams
+        are skipped: they are disarmed and no data is expected.
         """
-        now = time.monotonic()
         with self._lock:
             streams = dict(self._streams)
         for instance_id, stream in streams.items():
             if stream.get("paused"):
-                continue          # disarmed: no data expected, nothing to protect
-            if stream.get("starved"):
-                continue          # already released, waiting for data to return
-            if now - stream["last_data_monotonic"] > self.watchdog_ms / 1000.0:
-                self._release(instance_id)
-                with self._lock:
-                    stream["starved"] = True
-                    self._last_error = (
-                        f"手部视觉数据超过 {self.watchdog_ms} ms 未更新，"
-                        "已释放力矩；数据恢复后需人工确认安全再 resume")
-                self._reject("watchdog")
+                continue
+            sink = stream.get("sink")
+            if sink is None:
+                continue
+            outcome = sink.tick()
+            if outcome is not None:
+                self._reject(f"control sink: {outcome.verdict.value} {outcome.reason}")
         # Never close the node here: the subscription must survive a dropout
         # so recovery can happen without a fresh start.
