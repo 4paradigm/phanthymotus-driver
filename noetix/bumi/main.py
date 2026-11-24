@@ -204,6 +204,17 @@ class BumiDeviceBundle:
                 plugins_cfg["vision_capture"], camera_plugin))
             print("[bundle] VisionCapturePlugin loaded")
 
+        # vision_tf is a pure data adapter: it turns vision-localisation JSON
+        # into tf-shaped transforms for a downstream tf-tree card.  It touches
+        # no hardware, so it is deliberately NOT gated on high_ctrl/media_ctrl —
+        # those may both be None (e.g. a data-only deployment) and the card must
+        # still come up.
+        if plugins_cfg.get("vision_tf", {}).get("enabled", False):
+            from vision_tf_card import VisionTfPlugin
+            self._plugins.append(VisionTfPlugin(
+                plugins_cfg["vision_tf"], namespace, executor))
+            print("[bundle] VisionTfPlugin loaded")
+
     def start_all(self) -> None:
         failed = 0
         for i, p in enumerate(self._plugins):

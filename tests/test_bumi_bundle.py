@@ -61,6 +61,22 @@ class FakeSpeakerPlugin:
         pass
 
 
+class FakeVisionTfPlugin:
+    def __init__(self, plugin_config, namespace, executor):
+        self.plugin_config = plugin_config
+        self.namespace = namespace
+        self.executor = executor
+
+    def get_tool(self):
+        return {"name": "vision_tf", "type": "processor"}
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+
 @pytest.fixture
 def bundle_module(monkeypatch):
     """Load the real bundle and servo card with hardware imports replaced."""
@@ -74,6 +90,13 @@ def bundle_module(monkeypatch):
     fake_device.LocoPlugin = FakeLocoPlugin
     fake_device.SpeakerPlugin = FakeSpeakerPlugin
     monkeypatch.setitem(sys.modules, "device", fake_device)
+
+    # vision_tf is a pure data card; stub it so the real main.py registration
+    # guard can be exercised without rclpy in the host test process.
+    fake_vision_tf = types.ModuleType("vision_tf_card")
+    fake_vision_tf.VisionTfPlugin = FakeVisionTfPlugin
+    monkeypatch.setitem(sys.modules, "vision_tf_card", fake_vision_tf)
+
     monkeypatch.syspath_prepend(str(BUMI))
     previous_loco_servo = sys.modules.pop("loco_servo", None)
 
@@ -169,4 +192,32 @@ def test_existing_bumi_plugin_loading_is_unchanged(bundle_module):
 
     assert [tool["name"] for tool in bundle.get_all_tools()] == [
         "loco", "loco_servo", "speaker"]
+
+
+def test_enabled_vision_tf_registers_even_without_any_controller(bundle_module):
+    # vision_tf is a pure data card: no high_ctrl, no media_ctrl, yet it must
+    # still load — gating it on a controller would make it silently disappear.
+    config = _config()
+    config["plugins"]["vision_tf"] = {"enabled": True, "source_name": "ar"}
+
+    bundle = bundle_module.BumiDeviceBundle(
+        config, "bumi_test", object(), high_ctrl=None, media_ctrl=None)
+
+    tools = bundle.get_all_tools()
+    # With high_ctrl=None the controller-gated loco/loco_servo cards do NOT
+    # register — but vision_tf must still load because it is a pure data card.
+    assert [t["name"] for t in tools] == ["vision_tf"]
+    vision_tf = bundle._plugins[-1]
+    assert vision_tf.plugin_config["source_name"] == "ar"
+    assert vision_tf.namespace == "bumi_test"
+
+
+def test_vision_tf_is_skipped_when_disabled(bundle_module):
+    config = _config()
+    config["plugins"]["vision_tf"] = {"enabled": False}
+
+    bundle = bundle_module.BumiDeviceBundle(
+        config, "bumi_test", object(), high_ctrl=None, media_ctrl=None)
+
+    assert "vision_tf" not in [t["name"] for t in bundle.get_all_tools()]
 

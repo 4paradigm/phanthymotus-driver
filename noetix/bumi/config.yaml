@@ -93,3 +93,24 @@ plugins:
     output_dir: /opt/phanthy-motus/data/vision_capture
     fps: 15
     max_duration_s: 30
+  # 视觉定位结果 -> tf 变换的纯数据处理器卡。默认关闭：只有把视觉目标挂进
+  # 全身 tf 树的部署才需要它。左联视觉定位卡的 data/json，右联 tf 构建卡。
+  # 本卡不做旋转、不发 /tf、不碰硬件；旋转在 URDF 的 camera_optical_joint 里。
+  vision_tf:
+    enabled: false
+    source_name: vision          # 子帧前缀 vision_<source>_<id>；也用于话题名区分不同视觉源
+    adapter: pose                # pose | pose_tf_like | ar_marker | pixel_depth
+    # 输入坐标约定决定父帧：optical->camera_optical_frame(x右y下z深)，
+    # body->camera_link(x前y左z上)，base->base_link(已含安装平移)。
+    input_frame: optical
+    # 输出帧：optical 原样透传（默认，旋转交给 URDF）；body 则卡内转成机体系并挂 camera_link。
+    output_frame: optical
+    pose_direction: object_in_camera   # object_in_camera | camera_in_object（后者求逆）
+    child_prefix: vision
+    units: m                     # m | mm（显式声明，禁止按数值大小推断）
+    ttl_ms: 500                  # [50,60000]，超时未更新的目标不再发布并计入 dropped
+    min_confidence: 0.0          # [0,1]，默认不过滤
+    focal_px: 460.0              # [100,2000]，pixel_depth 适配器缺省内参
+    image_width: 640             # [16,4096]
+    image_height: 480            # [16,4096]
+    publish_rate_hz: 10          # [1,50]
