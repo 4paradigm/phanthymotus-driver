@@ -173,3 +173,68 @@ def test_rejected_address_reports_the_error_without_the_key(jpeg):
     plugin.dispatch("stop", {})
     assert result["state"] == "error"
     assert "推流失败" in result["error"] and "secret-key" not in result["error"]
+
+
+def test_stop_invalidates_start_while_node_initializes():
+    entered, release = threading.Event(), threading.Event()
+    destroyed = []
+    executor = _Executor()
+
+    class SlowInputs:
+        image_topic, audio_topic = "/robot/camera/color", "/robot/mic/audio"
+
+        def __init__(self, topics, on_jpeg, on_pcm):
+            self.node = types.SimpleNamespace(destroy_node=lambda: destroyed.append(True))
+            entered.set()
+            assert release.wait(timeout=5)
+
+    plugin = _load().LiveStreamPlugin({}, "robot", executor, input_node=SlowInputs)
+    result = {}
+    thread = threading.Thread(target=lambda: result.setdefault("old", plugin.dispatch("start", {"input_topics": ["/robot/camera/color"]})))
+    thread.start()
+    try:
+        assert entered.wait(timeout=5)
+        assert plugin.dispatch("stop", {}) == {"state": "idle"}
+    finally:
+        release.set()
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert result["old"]["state"] == "superseded"
+    assert destroyed == [True]
+    assert executor.nodes == []
+    assert plugin.dispatch("info", {})["topic_in"] == []
+
+
+def test_newer_start_replaces_in_flight_older_start():
+    entered, release = threading.Event(), threading.Event()
+    executor = _Executor()
+    created = []
+
+    class Inputs:
+        image_topic, audio_topic = "/robot/camera/color", "/robot/mic/audio"
+
+        def __init__(self, topics, on_jpeg, on_pcm):
+            self.node = types.SimpleNamespace(destroyed=False)
+            self.node.destroy_node = lambda: setattr(self.node, "destroyed", True)
+            created.append(self.node)
+            if len(created) == 1:
+                entered.set()
+                assert release.wait(timeout=5)
+
+    plugin = _load().LiveStreamPlugin({}, "robot", executor, input_node=Inputs)
+    result = {}
+    thread = threading.Thread(target=lambda: result.setdefault("old", plugin.dispatch("start", {"input_topics": ["/robot/old"]})))
+    thread.start()
+    try:
+        assert entered.wait(timeout=5)
+        assert plugin.dispatch("start", {"input_topics": ["/robot/new"]})["state"] == "ready"
+    finally:
+        release.set()
+        thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert result["old"]["state"] == "superseded"
+    assert created[0].destroyed
+    assert executor.nodes == [created[1]]
+    assert not created[1].destroyed
+    assert plugin.dispatch("stop", {}) == {"state": "idle"}
+    assert executor.nodes == []
