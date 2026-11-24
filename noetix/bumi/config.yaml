@@ -53,8 +53,7 @@ plugins:
   # 只读 RGB-D 视觉里程计（RTAB-Map rgbd_odometry，在 bundle 进程内运行）。
   # 内置 IMU 只辅助旋转初值；无惯性位移积分/EKF，不参与运动控制；
   # 停止本卡片只回收它自己的估计子进程和私有话题，不影响相机/媒体/动作卡。
-  # 默认只约定相机光学坐标系到机体轴的方向；零平移不代表已测量机身原点。
-  # vendor.pose_reference=body_axes，数值外参仍可供通用 SLAM 使用。
+  # 默认使用实测的相机到机身外参，vendor.pose_reference=body。
   visual_odometry:
     # 默认开启只读视觉里程计；原始 RGB-D 分支限频见下方。
     enabled: true
@@ -69,10 +68,10 @@ plugins:
     # the extra DDS/CPU load instead of duplicating every 30 Hz camera frame.
     # Invalid values fall back to 10 Hz; the camera-side upper bound is 30 Hz.
     max_rate_hz: 10
-    # Level-forward axis convention. Supply a measured translation in metres
-    # for a body-origin pose, and measured IMU lever arms for full IMU fusion.
+    # Measured camera-to-body transform, translation in metres and rotation in xyzw.
     calibration:
       camera_to_body:
+        translation: [0.0, 0.0, 0.0]
         quaternion: [-0.5, 0.5, -0.5, 0.5]
   # Independent raw leg kinematics, with SDK attitude for coordinate rotation.
   # 40 Hz reads / 20 Hz state/odom output; visual correction lives in Perception.

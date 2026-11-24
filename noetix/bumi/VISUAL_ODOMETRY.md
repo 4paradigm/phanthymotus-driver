@@ -43,11 +43,10 @@ is derived from the IMU quaternion, not integrated angular velocity, and resets
 with each segment.
 Displacement is the 3-D straight-line distance from the **first tracking pose of
 the current segment**, not accumulated walking distance or validated accuracy.
-The shipping `config.yaml` uses a level-forward
-optical-to-body axis convention: `x` forward, `y` left, `z` up
-(`pose_reference=body_axes`). The pose origin is the camera. Supply
-`camera_to_body.translation` measured in metres to report a body-origin pose.
-The numeric rotation remains usable for body-IMU assistance. Reset starts a new
+The shipping `config.yaml` uses the measured camera-to-body transform.
+It reports `pose_reference=body` with `x` forward, `y` left, and `z` up.
+A custom mount with only rotation reports `body_axes` at the camera origin.
+The numeric rotation also supports body-IMU assistance. Reset starts a new
 segment and distance origin.
 
 The card declares two outputs, both pre-existing contracts: the full
@@ -110,10 +109,9 @@ reset is required.
   check and the camera 250 ms/1 s freshness limits are unchanged; RTAB-Map
   results get the 1.5 s grace described above.
 - One segment-scoped static TF `base -> optical` is published before the child
-  starts. The default config uses the standard level-forward rotation
-  (`[-0.5, 0.5, -0.5, 0.5]`, xyzw) with zero translation, so `base` carries robot
-  body axes (x forward, y left, z up) at the camera origin; `publish_tf` of the
-  estimator stays false. Removing calibration falls back to `rgb_optical`.
+  starts. The default measured translation is `[0, 0, 0]` metres and the
+  rotation is `[-0.5, 0.5, -0.5, 0.5]` (xyzw). The estimator's `publish_tf`
+  stays false. Removing calibration falls back to `rgb_optical`.
 - With `imu_assisted: false`, the unused `imu` remap prevents an accidental live
   subscription. With body assistance enabled, the segment's private republished
   body orientation topic is remapped to RTAB-Map.
@@ -127,12 +125,11 @@ RTAB-Map's odometry message is a trajectory delta, not a measured body twist.
 `pose` is `null` unless the segment is tracking; no last pose is repeated.
 
 - `pose`: `{position, quaternion xyzw, frame_id, child_frame_id, covariance[36]}`;
-  `child_frame_id` is `<segment>_base`, which carries robot body axes by default
-  (x forward, y left, z up) at the camera origin.
+  `child_frame_id` is `<segment>_base`, which uses the configured body origin
+  and axes by default.
 - `vendor`: `status` (`initializing`/`tracking`/`lost`), `reason`, `segment_id`,
-  `calibration_id`, `pose_reference` (`body_axes` by the shipped level-forward
-  assumption; `body` for a measured mount; `rgb_optical` if calibration is
-  removed),
+  `calibration_id`, `pose_reference` (`body` with configured translation,
+  `body_axes` with rotation only, `rgb_optical` with no calibration),
   `visual_diagnostic`, `input_age_ms`, `visual_stamp_ns`,
   `camera_time_provenance`, `source: rtabmap_rgbd_odometry`, `accuracy_validated:
   false`, `twist_source: null`.
@@ -176,10 +173,9 @@ The camera-IMU RSUSB build path and its modules have been removed.
 The visual-odometry `motus.odom/1` stream retains its existing status and pose
 ports. PR #371 accepts the numeric pose without the full driver profile. Once
 the optical frame is known, `vendor.motus_slam.extrinsic` describes the same
-segment pose-frame transform used by RTAB-Map. With the shipping rotation-only
-preset its parent is the camera-origin `<segment>_base` frame. The shared
-`body_mount` sidecar uses an explicitly configured body-origin translation or
-a capture-time TF lookup.
+segment pose-frame transform used by RTAB-Map. The shared `body_mount`
+sidecar uses the configured camera-to-body transform and falls back to a
+capture-time TF lookup when the translation is omitted.
 
 The public depth port now carries the normalized native-color optical grid,
 with its actual `motus.camera/1` calibration and capture clock. It no longer

@@ -22,7 +22,8 @@ def calibration():
                 camera_to_body=dict(translation=[0.4, 0, 0.2], quaternion=[0, 0, 0, 1]))
 
 
-def test_shipped_mount_exposes_body_axes_at_the_camera_origin():
+@pytest.mark.parametrize('rotation_only', [False, True])
+def test_shipped_mount_reports_body_origin_with_confirmed_translation(rotation_only):
     from pathlib import Path
     import yaml
     from noetix.bumi.rgbd_camera import fixed_body_mount
@@ -31,14 +32,20 @@ def test_shipped_mount_exposes_body_axes_at_the_camera_origin():
                              'noetix/bumi/config.yaml').read_text())
     node = object.__new__(VisualOdometryNode)
     preset = config['plugins']['visual_odometry']['calibration']
+    if rotation_only:
+        preset['camera_to_body'].pop('translation', None)
     node.calibration = CameraCalibration(preset)
     node.namespace, node.segment, node.frame_id = 'robot', 'segment', 'robot_rgb_optical'
-    assert node.pose_reference() == 'body_axes'
+    assert node.pose_reference() == ('body_axes' if rotation_only else 'body')
     mount = node.slam_extrinsic()
     assert not {'calibrated', 'assumed', 'source', 'version'} & mount.keys()
     assert np.asarray(mount['matrix']).shape == (4, 4)
     assert [row[3] for row in mount['matrix']] == [0., 0., 0., 1.]
-    assert fixed_body_mount(preset) is None
+    capture_mount = fixed_body_mount(preset)
+    if rotation_only:
+        assert capture_mount is None
+    else:
+        np.testing.assert_allclose(capture_mount, mount['matrix'], atol=1e-12)
 
 
 def test_finite_rejects_nan_and_wrong_size():

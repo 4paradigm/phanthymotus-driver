@@ -40,11 +40,11 @@ def test_card_and_plugin_config_are_in_sync():
     plugin = config['plugins']['visual_odometry']
     assert plugin['enabled'] is True
     assert plugin['max_rate_hz'] == 10
-    # The shipping preset supplies body axes without a body-origin translation.
+    # The shipping preset supplies the measured camera-to-body transform.
     cal = plugin['calibration']
     assert not {'calibration_id', 'fixed_mount', 'assumed', 'calibrated'} & cal.keys()
     assert cal['camera_to_body']['quaternion'] == [-0.5, 0.5, -0.5, 0.5]
-    assert 'translation' not in cal['camera_to_body']
+    assert cal['camera_to_body']['translation'] == [0.0, 0.0, 0.0]
     assert 'body_imu_translation' not in cal
     # The tool name lives in code; keep the driver card pointing at it.
     source = (BUMI/'visual_odometry.py').read_text()

@@ -19,6 +19,7 @@ from pathlib import Path
 from types import SimpleNamespace as NS
 
 import pytest
+import yaml
 
 BUMI = Path(__file__).resolve().parents[2]/'noetix/bumi'
 
@@ -267,21 +268,27 @@ def test_original_depth_is_normalized_capture_mapped_and_owned_once(capture, mon
     assert state.stopped
 
 
-def test_fixed_body_mount_is_available_with_driver_visual_odometry_off(capture, monkeypatch):
+@pytest.mark.parametrize('use_shipped_mount', [False, True])
+def test_fixed_body_mount_is_available_with_driver_visual_odometry_off(capture, monkeypatch, use_shipped_mount):
     device, state = capture
     monkeypatch.delenv('BUMI_VISUAL_ODOMETRY', raising=False)
     monkeypatch.setitem(sys.modules, 'tf2_ros', None)
     monkeypatch.setattr(sys.modules['rclpy.qos'], 'qos_profile_sensor_data', object(), raising=False)
-    monkeypatch.setenv('BUMI_BODY_IMU_MOUNT', json.dumps({
+    calibration = {
         'calibration_id': 'configured_mount', 'fixed_mount': True, 'assumed': True,
         'camera_to_body': {'translation': [.15, -.03, .4],
                            'quaternion': [-.5, .5, -.5, .5]},
-    }))
+    }
+    if use_shipped_mount:
+        config = yaml.safe_load((BUMI/'config.yaml').read_text())
+        calibration = config['plugins']['visual_odometry']['calibration']
+    monkeypatch.setenv('BUMI_BODY_IMU_MOUNT', json.dumps(calibration))
     device._camera_subprocess('robot')
     mounts = state.published['/robot/camera/rgbd/body_mount']
     packet = json.loads(mounts[0].data)
-    assert packet['matrix'] == [[0., 0., 1., .15], [-1., 0., 0., -.03],
-                                [0., -1., 0., .4], [0., 0., 0., 1.]]
+    tx, ty, tz = (0., 0., 0.) if use_shipped_mount else (.15, -.03, .4)
+    assert packet['matrix'] == [[0., 0., 1., tx], [-1., 0., 0., ty],
+                                [0., -1., 0., tz], [0., 0., 0., 1.]]
     assert packet['parent_frame'] == 'base_link'
     assert packet['child_frame'] == 'robot_rgb_optical'
     assert packet['mode'] == 'static'

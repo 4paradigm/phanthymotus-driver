@@ -37,10 +37,12 @@ def test_legacy_labels_do_not_change_numeric_bumi_mount():
         [0, -1, 0, 0], [0, 0, 0, 1]])
 
 
-def test_shipped_bumi_mount_keeps_numeric_axes_without_claiming_calibration():
+def test_shipped_bumi_mount_reports_the_measured_numeric_transform():
     config_path = Path(__file__).resolve().parents[2] / 'noetix/bumi/config.yaml'
     calibration = yaml.safe_load(config_path.read_text())['plugins']['visual_odometry']['calibration']
-    mount = _node(calibration).slam_extrinsic()
+    node = _node(calibration)
+    assert node.pose_reference() == 'body'
+    mount = node.slam_extrinsic()
     assert set(mount) == {'parent_frame', 'child_frame', 'mode', 'matrix'}
     np.testing.assert_allclose(mount['matrix'], [
         [0, 0, 1, 0], [-1, 0, 0, 0],

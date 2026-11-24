@@ -509,10 +509,9 @@ layouts reference the declared ports by index and direct ROS subscribers use
 the status topic. The full sample includes `vendor.turn_angle_deg` (body yaw
 relative to the first IMU sample of the current segment, wrapped to -180..180
 degrees) and `vendor.displacement_m` (distance from the first tracking pose in
-the segment). No loco card is wired to either output. The shipped config applies
-the level-forward optical-to-body axis convention so `position` uses
-robot body axes (x forward, y left, z up; `pose_reference: body_axes`) at the
-camera origin. The card defaults to `initializing` and publishes no pose
+the segment). No loco card is wired to either output. The shipped config uses
+the measured camera-to-body transform and reports `pose_reference: body`.
+The card defaults to `initializing` and publishes no pose
 until the estimator is tracking; a fault ends that segment and recovery starts a
 fresh one automatically. Stopping the card reaps its estimator and private
 topics and disables the shared raw RGB-D branch through
@@ -587,7 +586,7 @@ accuracy acceptance of this adapter remain pending.
 
 ### Capture-time body-camera TF
 
-The paired RGB/depth declarations advertise the `/{namespace}/camera/rgbd/body_mount` sidecar automatically, without adding a second output to the depth card. Both camera declarations carry the same `vendor.body_mount`; Perception discovers this topic automatically, so no card matrix is required. The existing camera ROS node queries `base_link <- {namespace}_rgb_optical` at the original mapped capture timestamp selected by pinned RTAB-Map and Perception PR371: the later image in double-precision seconds, depth on a tie, retaining the selected integer nanoseconds. It publishes `motus.camera_mount/1` JSON before the matching images without rewriting either image header. `CAMERA_BODY_FRAME` overrides only the body frame name. Dynamic joint transforms are looked up for every capture.
+The paired RGB/depth declarations advertise the `/{namespace}/camera/rgbd/body_mount` sidecar automatically, without adding a second output to the depth card. Both camera declarations carry the same `vendor.body_mount`, which Perception discovers automatically. By default the camera node publishes the measured fixed transform `base_link <- {namespace}_rgb_optical`. For configurations without fixed translation, it looks up TF at the selected capture time. Both paths publish `motus.camera_mount/1` JSON before the matching images, using the later image's original integer timestamp (depth on a tie in double-precision seconds). `CAMERA_BODY_FRAME` overrides the body frame name.
 
 `body_mount_status` exposes the selected frames and availability independently of RGB-D readiness. Missing TF packages, frames, capture-time transforms or publisher failures preserve video, RGB-D and IMU. The driver never substitutes SDK internal extrinsics, a URDF guess, identity or latest TF. The node remains in its existing ROS domain 42; installed TF domain, real optical calibration chain, timing and accuracy still require hardware acceptance. Bumi already includes `tf2_ros` through its existing RTAB-Map dependency; the build import guard now checks its Buffer and TransformListener APIs. No image was built or deployed for this change. Main odometry stays camera referenced; available evidence supports only a separately named derived body pose.
 
@@ -620,8 +619,8 @@ commands. Enable **both** `plugins.visual_odometry.enabled: true` and
 `plugins.fused_odometry.enabled: true` in `config.yaml`, then deploy the Bumi
 driver image. A live HighController connection is required.
 
-With the shipped rotation-only preset, VO reports `body_axes` at the camera
-origin. This planar body-origin filter does not apply those visual corrections:
+If a custom mount supplies rotation only, VO reports `body_axes` at the camera
+origin. In that case the planar body-origin filter cannot apply visual corrections:
 it continues leg/IMU prediction, reports `visual_result=body_reference_unavailable`,
 and explains the received reference in status `reason` and odometry `last_error`.
 Supply an actual body-reference pose to enable its visual corrections. A later
