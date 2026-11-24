@@ -6,7 +6,9 @@ hardware_model: piper
 image_name: agilex-piper
 port: 15741
 mcp_url: "http://localhost:15741/mcp"
-description: "PiPER Arm control, independent read-only Joints and On camera sensor cards."
+description: >-
+  PiPER Arm control, independent Joints and On camera sensor cards,
+  and optional ALOHA three-view capture.
 build_context_extras:
   - ../../common
 cards:

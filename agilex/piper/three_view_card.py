@@ -149,10 +149,11 @@ class ThreeViewCapture:
         elif action == "stop":
             self.stop()
         elif action != "info":
-            raise ValueError(f"不支持的三视角取证操作：{action}")
+            return None
+        active_state = "ready" if action == "start" else "running"
         with self._lock:
             return {
-                "state": "running" if self._node is not None else "idle",
+                "state": active_state if self._node is not None else "idle",
                 "sources": self.sources,
                 "topic_out": self._ports(),
             }

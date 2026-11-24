@@ -80,8 +80,9 @@ class ThreeViewCaptureTests(unittest.TestCase):
 
         self.assertEqual(self.call("info")["state"], "idle")
         self.assertEqual(self.call("capture")["status"], "inactive")
-        self.assertEqual(self.call("start")["state"], "running")
-        self.assertEqual(self.call("start")["state"], "running")
+        self.assertEqual(self.call("start")["state"], "ready")
+        self.assertEqual(self.call("start")["state"], "ready")
+        self.assertEqual(self.call("info")["state"], "running")
         self.ros2.executor_core.add_node.assert_called_once_with(self.node)
         self.assertEqual(self.node.create_subscription.call_count, 3)
         self.assertEqual(self.call("stop")["state"], "idle")
@@ -89,6 +90,10 @@ class ThreeViewCaptureTests(unittest.TestCase):
         self.assertEqual(self.call("capture")["status"], "inactive")
         self.ros2.executor_core.remove_node.assert_called_once_with(self.node)
         self.node.destroy_node.assert_called_once()
+
+    def test_unsupported_action_returns_none(self):
+        self.assertIsNone(self.call("unsupported_action"))
+        self.assertEqual(self.call("info")["state"], "idle")
 
     def test_missing_views(self):
         self.call("start")
