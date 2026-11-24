@@ -16,7 +16,7 @@ def inside(point, workspace):
 class PickTransfer:
     def __init__(self, config, tcp):
         if not isinstance(config, dict):
-            raise ValueError("Configure vision_pick.transfer before enabling visio_pick_and_drop")
+            raise ValueError("Configure vision_pick.transfer before running grab_to")
         box = config.get("workspace_mm")
         if not isinstance(box, list) or len(box) != 3:
             raise ValueError("workspace_mm must have X, Y and Z intervals")

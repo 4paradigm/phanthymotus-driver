@@ -1,4 +1,4 @@
-# visio_pick_and_drop
+# vision_pick_and_drop
 
 This PiPER actuator uses aligned RGB-D to pick from an operator-selected point,
 carry the object to a configured drop point, then open the gripper and retract.
@@ -78,15 +78,26 @@ enabled in CAN control.
 
 ## Use on the canvas
 
-1. Add `visio_pick_and_drop`. Use `info` to check camera and motion status.
+Add the PiPER driver's `vision_pick_and_drop` actuator. For manual localization
+it is the only card needed. The PiPER deployment supplies color, aligned depth,
+camera intrinsics and wrist joint feedback over ROS and CAN. To use object
+detections, add `vop` and connect the actuator's `image/jpeg` output to the VOP
+image input. Use the vocabulary for the objects in the scene. The driver reads
+the VOP output on `<RGB topic>/objects` automatically. `info.topic_out` shows
+the RGB topic and `info.source.objects_topic` shows the return topic. VOP needs
+no return connection on the canvas.
+
+1. Use `info` to check camera and motion status.
 2. Run `observe` with the arm and object stationary. Use its observation ID
-   and normalized image coordinates with `plan_pick`. The image centre is
+   and normalized image coordinates with `plan_pick`. Use `start_point_x` and
+   `start_point_y` with the same convention as RealMan and FR3. With VOP, copy
+   `objects[].position[0]` and `[1]` from the observation. The image centre is
    `(0, 0)`, and X and Y increase to the right and down.
    Preview returns the selected base-frame point while transfer setup is
    pending. `info.transfer_setup_error` identifies the remaining setup.
 3. Review the returned waypoints. With the shared PiPER motion permit open,
    pass the returned plan ID to `grab_to` and confirm the path and workspace.
-4. Read `info` or wait for ACP completion. `stop_motion` cancels an active
+4. Read `info` or wait for ACP completion. `cancel` stops an active
    operation. After a stopped or failed transfer that may have moved the arm,
    recover the arm and check the gripper on site before restarting the driver.
 

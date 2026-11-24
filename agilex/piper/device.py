@@ -236,12 +236,12 @@ def build_plugins(config, namespace, ros2):
     plugins = add_intent_monitor([arm], config, ros2, joints_card=True)
     plugins = add_camera_live(plugins, config, ros2, sensor_card=True)
     if config.get("vision_pick", {}).get("enabled") is True:
-        from agilex.piper.vision_pick import PiperVisionPick
+        from agilex.piper.vision_pick import NAME, PiperVisionPick
 
         try:
             vision = PiperVisionPick(config, namespace, ros2, arm)
         except (OSError, RuntimeError, SyntaxError, TypeError, ValueError) as exc:
-            print(f"[piper] visio_pick_and_drop configuration rejected: {exc}", flush=True)
+            print(f"[piper] {NAME} configuration rejected: {exc}", flush=True)
         else:
             plugins.append(vision)
     return plugins

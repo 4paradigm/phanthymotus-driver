@@ -18,7 +18,7 @@ from agilex.piper.vision_transfer import PickTransfer
 from common.vendor_runtime import action_schema, tool
 
 
-NAME = "visio_pick_and_drop"
+NAME = "vision_pick_and_drop"
 OBSERVATION_LIFETIME = 30
 SCENE_TOLERANCE_MM = 8
 DEFAULT_URDF = Path(__file__).with_name("resource") / "upstream/piper_description.urdf"
@@ -67,7 +67,7 @@ class PiperVisionPick:
                     raise ValueError("PiPER URDF does not match the wrist calibration")
                 model = PiperKinematics(arm_urdf)
         if self.camera_transform is None:
-            raise ValueError("Configure the installed camera calibration before enabling visio_pick_and_drop")
+            raise ValueError(f"Configure the installed camera calibration before enabling {NAME}")
         self.transfer = None
         self.transfer_setup_error = None
         try:
@@ -77,19 +77,25 @@ class PiperVisionPick:
         joint_feedback = runtime.read_cached_joint_feedback if self.wrist and not joint_topic else None
         self.source = ObservationSource(ros2, vision, self.rgb_topic, model, joint_feedback=joint_feedback)
 
+    def rgb_output(self):
+        return [{"topic": self.rgb_topic, "format": "image/jpeg"}]
+
     def get_tools(self):
         actions = {
             "start": ([], "Subscribe to RGB-D and publish RGB for VOP"),
             "stop": ([], "Stop this card and cancel any active transfer"),
-            "stop_motion": ([], "Stop an active transfer and keep motor torque"),
+            "cancel": ([], "Stop an active transfer and keep motor torque"),
             "info": ([], "Read camera, motion permission and transfer status"),
             "observe": ([], "Save a fresh RGB-D observation of a stationary scene"),
-            "plan_pick": (["observation_id", "pick_x", "pick_y"], "Preview the 3D pick point and any configured drop path"),
+            "plan_pick": (["observation_id", "start_point_x", "start_point_y"],
+                          "Preview the 3D pick point and any configured drop path"),
         }
         fields = {
             "observation_id": {"type": "string", "title": "Observation ID"},
-            "pick_x": {"type": "number", "minimum": -1, "maximum": 1, "title": "Pick X (positive right)"},
-            "pick_y": {"type": "number", "minimum": -1, "maximum": 1, "title": "Pick Y (positive down)"},
+            "start_point_x": {"type": "number", "minimum": -1, "maximum": 1,
+                              "title": "Pick X (positive right)", "description": "Use VOP position[0]."},
+            "start_point_y": {"type": "number", "minimum": -1, "maximum": 1,
+                              "title": "Pick Y (positive down)", "description": "Use VOP position[1]."},
         }
         if self.transfer is not None:
             actions["grab_to"] = (["plan_id", "confirm_motion"], "Run the reviewed pick and drop plan")
@@ -101,7 +107,7 @@ class PiperVisionPick:
         schema = action_schema(actions, fields)
         schema["properties"]["action"]["default"] = "info"
         schema.update({"additionalProperties": False, "x-manual-execution": True, "x-resource": "arm",
-                       "x-hooks": {hook: {"action": "stop_motion"}
+                       "x-hooks": {hook: {"action": "cancel"}
                                    for hook in ("on_interrupt_motion", "on_interrupt_all")}})
         if self.transfer is not None:
             schema["x-is-dangerous"] = True
@@ -109,7 +115,7 @@ class PiperVisionPick:
         description = ("Pick from aligned RGB-D and move to the configured drop point."
                        if self.transfer is not None else "Preview a 3D pick point from calibrated aligned RGB-D.")
         definition = tool(NAME, "actuator", description,
-                          schema, topic_out=[{"topic": self.rgb_topic, "format": "image/jpeg"}])
+                          schema, topic_out=self.rgb_output())
         definition["title"] = NAME
         return [definition]
 
@@ -126,7 +132,8 @@ class PiperVisionPick:
             state = "ready" if rgbd_ready and (not self.wrist or source["joints_fresh"]) else "awaiting_feedback"
         return {"state": state,
                 "can_interface": self.can_interface, "source": source,
-                "rgb_topic": self.rgb_topic, "calibration_id": self.calibration["id"],
+                "rgb_topic": self.rgb_topic, "topic_out": self.rgb_output(),
+                "calibration_id": self.calibration["id"],
                 "motion_permission": self.runtime.motion_enabled,
                 "transfer_setup_error": self.transfer_setup_error,
                 "last_transfer": deepcopy(self.last_transfer)}
@@ -167,7 +174,8 @@ class PiperVisionPick:
         self.plan = None
         if not snapshot or args["observation_id"] != snapshot["id"] or snapshot["expires"] <= time.monotonic():
             raise ValueError("Observation is missing, mismatched or expired. Run observe again.")
-        pixel, point, spread = camera_point(snapshot["depth"], snapshot["info"], (args["pick_x"], args["pick_y"]))
+        pick_xy = (args["start_point_x"], args["start_point_y"])
+        pixel, point, spread = camera_point(snapshot["depth"], snapshot["info"], pick_xy)
         base_point = self.base_point(snapshot, point)
         preview = {"state": "preview", "observation_id": snapshot["id"], "pick_pixel": pixel,
                    "camera_xyz_mm": point, "depth_patch_spread_mm": spread, "base_xyz_mm": base_point,
@@ -176,7 +184,7 @@ class PiperVisionPick:
             return {**preview, "transfer_setup_error": self.transfer_setup_error}
         waypoints = self.transfer.waypoints(base_point)
         plan = self.plan = {"id": uuid4().hex, "observation": snapshot,
-                            "xy": (args["pick_x"], args["pick_y"]), "base_point": base_point,
+                            "xy": pick_xy, "base_point": base_point,
                             "waypoints": waypoints}
         return {**preview, "plan_id": plan["id"], "waypoints_tip_mm_deg": waypoints}
 
@@ -232,11 +240,11 @@ class PiperVisionPick:
         args = {key: value for key, value in args.items()
                 if key not in {"_tool_name", "instance_id", "action"}
                 and not (key == "input_topic" and value == "") and not (key == "input_topics" and value == [])}
-        required = {"plan_pick": {"observation_id", "pick_x", "pick_y"},
+        required = {"plan_pick": {"observation_id", "start_point_x", "start_point_y"},
                     "grab_to": {"plan_id", "confirm_motion"}}
         if set(args) != required.get(action, set()):
             raise ValueError("Unexpected or missing action parameters")
-        if action == "stop_motion":
+        if action == "cancel":
             return (self.runtime.request_stop(NAME, only_if_active=True)
                     or {"state": "idle", "operation_stopping": False})
         with self.lock:

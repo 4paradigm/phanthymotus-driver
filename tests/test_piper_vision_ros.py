@@ -33,7 +33,7 @@ from test_piper_intent import IntentDriver
 from test_piper_unified import fast_execute
 
 ROOT = Path(__file__).resolve().parents[1]
-TOOL = "visio_pick_and_drop"
+TOOL = "vision_pick_and_drop"
 TRANSFER = {
     "workspace_mm": [[0, 800], [-100, 100], [10, 320]], "pick_tcp_offset_mm": [0, 0, -5],
     "drop_tcp_xyz_mm": [250, 60, 30], "tool_rpy_deg": [180, 0, 90], "transit_z_mm": 300,
@@ -152,13 +152,16 @@ runpy.run_module("agilex.piper.main", run_name="__main__")
             assert registration[0][1]["url"] == f"http://localhost:{port}/mcp"
             assert observation["objects"] == [{"name": "orange", "position": [0, 0]}]
             assert call(port, "info")["source"]["joint_feedback_source"] == "can"
-            result = call(port, "plan_pick", observation_id=observation["observation_id"], pick_x=0, pick_y=0)
+            result = call(port, "plan_pick", observation_id=observation["observation_id"],
+                          start_point_x=0, start_point_y=0)
             assert result["camera_xyz_mm"] == pytest.approx([0, 0, 600], abs=.001)
             assert result["base_xyz_mm"] == pytest.approx([653.85, 0, 265.47], abs=.2)
             assert result["executed"] is False
             assert "plan_id" not in result and "calibrated" in result["transfer_setup_error"]
             tool = next(tool for tool in rpc(port, "tools/list")["result"]["tools"] if tool["name"] == TOOL)
             assert tool["title"] == TOOL and tool["type"] == "actuator"
+            assert call(port, "info")["topic_out"] == tool["topic_out"]
+            assert call(port, "cancel")["state"] == "idle"
             assert "grab_to" not in tool["inputSchema"]["properties"]["action"]["enum"]
             with pytest.raises(RuntimeError, match="not calibrated"):
                 call(port, "grab_to", plan_id="unavailable", confirm_motion=True)
@@ -211,7 +214,7 @@ def test_canvas_transfer_checks_end_pose_and_completes_with_gripper_contact(tmp_
     def submit():
         observed = bundle.dispatch(TOOL, {"action": "observe"})
         plan = bundle.dispatch(TOOL, {"action": "plan_pick", "observation_id": observed["observation_id"],
-                                      "pick_x": 0, "pick_y": 0})
+                                      "start_point_x": 0, "start_point_y": 0})
         response = bundle.dispatch(TOOL, {"action": "grab_to", "plan_id": plan["plan_id"], "confirm_motion": True})
         assert response["state"] == "running"
         runtime.completions.wait(6)

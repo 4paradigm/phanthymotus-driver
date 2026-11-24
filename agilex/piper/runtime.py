@@ -410,7 +410,7 @@ class PiperRuntime:
                 self.previews.invalidate()
                 affected = self.gate.locked() and self.active_card in {
                     "arm_control", "piper_arm", "piper_joint", "piper_gripper", "piper_mode",
-                    "piper_enable", "piper_disable", "piper_standby", "piper_can", "visio_pick_and_drop",
+                    "piper_enable", "piper_disable", "piper_standby", "piper_can", "vision_pick_and_drop",
                 }
                 if affected:
                     self.cancel.set()

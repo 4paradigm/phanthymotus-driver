@@ -7,7 +7,7 @@ import urllib.request
 
 def call(endpoint, action, **params):
     body = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-            "params": {"name": "visio_pick_and_drop", "arguments": {"action": action, **params}}}
+            "params": {"name": "vision_pick_and_drop", "arguments": {"action": action, **params}}}
     request = urllib.request.Request(endpoint, data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(request, timeout=5) as response:
@@ -41,7 +41,7 @@ def main():
             x, y = args.point if args.pixel is None else normalize_pixel(args.pixel, observation)
             report["observation"] = observation
             report["plan"] = call(args.endpoint, "plan_pick", observation_id=observation["observation_id"],
-                                  pick_x=x, pick_y=y)
+                                  start_point_x=x, start_point_y=y)
             if args.pixel is not None and report["plan"]["pick_pixel"] != args.pixel:
                 raise ValueError("卡片实际读取的像素与请求选点不一致")
     except (OSError, RuntimeError, ValueError) as exc:
