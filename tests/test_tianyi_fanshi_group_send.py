@@ -246,12 +246,25 @@ class FanshiTests(unittest.TestCase):
 
     def test_schema_uses_driver_upload_and_shared_sensitive_config(self):
         tool = self.plugin.get_tool()
+        schema = tool["inputSchema"]
+        props = schema["properties"]
+        actions = schema["x-action-params"]
         self.assertFalse(tool["multiInstance"])
-        self.assertEqual(tool["inputSchema"]["properties"]["image_path"]["uploadTo"], "mcp")
+        self.assertEqual(props["image_path"]["uploadTo"], "mcp")
+        self.assertIn("config", props["action"]["enum"])
+        self.assertEqual(actions["config"]["params"], ["webhook_url", "group_id"])
+        self.assertEqual(actions["send"]["params"], ["text", "image_path", "at_userid"])
+        self.assertEqual(actions["result"]["params"], ["action_id"])
         for name in ("webhook_url", "group_id"):
-            self.assertNotIn(name, tool["inputSchema"]["properties"])
-            self.assertTrue(tool["configSchema"]["properties"][name]["x-sensitive"])
-        self.assertEqual(tool["inputSchema"]["x-completion"]["actions"], ["send"])
+            field = tool["configSchema"]["properties"][name]
+            self.assertEqual(props[name], {k: v for k, v in field.items() if k != "default"})
+            self.assertIsNot(props[name], field)
+            self.assertNotIn("default", props[name])
+            self.assertTrue(props[name]["x-sensitive"])
+            self.assertEqual(field["scope"], "shared")
+            self.assertNotIn(name, schema.get("required", []))
+        self.assertEqual(props["webhook_url"]["format"], "password")
+        self.assertEqual(schema["x-completion"]["actions"], ["send"])
 
     def test_bundle_and_mcp_http_discover_configure_start_send(self):
         scope, bundle = bundle_scope()

@@ -160,7 +160,7 @@ class FanshiGroupSendPlugin:
                              Path(os.environ.get("FILE_INTAKE_DIR", "/work/uploads")))
 
     def get_tool(self):
-        return {
+        tool = {
             "name": self.PREFIX, "type": "actuator", "multiInstance": False,
             "description": (
                 "向预先配置的范式+群发送文字和可选单张图片、@一个成员。"
@@ -173,7 +173,7 @@ class FanshiGroupSendPlugin:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["send", "result"]},
+                    "action": {"type": "string", "enum": ["send", "result", "config"]},
                     "text": {"type": "string", "description": "文字；文字和图片至少提供一种"},
                     "image_path": {"type": "string", "format": "file", "uploadTo": "mcp",
                                    "accept": ".jpg,.jpeg,.png", "description": "驱动可读取的图片路径"},
@@ -184,6 +184,7 @@ class FanshiGroupSendPlugin:
                 "x-action-params": {
                     "send": {"params": ["text", "image_path", "at_userid"], "description": "发送群消息"},
                     "result": {"params": ["action_id"], "description": "查询本次发送结果"},
+                    "config": {"params": ["webhook_url", "group_id"], "description": "配置范式+群消息发送"},
                 },
                 "x-completion": {"actions": ["send"], "timeout": 45},
             },
@@ -198,6 +199,12 @@ class FanshiGroupSendPlugin:
                 "required": ["webhook_url", "group_id"],
             },
         }
+        # Expose config parameters to action-specific callers without defaults.
+        action_settings = copy.deepcopy(tool["configSchema"]["properties"])
+        for field in action_settings.values():
+            field.pop("default", None)
+        tool["inputSchema"]["properties"].update(action_settings)
+        return tool
 
     def start(self):
         # Bundle lazy-start does not have canvas configuration; dispatch arms it.

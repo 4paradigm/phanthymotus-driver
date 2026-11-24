@@ -256,10 +256,11 @@ class SplitSendTests(unittest.TestCase):
     def test_schema_keeps_tool_name_and_calling_parameters(self):
         tool = self.plugin.get_tool()
         self.assertEqual(tool["name"], "fanshi_group_send")
-        self.assertEqual(tool["inputSchema"]["properties"]["action"]["enum"], ["send", "result"])
+        self.assertEqual(tool["inputSchema"]["properties"]["action"]["enum"], ["send", "result", "config"])
         self.assertEqual(tool["inputSchema"]["properties"]["image_path"]["uploadTo"], "mcp")
         self.assertEqual(tool["inputSchema"]["x-completion"]["actions"], ["send"])
-        self.assertNotIn("webhook_url", tool["inputSchema"]["properties"])
+        self.assertEqual(tool["inputSchema"]["x-action-params"]["config"]["params"],
+                         ["webhook_url", "group_id"])
 
 
 if __name__ == "__main__":
