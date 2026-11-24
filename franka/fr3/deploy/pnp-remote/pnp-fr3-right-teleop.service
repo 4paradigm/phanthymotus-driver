@@ -1,0 +1,14 @@
+[Unit]
+Description=PNP FR3 right-arm vendor teleoperation
+[Service]
+Type=simple
+User=pnp
+WorkingDirectory=/home/pnp/frankateleop
+LimitMEMLOCK=8G
+LimitRTPRIO=99
+ExecStart=/home/pnp/miniconda3/envs/polymetis/bin/python /home/pnp/.local/lib/fr3-pnp/run_right.py
+ExecStop=/bin/sh /home/pnp/.local/lib/fr3-pnp/stop_right.sh ${MAINPID}
+KillMode=control-group
+TimeoutStopSec=6
+RuntimeMaxSec=infinity
+Restart=no

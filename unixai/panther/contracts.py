@@ -1,0 +1,304 @@
+"""ROS-free validation and data contracts for the UniX AI Panther driver."""
+
+from __future__ import annotations
+
+import math
+import time
+import xml.etree.ElementTree as ET
+from typing import Optional
+
+from common.odom import build_interface
+
+ODOM_RATE_HZ = 10.0
+ODOM_MAX_MEASUREMENT_DELAY_MS = 200
+
+
+def odom_interface(topic: str) -> dict:
+    interface = build_interface(
+        provides=["vx", "vy", "wz"], frame="body", rate_hz=ODOM_RATE_HZ,
+        pose_drift="unbounded", timing={"stamp_source": "robot",
+                                        "max_measurement_delay_ms": ODOM_MAX_MEASUREMENT_DELAY_MS},
+    )
+    return {**interface, "topic": topic,
+            "slam_pose": {"available": True, "profile": "motus_slam/1"}}
+
+
+LEFT_ARM_JOINTS = tuple(f"joint_la{i}" for i in range(8))
+RIGHT_ARM_JOINTS = tuple(f"joint_ra{i}" for i in range(8))
+# Short canvas/API field names. Values remain degrees; the range description
+# carries the unit so the narrow card does not waste label width on ``_deg``.
+ARM_JOINT_FIELDS = (
+    "shoulder_rot",
+    "shoulder_abd",
+    "shoulder_raise",
+    "elbow_rot",
+    "elbow_flex",
+    "wrist_1",
+    "wrist_2",
+    "wrist_3",
+)
+# Mirror across Panther's sagittal (XZ) plane.  Rotations around the vendor
+# URDF's X/Z axes reverse sign; rotations around Y retain their sign.
+ARM_MIRROR_SIGNS = (-1.0, 1.0, -1.0, -1.0, 1.0, -1.0, -1.0, 1.0)
+# Verified on the physical Panther: the forward-position controller's first
+# channel turns the head horizontally and the second channel controls pitch.
+# This intentionally overrides the semantic axes suggested by the vendor URDF.
+HEAD_YAW_JOINT = "joint_head0"
+HEAD_PITCH_JOINT = "joint_head1"
+HEAD_JOINTS = (HEAD_YAW_JOINT, HEAD_PITCH_JOINT)
+
+
+def finite_number(value, field: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field} must be a number")
+    value = float(value)
+    if not math.isfinite(value):
+        raise ValueError(f"{field} must be finite")
+    return value
+
+
+def finite_vector(value, field: str, length: int) -> list[float]:
+    if not isinstance(value, (list, tuple)) or len(value) != length:
+        raise ValueError(f"{field} must contain exactly {length} numbers")
+    return [finite_number(item, f"{field}[{index}]") for index, item in enumerate(value)]
+
+
+def byte_value(value, field: str = "byte") -> int:
+    """Return a ROS ``byte`` as an integer.
+
+    ROS 2 Humble exposes ``diagnostic_msgs/DiagnosticStatus.level`` as a
+    one-byte ``bytes`` value on Panther, rather than as a Python integer.
+    ``int(b"\x02")`` tries to parse ASCII digits and raises, so bytes must be
+    decoded by value instead.
+    """
+    if isinstance(value, (bytes, bytearray)):
+        if len(value) != 1:
+            raise ValueError(f"{field} must contain exactly one byte")
+        return value[0]
+    if isinstance(value, str):
+        if len(value) != 1:
+            raise ValueError(f"{field} must contain exactly one character")
+        return ord(value)
+    number = int(value)
+    if not 0 <= number <= 255:
+        raise ValueError(f"{field} must be in [0, 255]")
+    return number
+
+
+def degrees_to_radians(value, field: str) -> float:
+    return math.radians(finite_number(value, field))
+
+
+def degrees_vector_to_radians(value, field: str, length: int) -> list[float]:
+    return [math.radians(item) for item in finite_vector(value, field, length)]
+
+
+def mirrored_arm_degrees(value, field: str = "positions_deg") -> list[float]:
+    values = finite_vector(value, field, len(ARM_MIRROR_SIGNS))
+    return [item * sign for item, sign in zip(values, ARM_MIRROR_SIGNS)]
+
+
+def head_target_from_degrees(args: dict, current: dict[str, float]) -> list[float]:
+    """Map user-facing yaw/pitch degrees to the two verified controller channels."""
+    yaw = args.get("yaw_deg")
+    pitch = args.get("pitch_deg")
+    if yaw is None and pitch is None:
+        raise ValueError("at least one of yaw_deg/pitch_deg is required")
+    return [
+        current.get(HEAD_YAW_JOINT) if yaw is None else degrees_to_radians(yaw, "yaw_deg"),
+        current.get(HEAD_PITCH_JOINT) if pitch is None else degrees_to_radians(pitch, "pitch_deg"),
+    ]
+
+
+def parse_joint_limits(urdf: str) -> dict[str, tuple[float, float]]:
+    """Read authoritative revolute/prismatic limits from the live URDF."""
+    if not isinstance(urdf, str) or not urdf.strip():
+        return {}
+    root = ET.fromstring(urdf)
+    limits: dict[str, tuple[float, float]] = {}
+    for joint in root.findall("joint"):
+        name = joint.get("name")
+        limit = joint.find("limit")
+        if not name or limit is None:
+            continue
+        lower, upper = limit.get("lower"), limit.get("upper")
+        if lower is None or upper is None:
+            continue
+        try:
+            lo, hi = float(lower), float(upper)
+        except ValueError:
+            continue
+        if math.isfinite(lo) and math.isfinite(hi) and lo <= hi:
+            limits[name] = (lo, hi)
+    return limits
+
+
+def intersect_joint_limits(
+    joint_names: tuple[str, ...],
+    vendor_limits: dict[str, tuple[float, float]],
+    live_limits: dict[str, tuple[float, float]],
+) -> dict[str, tuple[float, float]]:
+    """Return the safe overlap of bundled vendor and live robot limits.
+
+    The bundled vendor URDF is the maximum permitted envelope.  A live
+    ``/robot_description`` may narrow that envelope, but it must never widen
+    it.  Missing or contradictory limits are rejected instead of guessed.
+    """
+    for label, limits in (("vendor", vendor_limits), ("live", live_limits)):
+        missing = [name for name in joint_names if name not in limits]
+        if missing:
+            raise ValueError(
+                f"{label} URDF has no limits for: " + ", ".join(missing)
+            )
+    bounded: dict[str, tuple[float, float]] = {}
+    for name in joint_names:
+        vendor_lower, vendor_upper = vendor_limits[name]
+        live_lower, live_upper = live_limits[name]
+        lower = max(vendor_lower, live_lower)
+        upper = min(vendor_upper, live_upper)
+        if lower > upper:
+            raise ValueError(f"vendor and live URDF limits do not overlap for {name}")
+        bounded[name] = (lower, upper)
+    return bounded
+
+
+def parse_joint_indices(urdf: str) -> dict[str, int]:
+    """Return stable kinematic-joint indices from the live URDF.
+
+    ``ros2_control`` blocks may repeat joint names without parent/child links;
+    those are controller declarations, not members of the visual kinematic
+    tree, and must not affect skeleton indices.
+    """
+    if not isinstance(urdf, str) or not urdf.strip():
+        return {}
+    root = ET.fromstring(urdf)
+    return {
+        joint.get("name"): index
+        for index, joint in enumerate(
+            item for item in root.findall("joint")
+            if item.get("name") and item.find("parent") is not None and item.find("child") is not None
+        )
+    }
+
+
+def validate_joint_target(
+    joint_names: tuple[str, ...],
+    positions,
+    limits: dict[str, tuple[float, float]],
+    current: dict[str, float],
+    max_delta_rad: Optional[float],
+    commanded_joint_names=None,
+    hold_limit_tolerance_rad: float = 0.0,
+) -> list[float]:
+    target = finite_vector(positions, "positions", len(joint_names))
+    missing_limits = [name for name in joint_names if name not in limits]
+    if missing_limits:
+        raise ValueError(
+            "live robot_description has no limits for: " + ", ".join(missing_limits)
+        )
+    missing_state = [name for name in joint_names if name not in current]
+    if missing_state:
+        raise ValueError("fresh joint state is missing: " + ", ".join(missing_state))
+    max_delta = None
+    if max_delta_rad is not None:
+        max_delta = finite_number(max_delta_rad, "max_delta_rad")
+        if max_delta <= 0:
+            raise ValueError("max_delta_rad must be positive")
+    commanded = (set(joint_names) if commanded_joint_names is None
+                 else set(commanded_joint_names))
+    unknown_commanded = commanded.difference(joint_names)
+    if unknown_commanded:
+        raise ValueError("unknown commanded joints: " + ", ".join(sorted(unknown_commanded)))
+    hold_tolerance = finite_number(hold_limit_tolerance_rad, "hold_limit_tolerance_rad")
+    if hold_tolerance < 0:
+        raise ValueError("hold_limit_tolerance_rad must not be negative")
+    for index, (name, value) in enumerate(zip(joint_names, target)):
+        lower, upper = limits[name]
+        if name not in commanded and not lower <= value <= upper:
+            distance = lower - value if value < lower else value - upper
+            if distance <= hold_tolerance:
+                # A partial command must still send a complete trajectory. A
+                # held joint can sit just beyond its nominal URDF boundary due
+                # to encoder/zero-point noise; bring only that implicit hold
+                # target back to the nearest hard limit. Explicit user targets
+                # never receive this tolerance.
+                value = min(max(value, lower), upper)
+                target[index] = value
+            else:
+                raise ValueError(
+                    f"{name} current position {math.degrees(value):.2f} deg is outside URDF limit "
+                    f"[{math.degrees(lower):.2f}, {math.degrees(upper):.2f}] deg; "
+                    "calibration or recovery is required"
+                )
+        if not lower <= value <= upper:
+            raise ValueError(
+                f"{name} target {math.degrees(value):.2f} deg is outside URDF limit "
+                f"[{math.degrees(lower):.2f}, {math.degrees(upper):.2f}] deg"
+            )
+        delta = abs(value - float(current[name]))
+        if max_delta is not None and delta > max_delta:
+            raise ValueError(
+                f"{name} target delta {math.degrees(delta):.2f} deg exceeds per-command limit "
+                f"{math.degrees(max_delta):.2f} deg"
+            )
+    return target
+
+
+def validate_drive(args: dict, config: dict) -> tuple[float, float, float, float]:
+    vx = finite_number(args.get("linear_x", 0.0), "linear_x")
+    vy = finite_number(args.get("linear_y", 0.0), "linear_y")
+    wz_deg_s = finite_number(args.get("angular_z_deg_s", 0.0), "angular_z_deg_s")
+    duration = finite_number(args.get("duration_s", 1.0), "duration_s")
+    max_linear = finite_number(config["max_linear_mps"], "max_linear_mps")
+    max_angular_deg_s = finite_number(config["max_angular_deg_s"], "max_angular_deg_s")
+    max_duration = finite_number(config["max_duration_s"], "max_duration_s")
+    if abs(vx) > max_linear or abs(vy) > max_linear:
+        raise ValueError(f"linear velocity exceeds configured cap {max_linear} m/s")
+    if abs(wz_deg_s) > max_angular_deg_s:
+        raise ValueError(
+            f"angular velocity exceeds configured cap {max_angular_deg_s} deg/s"
+        )
+    if not 0.1 <= duration <= max_duration:
+        raise ValueError(f"duration_s must be in [0.1, {max_duration}]")
+    return vx, vy, math.radians(wz_deg_s), duration
+
+
+def fresh(received_monotonic: Optional[float], max_age_s: float = 2.0) -> bool:
+    return received_monotonic is not None and time.monotonic() - received_monotonic <= max_age_s
+
+
+def age_ms(received_monotonic: Optional[float]) -> Optional[int]:
+    if received_monotonic is None:
+        return None
+    return max(0, int((time.monotonic() - received_monotonic) * 1000))
+
+
+def json_float(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def populate_switch_request(request, activate, deactivate) -> None:
+    """Support both controller_manager SwitchController field generations.
+
+    Humble installations exist with ``start/stop`` and with the renamed
+    ``activate/deactivate`` fields.  We inspect the installed interface rather
+    than assuming which controller_manager patch level Panther carries.
+    """
+    if hasattr(request, "activate_controllers"):
+        request.activate_controllers = list(activate)
+        request.deactivate_controllers = list(deactivate)
+        asap_field = "activate_asap"
+    elif hasattr(request, "start_controllers"):
+        request.start_controllers = list(activate)
+        request.stop_controllers = list(deactivate)
+        asap_field = "start_asap"
+    else:
+        raise RuntimeError("unsupported controller_manager SwitchController interface")
+    request.strictness = 2
+    setattr(request, asap_field, True)
+    request.timeout.sec = 5
+

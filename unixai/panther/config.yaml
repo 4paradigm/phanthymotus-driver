@@ -1,0 +1,161 @@
+name: "UniX AI Panther Bundle"
+mcp_port: 15792
+ros_namespace: "unixai_panther"
+
+ros:
+  robot_domain_id: 0
+  core_domain_id: 42
+  robot_rmw: "rmw_cyclonedds_cpp"
+
+plugins:
+  joints: {enabled: true}
+  robot_state: {enabled: true}
+  battery: {enabled: true}
+  imu: {enabled: true}
+  odom: {enabled: true}
+  laser_scan: {enabled: true}
+
+  camera:
+    workspace: "/home/unix_ai/orbbec_ws"
+    cyclonedds_profile: "/home/unix_ai/config/cyclonedds.xml"
+    startup_timeout_s: 30.0
+    first_frame_grace_s: 30.0
+    frame_stall_s: 15.0
+    max_watchdog_restarts: 2
+    rgb_hz: 10.0
+    depth_hz: 8.0
+    jpeg_quality: 70
+    # Shared rectified RGB-D outputs are always 640x480.
+    registered_depth: true
+    # Vendor ROS depth is uint16 millimetres; float32 input is always metres.
+    source_depth_unit_mm: 1.0
+    body_frame: "base_link"
+    estimated_body_mount:
+      enabled: true
+      model_frame: "link_rgbd"
+      source_frame: "camera_link"
+      # Assembly estimate: CAD RGB-D origin coincides with vendor camera origin.
+      # Not a measured optical/installation calibration; adjust after calibration.
+      translation_m: [0.0, 0.0, 0.0]
+      rpy_rad: [0.0, 0.0, 0.0]
+  camera_color: {enabled: true}
+  camera_depth: {enabled: true}
+  camera_left: {enabled: true}
+  camera_right: {enabled: true}
+  stereo_camera:
+    # Start the vendor stereo source only when an eye card is armed.
+    manage_vendor_source: true
+    source_topic: "/ros_srt"
+    calibration_path: "/proc/1/root/home/unix_ai/work/srt/video/stereo.yaml"
+    publish_hz: 10.0
+    jpeg_quality: 75
+
+  audio:
+    server: "auto"
+    uid: 1001
+    gid: 1002
+    # Physical USB devices verified on Panther; avoid onboard sound and monitor sources.
+    source: "alsa_input.usb-AISpeech.in_Mic_Arry_8_4169385A3935-00.multichannel-input"
+    sink: "alsa_output.usb-C-Media_Electronics_Inc._USB_Audio_Device-00.analog-stereo"
+  mic: {enabled: true}
+  speaker: {enabled: true}
+
+  base_drive:
+    enabled: true
+    # Operator-approved working caps; ROS receives angular velocity in radians/s.
+    # Prefer the SDK topic; retain the deployed teleop topic as a fallback.
+    cmd_topics: ["/cmd_vel", "/cmd_vel_teleop"]
+    max_linear_mps: 0.50
+    max_angular_deg_s: 45.0
+    max_duration_s: 10.0
+    publish_rate_hz: 20.0
+    stop_repetitions: 5
+    stop_publish_duration_s: 1.0
+    stop_match_timeout_s: 3.0
+  base_servo:
+    enabled: true
+    dry_run: false
+    rotate_only: false
+    expected_hz: 10.0
+    # Defaults to the existing base_drive caps (0.50 m/s, 45 deg/s).
+    # Set max_linear_mps/max_angular_rad_s here only for lower servo limits.
+    linear_acceleration_mps2: 0.30
+    angular_acceleration_rad_s2: 0.60
+    footprint:
+      shape: "circle"
+      half_width: 0.33
+      radius: 0.37
+      source: "configured"
+      provenance: "Operator-selected 0.33 m chassis half-width, checked against vendor CAD; retain vendor Nav2 0.37 m turning radius"
+  arm_control:
+    enabled: true
+    max_duration_s: 20.0
+    min_duration_s: 1.0
+    speed_deg_s: 20.0
+    # Per-command joint-step cap; URDF hard limits are always enforced too.
+    max_target_delta_deg: 20.0
+    # Only implicit hold targets may absorb this much encoder/zero-point noise;
+    # explicit user targets remain strictly bounded by the vendor URDF.
+    hold_limit_tolerance_deg: 0.5
+    # PR 521-compatible candidate pose; the ordinary per-command delta gate
+    # remains mandatory until this target is independently hardware-verified.
+    home_pose_deg:
+      joint_la0: 0.0
+      joint_la1: 0.0
+      joint_la2: 0.0
+      joint_la3: 0.0
+      joint_la4: 0.0
+      joint_la5: 0.0
+      joint_la6: 0.0
+      joint_la7: 0.0
+      joint_ra0: 0.0
+      joint_ra1: 0.0
+      joint_ra2: 0.0
+      joint_ra3: 0.0
+      joint_ra4: 0.0
+      joint_ra5: 0.0
+      joint_ra6: 0.0
+      joint_ra7: 0.0
+  gripper:
+    enabled: true
+    open_position: 0.0
+    closed_position: 1.0
+  lifting:
+    enabled: true
+    min_position_m: 0.4
+    max_position_m: 0.65
+    home_position_m: 0.6
+  head:
+    enabled: true
+    yaw_min_deg: -90.0
+    yaw_max_deg: 90.0
+    pitch_min_deg: -86.0
+    pitch_max_deg: 20.0
+    high_speed_deg_s: 20.0
+    low_speed_deg_s: 10.0
+    publish_rate_hz: 20.0
+    # Runtime-verified channel order: yaw -> joint_head0, pitch -> joint_head1.
+    home_pose_deg: {yaw_deg: 0.0, pitch_deg: 0.0}
+
+  # Continuous 50 Hz arm servo remains disabled until watchdog/hold behavior
+  # has been measured on Panther hardware.
+  servo: {enabled: false}
+
+  controlled_spatial:
+    enabled: true
+    # This robot has one active lidar. Preserve its frame and timestamp when
+    # feeding the vendor SLAM/Nav2 /scan input; do not wait for a rear sensor.
+    # Set to "" on dual-lidar variants whose native merger already works.
+    single_lidar_topic: "/lidar_front/scan"
+    base_frame: "base_link"
+    # Box in base_link x/y, covering the self returns seen in all 26 saved
+    # scans of test. Ray frame and time stay intact for SLAM's own TF lookup.
+    self_filter_box_m: [-0.15, 0.15, -0.14, 0.14]
+    require_origin_localization: true
+    navigator_state_service: "/bt_navigator/get_state"
+    native_slam_pcd_dir: "/opt/phanthy-motus/data/maps"
+    native_slam_db_path: "/opt/phanthy-motus/data/controlled_spatial.db"
+    vendor_map_dir: "/home/unix_ai/map_dir"
+    service_timeout_s: 20
+    navigation_timeout_s: 180
+  spatial_map: {enabled: true}
