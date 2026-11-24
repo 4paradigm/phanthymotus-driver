@@ -4,8 +4,8 @@ An SSH session has no desktop, so Edge cannot be shown or print from it.
 `run_job.ps1` (called over SSH) drops a `<id>.request.json` into data/jobs and
 starts the "Visitor Badge Worker" scheduled task, which runs this script in the
 interactive session.  It answers every pending request with `<id>.result.json`,
-then lingers a few seconds for late requests and exits — nothing listens on the
-network.
+then lingers a few seconds for late requests (longer while a login window is
+open) and exits — nothing listens on the network.
 
 Job: {"action": "list" | "print" | "login", "page_url", "printer", "name", "host"}
 Result: {"ok": true, ...} or {"ok": false, "code", "error"}
@@ -21,7 +21,8 @@ import traceback
 from datetime import date
 from pathlib import Path
 
-from visitor_site import ADMITTED, LEFT, NOT_ADMITTED, SiteError, Visit, VisitorSite, open_for_login
+from visitor_site import (ADMITTED, LEFT, NOT_ADMITTED, SiteError, Visit, VisitorSite,
+                          close_profile_edge, login_window_open, open_for_login)
 
 
 BASE = Path(__file__).resolve().parent
@@ -29,6 +30,10 @@ DATA = BASE / "data"
 JOBS = DATA / "jobs"
 PROFILE = DATA / "edge-profile"
 IDLE_EXIT_S = 10
+# Edge started from the scheduled task goes down with it, so the worker stays
+# while the login window is open — up to this long (install.ps1's task limit
+# is longer).
+LOGIN_WAIT_S = 15 * 60
 
 
 def choose(visits: list[Visit], name: str, host: str) -> Visit:
@@ -66,10 +71,11 @@ class Worker:
         today = date.today().isoformat()
         if action == "login":
             if self._site is not None:
-                # Let the automation Edge release the profile, or the new
-                # window is handed to the exiting browser and never shows.
+                # Wait until the automation Edge has fully exited: a window
+                # opened while it is still shutting down is handed to it and
+                # closes with it a moment later.
                 self.close()
-                time.sleep(2)
+                close_profile_edge(PROFILE)
             open_for_login(PROFILE, page_url)
             return {"ok": True}
         if action == "list":
@@ -95,8 +101,14 @@ def main() -> int:
     sys.stdout = sys.stderr = log.open("a", encoding="utf-8", buffering=1)
     worker = Worker()
     idle_since = time.monotonic()
+    next_login_check = 0.0
     try:
-        while time.monotonic() - idle_since < IDLE_EXIT_S:
+        while True:
+            idle = time.monotonic() - idle_since
+            if idle >= IDLE_EXIT_S and time.monotonic() >= next_login_check:
+                if idle >= LOGIN_WAIT_S or not login_window_open(PROFILE):
+                    break
+                next_login_check = time.monotonic() + 5
             pending = sorted(JOBS.glob("*.request.json"), key=lambda p: p.stat().st_mtime)
             if not pending:
                 time.sleep(0.1)

@@ -202,3 +202,23 @@ def test_frontdesk_job_reads_the_result_marker(monkeypatch, tmp_path):
 ])
 def test_ssh_failures_become_actionable_codes(stderr, code):
     assert frontdesk._explain(stderr).code == code
+
+
+def test_worker_stays_while_the_login_window_is_open(monkeypatch, tmp_path):
+    # Edge started from the scheduled task dies with it, so the worker must
+    # not exit while the operator is still logging in.
+    checks = iter([True, True, False])
+    monkeypatch.setattr(worker, "DATA", tmp_path)
+    monkeypatch.setattr(worker, "JOBS", tmp_path / "jobs")
+    monkeypatch.setattr(worker, "IDLE_EXIT_S", 0)
+    monkeypatch.setattr(worker, "login_window_open", lambda profile: next(checks))
+    monkeypatch.setattr(worker.time, "sleep", lambda s: None)
+    clock = iter(range(0, 10**6, 3))
+    monkeypatch.setattr(worker.time, "monotonic", lambda: next(clock))
+    stdout, stderr = sys.stdout, sys.stderr
+    try:
+        assert worker.main() == 0
+    finally:
+        sys.stdout.close()
+        sys.stdout, sys.stderr = stdout, stderr
+    assert next(checks, "done") == "done"

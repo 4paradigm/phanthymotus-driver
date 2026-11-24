@@ -57,7 +57,7 @@ $action = New-ScheduledTaskAction -Execute (Join-Path $venv 'Scripts\pythonw.exe
     -Argument "`"$(Join-Path $app 'worker.py')`"" -WorkingDirectory $app
 $principal = New-ScheduledTaskPrincipal -UserId $identity.Name -LogonType Interactive -RunLevel Highest
 $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -StartWhenAvailable `
-    -ExecutionTimeLimit (New-TimeSpan -Minutes 10) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+    -ExecutionTimeLimit (New-TimeSpan -Minutes 20) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 Register-ScheduledTask -TaskName 'Visitor Badge Worker' -Action $action -Principal $principal `
     -Settings $settings -Force | Out-Null
 

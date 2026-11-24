@@ -201,7 +201,7 @@ def close_profile_edge(profile_dir: Path) -> None:
         timeout=20)
 
 
-def _login_window_open(profile_dir: Path) -> bool:
+def login_window_open(profile_dir: Path) -> bool:
     """Is a login window (ours, not Playwright's) open on this profile?
 
     Counts browser main processes only (no --type=), and not Playwright's own,
@@ -221,7 +221,7 @@ def open_for_login(profile_dir: Path, url: str) -> None:
     Left alone if one is already open, so a repeated request does not close a
     login in progress.
     """
-    if _login_window_open(profile_dir):
+    if login_window_open(profile_dir):
         return
     subprocess.Popen(["cmd.exe", "/c", "start", "", "msedge", f"--user-data-dir={profile_dir}",
                       "--no-first-run", url or "about:blank"],
