@@ -82,7 +82,12 @@ class VisionTfPlugin:
         return {
             "name": "vision_tf",
             "type": "processor",
-            "multiInstance": True,
+            # The bundle creates ONE plugin instance and routes every dispatch
+            # to it, with no per-instance id. Advertising multiInstance here
+            # would let the canvas start a second source that tears down the
+            # first one's subscription/targets. Multiple vision sources need
+            # separate bundle deployments with distinct source_name settings.
+            "multiInstance": False,
             "description": (
                 "把各种视觉定位结果（AR 码 tvec/rvec、带时间戳的位姿、像素+深度、"
                 "物体列表）的 JSON 转换成 tf 变换 JSON，供下游 tf 构建卡挂进机器人"
@@ -93,6 +98,7 @@ class VisionTfPlugin:
                 "output_frame=body 时才在卡内转成机体系并挂 camera_link），"
                 "不构建 tf 树、不发 /tf、不驱动任何硬件。"
                 "四元数统一 xyzw。start 必须带 input_topic，否则如实报 idle。"
+                "单实例：多个视觉源请用不同 source_name 分别部署。"
             ),
             "inputSchema": {
                 "type": "object",

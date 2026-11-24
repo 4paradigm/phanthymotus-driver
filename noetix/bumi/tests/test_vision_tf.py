@@ -322,6 +322,32 @@ def test_one_message_then_silent_does_not_republish_forever(monkeypatch):
     plugin.stop()
 
 
+def test_card_declares_single_instance_honestly(monkeypatch):
+    """The bundle creates one plugin and passes no instance id. Claiming
+    multiInstance would promise two simultaneous sources that cannot coexist."""
+    card = _load_card(monkeypatch)
+    plugin = card.VisionTfPlugin({"enabled": True, "source_name": "ar"},
+                                 "bumi_test", _FakeExecutor())
+    assert plugin.get_tool()["multiInstance"] is False
+    plugin.stop()
+
+
+def test_restart_on_same_instance_reconfigures_without_leaking_threads(monkeypatch):
+    """A second start() on the single instance replaces the input cleanly."""
+    card = _load_card(monkeypatch)
+    plugin = card.VisionTfPlugin({"enabled": True, "source_name": "ar"},
+                                 "bumi_test", _FakeExecutor())
+    first = plugin.dispatch("start", {"input_topic": "/bumi_test/ar/poses"})
+    assert first["state"] == "running"
+    gen1, token1 = plugin._generation, plugin._run_token
+    second = plugin.dispatch("start", {"input_topic": "/bumi_test/ar/poses2"})
+    assert second["state"] == "running"
+    assert plugin._generation == gen1 + 1
+    assert plugin._run_token is not token1
+    assert plugin._input_topic == "/bumi_test/ar/poses2"
+    plugin.stop()
+
+
 def test_a_superseded_publish_thread_publishes_nothing(monkeypatch):
     """After stop(), an in-flight worker must not emit a stale batch."""
     card = _load_card(monkeypatch)
