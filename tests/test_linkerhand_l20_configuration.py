@@ -1,4 +1,4 @@
-"""Cross-check the shipped four-card configuration and deployment metadata."""
+"""Cross-check the shipped card configuration and deployment metadata."""
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -13,7 +13,7 @@ sys.path.insert(0, str(DRIVER))
 from can_client import validate_position_vector
 from adaptive_grasp_device import AdaptiveGraspPlugin
 from hand_device import build_plugins
-from common.vendor_runtime import resolve_namespace
+from common.vendor_runtime import DriverBundle, resolve_namespace
 
 
 def load(name):
@@ -24,11 +24,12 @@ def test_manifest_matches_enabled_runtime_cards_without_opening_can():
     config = load("config.yaml")
     manifest = load("driver.yaml")
     plugins = build_plugins(config, "", None)  # Do not start lifecycle workers.
-    definitions = [p.get_tool() for p in plugins]
+    definitions = DriverBundle(plugins).get_all_tools()
     actual = {d["name"]: d["type"] for d in definitions}
     assert actual == {d["name"]: d["type"] for d in manifest["cards"]}
     assert actual == {"hand": "actuator", "hand_gesture": "actuator",
-                      "hand_grasp": "actuator", "hand_tactile": "sensor"}
+                      "hand_grasp": "actuator", "hand_tactile": "sensor",
+                      "joints": "sensor", "model": "resource"}
     assert config["plugins"]["hand"]["enabled"]  # Sensor shares this controller.
 
 

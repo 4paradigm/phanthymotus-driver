@@ -12,6 +12,66 @@ external RealSense cameras over USB. It registers with Agent Core as
 | `gripper` | Actuator | Franka Hand opening, grasp, calibration, and stop |
 | `ext_camera` | Sensor | RGB, depth, or left near-infrared from a selected RealSense |
 
+## PNP Teach
+
+The FR3 driver exposes `teach` with `start_trajectory`, `stop_trajectory`,
+`stop_motion`, `list_trajectories`, `delete_trajectory`, `play`, `pause`,
+`resume`, and `status`.
+`start_trajectory` aligns the arms and automatically starts Follow.
+It starts the installed vendor scripts on the PNP workstation, including
+their startup movements. Both USB masters may share one workstation.
+Existing canvases that reference `teleop` need to select `teach` after the
+driver is updated.
+
+| Action | Result |
+| --- | --- |
+| `start_trajectory` | Align the connected arms, enable Follow, and begin recording available PNP telemetry |
+| `stop_trajectory` | Confirm PNP shutdown and finalize the recording when the PNP host saved frames |
+| `stop_motion` | Terminate teaching or playback and verify shutdown; discard resumable playback progress |
+| `list_trajectories` | List saved PNP recording folders for each arm |
+| `delete_trajectory` | Delete the selected PNP recording folder while the service is stopped |
+| `play` | Replay the left and/or right recording and report completion through ACP after every selected arm has finished |
+| `pause` | Decelerate active playback and hold its position for resume; use `stop_motion` during startup or approach |
+| `resume` | Verify the held position and continue playback |
+| `status` | Read initialization, PNP service and execution state |
+
+The driver discovers wired addresses and reads the workstation's arm configuration
+during initialization. PNP credentials and the workstation service provide access
+to the vendor scripts. Each arm records its measured joint state and the vendor
+control target after each successful Follow step. Stop lists left-arm recordings before right-arm recordings. New frames also carry a
+monotonic observation timestamp.
+New recordings are stored on PNP under
+`~/bc_data/teleop/franka-<side>-<local-timestamp><UTC-offset>/`, for example
+`franka-left-20261119T201738+0800`. Existing recordings with fractional seconds or a `Z` suffix
+remain available. Use `list_trajectories` to find each arm's recording name,
+then enter it in `left_trajectory` or `right_trajectory`. Leave an arm blank
+to exclude it. Two-arm playback requires both recordings on the same PNP
+workstation. Both arms must pass the first-frame check before either starts
+alignment. Playback begins after both have settled at their first frames. Pause becomes available once playback starts. Resume requires a
+confirmed pause. Use stop_motion to end alignment or playback for all selected
+arms. A fault on either arm terminates the run.
+Playback uses measured arm positions and the recorded gripper command.
+It follows the original frame timing. Existing recordings use their vendor
+frame timestamps. Pause and resume ramp the playback rate along the same path.
+Playback waits for fresh arm and gripper feedback before issuing movement
+commands. It reports which backend is still starting or has failed. Before
+playing, each selected arm approaches only the first recorded pose. Every
+joint must be within 50 degrees of that pose before alignment can start.
+The gripper target is held during approach. The arm uses the same joint
+impedance controller for approach and playback. That controller holds the
+start target until settling is confirmed. Tracking aborts if any joint differs from its target
+by more than 90 degrees.
+The card checks tighter position and velocity tolerances before reporting
+a confirmed pause or completion.
+Teach and playback use the same 80 mm fully open gripper target.
+Teach and playback share the PNP service. Stop the current session before
+starting either operation. A completed run can be replayed immediately once the
+service is inactive, even if closed TCP connections are still in TIME_WAIT.
+An active endpoint conflict reports its arm and port. Use only recordings
+created on the trusted PNP host.
+
+See [PNP deployment](deploy/pnp-remote/README.md).
+
 ## Requirements
 
 - ARM64 Jetson with an ARM64 ROS 2 Humble driver image and a running Agent Core.

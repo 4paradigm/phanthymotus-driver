@@ -1,0 +1,22 @@
+<launch>
+  <!-- The Gemini 335L SDK performs software D2C registration. Publish only the SDK camera-internal static TF. -->
+  <include file="$(find orbbec_camera)/launch/gemini_330_series.launch">
+    <arg name="camera_name" value="camera_head" />
+    <arg name="color_width" value="640" />
+    <arg name="color_height" value="480" />
+    <arg name="color_fps" value="15" />
+    <arg name="enable_depth" value="true" />
+    <arg name="depth_width" value="640" />
+    <arg name="depth_height" value="480" />
+    <arg name="depth_fps" value="15" />
+    <arg name="depth_registration" value="true" />
+    <arg name="enable_laser" value="true" />
+    <arg name="enable_point_cloud" value="false" />
+    <arg name="enable_colored_point_cloud" value="false" />
+    <arg name="enable_frame_sync" value="true" />
+    <arg name="publish_tf" value="true" />
+    <arg name="enable_gyro" value="true" />
+    <arg name="enable_accel" value="true" />
+    <arg name="time_domain" value="system" />
+  </include>
+</launch>

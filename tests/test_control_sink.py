@@ -118,6 +118,223 @@ def make_sink(clock, apply, descriptor=None, **kwargs):
     )
 
 
+def _twist_descriptor(*, zero_immediate=False):
+    raw = descriptor_dict(mode="twist", joint_names=["vx", "wz"],
+                          units={"linear": "m/s", "angular": "rad/s"})
+    raw["limits"]["zero_immediate"] = zero_immediate
+    return raw
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, "true", [], {}])
+def test_zero_immediate_requires_literal_boolean(value):
+    raw = _twist_descriptor()
+    raw["limits"]["zero_immediate"] = value
+    with pytest.raises(DescriptorError, match="zero_immediate.*boolean"):
+        parse_descriptor(raw)
+
+
+def test_zero_immediate_cannot_change_position_or_mixed_group_semantics():
+    raw = descriptor_dict()
+    raw["limits"]["zero_immediate"] = True
+    with pytest.raises(DescriptorError, match="only supported for twist"):
+        parse_descriptor(raw)
+    raw = _twist_descriptor(zero_immediate=True)
+    raw["groups"] = [{"name": "mixed", "offset": 0, "count": 2, "mode": "joint_position"}]
+    with pytest.raises(DescriptorError, match="twist-only groups"):
+        parse_descriptor(raw)
+    assert not parse_descriptor(descriptor_dict()).zero_immediate
+
+
+def test_optional_axis_response_is_validated_and_preserved():
+    raw = _twist_descriptor()
+    raw["response"] = {"wz": {"gain": .76, "delay_s": .12,
+                              "settling_s": .35, "source": "measured"}}
+    parsed = parse_descriptor(raw)
+    assert parsed.response == {
+        "wz": {"gain": .76, "delay_s": .12, "settling_s": .35,
+               "source": "measured"}}
+    assert parse_descriptor(_twist_descriptor()).response == {}
+
+
+@pytest.mark.parametrize("response,problem", [
+    ({"yaw": {"gain": 1, "delay_s": 0, "settling_s": 0,
+              "source": "measured"}}, "not in joint_names"),
+    ({"wz": {"gain": 0, "delay_s": 0, "settling_s": 0,
+             "source": "measured"}}, "gain must be positive"),
+    ({"wz": {"gain": 1, "delay_s": -1, "settling_s": 0,
+             "source": "measured"}}, "non-negative"),
+    ({"wz": {"gain": 1, "delay_s": 0, "settling_s": 0}}, "missing source"),
+    ({"wz": {"gain": 1, "delay_s": 0, "settling_s": 0,
+             "source": "guess"}}, "source must be one of"),
+    ({"wz": {"gain": 10 ** 400, "delay_s": 0, "settling_s": 0,
+             "source": "measured"}}, "finite number"),
+])
+def test_axis_response_rejects_incomplete_or_unphysical_measurements(response, problem):
+    raw = _twist_descriptor()
+    raw["response"] = response
+    with pytest.raises(DescriptorError, match=problem):
+        parse_descriptor(raw)
+
+
+def test_axis_response_is_currently_a_twist_only_contract():
+    raw = descriptor_dict()
+    raw["response"] = {
+        raw["joint_names"][0]: {
+            "gain": 1, "delay_s": 0, "settling_s": 0,
+            "source": "vendor-spec",
+        }
+    }
+    with pytest.raises(DescriptorError, match="non-twist group"):
+        parse_descriptor(raw)
+
+
+def test_axis_response_uses_the_axis_group_mode_in_a_mixed_descriptor():
+    raw = descriptor_dict(mode="joint_position", joint_names=["joint", "wz"])
+    raw["groups"] = [
+        {"name": "joint", "offset": 0, "count": 1,
+         "mode": "joint_position"},
+        {"name": "base", "offset": 1, "count": 1, "mode": "twist"},
+    ]
+    raw["response"] = {
+        "wz": {"gain": 0.8, "delay_s": 0.1, "settling_s": 0.2,
+               "source": "measured"},
+    }
+    assert parse_descriptor(raw).response["wz"]["gain"] == 0.8
+
+    raw["response"] = {
+        "joint": {"gain": 1, "delay_s": 0, "settling_s": 0,
+                  "source": "vendor-spec"},
+    }
+    with pytest.raises(DescriptorError, match="non-twist group 'joint'"):
+        parse_descriptor(raw)
+
+
+@pytest.mark.parametrize("mode,opt_in", [("joint_position", False), ("twist", False), ("twist", True)])
+def test_explicit_zero_only_bypasses_the_slew_clamp_when_opted_in(mode, opt_in):
+    clock, apply = FakeClock(), Recorder()
+    raw = _twist_descriptor(zero_immediate=opt_in) if mode == "twist" else descriptor_dict()
+    sink = make_sink(clock, apply, raw)
+    assert sink.submit(message(clock, [.8, -.8], mode=mode)).applied
+    clock.advance(10)
+    outcome = sink.submit(message(clock, [0, 0], mode=mode, seq=2))
+    assert outcome.applied
+    assert apply.last == pytest.approx((0, 0) if opt_in else (.7, -.7))
+
+
+@pytest.mark.parametrize("requested,expected", [([0, .2], [0, -.3]), ([.2, 0], [.4, 0])])
+def test_twist_zero_immediate_is_per_axis(requested, expected):
+    clock, apply = FakeClock(), Recorder()
+    sink = make_sink(clock, apply, _twist_descriptor(zero_immediate=True))
+    sink.submit(message(clock, [.5, -.4], mode="twist"))
+    clock.advance(10)
+    outcome = sink.submit(message(clock, requested, mode="twist", seq=2))
+    assert outcome.verdict is Verdict.CLAMPED
+    assert apply.last == pytest.approx(expected)
+
+
+def test_rebase_seeds_first_step_without_starting_a_watchdog_or_writing_hardware():
+    clock, apply, holds = FakeClock(), Recorder(), []
+    sink = make_sink(clock, apply, _twist_descriptor(), on_watchdog=lambda: holds.append(True))
+    sink.rebase([0, 0])
+    clock.advance(1000)
+    assert sink.tick() is None
+    assert not holds and not apply.calls
+    result = sink.submit(message(clock, [.8, .8], mode="twist"))
+    assert result.verdict is Verdict.CLAMPED
+    assert apply.last == (.1, .1)
+
+
+@pytest.mark.parametrize("values", [None, "00", [0], [0, 0, 0], [True, 0], [float("nan"), 0], [0, float("inf")]])
+def test_rebase_rejects_invalid_values_without_modifying_the_baseline(values):
+    clock, apply = FakeClock(), Recorder()
+    sink = make_sink(clock, apply, _twist_descriptor())
+    sink.rebase([0, 0])
+    with pytest.raises(ValueError):
+        sink.rebase(values)
+    assert sink.submit(message(clock, [.8, .8], mode="twist")).verdict is Verdict.CLAMPED
+    assert apply.last == (.1, .1)
+
+
+def test_rebase_after_confirmed_stop_keeps_sequence_holder_and_original_watchdog():
+    clock, apply, holds = FakeClock(), Recorder(), []
+    sink = make_sink(clock, apply, _twist_descriptor(), on_watchdog=lambda: holds.append(True))
+    sink.submit(message(clock, [.8, .8], mode="twist", seq=7, priority=100))
+    clock.advance(199)
+    sink.rebase((0, 0))
+    replay = sink.submit(message(clock, [.8, .8], mode="twist", seq=7, priority=100))
+    assert replay.verdict is Verdict.DROPPED and "seq" in replay.reason
+    outsider = sink.submit(message(clock, [.8, .8], mode="twist", source="other", priority=0))
+    assert outsider.verdict is Verdict.DROPPED and "outranked" in outsider.reason
+    clock.advance(1)
+    sink.tick()
+    assert holds == [True], "rebase must not restart the accepted-command watchdog"
+    fresh = sink.submit(message(clock, [.8, .8], mode="twist", seq=8, priority=100))
+    assert fresh.verdict is Verdict.CLAMPED
+    assert apply.last == (.1, .1), "resume must slew from the confirmed zero baseline"
+
+
+def test_rebase_does_not_clear_a_latched_abort():
+    clock, apply = FakeClock(), Recorder()
+    raw = _twist_descriptor()
+    raw["force_torque"] = [1, 1]
+    sink = make_sink(clock, apply, raw)
+    sink.submit(message(clock, [.1, .1], mode="twist"))
+    sink.force_torque([2, 0])
+    sink.rebase([0, 0])
+    assert sink.aborted
+    assert sink.submit(message(clock, [.1, .1], mode="twist", seq=2)).verdict is Verdict.ABORTED
+
+
+def test_reconfigure_applies_new_limits_and_freshness_without_resetting_admission():
+    clock, apply, holds = FakeClock(), Recorder(), []
+    sink = make_sink(clock, apply, _twist_descriptor(), on_watchdog=lambda: holds.append(True))
+    sink.submit(message(clock, [.1, .1], mode="twist", seq=7, priority=100))
+    clock.advance(60)
+    updated = _twist_descriptor()
+    updated["limits"]["max_delta_per_step"] = [.02, .02]
+    updated["rate"].update(watchdog_ms=100, max_obs_age_ms=50)
+    sink.reconfigure(parse_descriptor(updated))
+    replay = sink.submit(message(clock, [.2, .2], mode="twist", seq=7, priority=100))
+    assert replay.verdict is Verdict.DROPPED and "seq" in replay.reason
+    outsider = sink.submit(message(clock, [.2, .2], mode="twist", source="other", priority=0))
+    assert outsider.verdict is Verdict.DROPPED and "outranked" in outsider.reason
+    stale = sink.submit(message(clock, [.2, .2], mode="twist", seq=8, obs_stamp_ms=clock.now-51))
+    assert stale.verdict is Verdict.DROPPED and "observation" in stale.reason
+    clock.advance(40)
+    sink.tick()
+    assert holds == [True]
+    fresh = sink.submit(message(clock, [.2, .2], mode="twist", seq=8, priority=100))
+    assert fresh.verdict is Verdict.CLAMPED
+    assert apply.last == pytest.approx((.12, .12))
+
+
+@pytest.mark.parametrize("field,value", [
+    ("mode", "joint_velocity"), ("dof", 3), ("joint_names", ("other", "axis")),
+    ("units", {"angle": "deg"}), ("groups", ()), ("frame", "other_frame"),
+    ("end_effector", {"kind": "other"}), ("force_torque", (1, 1)),
+])
+def test_reconfigure_rejects_structure_changes_atomically(field, value):
+    from dataclasses import replace
+    clock, apply = FakeClock(), Recorder()
+    sink = make_sink(clock, apply, _twist_descriptor())
+    original = sink.descriptor
+    with pytest.raises(ValueError, match=field):
+        sink.reconfigure(replace(original, **{field: value}))
+    assert sink.descriptor is original
+
+
+@pytest.mark.parametrize("before,after", [(False, True), (True, False)])
+def test_reconfigure_rejects_zero_immediate_semantic_changes_atomically(before, after):
+    """A live session cannot change how an exact zero bypasses slew limits."""
+    from dataclasses import replace
+    clock, apply = FakeClock(), Recorder()
+    sink = make_sink(clock, apply, _twist_descriptor(zero_immediate=before))
+    original = sink.descriptor
+    with pytest.raises(ValueError, match="zero_immediate"):
+        sink.reconfigure(replace(original, zero_immediate=after))
+    assert sink.descriptor is original
+
+
 @pytest.mark.parametrize("field, value", [
     ("values", [math.nan, 0.0]),
     ("values", [math.inf, 0.0]),
@@ -290,6 +507,70 @@ def test_stale_observation_is_dropped_even_when_the_command_is_fresh():
     assert outcome.verdict is Verdict.DROPPED
     assert "observation" in outcome.reason
     assert apply.calls == []
+
+
+@pytest.mark.parametrize(
+    "ttl, observation_age, expected_lease",
+    [(80, 0, 80), (500, 450, 50), (500, 0, 200)],
+)
+def test_accepted_command_exposes_a_monotonic_lease(ttl, observation_age, expected_lease):
+    wall, mono, apply = FakeClock(1_700_000_000_000), FakeClock(4000), Recorder()
+    raw = descriptor_dict()
+    raw["rate"]["max_obs_age_ms"] = 500
+    sink = ControlSink(raw, apply, clock=mono, wall_clock=wall)
+    outcome = sink.submit(message(wall, [0.1, 0.1], ttl_ms=ttl,
+                                  obs_stamp_ms=wall.now - observation_age))
+    assert outcome.applied
+    assert outcome.expires_at_ms == mono.now + expected_lease
+
+
+@pytest.mark.parametrize("observation_stamp, lease_ms", [(None, 120), (1020, 80)])
+def test_active_expiry_uses_reported_lease_without_extending_future_stamps(observation_stamp, lease_ms):
+    wall, mono, apply = FakeClock(1000), FakeClock(4000), Recorder()
+    raw = _twist_descriptor()
+    raw["rate"].update(max_command_ttl_ms=120, max_obs_age_ms=80)
+    holds = []
+    sink = ControlSink(raw, apply, clock=mono, wall_clock=wall, max_ttl_ms=160,
+                       future_tolerance_ms=50, hold_on_command_expiry=True,
+                       on_watchdog=lambda: holds.append(mono.now))
+    msg = message(wall, [0.1, 0.1], mode="twist", ttl_ms=150,
+                  stamp_ms=1030, obs_stamp_ms=observation_stamp)
+
+    outcome = sink.submit(msg)
+    assert outcome.applied
+    assert outcome.expires_at_ms == 4000 + lease_ms
+    mono.advance(lease_ms - 1)
+    assert sink.tick() is None
+    mono.advance(1)
+    assert sink.tick().verdict is Verdict.DROPPED
+    assert sink.tick() is None
+    assert holds == [outcome.expires_at_ms]
+    assert sink.stats()["watchdog_strikes"] == 0
+
+
+@pytest.mark.parametrize(
+    "changes, verdict, reason",
+    [
+        ({"ttl_ms": 501}, Verdict.REJECTED, "ttl_ms"),
+        ({"stamp_ms": 1051}, Verdict.REJECTED, "future"),
+        ({"obs_stamp_ms": 1051}, Verdict.REJECTED, "future"),
+        ({"obs_stamp_ms": None}, Verdict.REJECTED, "obs_stamp_ms"),
+        ({"stamp_ms": 899}, Verdict.REJECTED, "start/resume"),
+        ({"stamp_ms": 900}, Verdict.DROPPED, "expired"),
+        ({"obs_stamp_ms": 500}, Verdict.DROPPED, "observation"),
+    ],
+)
+def test_strict_freshness_rejects_without_applying_or_granting_a_lease(changes, verdict, reason):
+    clock, apply = FakeClock(1000), Recorder()
+    raw = descriptor_dict()
+    raw["rate"]["max_obs_age_ms"] = 500
+    sink = make_sink(clock, apply, raw, max_ttl_ms=500, future_tolerance_ms=50,
+                     min_stamp_ms=900, require_observation=True, require_live_lease=True)
+    result = sink.submit(message(clock, [0.1, 0.1], **changes))
+    assert result.verdict is verdict
+    assert reason in result.reason
+    assert result.expires_at_ms is None
+    assert not apply.calls
 
 
 def test_out_of_order_seq_is_dropped():

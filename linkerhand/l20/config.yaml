@@ -106,3 +106,13 @@ plugins:
     stale_after_s: 1.0
     # Raw scalar >= threshold OR a positive matrix sum sets the contact flag.
     contact_threshold: 8
+
+  joints:
+    enabled: true
+    # The rate is fixed at 30 Hz in code (no user setting). Each round is one
+    # fresh five-frame position query; measured_hz reports what was achieved.
+    # The CAN interface is matched automatically; there is no interface setting.
+    # Wait for all five position replies; a missing reply makes the round invalid.
+    query_timeout_s: 0.2
+    # info/get_state treat a cached round older than this as not current.
+    stale_after_s: 1.0

@@ -1,0 +1,680 @@
+"""Exercise vendor-to-Agent mappings without ROS or hardware dependencies."""
+import json
+import math
+import threading
+import time
+import types
+import unittest
+import xml.etree.ElementTree as ET
+from unittest.mock import patch
+
+from test_driver import driver, FakeNode, FakeRos1, LINK_ORDER, JOINT_NAMES, ROOT, sensors_module
+
+
+class SensorTests(unittest.TestCase):
+    def setUp(self):
+        self.ros, self.node = FakeRos1(), FakeNode()
+        self.hub = driver.KuavoSensors({}, 'test', self.ros, self.node)
+        self.hub.discover()
+
+    def tearDown(self):
+        self.hub.close()
+
+    def odom(self, vx=1., vy=2., wz=3., child='base_link', secs=0):
+        self.ros.subscriptions['/odom'][1]({
+            'header': {'stamp': {'secs': secs, 'nsecs': 0}, 'frame_id': 'odom'},
+            'child_frame_id': child,
+            'pose': {'pose': {'position': dict(x=0., y=0., z=0.)}},
+            'twist': {'twist': {'linear': dict(x=vx, y=vy, z=0.),
+                                'angular': dict(x=0., y=0., z=wz)}}})
+
+    def test_discovers_wheel_profile_and_local_model(self):
+        self.hub.require_profile()
+        self.assertEqual(self.hub.health()['profile']['robot_type'], 1)
+        self.assertEqual(self.hub._names, JOINT_NAMES)
+        self.assertEqual(self.hub.dispatch('model', 'read'), {'urdf': self.hub._model_path.read_text()})
+        self.assertTrue(self.hub.health()['skeleton_model']['runtime_joint_names_verified'])
+        self.assertEqual(self.ros.services, [])
+        self.assertEqual(self.ros.published, [])
+
+    def vendor_arm_fixture(self):
+        self.hub.close()
+        self.ros.params['humanoid_description'] = (ROOT / 'resource' / 'kuavo5w_model.urdf').read_text()
+        self.ros.params['kuavo_configuration'] = {
+            'NUM_JOINT': 20, 'NUM_ARM_JOINT': 14, 'NUM_HEAD_JOINT': 2,
+            'min_joint_position_limits': [-180.] * 20,
+            'max_joint_position_limits': [180.] * 20}
+        self.hub = driver.KuavoSensors({'arm_limit_source': 'vendor_runtime'}, 'test', self.ros, self.node)
+        self.hub.discover()
+        self.ros.raw()
+
+    def test_vendor_arm_limits_use_live_urdf_and_stricter_controller_bounds(self):
+        self.vendor_arm_fixture()
+        self.ros.params['kuavo_configuration']['max_joint_position_limits'][4] = 45.
+        self.hub.discover()
+        self.ros.raw()
+        self.assertAlmostEqual(self.hub._joint_bounds('arm')[0][1], math.radians(45.))
+        self.assertAlmostEqual(self.hub._joint_bounds('arm')[1][0], -.349065850398866)
+        health = self.hub.health()['joint_limits']
+        self.assertEqual(health['arm']['source'], 'vendor_runtime')
+        self.assertFalse(health['arm']['hardware_verified'])
+        self.assertFalse(health['leg']['available'])
+        with self.assertRaises(ValueError):
+            self.hub.validate_joint_target('arm', [10000.] * 14)
+        self.assertFalse(self.ros.published)
+
+    def test_vendor_arm_missing_invalid_or_nonfinite_data_never_falls_back(self):
+        self.vendor_arm_fixture()
+        valid = json.loads(json.dumps(self.ros.params['kuavo_configuration']))
+        for bad in (None, {}, {**valid, 'NUM_JOINT': 19},
+                    {**valid, 'min_joint_position_limits': [True] * 20},
+                    {**valid, 'min_joint_position_limits': [math.nan] * 20},
+                    {**valid, 'min_joint_position_limits': [181.] * 20}):
+            self.ros.params['kuavo_configuration'] = bad
+            self.hub.discover()
+            with self.assertRaisesRegex(RuntimeError, 'limits unavailable'):
+                self.hub._joint_bounds('arm')
+        self.ros.params['kuavo_configuration'] = valid
+        xml = self.ros.params['humanoid_description']
+        for bad in ('nan', 'inf'):
+            self.ros.params['humanoid_description'] = xml.replace('lower="-3.14159265358979"',
+                                                               'lower="' + bad + '"')
+            self.hub.discover()
+            self.assertFalse(self.hub.health()['joint_limits']['arm']['available'])
+
+    def test_vendor_arm_timer_refresh_revokes_limits_and_invalid_record_has_priority(self):
+        self.vendor_arm_fixture()
+        self.assertTrue(self.hub.health()['joint_limits']['arm']['available'])
+        self.ros.params['kuavo_configuration'] = None
+        self.hub._retry_at = 0
+        self.hub.tick()
+        self.hub._thread.join(1)
+        self.assertFalse(self.hub.health()['joint_limits']['arm']['available'])
+        self.hub._vendor_arm_bounds = [(-1., 1.)] * 14
+        self.hub._joint_limit_config = {}
+        with self.assertRaisesRegex(RuntimeError, 'not configured'):
+            self.hub._joint_bounds('arm')
+        self.hub._joint_limit_config = None
+        self.hub._identity_checked_at = time.monotonic() - 4
+        with self.assertRaisesRegex(RuntimeError, 'stale'):
+            self.hub._joint_bounds('arm')
+
+    def test_raw_field_mapping_units_and_urdf_joint_names(self):
+        self.ros.raw(list(range(20)))
+        data = self.hub.snapshot('joints')
+        self.assertTrue(data['valid'])
+        joint = data['joints'][7]
+        self.assertEqual(joint, dict(idx=7, name=JOINT_NAMES[7], q=7, dq=1., ddq=2., tau=None))
+        self.assertEqual(data['units']['q'], 'rad')
+        self.assertIsNone(data['units']['tau'])
+        self.assertEqual(data['vendor']['joint_torque'], [3.] * 20)
+
+    def test_torque_exposed_only_when_unit_is_verified(self):
+        hub = driver.KuavoSensors({'joint_torque_unit': 'N*m'}, 'test', self.ros, FakeNode())
+        try:
+            hub.discover()
+            self.ros.raw()
+            data = hub.snapshot('joints')
+            self.assertEqual(data['joints'][0]['tau'], 3.)
+            self.assertEqual(data['joints'][0]['ddq'], 2.)
+            self.assertEqual(data['units']['tau'], 'N*m')
+        finally:
+            hub.close()
+
+    def test_imu_quaternion_order_and_units(self):
+        self.ros.raw()
+        sample = self.hub.snapshot('imu')
+        self.assertTrue(sample['valid'])
+        self.assertEqual(sample['quaternion'], [1., 0., 0., 0.])
+        self.assertEqual(sample['gyroscope'], [1., 2., 3.])
+        self.assertEqual(sample['accelerometer'], [0., 0., 9.81])
+        self.assertEqual(sample['units']['gyroscope'], 'rad/s')
+        self.assertIsNone(sample['frame_id'])
+
+    def test_standard_imu_operates_without_controller_profile(self):
+        self.hub._profile = None
+        self.hub._on_standard_imu({'header': {'frame_id': 'imu_link'},
+            'orientation': dict(w=1., x=0., y=0., z=0.),
+            'orientation_covariance': [0.] * 9,
+            'angular_velocity': dict(x=1., y=2., z=3.),
+            'linear_acceleration': dict(x=0., y=0., z=9.81)})
+        sample = self.hub.snapshot('imu')
+        self.assertTrue(sample['valid'])
+        self.assertEqual(sample['vendor']['topic'], '/imu')
+        self.assertEqual(sample['quaternion'], [1., 0., 0., 0.])
+        self.assertEqual(sample['rpy'], [0., 0., 0.])
+        self.assertIsNone(sample['free_acceleration'])
+        self.ros.params.clear()
+        self.hub.discover()
+        self.assertTrue(self.hub.snapshot('imu')['valid'])
+        self.assertTrue(self.hub.dispatch('joints', 'info')['skeleton_model']['reference_only'])
+
+    def test_missing_controller_parameters_report_not_ready_not_wrong_hardware(self):
+        self.ros.params.clear()
+        self.hub.discover()
+        self.assertIn('controller_not_ready', self.hub.health()['discovery_error'])
+        self.assertTrue(self.hub.health()['skeleton_model']['reference_only'])
+
+    def test_missing_optional_torque_not_replaced_by_acceleration(self):
+        self.ros.raw(joint_data={'joint_q': [0.] * 20, 'joint_vd': [9.] * 20})
+        j = self.hub.snapshot('joints')['joints'][0]
+        self.assertIsNone(j['tau'])
+        self.assertIsNone(j['dq'])
+        self.assertEqual(j['ddq'], 9.)
+
+    def test_invalid_q_does_not_leave_last_measurement_valid(self):
+        for value in ([0.] * 19, [math.nan] * 20, [True] * 20):
+            self.ros.raw()
+            self.ros.raw(value)
+            self.assertFalse(self.hub.snapshot('joints')['valid'])
+            with self.assertRaises(RuntimeError):
+                self.hub.joint_positions()
+
+    def test_bad_imu_quaternion_rejected(self):
+        self.ros.raw(imu_data={'quat': dict(w=0, x=0, y=0, z=0)})
+        self.assertFalse(self.hub.snapshot('imu')['valid'])
+
+    def test_joint_capture_timestamp_must_be_valid_and_recent(self):
+        now = int(time.time())
+        for capture in (None, {}, {'secs': 0, 'nsecs': 0}, {'secs': True, 'nsecs': 0},
+                        {'secs': now, 'nsecs': 1_000_000_000}, {'secs': now - 2, 'nsecs': 0},
+                        {'secs': now + 2, 'nsecs': 0}):
+            with self.subTest(capture=capture):
+                self.ros.raw(sensor_time=capture)
+                self.assertFalse(self.hub.snapshot('joints')['valid'])
+                with self.assertRaises(RuntimeError):
+                    self.hub.joint_positions()
+                self.assertTrue(self.hub.snapshot('imu')['valid'])
+
+    def test_capture_clock_offset_is_reported_without_accepting_fresh_header(self):
+        with patch.object(sensors_module.time, 'time', return_value=1000.8):
+            self.ros.raw(sensor_time={'secs': 1000, 'nsecs': 0},
+                         header={'stamp': {'secs': 1000, 'nsecs': 800_000_000}, 'seq': 123})
+        sample = self.hub.snapshot('joints')
+        self.assertFalse(sample['valid'])
+        self.assertIn('capture_age_s=0.800', sample['reason'])
+        with self.assertRaises(RuntimeError):
+            self.hub.joint_positions()
+
+    def cycle_frame(self, capture_ns, header_ns, q=None):
+        stamp = lambda ns: {'secs': ns // 1_000_000_000, 'nsecs': ns % 1_000_000_000}
+        self.ros.raw(q, sensor_time=stamp(capture_ns), header={'stamp': stamp(header_ns)})
+
+    def enable_cycle_profile(self):
+        self.ros.params['robot_version'] = 63
+        self.hub.discover()
+
+    def test_v63_cycle_offset_does_not_make_fresh_post_read_header_stale(self):
+        self.enable_cycle_profile()
+        now = time.time_ns()
+        self.cycle_frame(now - 824_000_000, now - 5_000_000, [0.1] * 20)
+        q, captured_at, cycle = self.hub.joint_positions()
+        self.assertEqual(q, [0.1] * 20)
+        self.assertLess(time.monotonic() - captured_at, .1)
+        self.assertEqual(cycle, now - 824_000_000)
+        sample = self.hub.snapshot('joints')
+        self.assertEqual(sample['vendor']['joint_timebase'], 'kuavo_v63_cycle')
+        self.assertAlmostEqual(sample['stamp_ms'], (now - 5_000_000) / 1e6, delta=1)
+        self.assertEqual(self.hub.health()['joint_timing']['source'], 'kuavo_v63_cycle')
+
+    def test_v63_replayed_cycle_with_new_header_does_not_refresh_measurement(self):
+        self.enable_cycle_profile()
+        now = time.time_ns()
+        self.cycle_frame(now - 824_000_000, now - 10_000_000, [0.1] * 20)
+        original = self.hub.joint_positions()
+        seen = self.hub._seen['joints']
+        self.cycle_frame(now - 824_000_000, now, [0.9] * 20)
+        self.assertEqual(self.hub.joint_positions(), original)
+        self.assertEqual(self.hub._seen['joints'], seen)
+        with patch.object(sensors_module.time, 'monotonic', return_value=seen + .6):
+            with self.assertRaisesRegex(RuntimeError, 'stale'):
+                self.hub.joint_positions()
+
+    def test_v63_stale_future_missing_and_invalid_headers_are_rejected(self):
+        self.enable_cycle_profile()
+        now = time.time_ns()
+        for stamp in (None, {}, {'secs': True, 'nsecs': 0},
+                      {'secs': (now // 1_000_000_000) - 2, 'nsecs': 0},
+                      {'secs': (now // 1_000_000_000) + 2, 'nsecs': 0}):
+            with self.subTest(stamp=stamp):
+                self.ros.raw(header={'stamp': stamp})
+                self.assertFalse(self.hub.snapshot('joints')['valid'])
+
+    def test_v63_cycle_or_header_reordering_cannot_replace_newer_q(self):
+        self.enable_cycle_profile()
+        now = time.time_ns()
+        self.cycle_frame(now - 824_000_000, now - 10_000_000, [0.1] * 20)
+        original = self.hub.joint_positions()
+        self.cycle_frame(now - 826_000_000, now, [0.9] * 20)
+        self.assertEqual(self.hub.joint_positions(), original)
+        self.cycle_frame(now - 822_000_000, now - 12_000_000, [0.9] * 20)
+        self.assertEqual(self.hub.joint_positions(), original)
+
+    def test_v63_cycle_jump_with_nearby_header_is_not_convergence_evidence(self):
+        self.enable_cycle_profile()
+        now = time.time_ns()
+        self.cycle_frame(now - 824_000_000, now - 10_000_000)
+        self.cycle_frame(now - 424_000_000, now)
+        self.assertIn('progression is inconsistent', self.hub.snapshot('joints')['reason'])
+        with self.assertRaises(RuntimeError):
+            self.hub.joint_positions()
+
+    def test_explicit_wall_mode_retains_capture_age_check_on_v63(self):
+        self.enable_cycle_profile()
+        self.hub._joint_timebase = 'wall'
+        now = time.time_ns()
+        self.cycle_frame(now - 824_000_000, now)
+        self.assertFalse(self.hub.snapshot('joints')['valid'])
+
+    def test_cycle_timebase_cannot_be_forced_for_unverified_version(self):
+        self.hub._joint_timebase = 'kuavo_v63_cycle'
+        now = time.time_ns()
+        self.cycle_frame(now - 824_000_000, now)
+        self.assertIn('requires runtime robot_version 63', self.hub.snapshot('joints')['reason'])
+
+    def test_reordered_capture_does_not_replace_newer_joint_sample(self):
+        ns = time.time_ns()
+        captured = lambda value: {'secs': value // 1_000_000_000, 'nsecs': value % 1_000_000_000}
+        self.ros.raw([1.] * 20, sensor_time=captured(ns))
+        seen, measured = self.hub._seen['joints'], self.hub.joint_positions()
+        self.ros.raw([9.] * 20, sensor_time=captured(ns - 1_000_000))
+        self.assertEqual(self.hub._seen['joints'], seen)
+        self.assertEqual(self.hub.joint_positions(), measured)
+
+    def test_periodic_identity_refresh_keeps_raw_subscription_and_fresh_sample(self):
+        self.ros.raw()
+        callback = self.ros.subscriptions['/sensors_data_raw'][1]
+        with patch.object(self.ros, 'subscribe', wraps=self.ros.subscribe) as subscribe:
+            self.hub._retry_at = 0
+            self.hub.tick()
+            self.hub._thread.join(1)
+        self.assertFalse(self.hub._thread.is_alive())
+        self.assertEqual(subscribe.call_count, 0)
+        self.assertIs(self.ros.subscriptions['/sensors_data_raw'][1], callback)
+        self.assertTrue(self.hub.snapshot('joints')['valid'])
+
+    def test_slow_parameter_round_does_not_grant_a_new_identity_lease_at_completion(self):
+        clock = [time.monotonic()]
+        original = self.ros.get_param
+        def slow(*args, **kwargs):
+            clock[0] += 1.
+            return original(*args, **kwargs)
+        fake_time = types.SimpleNamespace(monotonic=lambda: clock[0])
+        with patch.object(sensors_module, 'time', fake_time), patch.object(self.ros, 'get_param', side_effect=slow):
+            self.hub._retry_at = 0
+            self.hub.tick()
+            self.hub._thread.join(1)
+            self.assertFalse(self.hub._thread.is_alive())
+            self.assertFalse(self.hub.health()['identity_verification']['valid'])
+            with self.assertRaisesRegex(RuntimeError, 'identity verification is stale'):
+                self.hub.require_profile()
+
+    def test_identity_refresh_batches_one_configuration_read_and_keeps_start_cadence(self):
+        self.hub._arm_limit_source = self.hub._leg_limit_source = 'vendor_runtime'
+        clock = [time.monotonic()]
+        started = clock[0]
+        original = self.ros.get_params
+        def delayed(defaults):
+            result = original(defaults)
+            clock[0] += 1.4  # A slow round must not add another 1 s idle gap.
+            return result
+        with patch.object(sensors_module, 'time', types.SimpleNamespace(monotonic=lambda: clock[0])), \
+                patch.object(self.ros, 'get_params', side_effect=delayed) as batch, \
+                patch.object(self.ros, 'get_param', wraps=self.ros.get_param) as single:
+            self.hub.discover()
+            self.assertEqual(batch.call_count, 1)
+            self.assertEqual([c.args[0] for c in single.call_args_list].count('/kuavo_configuration'), 1)
+            self.assertEqual(len(batch.call_args.args[0]), 9)
+            self.assertAlmostEqual(self.hub._identity_checked_at, started)
+            self.assertAlmostEqual(self.hub._retry_at, started + sensors_module.IDENTITY_REFRESH_S)
+            self.assertLess(self.hub._retry_at, clock[0])
+
+    def test_stale_or_reconnected_measurements_are_not_zeros(self):
+        self.ros.raw()
+        self.hub._seen['joints'] = time.monotonic() - 1
+        self.assertEqual(self.hub.snapshot('joints')['joints'], [])
+        self.ros.connection = (True, 2)
+        self.assertFalse(self.hub.snapshot('imu')['valid'])
+        with self.assertRaises(RuntimeError):
+            self.hub.require_profile()
+        self.assertIn('urdf', self.hub.dispatch('model', 'read'))
+
+    def test_sensor_lifecycle_and_disconnected_publication(self):
+        self.hub.tick()
+        self.assertEqual(self.hub._pubs['imu'].messages, [])
+        self.hub.dispatch('imu', 'start')
+        self.ros.raw()
+        self.hub.tick()
+        self.assertTrue(json.loads(self.hub._pubs['imu'].messages[-1].data)['valid'])
+        self.ros.connection = (False, 1)
+        self.hub.tick()
+        disconnected = json.loads(self.hub._pubs['imu'].messages[-1].data)
+        self.assertFalse(disconnected['connected'])
+        self.assertNotIn('quaternion', disconnected)
+        self.hub.dispatch('imu', 'stop')
+        before = len(self.hub._pubs['imu'].messages)
+        self.hub.tick()
+        self.assertEqual(len(self.hub._pubs['imu'].messages), before)
+
+    def test_shm_selection_unsubscribes_previous_source(self):
+        self.ros.raw()
+        old_callback = self.ros.subscriptions['/sensors_data_raw'][1]
+        self.ros.params['use_shm_communication'] = True
+        self.hub.discover()
+        self.assertNotIn('/sensors_data_raw', self.ros.subscriptions)
+        self.assertIn('/sensors_data_raw_shm', self.ros.subscriptions)
+        self.assertFalse(self.hub.snapshot('joints')['valid'])
+        old_callback({'joint_data': {'joint_q': [99.] * 20}})
+        self.assertFalse(self.hub.snapshot('joints')['valid'])
+        self.ros.raw()
+        self.assertTrue(self.hub.snapshot('joints')['valid'])
+
+    def test_old_discovery_cannot_leave_trusted_profile_after_mismatch(self):
+        self.ros.raw()
+        self.ros.params['robot_type'] = 2
+        self.hub.discover()
+        with self.assertRaises(RuntimeError):
+            self.hub.require_profile()
+        self.assertIn('urdf', self.hub.dispatch('model', 'read'))
+        self.assertFalse(self.hub.health()['skeleton_model']['runtime_joint_names_verified'])
+        self.assertFalse(self.hub.snapshot('imu')['valid'])
+
+    def test_model_recovery_requires_new_correctly_named_measurement(self):
+        urdf = self.ros.params.pop('humanoid_description')
+        self.hub.discover()
+        self.ros.raw()
+        self.ros.params['humanoid_description'] = urdf
+        self.hub.discover()
+        self.assertFalse(self.hub.snapshot('joints')['valid'])
+        self.ros.raw()
+        self.assertEqual(self.hub.snapshot('joints')['joints'][0]['name'], JOINT_NAMES[0])
+
+    def test_wrong_robot_or_dof_never_enables_motion(self):
+        for key, value in [('robot_type', 2), ('armRealDof', 8), ('legRealDof', 12), ('headRealDof', True)]:
+            ros = FakeRos1()
+            ros.params[key] = value
+            hub = driver.KuavoSensors({}, 'test', ros, FakeNode())
+            try:
+                hub.discover()
+                with self.assertRaises(RuntimeError):
+                    hub.require_profile()
+            finally:
+                hub.close()
+
+    def test_missing_runtime_urdf_preserves_model_without_inventing_measurements(self):
+        del self.ros.params['humanoid_description']
+        self.hub.discover()
+        self.ros.raw()
+        self.assertFalse(self.hub.snapshot('joints')['valid'])
+        self.assertEqual(self.hub.snapshot('joints')['joints'], [])
+        self.assertIn('urdf', self.hub.dispatch('model', 'read'))
+        self.assertIsNotNone(self.hub.health()['model_error'])
+        self.assertTrue(self.hub.snapshot('imu')['valid'])
+
+    def test_biped_or_unsafe_runtime_xml_never_validates_measured_joints(self):
+        for urdf in ('<robot name="biped"/>', '<!DOCTYPE robot><robot/>',
+                     self.ros.params['humanoid_description'].replace('zhead_2_link', 'other')):
+            self.ros.params['humanoid_description'] = urdf
+            self.hub.discover()
+            self.ros.raw()
+            self.assertIsNone(self.hub._names)
+            self.assertFalse(self.hub.snapshot('joints')['valid'])
+            self.assertIn('urdf', self.hub.dispatch('model', 'read'))
+
+    def test_local_model_available_before_discovery_and_without_ros_parameters(self):
+        ros = FakeRos1()
+        ros.connection = (False, 1)
+        ros.params.clear()
+        hub = driver.KuavoSensors({}, 'test', ros, FakeNode())
+        try:
+            model = hub.dispatch('model', 'read')
+            self.assertEqual(model, {'urdf': hub._model_path.read_text()})
+            self.assertFalse(hub.snapshot('joints')['valid'])
+            self.assertEqual(hub.snapshot('joints')['joints'], [])
+            hub.discover()
+            self.assertEqual(hub.dispatch('model', 'read'), model)
+            self.assertEqual(ros.services, [])
+            self.assertEqual(ros.published, [])
+        finally:
+            hub.close()
+
+    def test_local_model_read_errors_are_explicit(self):
+        with patch.object(type(self.hub._model_path), 'read_text', side_effect=FileNotFoundError('missing')):
+            self.assertIn('local skeleton URDF unavailable', self.hub.dispatch('model', 'read')['error'])
+        for xml in ('<robot>', '<robot/>', '<!DOCTYPE robot><robot/>'):
+            with patch.object(type(self.hub._model_path), 'read_text', return_value=xml):
+                self.assertIn('error', self.hub.dispatch('model', 'read'))
+
+    def test_model_lifecycle_markers_are_idempotent_and_preserve_resource_reads(self):
+        model = self.hub.dispatch('model', 'read')
+        self.assertEqual(self.hub.dispatch('model', 'info'), {'state': 'idle'})
+        for _ in range(2):
+            self.assertEqual(self.hub.dispatch('model', 'start'), {'state': 'running'})
+        self.assertEqual(self.hub.dispatch('model', 'info'), {'state': 'running'})
+        self.assertEqual(self.hub.dispatch('model', 'read'), model)
+        self.assertNotIn('model', self.hub._running)
+        self.hub.tick()  # A resource must never enter the sensor publication loop.
+        self.assertTrue(all(not pub.messages for pub in self.hub._pubs.values()))
+        for _ in range(2):
+            self.assertEqual(self.hub.dispatch('model', 'stop'), {'state': 'idle'})
+        self.assertEqual(self.hub.dispatch('model', 'info'), {'state': 'idle'})
+        self.assertEqual(self.hub.dispatch('model', 'read'), model)
+        self.assertFalse(self.ros.published)
+
+    def test_model_lifecycle_is_offline_and_does_not_read_urdf(self):
+        self.ros.connection = (False, 2)
+        with patch.object(type(self.hub._model_path), 'read_text', side_effect=FileNotFoundError('missing')):
+            self.assertEqual(self.hub.dispatch('model', 'start'), {'state': 'running'})
+            self.assertEqual(self.hub.dispatch('model', 'stop'), {'state': 'idle'})
+            self.assertIn('error', self.hub.dispatch('model', 'read'))
+        self.assertFalse(self.ros.published)
+
+    def test_runtime_joint_names_must_match_displayed_model(self):
+        self.ros.raw()
+        self.ros.params['humanoid_description'] = self.ros.params['humanoid_description'].replace(
+            f'name="{JOINT_NAMES[0]}"', 'name="different_knee"')
+        self.hub.discover()
+        self.ros.raw()
+        self.assertIn('runtime joint names differ', self.hub.health()['model_error'])
+        self.assertEqual(self.hub.snapshot('joints')['joints'], [])
+        self.assertFalse(self.hub.snapshot('joints')['valid'])
+        self.assertIn('urdf', self.hub.dispatch('model', 'read'))
+
+    def test_packaged_skeleton_is_one_connected_tree_without_mesh_dependencies(self):
+        root = ET.fromstring((ROOT / 'resource' / 'kuavo5w_model.urdf').read_text())
+        links, joints = root.findall('link'), root.findall('joint')
+        names = {link.get('name') for link in links}
+        self.assertEqual(len(names), len(links))
+        self.assertEqual(len(joints), len(links) - 1)
+        self.assertEqual(len({joint.get('name') for joint in joints}), len(joints))
+        children, adjacency = set(), {name: [] for name in names}
+        for joint in joints:
+            parent, child = joint.find('parent').get('link'), joint.find('child').get('link')
+            self.assertIn(parent, names)
+            self.assertIn(child, names)
+            self.assertNotIn(child, children)
+            children.add(child)
+            adjacency[parent].append(child)
+        self.assertEqual(names - children, {'base_link'})
+        visited, pending = set(), ['base_link']
+        while pending:
+            link = pending.pop()
+            self.assertNotIn(link, visited)
+            visited.add(link)
+            pending.extend(adjacency[link])
+        self.assertEqual(visited, names)
+        self.assertTrue(set(LINK_ORDER) <= names)
+        self.assertTrue(set(JOINT_NAMES) <= {joint.get('name') for joint in joints})
+        for tag in ('mesh', 'visual', 'collision', 'inertial'):
+            self.assertEqual(root.findall('.//' + tag), [])
+
+    def test_odom_averages_window_null_axes_and_reports_provenance(self):
+        self.odom(1., 2., 3.)
+        self.odom(3., 4., 5.)
+        sample = self.hub.snapshot('loco_state')
+        self.assertTrue(sample['valid'])
+        self.assertEqual(sample['schema'], 'motus.odom/1')
+        self.assertEqual(sample['frame'], 'body')
+        self.assertEqual(sample['twist'], [2., 3., None, None, None, 4.])
+        self.assertIsNone(sample['pose'])
+        self.assertEqual(sample['vendor']['samples'], 2)
+        self.assertEqual(sample['vendor']['stamp_source'], 'received')
+        self.assertEqual(self.hub.dispatch('loco_state', 'info')['odom_interface']['provides'], ['vx', 'vy', 'wz'])
+        self.assertEqual(next(t for t in self.hub.tools() if t['name'] == 'loco_state')['topic_out'][1]['format'], 'state/odom')
+
+    def test_odometry_is_not_decimated_before_window_averaging(self):
+        ros = FakeRos1()
+        with patch.object(ros, 'subscribe', wraps=ros.subscribe) as subscribe:
+            hub = driver.KuavoSensors({}, 'test', ros, FakeNode())
+        try:
+            call = next(c for c in subscribe.call_args_list if c.args[0] == '/odom')
+            self.assertEqual(call.kwargs.get('throttle_ms', 0), 0)
+        finally:
+            hub.close()
+
+    def test_odom_reading_does_not_require_whole_body_controller(self):
+        self.hub._profile = None
+        self.hub._discovery_error = 'whole-body controller unlaunch'
+        self.odom(vx=0.12, vy=0.03, wz=0.01, child='base_footprint')
+        sample = self.hub.snapshot('loco_state')
+        self.assertTrue(sample['valid'])
+        self.assertIsNone(sample['reason'])
+        self.assertEqual(sample['twist'], [0.12, 0.03, None, None, None, 0.01])
+        with self.assertRaises(RuntimeError):
+            self.hub.require_profile()  # Reading data must never enable motion.
+        for key in ('robot_type', 'armRealDof', 'headRealDof', 'legRealDof', 'waistRealDof'):
+            self.ros.params.pop(key, None)
+        self.hub.discover()
+        self.assertTrue(self.hub.snapshot('loco_state')['valid'])
+        with self.assertRaises(RuntimeError):
+            self.hub.require_profile()
+
+    def test_switching_raw_source_preserves_independent_odometry(self):
+        self.odom()
+        self.ros.params['use_shm_communication'] = True
+        self.hub.discover()
+        self.assertTrue(self.hub.snapshot('loco_state')['valid'])
+        self.ros.connection = (True, 2)
+        self.assertFalse(self.hub.snapshot('loco_state')['valid'])
+
+    def test_odom_empty_window_does_not_republish_old_velocity(self):
+        self.hub.dispatch('loco_state', 'start')
+        self.odom()
+        self.hub.tick()
+        self.hub.tick()
+        sample = json.loads(self.hub._pubs['loco_state'].messages[-1].data)
+        self.assertFalse(sample['valid'])
+        self.assertEqual(sample['twist'], [None] * 6)
+        self.assertEqual(sample['vendor']['samples'], 0)
+
+    def test_odom_unknown_frame_nan_or_missing_twist_is_unavailable(self):
+        self.odom(child='map')
+        self.assertFalse(self.hub.snapshot('loco_state')['valid'])
+        self.odom(vx=math.nan)
+        self.assertFalse(self.hub.snapshot('loco_state')['valid'])
+        self.ros.subscriptions['/odom'][1]({})
+        self.assertEqual(self.hub.snapshot('loco_state')['twist'], [None] * 6)
+
+    def test_odom_receipt_time_is_stable_and_capture_time_remains_separate(self):
+        now = int(time.time())
+        self.odom(secs=now)
+        sample = self.hub.snapshot('loco_state')
+        self.assertLess(abs(sample['stamp_ms'] - time.time()*1000), 100)
+        self.assertEqual(sample['vendor']['stamp_source'], 'received')
+        self.assertEqual(sample['vendor']['source_timing']['stamp_ms'], now * 1000)
+        self.assertEqual(sample['vendor']['source_timing']['stamp_source'], 'robot')
+        interface = self.hub.dispatch('loco_state', 'info')['odom_interface']
+        self.assertEqual(interface['topic'], self.hub._topics['loco_state'])
+        self.assertEqual(interface['timing']['stamp_source'], 'received')
+        self.assertNotIn('max_measurement_delay_ms', interface['timing'])
+        self.assertEqual(interface['timing']['measurement_delay_bound'], 'unverified')
+        self.odom(secs=1)  # Unsynchronized source never changes the public clock.
+        sample = self.hub.snapshot('loco_state')
+        self.assertEqual(sample['vendor']['stamp_source'], 'received')
+        self.assertLess(abs(sample['stamp_ms'] - time.time()*1000), 100)
+
+    def test_discovery_runs_off_receiver_and_discards_old_session_result(self):
+        entered, release = threading.Event(), threading.Event()
+        original = self.ros.get_param
+        def blocking(name, default=None):
+            entered.set()
+            release.wait(1)
+            return original(name, default)
+        self.hub._profile = None
+        with patch.object(self.ros, 'get_param', side_effect=blocking):
+            self.hub._retry_at = 0
+            self.hub.tick()
+            self.assertTrue(entered.wait(1))
+            self.ros.connection = (True, 2)
+            self.hub.snapshot('imu')
+            release.set()
+            self.hub._thread.join(1)
+        self.assertIsNone(self.hub._profile)
+        self.assertFalse(self.hub._thread.is_alive())
+
+    def test_joints_exposes_skeleton_and_independent_raw_stream(self):
+        tool = next(t for t in self.hub.tools() if t['name'] == 'joints')
+        self.assertEqual([p['format'] for p in tool['topic_out']], ['sensor/skeleton', 'data/json'])
+        self.hub._profile = self.hub._names = None
+        self.ros.raw([.1] * 20, sensor_time={'secs': 0, 'nsecs': 0})
+        raw = self.hub.joint_raw_snapshot()
+        self.assertTrue(raw['valid'])
+        self.assertFalse(raw['model_mapping_verified'])
+        self.assertEqual(raw['joint_q'], [.1] * 20)
+        self.assertEqual(raw['joint_vd'], [2.] * 20)
+        self.assertEqual(raw['joint_torque'], [3.] * 20)
+        self.assertFalse(self.hub.snapshot('joints')['valid'])
+        with self.assertRaises(RuntimeError):
+            self.hub.joint_positions()
+
+    def test_raw_joint_diagnostics_are_bounded_and_cleared_on_reconnect(self):
+        self.ros.raw([.1] * 20)
+        self.assertTrue(self.hub.joint_raw_snapshot()['valid'])
+        self.ros.connection = (True, 2)
+        self.assertFalse(self.hub.joint_raw_snapshot()['valid'])
+        self.hub._on_joint_raw({'joint_data': {'joint_q': [0.] * 257}}, '/sensors_data_raw')
+        self.assertFalse(self.hub.joint_raw_snapshot()['valid'])
+
+    def test_joint_raw_data_is_published_without_runtime_model(self):
+        self.hub._profile = self.hub._names = None
+        self.hub.dispatch('joints', 'start')
+        self.ros.raw([.2] * 20)
+        self.hub.tick()
+        self.assertEqual(json.loads(self.hub._joint_state_pub.messages[-1].data)['joint_q'], [.2] * 20)
+        self.assertEqual(json.loads(self.hub._pubs['joints'].messages[-1].data)['joints'], [])
+
+    def test_loco_display_separates_map_pose_from_navigation_odometry(self):
+        self.odom()
+        self.hub._on_localization({'header': {'frame_id': 'map'}, 'pose': {'pose': {
+            'position': dict(x=4., y=-2., z=0.),
+            'orientation': dict(w=math.sqrt(.5), x=0., y=0., z=math.sqrt(.5))}}})
+        display = self.hub.loco_display()
+        self.assertTrue(display['localization_valid'])
+        self.assertAlmostEqual(display['yaw_deg'], 90.)
+        self.assertEqual((display['x_m'], display['y_m'], display['frame_id']), (4., -2., 'map'))
+        self.assertEqual((display['vx_m_s'], display['vy_m_s'], display['wz_rad_s']), (1., 2., 3.))
+        self.assertIsNone(self.hub.snapshot('loco_state')['pose'])
+        tool = next(t for t in self.hub.tools() if t['name'] == 'loco_state')
+        self.assertEqual([p['format'] for p in tool['topic_out']], ['data/json', 'state/odom'])
+
+    def test_loco_display_falls_back_to_explicit_odom_frame_and_expires(self):
+        self.ros.subscriptions['/odom'][1]({'header': {'frame_id': 'odom'}, 'child_frame_id': 'base_link',
+            'pose': {'pose': {'position': dict(x=1., y=2., z=0.), 'orientation': dict(w=1., x=0., y=0., z=0.)}},
+            'twist': {'twist': {'linear': dict(x=0., y=0., z=0.), 'angular': dict(x=0., y=0., z=0.)}}})
+        display = self.hub.loco_display()
+        self.assertEqual((display['frame_id'], display['pose_source']), ('odom', '/odom'))
+        self.assertFalse(display['localization_valid'])
+        self.hub._seen['loco_state'] -= 1
+        self.assertFalse(self.hub.loco_display()['valid'])
+
+    def test_loco_display_publication_keeps_velocity_after_odom_window_consumption(self):
+        self.hub.dispatch('loco_state', 'start')
+        self.odom()
+        self.hub.tick()
+        display = json.loads(self.hub._loco_pub.messages[-1].data)
+        self.assertEqual(display['vx_m_s'], 1.)
+        self.assertIsNone(display.get('x_m'))  # No orientation in fixture: no invented pose.
+
+
+if __name__ == '__main__':
+    unittest.main()

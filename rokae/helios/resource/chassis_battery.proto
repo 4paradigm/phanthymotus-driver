@@ -1,0 +1,14 @@
+// Read-only subset of the installed chassis UI protocol (2026-11-18).
+// Wire field numbers verified against /static/proto/uidata.proto and robottype.proto.
+// Other messages and fields are intentionally left to Protobuf unknown-field handling.
+syntax = "proto3";
+package helios_readonly;
+
+message RobotBase {
+  string robot_id = 5;
+  string data_pool = 11;
+}
+
+message UiDatagram {
+  RobotBase robot_base = 8;
+}
