@@ -44,7 +44,8 @@ class ThreeViewCapture:
                 ("capture", "取证"), ("info", "查看状态"), ("start", "开始订阅"), ("stop", "停止订阅")
             )
         ]
-        definition = tool(TOOL_NAME, "sensor", "复用 ALOHA 三路 JPEG 图像，按时间戳完成工位取证。",
+        schema["x-is-dangerous"] = False
+        definition = tool(TOOL_NAME, "actuator", "复用 ALOHA 三路 JPEG 图像，按时间戳完成工位取证。",
                           schema, topic_out=self._ports())
         definition["title"] = "三视角工位取证"
         return definition
@@ -94,7 +95,9 @@ class ThreeViewCapture:
         stamp = message.header.stamp
         timestamp_ms = stamp.sec * 1000 + stamp.nanosec // 1_000_000
         data = message.data
-        if timestamp_ms <= 0 or not 2 <= len(data) <= MAX_JPEG_BYTES or bytes(data[:2]) != b"\xff\xd8":
+        if timestamp_ms <= 0 or not 4 <= len(data) <= MAX_JPEG_BYTES:
+            return
+        if bytes(data[:2]) != b"\xff\xd8" or bytes(data[-2:]) != b"\xff\xd9":
             return
         with self._lock:
             if self._node is node:

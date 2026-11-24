@@ -1,6 +1,6 @@
 # PiPER Arm control, Joints and On camera
 
-The current bundle provides three canvas cards: **Arm control** (`arm_control`),
+The default canvas cards include **Arm control** (`arm_control`),
 **Joints** (`joints`) and **On camera** (`piper_camera_live`). Joints and On camera
 are independent read-only sensors. They share the existing driver lifecycle and
 keep monitoring when the control card stops. No Parameters or
@@ -40,6 +40,20 @@ submission for actual stable arrival. Low-speed large moves can still exceed thi
 limit. Reset is a trajectory, not firmware reset, zero calibration or error
 clearing; its target and source appear in Get status. Physical return paths and
 stopping latency require separate supervised acceptance.
+
+## Three-view capture on ALOHA
+
+Set `enabled` to `true` under `three_view_capture` in the PiPER driver
+configuration to expose **三视角工位取证** (`piper_three_view_capture`). The card reads
+`/aloha_lab/camera/{front,left,right}/jpeg` from the existing ALOHA camera
+bridge. Start forwarding on all three camera cards before capturing.
+
+Choose **取证** (`capture`) on the canvas. The card selects the closest group
+from the recent frames. A successful capture reports `ready`, the three
+timestamps and their maximum difference. Open the card's data streams to view
+the three captured JPEGs. If a view has no frame within the two-second age
+limit, the response lists it in `missing_views`. A group more than 100 ms apart
+returns `out_of_sync`. The capture uses only image data.
 
 ## Monitoring and ACP
 
