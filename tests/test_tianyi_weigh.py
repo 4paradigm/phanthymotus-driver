@@ -415,8 +415,11 @@ def test_tool_schema(tmp_path):
     for spec in schema["x-action-params"].values():
         assert set(spec["params"]) <= set(schema["properties"])
     assert schema["x-resource"] == ["arm_l", "arm_r", "hand_l", "hand_r"]
-    assert schema["x-completion"]["actions"] == ["pose", "retract", "tare", "weigh", "calibrate"]
+    assert schema["x-completion"]["actions"] == ["pose", "retract"]
     assert 60 < schema["x-completion"]["timeout"] <= 180
+    assert schema["properties"]["duration_s"]["maximum"] == 5
+    assert schema["properties"]["timeout_s"]["maximum"] == 10
+    assert schema["properties"]["timeout_s"]["default"] == 8
     assert schema["properties"]["side"]["enum"] == ["right", "left", "both"]
     assert "side" in schema["x-action-params"]["pose"]["params"]
     assert "side" in schema["x-action-params"]["retract"]["params"]
@@ -711,7 +714,6 @@ def test_dispatch_logs_one_summary_line_per_call(rig, capsys, tmp_path):
     p = weigh.WeighPlugin({"state_file": str(tmp_path / "w.json")}, "ns", _FakeRos2())
     p.start = lambda: None
     p._engine = rig.engine
-    p._sync_grace_s = 60          # 假时钟跑得快：让这些调用都在宽限期内同步返回
     p.dispatch("tare", {"side": "right", "_tool_name": "weigh"})
     rig.mass = 0.59
     rig.warm()
@@ -891,18 +893,25 @@ def _async_plugin(rig, tmp_path, grace=0.0):
     return p, calls, fired
 
 
-def test_long_action_returns_action_id_then_completes(rig, tmp_path):
-    p, calls, fired = _async_plugin(rig, tmp_path)
-    rig.engine.tare({})
-    rig.mass = 0.59
-    rig.warm()
-    res = p.dispatch("weigh", {"side": "right"})
-    assert res["state"] == "weighing" and res["action_id"].startswith("weigh_weigh_"), res
+def test_long_action_returns_action_id_then_completes(hanging, tmp_path, monkeypatch):
+    p, calls, fired = _async_plugin(hanging, tmp_path)
+    gate = threading.Event()
+    real_pose = hanging.engine.pose
+
+    def delayed_pose(args):
+        assert gate.wait(10)
+        return real_pose(args)
+
+    monkeypatch.setattr(hanging.engine, "pose", delayed_pose)
+    try:
+        res = p.dispatch("pose", {"side": "right"})
+        assert res["state"] == "posing" and res["action_id"].startswith("weigh_pose_"), res
+    finally:
+        gate.set()
     assert fired.wait(30)
     action_id, status, result, tool = calls[0]
     assert action_id == res["action_id"] and status == "completed" and tool == "weigh"
-    assert result["action"] == "weigh" and result["valid"]
-    assert result["mass_kg"] == pytest.approx(0.59, abs=0.005)
+    assert result["action"] == "pose" and result["state"] == "posed"
     assert len(calls) == 1
     assert p._busy.acquire(blocking=False)        # 完成前已释放
     p._busy.release()
@@ -926,20 +935,29 @@ def test_quick_result_stays_synchronous_without_callback(rig, tmp_path):
     assert res["code"] == "not_tared" and "action_id" not in res
     res = p.dispatch("calibrate", {"side": "right", "scale": 1.05})
     assert res["state"] == "calibrated" and "action_id" not in res
-    time.sleep(0.05)
+    rig.error = 1
+    rig.warm()
+    res = p.dispatch("pose", {"side": "right"})
+    assert res["code"] == "joint_error" and "action_id" not in res
     assert calls == []
 
 
-def test_busy_while_async_action_runs(rig, tmp_path):
-    p, calls, fired = _async_plugin(rig, tmp_path)
+def test_busy_while_async_action_runs(hanging, tmp_path, monkeypatch):
+    p, calls, fired = _async_plugin(hanging, tmp_path)
     gate = threading.Event()
-    real = rig.engine.tare
-    rig.engine.tare = lambda args: (gate.wait(10), real(args))[1]
-    res = p.dispatch("tare", {"side": "right"})
-    assert "action_id" in res
-    assert p.dispatch("weigh", {"side": "right"})["code"] == "busy"
-    assert p.dispatch("read", {"side": "right"})["state"] == "ok"   # read 不受影响
-    gate.set()
+    real_pose = hanging.engine.pose
+
+    def delayed_pose(args):
+        assert gate.wait(10)
+        return real_pose(args)
+
+    monkeypatch.setattr(hanging.engine, "pose", delayed_pose)
+    try:
+        assert "action_id" in p.dispatch("pose", {"side": "right"})
+        assert p.dispatch("weigh", {"side": "right"})["code"] == "busy"
+        assert p.dispatch("read", {"side": "right"})["state"] == "ok"
+    finally:
+        gate.set()
     assert fired.wait(30) and calls[0][1] == "completed"
 
 
@@ -950,12 +968,68 @@ def test_engine_exception_becomes_error_completion(rig, tmp_path):
     def boom(args):
         gate.wait(10)
         raise RuntimeError("kaput")
-    rig.engine.weigh = boom
-    res = p.dispatch("weigh", {"side": "right"})
-    gate.set()
+    rig.engine.pose = boom
+    try:
+        res = p.dispatch("pose", {"side": "right"})
+    finally:
+        gate.set()
     assert fired.wait(30)
     assert calls[0][0] == res["action_id"] and calls[0][1] == "error"
     assert calls[0][2]["code"] == "internal_error"
+
+
+def test_measurement_exception_returns_synchronous_error(rig, tmp_path, monkeypatch):
+    p, calls, _ = _async_plugin(rig, tmp_path)
+
+    def boom(args):
+        raise RuntimeError("kaput")
+
+    monkeypatch.setattr(rig.engine, "weigh", boom)
+    res = p.dispatch("weigh", {"side": "right"})
+    assert res["state"] == "error" and res["code"] == "internal_error"
+    assert "action_id" not in res and calls == []
+
+
+def test_measurement_actions_are_not_acp(tmp_path):
+    """agent-core 的 _slim_acp_result 会丢掉成功通知中的测量字段。"""
+    p = weigh.WeighPlugin({"state_file": str(tmp_path / "w.json")}, "ns", _FakeRos2())
+    assert set(weigh.ASYNC_ACTIONS) == {"pose", "retract"}
+    actions = p.get_tool()["inputSchema"]["x-completion"]["actions"]
+    assert set(actions).isdisjoint({"tare", "weigh", "calibrate"})
+
+
+@pytest.mark.parametrize("action, state", [
+    ("tare", "tared"), ("weigh", "weighed"), ("calibrate", "calibrated"),
+])
+def test_measurement_returns_result_synchronously_even_when_slow(rig, tmp_path, monkeypatch, action, state):
+    p, calls, _ = _async_plugin(rig, tmp_path, grace=0)
+
+    def unexpected_action_id():
+        pytest.fail("measurement allocated an ACP action ID")
+
+    monkeypatch.setattr(weigh, "uuid4", unexpected_action_id)
+    args = {"side": "right"}
+    if action != "tare":
+        assert rig.engine.tare(args)["state"] == "tared"
+        rig.mass = 0.59
+        if action == "calibrate":
+            args["known_mass_kg"] = rig.mass
+    before = rig.t
+    res = p.dispatch(action, args)
+    assert rig.t - before >= 3 - 1e-6
+    assert res["state"] == state and "action_id" not in res and calls == []
+    if action == "weigh":
+        assert res["valid"] and res["mass_kg"] == pytest.approx(0.59, abs=0.005)
+    elif action == "calibrate":
+        assert res["scale_source"] == "measured"
+        assert res["scale"] == pytest.approx(rig.gain, abs=0.005)
+
+
+def test_measurement_limits_apply_to_direct_calls(rig):
+    args = {"side": "right", "duration_s": 30, "timeout_s": 45}
+    assert rig.engine._params(args)[2:] == (5, 10)
+    rig.engine.cfg["max_timeout_s"] = 4
+    assert rig.engine._params(args)[2:] == (3, 4)
 
 
 # ── retract 从中间姿态出发也要确认空掌 ─────────────────────────────────────
@@ -1014,9 +1088,39 @@ def test_stop_cancels_pending_pose_and_sends_nothing_more(hanging, tmp_path):
     assert hanging.engine._tare["right"] is None
     hanging.engine._raw_sleep = real_sleep          # 之后的新动作不受上一次取消影响
     hanging.warm(1)
-    p._sync_grace_s = 60
     assert p.dispatch("read", {"side": "right"})["state"] == "ok"
     assert p.dispatch("calibrate", {"side": "right", "scale": 1.05})["state"] == "calibrated"
+
+
+def test_stop_cancels_running_weigh(rig, tmp_path, monkeypatch):
+    p, calls, _ = _async_plugin(rig, tmp_path)
+    assert rig.engine.tare({"side": "right"})["state"] == "tared"
+    entered, release = threading.Event(), threading.Event()
+    real_sleep, real_cancel = rig.engine._raw_sleep, rig.engine.cancel
+
+    def wait_for_stop(dt):
+        entered.set()
+        assert release.wait(10)
+        real_sleep(dt)
+
+    def cancel():
+        real_cancel()
+        release.set()
+
+    monkeypatch.setattr(rig.engine, "_raw_sleep", wait_for_stop)
+    monkeypatch.setattr(rig.engine, "cancel", cancel)
+    result = []
+    request = threading.Thread(target=lambda: result.append(p.dispatch("weigh", {"side": "right"})))
+    request.start()
+    try:
+        assert entered.wait(5)
+        assert p.dispatch("stop", {}) == {"state": "idle"}
+    finally:
+        release.set()
+        request.join(10)
+    assert not request.is_alive() and not p._worker.is_alive()
+    assert result[0]["state"] == "cancelled" and "action_id" not in result[0]
+    assert calls == []
 
 
 # ── servo 指令流：显式动作前先暂停它，动作中被恢复就停下 ──────────────────────

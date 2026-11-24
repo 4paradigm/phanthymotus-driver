@@ -10,8 +10,8 @@
   5. ``read`` 不阻塞，返回去皮状态、上一次结果和实时读数；
   6. ``retract``：称完收回手臂（掌心上还有物体时拒绝，避免掉落；张不开手指时不动手臂）。
 
-pose / retract / tare / weigh / calibrate 超过约 0.5 s 时走 ACP：先返回 ``action_id``，
-做完后把完整结果 POST 到 Agent Core 的 /api/acp/complete（见 README_dev.md § ACP）。
+pose / retract 超过约 0.5 s 时走 ACP，先返回 ``action_id``，完成后通知 Agent Core。
+tare / weigh / calibrate 同步返回测量结果。
 
 只有 ``pose`` / ``retract`` 会让手臂和手指运动，而且不自己发指令：经 bundle 调用 arm 卡的
 ``move_pos``（复用它的急停/故障/限位预检、电流上限和运动反馈）和 hand 卡的 ``set_fingers_raw``。其余动作只订阅 ``/arm_6dof_{side}``（WrenchStamped，约 100 Hz）
@@ -65,6 +65,7 @@ ARM_STATUS_TOPIC = "/arm/status"
 # 在 cup 手型中读数 602 g（按整箱 14.72 kg 推算约 600 g），两种参照一致。未经电子秤验证。
 DEFAULT_SCALE = 1.068
 DEFAULT_SCALE_SOURCE = "default_phone_ref_2026-11-23"
+MAX_DURATION_S = 5.0
 
 DEFAULTS = {
     "sides": ["left", "right"],      # 订阅并允许使用的手
@@ -92,10 +93,10 @@ DEFAULTS = {
     "min_calibration_kg": 0.2,       # 实测校准的最小参考质量
     "max_calibration_kg": 3.0,       # 未设 load_limit_kg 时，实测校准参考质量的上限（防输错单位）
     "default_duration_s": 3.0,
-    "default_timeout_s": 15.0,
-    "max_timeout_s": 45.0,           # agent-core 对 actuator 调用的 HTTP 超时是 60 s
+    "default_timeout_s": 8.0,
+    "max_timeout_s": 10.0,           # 同步测量时限须远小于 agent-core 的 60 s actuator 超时
     "data_grace_s": 2.0,             # 刚启动时等数据到达的宽限
-    "history_s": 12.0,               # 缓冲区保留时长（≥ 最长窗口 10 s；/arm/status 约 500 Hz）
+    "history_s": 12.0,               # 缓冲区保留时长（≥ 最长窗口 5 s；/arm/status 约 500 Hz）
     "poll_s": 0.2,
     "joint_min_interval_s": 0.02,    # /arm/status 抽帧间隔（原始约 490 Hz）
     # ── pose / retract（只支持右手）──
@@ -470,7 +471,7 @@ class WeighEngine:
             raise ValueError("duration_s / timeout_s must be numbers")
         if not math.isfinite(duration) or not math.isfinite(timeout):
             raise ValueError("duration_s / timeout_s must be finite")
-        duration = min(max(duration, 1.0), 10.0)
+        duration = min(max(duration, 1.0), MAX_DURATION_S, self.cfg["max_timeout_s"] - 1.0)
         timeout = min(max(timeout, duration + 1.0), self.cfg["max_timeout_s"])
         return side, sides, duration, timeout
 
@@ -1217,13 +1218,12 @@ class WeighEngine:
 _RELIABLE_DEPTH = 10
 
 
-# 会等待物理运动或稳定窗口的动作（> 3 s）走 ACP：先返回 action_id，做完再回调 Agent Core。
-# 在 SYNC_GRACE_S 内就结束的调用（参数错误、未去皮、手动设定比例系数……）仍同步返回，
-# 不带 action_id，Agent Core 也就不登记 pending。
-ASYNC_ACTIONS = ("pose", "retract", "tare", "weigh", "calibrate")
-RUNNING_STATE = {"pose": "posing", "retract": "retracting", "tare": "taring",
-                 "weigh": "weighing", "calibrate": "calibrating"}
-# 最坏情况：两段运动各约 13 s + 起臂/手指约 3 s + 去皮最多 45 s ≈ 75 s，留余量。
+# agent-core/src/collector.py 的 _slim_acp_result 对成功的 ACP 通知只保留
+# elapsed_s、distance_m、duration_s。测量动作同步返回，以保留 mass_kg、valid 等字段。
+# 手臂运动超过 SYNC_GRACE_S 时返回 action_id，完成后通知 Agent Core。
+ASYNC_ACTIONS = ("pose", "retract")
+SYNC_ACTIONS = ("tare", "weigh", "calibrate")
+RUNNING_STATE = {"pose": "posing", "retract": "retracting"}
 COMPLETION_TIMEOUT_S = 120
 SYNC_GRACE_S = 0.5
 
@@ -1263,11 +1263,13 @@ class WeighPlugin:
 
     def get_tool(self) -> dict:
         cfg = self._engine.cfg
-        window = {"type": "number", "minimum": 1, "maximum": 10, "default": cfg["default_duration_s"],
+        window = {"type": "number", "minimum": 1,
+                  "maximum": min(MAX_DURATION_S, cfg["max_timeout_s"] - 1.0),
+                  "default": cfg["default_duration_s"],
                   "description": "稳定窗口长度（秒），默认 3"}
         timeout = {"type": "number", "minimum": 2, "maximum": cfg["max_timeout_s"],
                    "default": cfg["default_timeout_s"],
-                   "description": "最长等待读数稳定的时间（秒），默认 15"}
+                   "description": f"最长等待读数稳定的时间（秒），默认 {cfg['default_timeout_s']:g}"}
         return {
             "name": "weigh",
             "type": "actuator",
@@ -1282,8 +1284,8 @@ class WeighPlugin:
                 + (f"上限 {cfg['load_limit_kg']} kg；" if cfg["load_limit_kg"] else
                    f"上限由腕部电流决定（超过额定 {int(cfg['current_ratio_max'] * 100)}% 判无效，估计掌心约 2 kg，未实测）；")
                 + "结果带 valid 标记，valid=false 时不要使用 mass_kg。不能替代电子秤计量。"
-                "pose/retract/tare/weigh/calibrate 需要较长时间时先返回 action_id，"
-                "完成后结果（含 mass_kg、valid 等）随完成通知送达，也可以再用 read 查看 last_result。"
+                "pose/retract 需要较长时间时先返回 action_id，完成后发送通知。"
+                "tare/weigh/calibrate 同步返回测量结果，默认采集约 3 秒，重量直接出现在 weigh 返回值里。"
             ),
             "inputSchema": {
                 "type": "object",
@@ -1470,7 +1472,7 @@ class WeighPlugin:
             return {"state": "stopping", "error": "进行中的动作还没退出；它不会再下发指令，退出后自动停止"}
         if action == "info":
             return {"state": "ready" if self._node is not None else "idle", "sides": list(self._sides)}
-        if action not in ("pose", "tare", "weigh", "calibrate", "read", "retract"):
+        if action not in (*ASYNC_ACTIONS, *SYNC_ACTIONS, "read"):
             return {"error": f"unknown action: {action}"}
         if args.get("side") in (None, ""):
             result = {"state": "error", "code": "side_required", "experimental": True,
@@ -1482,7 +1484,7 @@ class WeighPlugin:
         except Exception as exc:
             return {"state": "error", "error": f"weigh start failed: {exc}"}
         t0 = time.monotonic()
-        if action in ("pose", "retract"):
+        if action in ASYNC_ACTIONS:
             print(f"[weigh] {action} called args={args}", flush=True)
         result = self._engine.read(args) if action == "read" else self._start_job(action, args, t0)
         print(f"[weigh] {action} args={args} -> {_brief(result)} ({time.monotonic() - t0:.1f}s)",
@@ -1503,8 +1505,7 @@ class WeighPlugin:
             return {"state": "error", "code": "internal_error", "error": f"{type(exc).__name__}: {exc}"}
 
     def _start_job(self, action: str, args: dict, t0: float) -> dict:
-        """在工作线程里执行一个动作。SYNC_GRACE_S 内结束就同步返回结果；否则返回 action_id，
-        做完后经 ACP 回调完成状态和完整结果。同一时间只允许一个动作。"""
+        """在可取消的工作线程中执行动作。测量同步返回，较长的手臂动作走 ACP。"""
         if self._stopping:
             return {"state": "error", "code": "stopping", "error": "卡片正在停止，等上一个动作退出后再调用"}
         if not self._busy.acquire(blocking=False):
@@ -1513,7 +1514,7 @@ class WeighPlugin:
             self._busy.release()
             return {"state": "error", "code": "stopping", "error": "卡片正在停止，等上一个动作退出后再调用"}
         self._engine.clear_cancel()       # 持有 busy 说明上一个动作已退出
-        action_id = f"weigh_{action}_{uuid4().hex[:8]}"
+        action_id = f"weigh_{action}_{uuid4().hex[:8]}" if action in ASYNC_ACTIONS else None
         done = threading.Event()
         lock = threading.Lock()
         job = {"result": None, "async": False}
@@ -1539,6 +1540,9 @@ class WeighPlugin:
 
         self._worker = threading.Thread(target=work, name=f"weigh-{action}", daemon=True)
         self._worker.start()
+        if action_id is None:
+            done.wait()
+            return job["result"]
         if done.wait(self._sync_grace_s):
             return job["result"]
         with lock:
