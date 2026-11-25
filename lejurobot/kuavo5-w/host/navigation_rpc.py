@@ -142,7 +142,7 @@ def map_archive_write(operation, args, root=Path('/home/jt/jmap_config/jmaps'),
                 raise
             shutil.rmtree(stage)
         elif operation == 'map_delete':
-            manifest = map_archive_read('map_archive_manifest', args, root)
+            manifest = map_delete_manifest(name, root)
             if manifest != args['manifest']:
                 raise ValueError('map_changed_since_backup')
             assert_inactive(name)
@@ -151,6 +151,8 @@ def map_archive_write(operation, args, root=Path('/home/jt/jmap_config/jmaps'),
             try:
                 # Remove the entry from the factory list before its sidecars.
                 for suffix in reversed(_MAP_FILES):
+                    if suffix not in manifest['files']:
+                        continue
                     live[suffix].rename(stage / live[suffix].name)
                     moved.append(suffix)
             except Exception:
@@ -293,6 +295,43 @@ def map_save_status(name, root=Path('/home/jt/jmap_config/jmaps')):
         return {'complete': complete, 'files': stats}
     except (OSError, ValueError):
         return {'complete': False}
+
+
+def map_runtime_status():
+    """Read-only boot fence; a container restart is NOT a chassis restart."""
+    from uuid import UUID
+    return {'boot_id': str(UUID(Path('/proc/sys/kernel/random/boot_id').read_text().strip())),
+            'uptime_s': float(Path('/proc/uptime').read_text().split()[0]),
+            'observed_at': time.time()}
+
+
+def map_delete_manifest(name, root=Path('/home/jt/jmap_config/jmaps')):
+    """Deletion needs exact existing files, including empty/partial save outputs.
+
+    Do not weaken the complete-map fence used by backup and upload.
+    """
+    if (not isinstance(name, str) or not name.strip() or len(name) > 80 or name in ('.', '..')
+            or any(c in name for c in '/\\') or any(ord(c) < 32 for c in name)):
+        raise ValueError('invalid_map_name')
+    files = {}
+    for suffix in _MAP_FILES:
+        path = root / (name + suffix)
+        if not os.path.lexists(path):
+            continue
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > 512 * _MAP_CHUNK:
+            raise RuntimeError('invalid_map_delete_source')
+        before = path.stat()
+        digest = hashlib.sha256()
+        with path.open('rb') as stream:
+            for chunk in iter(lambda: stream.read(_MAP_CHUNK), b''):
+                digest.update(chunk)
+        after = path.stat()
+        if (before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_ino, after.st_size, after.st_mtime_ns):
+            raise RuntimeError('map_changed_during_delete_inspection')
+        files[suffix] = {'size': after.st_size, 'mtime_ns': after.st_mtime_ns, 'sha256': digest.hexdigest()}
+    if not files:
+        raise ValueError('grid_map_not_found')
+    return {'map_name': name, 'files': files}
 
 
 def tracker_command(rospy, operation, request=None):
@@ -513,6 +552,10 @@ def remote_idle_guard(rospy, owner):
 
 
 def main(request):
+    if request['operation'] == 'map_runtime_status':
+        return map_runtime_status()
+    if request['operation'] == 'map_delete_manifest':
+        return map_delete_manifest(request.get('args', {}).get('map_name'))
     if request['operation'] in ('map_upload_begin', 'map_upload_abort', 'map_upload_chunk',
                                 'map_upload_commit', 'map_delete'):
         return map_archive_write(request['operation'], request.get('args', {}))

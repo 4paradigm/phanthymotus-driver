@@ -6,7 +6,7 @@ from pathlib import Path
 import sqlite3
 import threading
 import time
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from spatial_client import JatenClient, MapCommandRejected, NavigationStateUnavailable
 from map_storage import MapArchive, migrate_database, safe_name
@@ -102,6 +102,17 @@ class SpatialStore:
                     db.execute('INSERT OR REPLACE INTO state VALUES (?, ?)',
                                (self.anchor_key(identity), json.dumps(start_pose)))
 
+    def retire_mapping(self, mapping, pending, evidence):
+        """Audit and clear only the obsolete session, in one transaction."""
+        with self.lock, self.db() as db:
+            for key, expected in (('mapping', mapping), ('pending', pending)):
+                row = db.execute('SELECT value FROM state WHERE key=?', (key,)).fetchone()
+                if (json.loads(row[0]) if row else None) != expected:
+                    raise RuntimeError('mapping_record_changed_during_reconciliation')
+            updated = dict(pending, map_transition=None)
+            for key, value in (('last_mapping_reconciliation', evidence), ('mapping', None), ('pending', updated)):
+                db.execute('INSERT OR REPLACE INTO state VALUES (?,?)', (key, json.dumps(value)))
+
     @staticmethod
     def anchor_key(identity):
         return 'mapping_anchor:' + json.dumps(identity, ensure_ascii=False)
@@ -121,6 +132,7 @@ class ControlledSpatialPlugin:
     ACTIONS = {
         'start_mapping': (['map_name'], '开始厂商Cartographer建图；人工控制底盘采集'),
         'stop_mapping': ([], '保存当前建图，重启厂商地图服务并确认地图身份'),
+        'reconcile_mapping': (['map_name', 'confirm_abandon'], '底盘重启且已退出建图后，确认放弃旧会话记录；保留地图文件和点位，不恢复运动'),
         'tag_place': (['name', 'description'], '记录当前位置和朝向，绑定地图身份'),
         'untag_place': (['name'], '删除当前地图中的语义点'),
         'list_tags': ([], '列出当前地图语义点及相对位置'),
@@ -186,12 +198,14 @@ class ControlledSpatialPlugin:
                  **{k: {'type': 'string'} for k in ('map_name', 'name', 'description', 'tag_name')},
                  **{k: {'type': 'number', 'description': 'map坐标系位置，米'} for k in ('x', 'y')},
                  'confirm_delete': {'type': 'boolean', 'description': '确认永久删除地图及关联点位'},
+                 'confirm_abandon': {'type': 'boolean', 'description': '确认放弃指定旧建图会话；不保存、不删除地图文件和点位'},
                  'yaw': {'type': 'number', 'description': 'map坐标系绝对朝向，弧度'},
                  'speed': {'type': 'number',
                            'description': f'{NAV_SPEED_MIN:g}–{NAV_SPEED_MAX:g} m/s；导航线速度上限，默认{NAV_SPEED_DEFAULT:g} m/s，实际速度由厂商规划及安全限速决定',
                            'minimum': NAV_SPEED_MIN, 'maximum': NAV_SPEED_MAX, 'default': NAV_SPEED_DEFAULT}}
         required = {'start_mapping': ['map_name'], 'tag_place': ['name'], 'untag_place': ['name'],
                     'load_map': ['map_name'], 'delete_map': ['map_name', 'confirm_delete'],
+                    'reconcile_mapping': ['map_name', 'confirm_abandon'],
                     'navigate_to_pose': ['x', 'y', 'yaw'],
                     'navigate_to_tag': ['tag_name']}
         return {'name': self.PREFIX, 'type': 'actuator', 'multiInstance': False,
@@ -587,6 +601,14 @@ class ControlledSpatialPlugin:
                 if mapping and mapping.get('phase') == 'saving':
                     result['state'] = 'saving'
                     result['message'] = 'Optimizing and saving the map in background. Please wait; do not restart mapping.'
+                if mapping and self._map_pending is not None and not self._map_worker_active():
+                    result['state'] = 'recovery_required'
+                    result['message'] = 'The previous map operation is no longer running in this driver. Inspect the chassis and reconcile the old session before deleting or starting another map.'
+                    result['recovery'] = {'action': 'reconcile_mapping', 'map_name': mapping['name'],
+                                          'confirm_abandon_required': True,
+                                          'previous_chassis_operation_must_be_proven_inactive': True,
+                                          'container_restart_is_not_evidence': True}
+                result['last_mapping_reconciliation'] = self.store.state('last_mapping_reconciliation')
                 try:
                     result['map'] = self.client.current_map()
                 except Exception:
@@ -615,6 +637,8 @@ class ControlledSpatialPlugin:
                     return self._navigate(action, args)
                 if action == 'get_pose':
                     return self.get_pose()
+                if action == 'reconcile_mapping':
+                    return self._reconcile_mapping(args)
                 return self._map_action(action, args)
             finally:
                 self._operations.release()
@@ -836,6 +860,84 @@ class ControlledSpatialPlugin:
             self._task = None
             self._persist()
 
+    def _map_worker_active(self):
+        return any(w.is_alive() and w.name == 'kuavo-map-operation' for w in self._workers.copy())
+
+    @staticmethod
+    def _runtime_identity(runtime):
+        return str(UUID(runtime['boot_id']))
+
+    def _reconcile_mapping(self, args):
+        name = safe_name(args.get('map_name'))
+        if args.get('confirm_abandon') is not True:
+            raise ValueError('confirm_abandon_required')
+        with self._native_lock:
+            with self.bundle.tracker.lock:
+                mapping, pending = self.store.state('mapping'), self.store.state('pending')
+                transition = json.loads(json.dumps(self._map_pending))
+                epoch, connection = self.bundle._stop_epoch, self.bundle.ros1.connection
+                def check():
+                    if (not connection[0] or self.bundle.ros1.connection != connection
+                            or epoch != self.bundle._stop_epoch or self._closed.is_set()
+                            or self._map_worker_active() or self.bundle._transition is not None
+                            or self.bundle.tracker._active or self.keyboard.session is not None
+                            or self._keyboard_pending or self._task is not None or self._uncertain
+                            or self._preparation is not None or self.bundle.state.motion_send_uncertain
+                            or self.bundle._resume_unresolved() or self.bundle._mode_unresolved()
+                            or self.store.state('mapping') != mapping or self._map_pending != transition):
+                        raise RuntimeError('mapping_reconciliation_busy_or_state_changed')
+                check()
+                if (not mapping or mapping.get('name') != name or not transition
+                        or transition.get('operation') not in ('start_mapping', 'stop_mapping')):
+                    raise RuntimeError('matching_unconfirmed_mapping_session_required')
+            # No stop/restart/mode/enable calls. A stopped web state alone does
+            # not prove an old synchronous SaveCartoMap has finished.
+            runtime = self.client.native('map_runtime_status')
+            identity = self._runtime_identity(runtime)
+            previous_boot = transition.get('chassis_boot_id')
+            evidence_type = 'different_chassis_boot_id'
+            if previous_boot is not None:
+                if self._runtime_identity({'boot_id': previous_boot}) == identity:
+                    raise RuntimeError('old_map_operation_may_still_be_running_chassis_reboot_not_confirmed')
+            else:
+                # Legacy records predate boot IDs. Require a clock-consistent
+                # chassis boot strictly AFTER the persisted command timestamp.
+                observed = number(runtime.get('observed_at'), 'observed_at')
+                uptime = number(runtime.get('uptime_s'), 'uptime_s', 0)
+                started = number(transition.get('stage_started_at'), 'stage_started_at')
+                if abs(time.time()-observed) > 5 or observed-uptime <= started+10:
+                    raise RuntimeError('legacy_map_operation_requires_confirmed_later_chassis_boot')
+                evidence_type = 'legacy_command_predates_chassis_boot'
+            current = None
+            for _ in range(2):
+                observation = self.client.observe(required=('agvState', 'state'))
+                if (observation['agvState'].get('isMapping') is not False
+                        or observation['state'].get('driving') is not False
+                        or observation['state'].get('nodeStates') or observation['state'].get('edgeStates')
+                        or observation['state'].get('actionStates')):
+                    raise RuntimeError('chassis_mapping_or_task_still_active')
+                selected = self.client.current_map()
+                if current is not None and selected != current:
+                    raise RuntimeError('current_map_changed_during_reconciliation')
+                current = selected
+            if self._runtime_identity(self.client.native('map_runtime_status')) != identity:
+                raise RuntimeError('chassis_rebooted_during_reconciliation')
+            evidence = {'state': 'abandoned', 'map_name': name, 'at': time.time(),
+                        'previous_mapping': mapping, 'previous_transition': transition,
+                        'chassis_boot_id': identity, 'basis': evidence_type,
+                        'current_map': current, 'files_and_tags_preserved': True,
+                        'motion_command_sent': False}
+            with self.bundle.tracker.lock:
+                check()
+                self.store.retire_mapping(mapping, pending, evidence)
+                self._map_pending = None
+                self.base_preparation_required = True
+                with self._startup_guard:
+                    self._startup_key = None
+            return {'state': 'completed', **{k: evidence[k] for k in
+                    ('map_name', 'basis', 'current_map', 'files_and_tags_preserved', 'motion_command_sent')},
+                    'message': 'Old mapping session retired. Map files and tags were preserved; deletion requires a separate confirmed delete_map request.'}
+
     def _map_action(self, action, args):
         epoch = self.bundle._stop_epoch
         if action == 'list_maps':
@@ -943,7 +1045,7 @@ class ControlledSpatialPlugin:
                 self.base_preparation_required = True
                 with self._startup_guard:
                     self._startup_key = None
-            self._map_pending = {'operation': action, 'action_id': aid}
+            self._map_pending = {'operation': action, 'action_id': aid, 'stage_started_at': time.time()}
             if recovering_save:
                 self._map_pending['stage'] = 'SaveCartoMap'
             if recovering_delete:
@@ -981,7 +1083,7 @@ class ControlledSpatialPlugin:
                 failed_stage = (self._map_pending or {}).get('stage')
                 # 8211 is the verified native precondition rejection, before
                 # ChangeCartoMap touches the map. No mutation is still running.
-                if (failed_stage is None or
+                if ((failed_stage is None and self.store.state('mapping') is None) or
                         (action == 'load_map' and isinstance(exc, MapCommandRejected)
                          and exc.method == 'ChangeCartoMap' and exc.code == 8211)):
                     self._map_pending = None
@@ -1002,13 +1104,19 @@ class ControlledSpatialPlugin:
     def _delete_map(self, name, cancelled):
         if self.client.current_map()['mapId'] == name:
             raise ValueError('cannot_modify_active_map')
+        if self.client.observe(required=('agvState',))['agvState'].get('isMapping') is not False:
+            raise RuntimeError('finish_factory_mapping_before_deleting')
         exists = name in {Path(m.get('fileName', '')).stem for m in self.client.maps()}
         if exists:
             if self._map_pending.get('stage') == 'delete_local_map':
                 raise RuntimeError('chassis_map_reappeared_during_delete')
-            manifest = self.client.native('map_archive_manifest', map_name=name)
-            MapArchive.validate(manifest, name)
+            manifest = self.client.native('map_delete_manifest', map_name=name)
+            if (manifest.get('map_name') != name or not isinstance(manifest.get('files'), dict)
+                    or not manifest['files'] or not set(manifest['files']) <= {'.pgm', '.yaml', '.pbstream', '.path'}):
+                raise RuntimeError('invalid_map_delete_manifest')
             self._require_stationary()
+            if self.client.observe(required=('agvState',))['agvState'].get('isMapping') is not False:
+                raise RuntimeError('finish_factory_mapping_before_deleting')
             if cancelled.is_set() or time.monotonic() >= self._map_deadline:
                 raise RuntimeError('map_delete_interrupted')
             token = uuid4().hex
@@ -1222,6 +1330,11 @@ class ControlledSpatialPlugin:
             except NavigationStateUnavailable:
                 pass
         if self._map_pending is not None:
+            runtime = self.client.native('map_runtime_status')
+            identity = self._runtime_identity(runtime)
+            if self._map_pending.get('chassis_boot_id', identity) != identity:
+                raise RuntimeError('chassis_boot_changed_during_map_operation')
+            self._map_pending['chassis_boot_id'] = identity
             self._map_pending['stage'] = method
             self._map_pending['stage_started_at'] = time.time()
             self._persist()

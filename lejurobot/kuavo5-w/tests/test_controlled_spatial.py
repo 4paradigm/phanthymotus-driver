@@ -173,6 +173,9 @@ class Client:
             return {'success': True, 'stationary': getattr(self, 'stationary', True)}
         if operation == 'map_save_status':
             return {'complete': True, 'files': {'final': [2, 1]}}
+        if operation == 'map_runtime_status':
+            return {'boot_id': '00000000-0000-0000-0000-000000000001',
+                    'uptime_s': 60., 'observed_at': time.time()}
         if operation == 'cancel':
             return {'success': True, 'stationary': True}
         return {'owner': '/leju_node'}
