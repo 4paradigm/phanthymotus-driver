@@ -1,0 +1,14 @@
+id: samsung-watch7-driver
+name: Samsung Galaxy Watch7 Bundle
+category: driver
+hardware_provider: samsung
+hardware_model: "watch7"
+image_name: samsung-watch7
+port: 15750
+mcp_url: "http://localhost:15750/mcp"
+description: "Galaxy Watch7 — real heart-rate Sensor and device status Sensor (companion APK required; read-only)"
+build_context_extras:
+  - ../../common
+cards:
+  - { name: heart_rate, type: sensor }
+  - { name: device_state, type: sensor }
