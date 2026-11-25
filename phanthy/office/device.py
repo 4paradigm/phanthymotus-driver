@@ -172,12 +172,13 @@ class VisitorBadgePlugin:
             self._install(cfg, deadline - time.monotonic() - 20)
             result = desk.job(job, PACKAGE_VERSION, remaining())
         if result.get("code") == "login_required":
-            # Put the login window in front of the operator; it is left alone
-            # if already open, so a retry does not interrupt a login.
-            try:
-                desk.job({"action": "login", "page_url": cfg["page_url"]}, PACKAGE_VERSION, 20)
-            except FrontDeskError:
-                pass
+            # The worker opens the login window itself in the same job
+            # (`login_window`); a second job only as a fallback.
+            if not result.get("login_window"):
+                try:
+                    desk.job({"action": "login", "page_url": cfg["page_url"]}, PACKAGE_VERSION, 20)
+                except FrontDeskError:
+                    pass
             raise FrontDeskError("login_required", "访客系统需要登录：已在前台电脑打开 Edge，请前台登录后再试")
         if not result.get("ok"):
             raise FrontDeskError(str(result.get("code") or "failed"), str(result.get("error") or "前台电脑执行失败"))

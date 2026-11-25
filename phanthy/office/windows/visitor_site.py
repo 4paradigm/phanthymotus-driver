@@ -20,7 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from contextlib import closing
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -31,6 +31,34 @@ from urllib.request import urlopen
 QUERY_PATH = "/smart-admin-api/visitInfo/page/query"
 NOT_ADMITTED, ADMITTED, LEFT = "未入场", "已入场", "已离场"
 STATUSES = (NOT_ADMITTED, ADMITTED, LEFT)
+
+
+class _Timings:
+    """Where a job's time went, for worker.log: `launch=2.1 load=0.8 ...`.
+
+    A slow `login_required` was reported from the front desk with nothing to
+    say which step was slow; every step that can take seconds records itself.
+    """
+
+    def __init__(self):
+        self._marks: list[tuple[str, float]] = []
+
+    def reset(self) -> None:
+        self._marks = []
+
+    @contextmanager
+    def phase(self, name: str):
+        started = time.monotonic()
+        try:
+            yield
+        finally:
+            self._marks.append((name, time.monotonic() - started))
+
+    def report(self) -> str:
+        return " ".join(f"{name}={seconds:.1f}" for name, seconds in self._marks)
+
+
+timings = _Timings()
 
 
 class SiteError(RuntimeError):
@@ -203,6 +231,11 @@ def close_profile_edge(profile_dir: Path) -> None:
     Playwright cannot open a profile another Edge process holds.
     """
     path = str(profile_dir).replace("'", "''")
+    with timings.phase("close_edge"):
+        _close_profile_edge(path)
+
+
+def _close_profile_edge(path: str) -> None:
     _powershell(
         f"$p = Get-CimInstance Win32_Process -Filter \"Name='msedge.exe'\" | "
         f"Where-Object {{ $_.CommandLine -and $_.CommandLine.IndexOf('{path}', [StringComparison]::OrdinalIgnoreCase) -ge 0 }}; "
@@ -218,10 +251,11 @@ def login_window_open(profile_dir: Path) -> bool:
     which it launches with --remote-debugging-pipe.
     """
     path = str(profile_dir).replace("'", "''")
-    found = _powershell(
-        f"@(Get-CimInstance Win32_Process -Filter \"Name='msedge.exe'\" | Where-Object {{ $_.CommandLine -and "
-        f"$_.CommandLine.IndexOf('{path}', [StringComparison]::OrdinalIgnoreCase) -ge 0 -and "
-        "$_.CommandLine -notmatch '--type=|--remote-debugging-pipe' }).Count")
+    with timings.phase("scan_edge"):
+        found = _powershell(
+            f"@(Get-CimInstance Win32_Process -Filter \"Name='msedge.exe'\" | Where-Object {{ $_.CommandLine -and "
+            f"$_.CommandLine.IndexOf('{path}', [StringComparison]::OrdinalIgnoreCase) -ge 0 -and "
+            "$_.CommandLine -notmatch '--type=|--remote-debugging-pipe' }).Count")
     return found.stdout.strip() not in ("", "0")
 
 
@@ -256,8 +290,17 @@ def open_pages(profile_dir: Path) -> list[dict]:
             targets = json.load(resp)
     except (OSError, ValueError, IndexError):
         return []
-    return [{"url": t["url"], "title": t.get("title") or ""}
-            for t in targets if t.get("type") == "page" and _offerable(t.get("url", ""))]
+    pages, seen = [], set()
+    for t in targets:
+        url = t.get("url", "")
+        # One entry per page, however many tabs show it. Each time a list or
+        # print takes the profile over, Edge is closed; reopened, it restores
+        # the old tabs and opens the page again, so the same URL piles up and
+        # every 检测 offered it once more.
+        if t.get("type") == "page" and _offerable(url) and url not in seen:
+            seen.add(url)
+            pages.append({"url": url, "title": t.get("title") or ""})
+    return pages
 
 
 def recent_pages(profile_dir: Path, limit: int = 10) -> list[dict]:
@@ -314,11 +357,13 @@ class VisitorSite:
             from playwright.sync_api import sync_playwright
             close_profile_edge(self.profile_dir)
             if self._pw is None:
-                self._pw = sync_playwright().start()
+                with timings.phase("playwright"):
+                    self._pw = sync_playwright().start()
             try:
-                self._context = self._pw.chromium.launch_persistent_context(
-                    str(self.profile_dir), channel="msedge", headless=headless, accept_downloads=False,
-                    args=["--no-first-run", "--disable-session-crashed-bubble", "--kiosk-printing"])
+                with timings.phase("launch_headless" if headless else "launch_window"):
+                    self._context = self._pw.chromium.launch_persistent_context(
+                        str(self.profile_dir), channel="msedge", headless=headless, accept_downloads=False,
+                        args=["--no-first-run", "--disable-session-crashed-bubble", "--kiosk-printing"])
             except Exception as exc:
                 raise SiteError("edge_start_failed", f"无法启动专用 Edge：{exc}") from exc
             self._headless = headless
@@ -357,16 +402,19 @@ class VisitorSite:
         page.on("request", observe)
         try:
             try:
-                if page.url == self.list_url:
-                    response = page.reload(wait_until="domcontentloaded", timeout=10000)
-                else:
-                    response = page.goto(self.list_url, wait_until="domcontentloaded", timeout=10000)
+                with timings.phase("load"):
+                    if page.url == self.list_url:
+                        response = page.reload(wait_until="domcontentloaded", timeout=10000)
+                    else:
+                        response = page.goto(self.list_url, wait_until="domcontentloaded", timeout=10000)
             except Timeout as exc:
                 self._check_login(page)
                 raise SiteError("page_load_timeout", "访客网页加载超时，请检查前台电脑网络") from exc
             self._check_login(page)
             if response is not None and response.status >= 400:
                 raise SiteError("page_http_error", f"访客网页返回 HTTP {response.status}")
+            with timings.phase("settle"):
+                self._settle(page, captured)
             if not captured:
                 # The list may wait for a click on its search button.
                 button = page.get_by_role("button", name=re.compile("查询|搜索")).first
@@ -382,18 +430,33 @@ class VisitorSite:
         finally:
             page.remove_listener("request", observe)
 
+    def _settle(self, page, captured: list, seconds: float = 2.0) -> None:
+        """Wait briefly for the list's own query, or for the site to send us to login.
+
+        The site is a single-page app: DOMContentLoaded fires on the list URL and
+        its router moves to the login page only once its script has run. Checking
+        the URL once there missed that, and the logged-out case then sat through
+        the search-button wait below (3–5 s) before noticing.
+        """
+        deadline = time.monotonic() + seconds
+        while not captured and time.monotonic() < deadline:
+            self._check_login(page)
+            page.wait_for_timeout(100)
+        self._check_login(page)
+
     def _query(self, day: str, headless: bool = True) -> tuple[Any, list[Visit]]:
         page = self._browser(headless)
         headers = self._load_list(page)
         body = {"bookingPerson": "", "contacts": "", "orders": [{"asc": False, "column": "visit_start_date"}],
                 "pageNum": 1, "pageSize": 100, "reasonId": None, "status": None,
                 "visitTimeBegin": f"{day} 00:00:00", "visitTimeEnd": f"{day} 23:59:59"}
-        result = page.evaluate("""async ([url, body, headers]) => {
-            const r = await fetch(url, {method: 'POST', credentials: 'include',
-              headers: {'Accept': 'application/json', 'Content-Type': 'application/json', ...headers},
-              body: JSON.stringify(body)});
-            return {status: r.status, url: r.url, text: await r.text()};
-        }""", [self.query_url, body, headers])
+        with timings.phase("query"):
+            result = page.evaluate("""async ([url, body, headers]) => {
+                const r = await fetch(url, {method: 'POST', credentials: 'include',
+                  headers: {'Accept': 'application/json', 'Content-Type': 'application/json', ...headers},
+                  body: JSON.stringify(body)});
+                return {status: r.status, url: r.url, text: await r.text()};
+            }""", [self.query_url, body, headers])
         if result["status"] in (401, 403) or "login" in result["url"].lower():
             raise SiteError("login_required", "访客系统登录已失效，请在前台电脑的 Edge 里重新登录")
         if result["status"] >= 400:
