@@ -114,7 +114,6 @@ class LiveStreamPlugin:
                         "title": "推流地址",
                         "description": "平台给出的完整 RTMP 地址，服务器地址后接推流码，如 "
                                        "rtmp://live-push.example.com/live/<推流码>",
-                        "format": "password",
                         "x-sensitive": True,
                         "scope": "shared",
                     },
