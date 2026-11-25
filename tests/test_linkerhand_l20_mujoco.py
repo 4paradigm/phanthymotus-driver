@@ -1,10 +1,14 @@
 """Hardware-free tests for the virtual cards exposed by the physical L20 registration."""
+import hashlib
 import json
 from io import BytesIO
 from pathlib import Path
+import struct
 import sys
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+import xml.etree.ElementTree as ET
+import zipfile
 
 import pytest
 import yaml
@@ -72,3 +76,41 @@ def test_playback_binding_busy_and_rejection():
         rt.start("second", "right", [topic])
     finally:
         rt.shutdown()
+
+@pytest.fixture
+def g20_fixture_archive(tmp_path):
+    """Use the shipped calibration and URDFs with tiny binary STL fixtures."""
+    vertices = [(0, 0, 0), (0.02, 0, 0), (0, 0.02, 0), (0, 0, 0.02)]
+    faces = [(0, 2, 1), (0, 1, 3), (0, 3, 2), (1, 2, 3)]
+    stl = bytearray(80) + struct.pack("<I", len(faces))
+    for a, b, c in faces:
+        stl.extend(struct.pack("<12fH", 0, 0, 0, *vertices[a], *vertices[b], *vertices[c], 0))
+    archive = tmp_path / "vendor.zip"
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as package:
+        for side in ("left", "right"):
+            prefix = f"L20/{side.upper()}/"
+            urdf = DRIVER / "resource" / f"linkerhand_g20_{side}.urdf"
+            calibration = DRIVER / "resource" / f"g20_{side}_G20.json"
+            for file in (urdf, calibration):
+                package.write(file, prefix + file.name)
+            for name in {mesh.attrib["filename"] for mesh in ET.parse(urdf).iter("mesh")}:
+                package.writestr(prefix + name, stl)
+    return archive
+
+
+def test_both_hand_models_load_from_pinned_archive_layout(g20_fixture_archive, monkeypatch):
+    pytest.importorskip("mujoco")
+    from mujoco_card import hand_model
+
+    archive = g20_fixture_archive
+    # The integrity check applies to the fixture just as it does to the real ZIP.
+    monkeypatch.setattr(hand_model, "ARCHIVE_SHA", hashlib.sha256(archive.read_bytes()).hexdigest())
+    for side in ("left", "right"):
+        model = hand_model.HandModel(archive, side)
+        assert model.model.njnt == 21
+        assert len(model.transforms([128] * 20)) == len(model.meshes) > 0
+        assert sum("pad_faces" in mesh for mesh in model.meshes) == 5
+    with archive.open("ab") as fp:
+        fp.write(b"changed")
+    with pytest.raises(ValueError, match="checksum"):
+        hand_model.HandModel(archive, "left")

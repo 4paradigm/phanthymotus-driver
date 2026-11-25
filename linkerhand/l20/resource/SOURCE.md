@@ -2,18 +2,24 @@
 
 Source: LinkerHand official URDF viewer and download site, <https://urdf-view.linkerbot.cn>, downloaded by the project team on 2026-11-12.
 
+The vendor catalog lists this package as `linkerhand_L20_0910`, model L20, version `v10.1`, download filename `L20.zip` (item 10). The L20-10 uses the G20 URDF and calibration files inside it. [Official model catalog](https://urdf-view.linkerbot.cn/) · [Official ZIP download](https://urdf-view.linkerbot.cn/api/v1/urdf-models/10/download)
+
+Download verified on 2026-11-25: 16,328,324 bytes, SHA-256 `f5558bc0aa0d70503cd21611efc9e446592aac535dd68c9e61f71754004b2327`. The pinned ZIP contains 22 STL meshes per hand.
+
 License: Apache License 2.0. The download contains no license file; on 2026-11-16 the vendor confirmed to the project team that these files are under the same license as their GitHub repository [linker-bot/linkerhand-urdf](https://github.com/linker-bot/linkerhand-urdf). `LICENSE` in this directory is a verbatim copy of that repository's `LICENSE` (main branch).
 
 Model applicability: the files are labelled G20. The vendor SDK ([linkerbot-hand-legacy-cpp-sdk](https://github.com/linker-bot/linkerbot-hand-legacy-cpp-sdk) README) states that `L20_10` and `L20_11` alias `G20` and that the ordinary `L20` is a different hand; on 2026-11-16 the vendor also confirmed that these files are the correct model for the L20-10. The ordinary `L20` model in linkerhand-urdf has the same joint names but different axes, origins and limits, and must not be used for this hand.
 
-| File | Downloaded as |
-| --- | --- |
-| `linkerhand_g20_left.urdf` | `LEFT/linkerhand_g20_left.urdf` |
-| `linkerhand_g20_right.urdf` | `RIGHT/linkerhand_g20_right.urdf` |
-| `g20_left_G20.json` | `LEFT/g20_left_G20.json` |
-| `g20_right_G20.json` | `RIGHT/g20_right_G20.json` |
+The pinned vendor ZIP has a top-level `L20/` directory. The archive paths below are relative to the ZIP root.
 
-All four files are copied verbatim (no edits). The download also contains STL meshes under `LEFT/meshes` and `RIGHT/meshes`; they are not included, the URDFs still reference them, but the driver never serves those references.
+| File | Path in vendor ZIP |
+| --- | --- |
+| `linkerhand_g20_left.urdf` | `L20/LEFT/linkerhand_g20_left.urdf` |
+| `linkerhand_g20_right.urdf` | `L20/RIGHT/linkerhand_g20_right.urdf` |
+| `g20_left_G20.json` | `L20/LEFT/g20_left_G20.json` |
+| `g20_right_G20.json` | `L20/RIGHT/g20_right_G20.json` |
+
+All four files are copied verbatim (no edits). The download also contains STL meshes under `L20/LEFT/meshes/` and `L20/RIGHT/meshes/`. This source directory stores the URDFs and calibration tables. The virtual preview reads the STL files directly from the separately checksum-verified archive at runtime.
 
 The URDFs are SolidWorks exports (internal robot name `linkerhand_L25NS_{left,right}.urdf`). The JSON files are vendor calibration records (`schema_version` 4, `model` G20, serial `G20_LEFT_001` / `G20_RIGHT_001`, `quality.passed` true, validation MAE 0.0032 / 0.0029 rad). For every URDF revolute joint they give the driving motor (`motor_index`, the driver's 20-item vector index) and a 256-entry `angle_rad` table indexed by the raw 0..255 position. The five distal joints are marked `passive` and have their own table on their parent's motor. The index, middle and ring tables are copies of the pinky tables (`source_joint`).
 
