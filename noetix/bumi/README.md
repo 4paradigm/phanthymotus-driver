@@ -396,8 +396,8 @@ navi 流水线时仍保留 `dry_run: true`，用于核对视觉控制方向。�
 `plugins.loco.enabled` 和 `plugins.walking_mode.enabled` 默认均为 `true`。
 `plugins.walking_mode.app_host` 默认直连 SDK 运动板 `192.168.55.102`，跳过 UDP 发现。
 手机 App 交替控制时，发现广播可能暂停；保留直连地址可避免等待这段广播。
-机器人运动板地址不同时应修改此项。留空才按 `discovery_source_ip` 监听 UDP 9090，
-端口无法共享或收不到广播时需指定 `app_host`。
+机器人运动板地址不同时应修改此项；省略时沿用 `discovery_source_ip`。
+显式留空才按 `discovery_source_ip` 监听 UDP 9090，端口无法共享或收不到广播时需指定 `app_host`。
 发现、查询和确认超时分别由 `discovery_timeout_s`、`query_timeout_s`、
 `verify_timeout_s` 控制，默认 3、1、4 秒。整次网络等待最多 20 秒，
 调用方超时应长于此值，Agent Core 的 actuator 默认调用超时为 60 秒。

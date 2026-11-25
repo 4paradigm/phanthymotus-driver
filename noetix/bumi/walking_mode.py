@@ -34,8 +34,8 @@ class WalkingModePlugin:
     def __init__(self, plugin_config: dict, high_ctrl, loco_plugin):
         self._high_ctrl = high_ctrl
         self._loco = loco_plugin
-        self._host = plugin_config.get("app_host") or None
         self._source_ip = plugin_config.get("discovery_source_ip", "192.168.55.102")
+        self._host = plugin_config.get("app_host", self._source_ip) or None
         self._query_timeout = _timeout(plugin_config, "query_timeout_s", 1.0)
         self._discovery_timeout = _timeout(plugin_config, "discovery_timeout_s", 3.0)
         self._verify_timeout = _timeout(plugin_config, "verify_timeout_s", 4.0)
