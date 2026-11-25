@@ -12,6 +12,7 @@ import shlex
 import threading
 import time
 import zlib
+from collections import deque
 from uuid import uuid4
 
 from common.camera_info import build as build_camera_info
@@ -36,6 +37,7 @@ class PantherCameraRuntime:
         self._lock = threading.RLock()
         self._source_lock = threading.Lock()
         self._frames = {"rgb": None, "depth": None, "imu": None}
+        self._pick_frames = {kind: deque(maxlen=8) for kind in ("rgb", "depth")}
         self._last_frame_at = {"rgb": 0.0, "depth": 0.0, "imu": 0.0}
         self._last_publish_at = {"rgb": 0.0, "depth": 0.0}
         self._frame_failures = {"rgb": 0, "depth": 0}
@@ -157,6 +159,8 @@ class PantherCameraRuntime:
         with self._lock:
             self._active.discard(kind)
             self._frames[kind] = None
+            if kind in self._pick_frames:
+                self._pick_frames[kind].clear()
         return self.info(kind)
 
     def close(self) -> None:
@@ -431,7 +435,36 @@ class PantherCameraRuntime:
             self._frames[kind] = None
             if message is not None:
                 self._last_publish_at[kind] = now
-            return message
+            return (message, self._last_frame_at[kind]) if message is not None else None
+
+    def _remember_pick_frame(self, kind, message, received, geometry, payload):
+        self._pick_frames[kind].append({
+            "stamp_ns": stamp_ns(message), "received": received, "geometry": geometry,
+            "frame_id": message.header.frame_id, "data": payload["data"],
+        })
+
+    def pick_snapshot(self, max_age_s, max_skew_s):
+        """Select a fresh rectified pair from the same camera calibration."""
+        with self._lock:
+            if not {"rgb", "depth"}.issubset(self._active):
+                raise RuntimeError("start both Panther camera cards before tabletop_pick")
+            geometry = self._geometry
+            now = time.monotonic()
+            colors, depths = (
+                [frame for frame in reversed(self._pick_frames[kind])
+                 if frame["geometry"] is geometry and 0 <= now - frame["received"] <= max_age_s]
+                for kind in ("rgb", "depth")
+            )
+            for rgb in colors:
+                candidates = [
+                    depth for depth in depths
+                    if abs(depth["stamp_ns"] - rgb["stamp_ns"]) <= max_skew_s * 1e9
+                    and abs(depth["received"] - rgb["received"]) <= max_skew_s
+                ]
+                if candidates:
+                    depth = min(candidates, key=lambda item: abs(item["stamp_ns"] - rgb["stamp_ns"]))
+                    return rgb, depth, geometry["K"].copy()
+        raise RuntimeError("no fresh registered RGB-D pair")
 
     @staticmethod
     def _header_payload(message) -> dict:
@@ -451,10 +484,11 @@ class PantherCameraRuntime:
         quality = max(20, min(int(self._config.get("jpeg_quality", 70)), 95))
         channels = {"rgb8": 3, "bgr8": 3, "rgba8": 4, "bgra8": 4, "mono8": 1}
         while not self._closed:
-            message = self._take_latest("rgb", hz)
-            if message is None:
+            sample = self._take_latest("rgb", hz)
+            if sample is None:
                 time.sleep(0.01)
                 continue
+            message, received = sample
             try:
                 encoding = str(message.encoding).lower()
                 count = channels.get(encoding)
@@ -481,6 +515,7 @@ class PantherCameraRuntime:
                 payload.update({"message_format": "jpeg", "data": encoded.tobytes()})
                 with self._lock:
                     if "rgb" in self._active and geometry is self._geometry and not self._closed:
+                        self._remember_pick_frame("rgb", message, received, geometry, payload)
                         self._publish_mount(message)
                         self._bridge.publish("camera_color", payload)
             except Exception as exc:
@@ -492,10 +527,11 @@ class PantherCameraRuntime:
 
         hz = max(1.0, min(float(self._config.get("depth_hz", 8.0)), 15.0))
         while not self._closed:
-            message = self._take_latest("depth", hz)
-            if message is None:
+            sample = self._take_latest("depth", hz)
+            if sample is None:
                 time.sleep(0.01)
                 continue
+            message, received = sample
             try:
                 depth = metric_depth(message, self._config.get("source_depth_unit_mm", 1.0))
                 geometry = self._image_geometry(message, "depth")
@@ -509,6 +545,7 @@ class PantherCameraRuntime:
                 )
                 with self._lock:
                     if "depth" in self._active and geometry is self._geometry and not self._closed:
+                        self._remember_pick_frame("depth", message, received, geometry, payload)
                         self._publish_mount(message)
                         self._bridge.publish("camera_depth", payload)
             except Exception as exc:

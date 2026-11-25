@@ -409,3 +409,37 @@ Deployment uses the image's `/deploy/service.yml` fragment. The repository
 `deploy/run-pr-image.sh` helper extracts that fragment, substitutes the tested
 image reference, and starts it as an isolated Compose project.
 
+
+## One-shot tabletop pick
+
+`tabletop_pick` uses the existing Panther color and depth cameras and the
+existing Perception VOP tool. Start both camera cards and then start
+`tabletop_pick`. Each observation uses a synchronized pair of rectified
+frames and the intrinsics derived from the camera's `CameraInfo`. The card
+uploads the chosen JPEG to local Perception and calls `recognize_by_photo`.
+Perception keeps snapshots according to its existing upload retention policy.
+When upload authentication is enabled, pass the same `ACCESS_TOKEN` to the
+Panther container.
+
+- `preview` takes the exact VOP class as `object_name` and optional `color`.
+  It returns the estimated tool point and approach point in `base_link`.
+- `pick` takes the same fields and `confirm_motion: true`. It opens, approaches,
+  descends, closes, and lifts once. It reports completion through ACP and
+  keeps the gripper closed. `grasp_checked: false` means positional feedback
+  was used and object presence was not independently confirmed.
+- `stop` cancels the active pick through the trajectory action. A gripper
+  position command already received by its controller may continue.
+
+Configure `plugins.tabletop_pick` with the measured color-optical-to-base
+transform at the fixed head/lift pose, TCP orientation, workspace, arm side
+and per-class gripper targets. Calibrate the selected gripper's feedback
+endpoints separately from the normalized command values. Check the active VOP
+vocabulary before commissioning an object class, such as `bottle` or `mouse`.
+
+Run MoveIt on the robot ROS domain with the full Panther collision model,
+current robot state, configured single-arm group and tool link, and the actual
+tabletop planning scene. The card rejects incomplete Cartesian paths and
+checks returned waypoints against the device's arm limits. Confirm the
+emergency-stop diagnostic name and verify its normal and abnormal states on
+the robot. After checking `preview` and validating the workcell, enable
+`allow_motion` for supervised commissioning. It defaults to `false`.

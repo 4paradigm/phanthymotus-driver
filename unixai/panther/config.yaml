@@ -137,6 +137,30 @@ plugins:
     # Runtime-verified channel order: yaw -> joint_head0, pitch -> joint_head1.
     home_pose_deg: {yaw_deg: 0.0, pitch_deg: 0.0}
 
+  tabletop_pick:
+    enabled: true
+    allow_motion: false
+    side: null
+    # Optical frame reported by the shared rectified RGB-D camera.
+    color_optical_frame: null
+    # Measured at the fixed head/lift pose below. Row-major 4x4, metres.
+    base_from_color: null
+    head_rad: null                  # [joint_head0, joint_head1]
+    lift_position: null
+    workspace_m: null               # [min_x, min_y, min_z, max_x, max_y, max_z]
+    tool_orientation_xyzw: null
+    clearance_m: 0.08
+    moveit_group: null
+    tool_link: null
+    cartesian_service: /compute_cartesian_path
+    estop_diagnostic_name: null
+    gripper_feedback_open_closed: null
+    perception_port: 15720
+    min_confidence: 0.50
+    # Key by the exact VOP class. Configure surface_to_tcp_z_m, gripper_open
+    # and gripper_close per class. Gripper commands are normalized to [0, 1].
+    objects: {}
+
   # Continuous 50 Hz arm servo remains disabled until watchdog/hold behavior
   # has been measured on Panther hardware.
   servo: {enabled: false}

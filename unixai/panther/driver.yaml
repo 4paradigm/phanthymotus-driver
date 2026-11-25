@@ -29,6 +29,7 @@ cards:
   - {name: gripper, type: actuator}
   - {name: lifting, type: actuator}
   - {name: head, type: actuator}
+  - {name: tabletop_pick, type: actuator}
 
   - {name: controlled_spatial, type: actuator}
   - {name: spatial_map, type: actuator}
