@@ -1,0 +1,15 @@
+primebot-q1:
+  image: __IMAGE__
+  container_name: embodied-primebot-q1
+  network_mode: host
+  ipc: host
+  volumes:
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+  environment:
+    FASTRTPS_DEFAULT_PROFILES_FILE: /opt/phanthy-motus/dds-local.xml
+  restart: always
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
