@@ -33,6 +33,7 @@ cards:
   - { name: camera_left,  type: sensor }
   - { name: camera_right, type: sensor }
   - { name: camera_depth, type: sensor }
+  - { name: vision_capture, type: actuator }
   - { name: ext_mic,      type: sensor }
   - { name: ext_camera,   type: sensor }
   - { name: smart_motion, type: actuator }
