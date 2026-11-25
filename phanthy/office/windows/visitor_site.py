@@ -174,7 +174,11 @@ def _powershell(script: str, timeout: float = 10) -> subprocess.CompletedProcess
 
 
 def use_printer(name: str) -> None:
-    """Make `name` the Windows default printer; kiosk printing always uses the default."""
+    """Make `name` the Windows default printer, which is where kiosk printing goes.
+
+    Only because install.ps1 sets Edge's PrintPreviewUseSystemDefaultPrinter
+    policy; without it Edge prints to the printer it last used.
+    """
     if not name:
         return
     quoted = name.replace("'", "''")
@@ -289,35 +293,55 @@ class VisitorSite:
         self.query_url = f"{parts.scheme}://{parts.netloc}{QUERY_PATH}"
         self.profile_dir = profile_dir
         self._pw = self._context = self._page = None
+        self._headless = True
 
     # ── Browser ──────────────────────────────────────────────────────────────
 
-    def _browser(self):
+    def _browser(self, headless: bool = True):
+        """The automation Edge: headless to read, on the desktop only to print.
+
+        Reading must not show a window. When the site is not logged in, a
+        visible window would open on the login page and be closed a moment
+        later for the plain login window (`open_for_login`) — the front desk
+        saw the login page open, vanish and open again. Printing needs a real
+        window: kiosk printing does nothing headless.
+        """
+        if self._context is not None and self._headless != headless:
+            self._close_context()
         if self._page is not None and not self._page.is_closed():
             return self._page
         if self._context is None:
             from playwright.sync_api import sync_playwright
             close_profile_edge(self.profile_dir)
-            self._pw = sync_playwright().start()
+            if self._pw is None:
+                self._pw = sync_playwright().start()
             try:
                 self._context = self._pw.chromium.launch_persistent_context(
-                    str(self.profile_dir), channel="msedge", headless=False, accept_downloads=False,
+                    str(self.profile_dir), channel="msedge", headless=headless, accept_downloads=False,
                     args=["--no-first-run", "--disable-session-crashed-bubble", "--kiosk-printing"])
             except Exception as exc:
                 raise SiteError("edge_start_failed", f"无法启动专用 Edge：{exc}") from exc
+            self._headless = headless
             self._context.add_init_script(script=_PRINT_READY_JS)
         self._page = next((p for p in self._context.pages if not p.is_closed()), None) or self._context.new_page()
         return self._page
 
-    def close(self) -> None:
+    def _close_context(self) -> None:
         try:
             if self._context is not None:
                 self._context.close()
+        except Exception:
+            pass
+        self._context = self._page = None
+
+    def close(self) -> None:
+        self._close_context()
+        try:
             if self._pw is not None:
                 self._pw.stop()
         except Exception:
             pass
-        self._pw = self._context = self._page = None
+        self._pw = None
 
     @staticmethod
     def _check_login(page) -> None:
@@ -358,8 +382,8 @@ class VisitorSite:
         finally:
             page.remove_listener("request", observe)
 
-    def _query(self, day: str) -> tuple[Any, list[Visit]]:
-        page = self._browser()
+    def _query(self, day: str, headless: bool = True) -> tuple[Any, list[Visit]]:
+        page = self._browser(headless)
         headers = self._load_list(page)
         body = {"bookingPerson": "", "contacts": "", "orders": [{"asc": False, "column": "visit_start_date"}],
                 "pageNum": 1, "pageSize": 100, "reasonId": None, "status": None,
@@ -418,7 +442,7 @@ class VisitorSite:
     def print_badge(self, visit: Visit, printer: str, day: str) -> str:
         """Click "打印访客贴" for `visit`; return its status afterwards."""
         use_printer(printer)
-        page, _ = self._query(day)
+        page, _ = self._query(day, headless=False)
         row = self._open_guest_row(page, visit)
         if NOT_ADMITTED not in row.inner_text(timeout=1000):
             raise SiteError("status_not_printable", "访客已不是未入场状态，没有打印")

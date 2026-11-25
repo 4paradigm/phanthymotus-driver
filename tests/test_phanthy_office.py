@@ -68,8 +68,12 @@ def test_card_contract():
     assert definition["name"] == "visitor_badge" and definition["type"] == "actuator"
     schema = definition["inputSchema"]
     assert schema["x-completion"]["actions"] == ["print"]
-    assert set(schema["x-action-params"]) >= {"list", "print", "detect"}
-    assert {o["const"]: o["title"] for o in schema["properties"]["action"]["oneOf"]}["detect"] == "检测前台电脑"
+    assert set(schema["x-action-params"]) >= {"list", "print"}
+    # Detect is the settings dialog's 检测 button, not a card action: listed, it
+    # showed in the action dropdown and was offered to the agent.
+    assert "detect" not in schema["properties"]["action"]["enum"]
+    assert "detect" not in schema["x-action-params"]
+    assert "detect" not in {o["const"] for o in schema["properties"]["action"]["oneOf"]}
     assert "setup" not in schema["x-action-params"]   # installing is the driver's business
     config = definition["configSchema"]
     assert config["properties"]["password"]["x-sensitive"] is True
@@ -386,3 +390,92 @@ def test_worker_stays_while_the_login_window_is_open(monkeypatch, tmp_path):
         sys.stdout.close()
         sys.stdout, sys.stderr = stdout, stderr
     assert next(checks, "done") == "done"
+
+
+# ── Windows side: which Edge a job opens ─────────────────────────────────────
+
+class _FakePage:
+    def __init__(self, url="about:blank"):
+        self.url, self.closed = url, False
+
+    def is_closed(self):
+        return self.closed
+
+    def on(self, *_):
+        pass
+
+    remove_listener = on
+
+    def goto(self, url, **_):
+        return None   # the url stays wherever the fake was told it lands
+
+
+class _FakeContext:
+    def __init__(self, headless, landing):
+        self.headless, self.pages, self.closed = headless, [_FakePage(landing)], False
+
+    def add_init_script(self, **_):
+        pass
+
+    def new_page(self):
+        self.pages.append(_FakePage())
+        return self.pages[-1]
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.fixture
+def edge(monkeypatch):
+    """A fake Playwright that records every Edge launched on the profile."""
+    import types
+    launched = []
+    state = {"landing": "https://visit.example/list"}
+
+    def launch(profile, headless, **_):
+        launched.append(_FakeContext(headless, state["landing"]))
+        return launched[-1]
+
+    pw = types.SimpleNamespace(chromium=types.SimpleNamespace(launch_persistent_context=launch),
+                               stop=lambda: None)
+    api = types.ModuleType("playwright.sync_api")
+    api.sync_playwright = lambda: types.SimpleNamespace(start=lambda: pw)
+    api.TimeoutError = TimeoutError
+    monkeypatch.setitem(sys.modules, "playwright", types.ModuleType("playwright"))
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", api)
+    monkeypatch.setattr(visitor_site, "close_profile_edge", lambda _profile: None)
+    return launched, state
+
+
+def test_reading_visits_never_shows_a_window(edge, tmp_path):
+    """Not logged in: the check must not open the login page in a visible
+    window — the login job then closed it for the plain login window, so the
+    front desk saw the login page open, vanish and open again."""
+    launched, state = edge
+    state["landing"] = "https://visit.example/login?redirect=list"
+    site = visitor_site.VisitorSite(CONFIG["page_url"], tmp_path)
+    with pytest.raises(visitor_site.SiteError) as exc:
+        site.visits("2026-11-25")
+    assert exc.value.code == "login_required"
+    assert [c.headless for c in launched] == [True]
+
+
+def test_only_printing_opens_edge_on_the_desktop(edge, tmp_path):
+    launched, _ = edge
+    site = visitor_site.VisitorSite(CONFIG["page_url"], tmp_path)
+    site._browser()
+    site._browser()
+    assert [c.headless for c in launched] == [True], "a second read reuses the headless Edge"
+    site._browser(headless=False)
+    assert [c.headless for c in launched] == [True, False]
+    assert launched[0].closed, "the profile is freed before the visible Edge takes it"
+    site._browser(headless=False)
+    assert len(launched) == 2
+
+
+def test_install_makes_edge_print_to_the_windows_default_printer():
+    """The printer setting works by switching the Windows default; Edge only
+    follows it with this policy, otherwise it reuses the last printer."""
+    script = (DRIVER / "windows" / "install.ps1").read_text(encoding="ascii")   # PS 5.1: ASCII only
+    assert "SOFTWARE\\Policies\\Microsoft\\Edge" in script
+    assert "'PrintPreviewUseSystemDefaultPrinter' -PropertyType DWord -Value 1" in script

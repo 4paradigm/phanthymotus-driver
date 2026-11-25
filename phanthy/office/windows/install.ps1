@@ -65,6 +65,15 @@ foreach ($name in @('worker.py', 'visitor_site.py', 'run_job.ps1')) {
     Copy-Item -LiteralPath (Join-Path $upload $name) -Destination $app -Force
 }
 
+# Kiosk printing sends the job to whatever print preview would preselect, and
+# Edge preselects the printer this profile last printed to, not the Windows
+# default. Without this the card's printer setting (applied by switching the
+# Windows default, visitor_site.use_printer) is ignored after the first print:
+# every badge kept going to the label printer it had first printed on.
+$policy = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge'
+New-Item -Path $policy -Force | Out-Null
+New-ItemProperty -Path $policy -Name 'PrintPreviewUseSystemDefaultPrinter' -PropertyType DWord -Value 1 -Force | Out-Null
+
 # Edge must run on the user's desktop, which an SSH session does not have: the
 # worker runs as an interactive scheduled task of this same account. pythonw,
 # so it does not flash a console over the front-desk screen.
