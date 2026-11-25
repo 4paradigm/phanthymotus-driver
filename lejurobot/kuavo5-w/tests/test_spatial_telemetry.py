@@ -62,6 +62,7 @@ class SpatialTelemetryTests(unittest.TestCase):
         ros,node=FakeRos1(),FakeNode();hub=KuavoSensors({},'test',ros,node)
         try:
             hub._on_odom(self.odom());s=hub.snapshot('loco_state')
+            self.assertEqual(s.get('motion_model'), 'planar')
             self.assertEqual(s['pose']['stamp_ms'],1234.567891)
             self.assertNotEqual(s['stamp_ms'],s['pose']['stamp_ms'])
             self.assertEqual(s['vendor']['motus_slam']['stamp_ns'],1234567891)
@@ -73,6 +74,47 @@ class SpatialTelemetryTests(unittest.TestCase):
             self.assertIsNone(hub.snapshot('loco_state')['pose'])
             self.assertEqual(hub.snapshot('loco_state')['vendor']['motus_slam']['status'],'unavailable')
         finally:hub.close()
+
+    def test_body_gravity_requires_fixed_imu_mount_and_nearby_capture(self):
+        hub = KuavoSensors({}, 'test', FakeRos1(), FakeNode())
+        odom = self.odom()
+        stamp = odom['header']['stamp'].copy()
+        axes = dict(x=0., y=0., z=0.)
+        imu = dict(header=dict(stamp=stamp, frame_id='imu_link'),
+                   orientation=dict(w=1., **axes), angular_velocity=axes, linear_acceleration=axes)
+        try:
+            hub._on_odom(odom)
+            hub._on_standard_imu(imu)
+            self.assertNotIn('body_gravity', hub.snapshot('loco_state')['vendor'])
+            turn = .5 ** .5
+            hub._on_static_tf(dict(transforms=[dict(header=dict(frame_id='base_link'),
+                child_frame_id='imu_link', transform=dict(rotation=dict(x=turn,y=0.,z=0.,w=turn)))]))
+            hub._on_standard_imu(imu)
+            gravity = hub.snapshot('loco_state')['vendor']['body_gravity']
+            self.assertEqual(gravity['frame_id'], 'base_link')
+            self.assertEqual(gravity['stamp_ns'], 1234567891)
+            for actual, expected in zip(gravity['up'], [0., -1., 0.]):
+                self.assertAlmostEqual(actual, expected)
+            # Equivalent mounting through a shared fixed parent.
+            hub._on_static_tf(dict(transforms=[
+                dict(header=dict(frame_id='mount'), child_frame_id='base_link',
+                     transform=dict(rotation=dict(x=-turn,y=0.,z=0.,w=turn))),
+                dict(header=dict(frame_id='mount'), child_frame_id='imu_link',
+                     transform=dict(rotation=dict(x=0.,y=0.,z=0.,w=1.)))]))
+            hub._on_standard_imu(imu)
+            self.assertEqual(hub.snapshot('loco_state')['vendor']['body_gravity'], gravity)
+            imu['orientation_covariance'] = [.01,0.,0.,0.,.02,0.,0.,0.,.03]
+            hub._on_standard_imu(imu)
+            self.assertEqual(hub.snapshot('loco_state')['vendor']['body_gravity']['variance_bound_rad2'], .03)
+            stamp['secs'] += 1
+            hub._on_standard_imu(imu)
+            self.assertNotIn('body_gravity', hub.snapshot('loco_state')['vendor'])
+            imu['orientation_covariance'] = [-1.] + [0.] * 8
+            stamp['secs'] -= 1
+            hub._on_standard_imu(imu)
+            self.assertNotIn('body_gravity', hub.snapshot('loco_state')['vendor'])
+        finally:
+            hub.close()
 
     def test_missing_source_timestamp_never_becomes_a_fresh_slam_pose(self):
         m=self.odom();m['header']['stamp']={'secs':0,'nsecs':0}
