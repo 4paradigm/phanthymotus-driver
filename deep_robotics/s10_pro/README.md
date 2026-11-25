@@ -110,6 +110,7 @@ The card gear and `config`/`start` actions expose:
 | `angular_acceleration` | 2.0 | Nominal rad/s² at expected10Hz |
 | `wz_limit` | 1.0 | Execution yaw cap, rad/s; does not multiply commands |
 | `min_vx` | 0 | Measured minimum stable speed, planner metadata only; no forced speed floor |
+| `min_wz` | 0 | Minimum stable yaw magnitude for Navi in either direction (rad/s), from 0 to `wz_limit`. Zero disables the floor. Restart Navi to read a change. |
 
 Presets change the declared/enforced vx operating limit, not the native ceiling
 (1.67m/s). Lateral0.4m/s and native yaw1.0rad/s bounds remain unchanged. These

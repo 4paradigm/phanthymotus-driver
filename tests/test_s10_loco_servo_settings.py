@@ -97,6 +97,20 @@ def test_speed_presets_change_forward_limit_without_scaling_yaw_or_raising_floor
         assert info['min_vx'] == 0
 
 
+def test_yaw_floor_is_advertised_to_planners_without_raising_native_commands(servo):
+    p = servo.plugin
+    assert p.dispatch('info', {})['control_interface']['limits']['min_magnitude'][5] == 0
+    assert p.dispatch('config', {'config': {'min_wz': .3, 'wz_limit': .3}})['ok']
+    assert not p.dispatch('config', {'wz_limit': .2})['ok']
+    started = p.dispatch('start', {'input_topic': '/policy/cmd', 'dry_run': False})
+    assert started['state'] == 'ready'
+    assert started['control_interface']['limits']['min_magnitude'] == [0, 0, 0, 0, 0, .3]
+    assert p.dispatch('info', {})['min_wz'] == .3
+    for seq, yaw in enumerate((.05, -.05, 0.), start=1):
+        submit(p, command(p, [0, 0, 0, 0, 0, yaw], seq=seq))
+        assert servo.native.calls[-1][2]['Yaw'] == pytest.approx(yaw)
+
+
 def test_servo_reports_static_standing_footprint_as_an_estimate(servo):
     descriptor = servo.plugin.dispatch('info', {})['control_interface']
     assert descriptor['frame'] == 'base_link'
@@ -229,6 +243,8 @@ def test_s10_sends_zero_at_active_command_expiry_before_watchdog(
 @pytest.mark.parametrize('settings', [
     {'speed_preset': 'turbo'}, {'linear_acceleration': 0},
     {'linear_acceleration': float('nan')}, {'angular_acceleration': True},
+    {'min_wz': -0.1}, {'min_wz': True}, {'min_wz': float('nan')},
+    {'min_wz': float('inf')}, {'min_wz': .4, 'wz_limit': .3},
     {'wz_limit': 1.01}, {'wz_limit': 0}, {'min_vx': .61},
     {'rotate_only': 'false'}, {'unexpected': 1},
 ])
@@ -247,7 +263,9 @@ def test_config_schema_exposes_controls_without_start_defaults(servo):
     props = tool['configSchema']['properties']
     for action in ['start', 'config']:
         assert 'confirm' in tool['inputSchema']['x-action-params'][action]['params']
-    for key in ['speed_preset', 'dry_run', 'rotate_only', 'min_vx',
+        assert 'min_wz' in tool['inputSchema']['x-action-params'][action]['params']
+    assert props['min_wz']['default'] == 0
+    for key in ['speed_preset', 'dry_run', 'rotate_only', 'min_vx', 'min_wz',
                 'linear_acceleration', 'angular_acceleration', 'wz_limit']:
         assert key in props
         assert 'default' not in tool['inputSchema']['properties'][key]
