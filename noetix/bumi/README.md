@@ -477,7 +477,8 @@ docker logs -f embodied-noetix-bumi
 安全边界：
 
 - `start` 是 `x-is-dangerous` 动作，**必须显式传 `confirm: true`**；缺省或为
-  `false` 时直接拒绝，不准备模式、不发送任何命令。
+  `false` 时直接拒绝，不准备模式、不发送任何命令。上传文件先完整校验并生成
+  节拍/动作计划，之后才占用身体和准备行走模式：无效文件不会改变 workmode。
 - `start` 是 ACP 异步动作（`x-completion`，最长 165 s）：立即返回唯一
   `action_id`，worker 在连播自然结束 / 被 `stop` 取消 / 出错时分别向
   `/api/acp/complete` 上报 `completed` / `cancelled` / `error`，且只上报一次。
