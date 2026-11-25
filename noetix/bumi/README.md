@@ -476,6 +476,11 @@ docker logs -f embodied-noetix-bumi
 
 安全边界：
 
+- `start` 是 `x-is-dangerous` 动作，**必须显式传 `confirm: true`**；缺省或为
+  `false` 时直接拒绝，不准备模式、不发送任何命令。
+- `start` 是 ACP 异步动作（`x-completion`，最长 165 s）：立即返回唯一
+  `action_id`，worker 在连播自然结束 / 被 `stop` 取消 / 出错时分别向
+  `/api/acp/complete` 上报 `completed` / `cancelled` / `error`，且只上报一次。
 - 动作命令和转身脉冲都经 `LocoPlugin` 的共享 `publish_cmd` 限速器发出，
   相邻命令间隔 ≥2 ms；语义动作是 `COMMAND → 10 ms → DEFAULT` 的边沿，
   非动作帧只发 `DEFAULT`，转身脉冲是有限帧速度串并以 `DEFAULT` 收尾。
