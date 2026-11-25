@@ -17,8 +17,6 @@ plugins:
     enabled: true
     # Prefer the robot's fused scan; also support units with only a front scanner.
     topics: ["/scan", "/lidar_front/scan"]
-    max_points: 20000
-    max_range_m: 12.0
 
   camera:
     workspace: "/home/unix_ai/orbbec_ws"

@@ -46,6 +46,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       python3-numpy python3-opencv && \
     rm -rf /var/lib/apt/lists/*
 
+# FFmpeg is only here for vision_capture.record_video (silent H.264 MP4);
+# python3-opencv cannot write H.264 on this base. It is Panther-only and
+# installed without recommends, with apt lists removed in the same layer.
 # Keep the known-good OpenCV transaction unchanged: adding FFmpeg to it
 # crashed the libc-bin trigger under ARM64 emulation. Check the encoder in
 # the final runtime environment so a build without H.264 support fails here.

@@ -18,6 +18,8 @@ from unittest.mock import patch
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[1]
 DRIVER = ROOT / "unixai" / "panther"
 sys.path.insert(0, str(ROOT))
@@ -792,6 +794,39 @@ class PantherDriverTest(unittest.TestCase):
             clock.return_value = 11.3
             device._on_laser_topic("front-3", front)
             self.assertEqual(seen[-1], ("front-3", front))
+
+    def test_every_configured_lidar_topic_is_subscribed_through_the_preference_path(self):
+        config = yaml.safe_load((DRIVER / "config.yaml").read_text(encoding="utf-8"))
+        configured = tuple(config["plugins"]["laser_scan"]["topics"])
+        self.assertEqual(configured, ("/scan", "/lidar_front/scan"))
+        self.assertNotIn("max_points", config["plugins"]["laser_scan"])
+        self.assertNotIn("max_range_m", config["plugins"]["laser_scan"])
+
+        subscriptions = {}
+        device = object.__new__(device_module.PantherDevice)
+        device._node = SimpleNamespace(create_subscription=lambda kind, topic, callback, qos:
+                                       subscriptions.setdefault(topic, (kind, callback, qos)))
+        device._laser_lock = threading.Lock()
+        device._laser_topics = configured
+        device._laser_source = None
+        device._laser_seen = {}
+        device._callback_errors = {}
+        device._lock = threading.RLock()
+        device._cache = {}
+        seen = []
+        device._on_laser = lambda msg: seen.append((msg, device._laser_source))
+
+        device._subscribe_laser("LaserScan", "qos")
+        self.assertEqual(tuple(subscriptions), configured)
+        self.assertTrue(all(kind == "LaserScan" and qos == "qos" for kind, _, qos in subscriptions.values()))
+
+        with patch.object(device_module.time, "monotonic", return_value=10.0):
+            subscriptions["/lidar_front/scan"][1]("front")
+            self.assertEqual(seen[-1], ("front", "/lidar_front/scan"))
+            subscriptions["/scan"][1]("merged")
+            self.assertEqual(seen[-1], ("merged", "/scan"))
+            subscriptions["/lidar_front/scan"][1]("front-again")
+            self.assertEqual(seen[-1], ("merged", "/scan"))
 
     def test_removed_nav_and_ultrasonic_have_no_runtime_code(self):
         plugins = (DRIVER / "plugins.py").read_text()

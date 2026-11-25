@@ -260,9 +260,7 @@ class PantherDevice:
         self._laser_cloud_pub = self._node.create_publisher(
             PointCloud2, f"/{namespace}/panther/laser_scan/points", sensor_qos
         )
-        self._node.create_subscription(
-            LaserScan, "/scan", guarded("laser_scan", self._on_laser), sensor_qos,
-        )
+        self._subscribe_laser(LaserScan, sensor_qos)
 
         self._twist_type = Twist
         self._drive_qos = reliable_qos
@@ -500,6 +498,16 @@ class PantherDevice:
                 "child_frame_id": msg.child_frame_id,
                 "pose": pose, "motus_slam": quality,
             }
+
+    def _subscribe_laser(self, message_type, qos) -> None:
+        """Subscribe to every configured scan topic; each reports its own name."""
+        for topic in self._laser_topics:
+            self._node.create_subscription(
+                message_type, topic,
+                lambda msg, topic=topic: self._safe_callback(
+                    "laser_scan", self._on_laser_topic, msg, topic),
+                qos,
+            )
 
     def _on_laser_topic(self, msg, topic) -> None:
         """Use the first fresh topic in preference order, then publish its scan."""
