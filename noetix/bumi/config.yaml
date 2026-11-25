@@ -93,3 +93,8 @@ plugins:
     output_dir: /opt/phanthy-motus/data/vision_capture
     fps: 15
     max_duration_s: 30
+  live_stream:
+    enabled: true
+    # The RTMP address is a card setting entered on the canvas, never here.
+    fps: 15
+    video_bitrate_kbps: 1200
