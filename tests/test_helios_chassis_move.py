@@ -106,15 +106,29 @@ def test_stop_during_steering_wait_cancels():
     assert status == "cancelled" and nav.calls[-1] == "release"
 
 
-def test_moving_check_uses_fresh_odometry_only():
+def test_moving_check_needs_real_displacement_not_speed_spikes():
     events = []
     worker = Worker(FakeNav(), events.append, 50, odom=OdomTracker(events.append))
-    check = worker._moving_check(0.1, 0, 0)
+    check = worker._moving_check(0.05, 0, 0)
     assert check() is True  # no odometry yet: do not extend the move
-    worker._odom.on_odom(type("O", (), {"x": 0.0, "y": 0.0, "theta": 0.0, "vx": 0.0, "vy": 0.0, "w": 0.0})())
-    assert check() is False  # standing still while the wheels turn
-    worker._odom.on_odom(type("O", (), {"x": 0.0, "y": 0.0, "theta": 0.0, "vx": 0.05, "vy": 0.0, "w": 0.0})())
-    assert check() is True
+
+    def odom(x, y=0.0, th=0.0, vx=0.0):
+        worker._odom.on_odom(type("O", (), {"x": x, "y": y, "theta": th, "vx": vx, "vy": 0.0, "w": 0.0})())
+    check = worker._moving_check(0.05, 0, 0)
+    odom(0.131)
+    assert check() is False  # origin recorded
+    odom(0.129, vx=0.018)  # wheel-turning spike seen on the robot: fast but going nowhere
+    assert check() is False
+    odom(0.136)
+    assert check() is False  # 5 mm forward: still turning/creeping
+    odom(0.142)
+    assert check() is True  # 11 mm along the command
+
+    turn = worker._moving_check(0, 0, -0.17)
+    odom(0.142, th=0.0)
+    assert turn() is False
+    odom(0.142, th=-0.03)  # turned 1.7 degrees clockwise
+    assert turn() is True
 
 
 def test_session_retries_acquire_rpc_timeouts_then_moves():

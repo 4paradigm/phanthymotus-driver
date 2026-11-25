@@ -43,7 +43,7 @@ The worker subscribes to `odometry.odom_state` (x/y m, theta rad, vx/vy m/s, w r
 
 ## Steerable wheels and move timing
 
-The FH-6-140-X-DP base has steerable wheels. When the direction changes (for example forward after a lateral move) it first turns the wheels and only then drives; on the robot a 1 s forward move right after lateral moves only straightened the wheels, and the next one moved about 5 cm. `duration_s` therefore counts from the moment odometry shows the base following the command (measured speed at least 30% of the command), waiting at most 2 s for that; with no fresh odometry it counts from the first command. The move result reports the wait as `start_delay_s`, and the watchdog allows for it.
+The FH-6-140-X-DP base has steerable wheels. When the direction changes (for example forward after a lateral move) it first turns the wheels and only then drives; on the robot a 1 s forward move right after lateral moves only straightened the wheels, and the next one moved about 5 cm. `duration_s` therefore counts from the moment odometry shows the base has actually covered 1 cm along the commanded direction (or turned 1.5°), waiting at most 2 s for that. Speed is not used for this: while the wheels turn, odometry reports short speed spikes (0.016–0.037 m/s for a 0.05 m/s command, recorded on the robot) with only 2–5 mm of real displacement; with no fresh odometry it counts from the first command. The move result reports the wait as `start_delay_s`, and the watchdog allows for it.
 
 ## Chassis prerequisites
 

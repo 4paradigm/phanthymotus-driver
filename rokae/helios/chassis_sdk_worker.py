@@ -35,7 +35,11 @@ ACQUIRE_RETRY_DELAY_S = 0.5
 # lateral move) it first turns the wheels and only then drives. duration_s counts from
 # the moment odometry shows the base moving, waiting at most STEER_GRACE_S for that.
 STEER_GRACE_S = 2.0
-MOVING_FRACTION = 0.3  # measured speed >= 30% of the command counts as moving
+# Motion is judged by distance actually covered, not by speed: while the wheels turn,
+# odometry shows short speed spikes (measured 0.016-0.037 m/s for a 0.05 m/s command)
+# with only 2-5 mm of real displacement.
+START_DISTANCE_M = 0.01
+START_YAW_DEG = 1.5
 
 
 def _twist(nav, vx, vy, wz):
@@ -269,16 +273,24 @@ class Worker:
                     "start_delay_s": getattr(self._session, "start_delay_s", 0.0)})
 
     def _moving_check(self, vx, vy, wz):
-        """True once odometry shows the base following the command; True if odometry is stale."""
-        linear, angular = math.hypot(vx, vy), abs(wz)
+        """True once odometry shows the base has covered START_DISTANCE_M along the command
+        (or turned START_YAW_DEG); True if odometry is stale, so a move is never extended on a guess."""
+        linear = math.hypot(vx, vy)
+        origin = []
 
         def moving():
             sample = self._odom.snapshot(max_age_s=0.5)
             if sample is None:
-                return True  # no fresh feedback: never extend a move on a guess
-            if linear > 0 and math.hypot(sample.get("vx", 0.0), sample.get("vy", 0.0)) >= MOVING_FRACTION * linear:
                 return True
-            return angular > 0 and abs(sample.get("w", 0.0)) >= MOVING_FRACTION * angular
+            if not origin:
+                origin.append(sample)
+                return False
+            moved = OdomTracker.displacement(origin[0], sample)
+            if linear > 0:
+                along = (moved["forward_m"] * vx + moved["left_m"] * vy) / linear
+                if along >= START_DISTANCE_M:
+                    return True
+            return wz != 0 and math.copysign(1.0, wz) * moved["yaw_deg"] >= START_YAW_DEG
         return moving
 
     def stop(self, timeout_s=3.0):
