@@ -606,7 +606,7 @@ def test_rtsp_mjpeg_parser_handles_fragmented_and_multiple_frames():
     assert command[0] == "ffmpeg"
     assert command[command.index("-rtsp_transport") + 1] == "tcp"
     assert command[command.index("-i") + 1] == "rtsp://10.21.33.103:8554/video4"
-    assert command[command.index("-vf") + 1] == "fps=15,scale='min(640,iw)':-2"
+    assert command[command.index("-drop_pkts_on_overflow") + 1] == "1"
     assert command[-1] == "pipe:1"
 
 

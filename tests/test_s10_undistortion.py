@@ -7,13 +7,11 @@ import numpy as np
 import pytest
 
 from deep_robotics.s10_pro import undistortion as u
-from deep_robotics.s10_pro.media_workers import _rtsp_command
 
 
 @pytest.mark.parametrize('command', [
-    _rtsp_command('rtsp://camera/front'),
-    u.raw_command('rtsp://camera/front'),
-    u.remap_command('rtsp://camera/front', 'x.pgm', 'y.pgm', (1024, 576)),
+    u.raw_command(),
+    u.remap_command('x.pgm', 'y.pgm', (1024, 576)),
 ])
 def test_camera_thread_limit_applies_to_output_encoder(command):
     # Input-side -threads affects decoding and does not remove MJPEG buffering.
@@ -174,13 +172,13 @@ def test_only_changed_lane_restarts_and_old_generation_frames_are_dropped(contro
         def poll(self): return None
         def terminate(self): self.terminated = True
     worker = MediaWorkers(lambda *args: None)
-    front, rear = Process(), Process()
+    front, rear = (Process(), Process()), (Process(), Process())
     worker._rtsp_processes.update(camera_front=front, camera_rear=rear)
     worker.camera_undistortion = controller
     controller.on_change = worker.restart_rtsp_camera
     old = controller.generation('camera_front')
     controller.configure('camera_front', {'undistort': False})
-    assert front.terminated and not rear.terminated
+    assert all(p.terminated for p in front) and not any(p.terminated for p in rear)
     published = []
     worker._on_result = lambda *a: published.append(a)
     data = b'\xff\xd8frame\xff\xd9'
@@ -254,7 +252,7 @@ def test_missing_or_invalid_packaged_intrinsics_fail_at_camera_use(tmp_path, con
     assert controller.declaration('camera_front')['source'] == 'unknown'
     assert 's10_pro_camera_intrinsics.json' in controller.status('camera_front')['error']
     with pytest.raises(ValueError, match='s10_pro_camera_intrinsics.json'):
-        controller.rtsp_command('camera_front', 'rtsp://camera/front')
+        controller.converter_command('camera_front')
 
 
 def test_packaged_intrinsics_preserve_original_measurements():
@@ -296,4 +294,4 @@ def test_invalid_packaged_camera_row_reports_resource_error(tmp_path, key, value
     controller = isolated.CameraUndistortion(('camera_front',), config_path=tmp_path / 'settings.json')
     assert 's10_pro_camera_intrinsics.json' in controller.status('camera_front')['error']
     with pytest.raises(ValueError, match='s10_pro_camera_intrinsics.json'):
-        controller.rtsp_command('camera_front', 'rtsp://camera/front')
+        controller.converter_command('camera_front')

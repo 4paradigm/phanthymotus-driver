@@ -264,31 +264,35 @@ def write_maps(cal, directory):
     return str(xpath), str(ypath), invalid
 
 
-def raw_command(url):
+def _converter_input():
+    # Y4M carries frame dimensions. Limit input buffering when remap also has
+    # two static map inputs; a converter catching up should consume live video.
     return ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
-            "-rtsp_transport", "tcp", "-fflags", "nobuffer", "-flags", "low_delay",
-            "-i", str(url), "-an", "-vf", "fps=15,scale='min(640,iw)':-2",
-            "-q:v", "5", "-f", "image2pipe", "-vcodec", "mjpeg", "-threads", "1", "pipe:1"]
+            "-thread_queue_size", "1", "-probesize", "32", "-fpsprobesize", "0",
+            "-f", "yuv4mpegpipe", "-i", "pipe:0"]
 
 
-def remap_command(url, xpath, ypath, source_resolution, output_size=OUTPUT_SIZE):
-    """Raw command with a remap stage: fps first (remap only what is published),
-    force the calibrated source size, remap, then scale to the published size."""
+def raw_command():
+    return [*_converter_input(), "-an", "-vf", "scale='min(640,iw)':-2",
+            "-vsync", "0", "-q:v", "5", "-f", "image2pipe", "-vcodec", "mjpeg",
+            "-threads", "1", "pipe:1"]
+
+
+def remap_command(xpath, ypath, source_resolution, output_size=OUTPUT_SIZE):
+    """Remap decoded frames at the calibrated source size before downscaling."""
     src_w, src_h = source_resolution
     out_w, out_h = output_size
-    graph = (f"[0:v]fps=15,scale={src_w}:{src_h},format=gbrp[src];"
+    graph = (f"[0:v]scale={src_w}:{src_h},format=gbrp[src];"
              f"[src][1:v][2:v]remap,scale={out_w}:{out_h}[out]")
-    return ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
-            "-rtsp_transport", "tcp", "-fflags", "nobuffer", "-flags", "low_delay",
-            "-i", str(url), "-i", str(xpath), "-i", str(ypath),
-            "-filter_complex", graph, "-map", "[out]", "-an",
+    return [*_converter_input(), "-i", str(xpath), "-i", str(ypath),
+            "-filter_complex", graph, "-map", "[out]", "-an", "-vsync", "0",
             "-q:v", "5", "-f", "image2pipe", "-vcodec", "mjpeg", "-threads", "1", "pipe:1"]
 
 
 class CameraUndistortion:
     """Settings, persistence and runtime state of undistortion for all lanes.
 
-    `rtsp_command` is the MediaWorkers hook; `configure`,
+    `converter_command` is the MediaWorkers hook; `configure`,
     `status` and `declaration` serve the camera cards. `on_change(lane)` is
     called after a setting changes so the lane can reconnect with its new
     command.
@@ -418,13 +422,13 @@ class CameraUndistortion:
 
     # ── MediaWorkers hooks ─────────────────────────────────────────────────
 
-    def rtsp_command(self, lane, url):
+    def converter_command(self, lane):
         with self._lock:
             enabled = self._settings[lane]["undistort"]
         if not enabled:
             with self._lock:
                 self._runtime[lane]["mode"] = "raw"
-            return raw_command(url)
+            return raw_command()
         cal, source = self.calibration(lane)
         if cal is None:
             raise ValueError(source)
@@ -437,7 +441,7 @@ class CameraUndistortion:
             raise ValueError(f"cannot prepare undistortion maps for {lane}: {exc}") from exc
         with self._lock:
             self._runtime[lane].update(mode="undistort", invalid_fraction=invalid)
-        return remap_command(url, xpath, ypath, cal["source_resolution"])
+        return remap_command(xpath, ypath, cal["source_resolution"])
 
     # ── card views ─────────────────────────────────────────────────────────
 

@@ -1111,8 +1111,8 @@ def test_worker_close_releases_collector_after_partial_result(monkeypatch):
 def test_output_config_keeps_projection_worker_and_encoder_latency_fix():
     text = (DRIVER / "Dockerfile").read_text()
     assert "front_depth.py" in text and "depth_projection.py" in text
-    from deep_robotics.s10_pro.media_workers import _rtsp_command
-    cmd = _rtsp_command("rtsp://camera")
+    from deep_robotics.s10_pro.undistortion import raw_command
+    cmd = raw_command()
     assert cmd[cmd.index("-threads") + 1] == "1"
 
 def test_only_filled_stream_uses_original_topic_receipt_stamp_and_estimated_provenance(rig):
