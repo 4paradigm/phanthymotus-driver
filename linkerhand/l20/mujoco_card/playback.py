@@ -29,8 +29,8 @@ class Slot:
 
 
 class Playback:
-    def __init__(self, models, planner, bus, directory=None):
-        self.models, self.planner, self.bus = models, planner, bus
+    def __init__(self, models, initial_poses, bus, directory=None):
+        self.models, self.initial_poses, self.bus = models, initial_poses, bus
         self.lock = threading.Condition(threading.RLock())
         self.sources, self.slots = {}, {}
         self.path = Path(directory)/'instances.json' if directory else None
@@ -79,7 +79,7 @@ class Playback:
     def slot(self,key,side):
         with self.lock:
             if key not in self.slots:
-                self.slots[key]=Slot(side,list(self.planner.open[side]))
+                self.slots[key]=Slot(side,list(self.initial_poses[side]))
             slot=self.slots[key]
             if slot.side!=side:raise ValueError('模拟实例左右手发生冲突')
             return slot

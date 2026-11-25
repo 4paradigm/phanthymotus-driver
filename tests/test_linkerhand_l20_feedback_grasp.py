@@ -1,4 +1,4 @@
-"""Bench-frame replay and card lifecycle for the low-load whole-hand grasp."""
+"""Synthetic sensor traces and lifecycle tests for parameterized contact control."""
 from __future__ import annotations
 
 import time
@@ -10,7 +10,7 @@ from test_linkerhand_l20_adaptive_grasp import test_setup
 from adaptive_grasp_device import PLACEMENT_NOTICE, DEFAULT_CLOSE_LIMIT_POSE, DEFAULT_PREP_POSE, FINGER_JOINTS
 from grasp_feedback import Contact, FeedbackGrasp, GraspSettings, contact_patches, empty_baseline, settings_from
 
-PROFILES = {"paper_cup": GraspSettings(55,40,5,28,95,3), "tissue": GraspSettings(40,35,3,18,110,2)}
+PROFILES = {"output_55": GraspSettings(55,40,5,28,95,3), "output_40": GraspSettings(40,35,3,18,110,2)}
 
 
 def patches(peak=10, total=60, row=5.0):
@@ -53,14 +53,14 @@ def test_static_and_slip_then_cap(name):
 
 
 def test_overpressure_and_loss_never_chase():
-    c = FeedbackGrasp(PROFILES["paper_cup"], [250] * 20, [0] * 20)
+    c = FeedbackGrasp(PROFILES["output_55"], [250] * 20, [0] * 20)
     for i in range(5):
         c.update(patches(), c.target, i, True)
     c.target[0] -= 3
     previous = list(c.target)
     assert c.update(patches(peak=100), c.target, 6, True)
     assert all(a >= b for a, b in zip(c.target, previous)) and c.paused
-    c = FeedbackGrasp(PROFILES["tissue"], [250] * 20, [0] * 20)
+    c = FeedbackGrasp(PROFILES["output_40"], [250] * 20, [0] * 20)
     for _ in range(3):
         c.update(patches(), c.target, 0, False)
     missing = patches(); missing["thumb"] = Contact(0, 0, 0, 0)
@@ -125,7 +125,7 @@ def test_prepare_transfer_monitor_and_release(test_setup, monkeypatch, fingers):
     assert "ring" in wrapping["tactile_status"]["remaining_fingers"] and not any(e[0] == wrapping["action_id"] for e in events)
     ready = wait_for(state, lambda s:s["tactile_status"].get("phase")=="monitoring"
                      and s.get("holding"))
-    assert ready["tactile_status"]["output_limit_raw"] == PROFILES["tissue"].output_limit
+    assert ready["tactile_status"]["output_limit_raw"] == PROFILES["output_40"].output_limit
     assert ready["tactile_status"]["remaining_fingers"] == []
     assert set(ready["tactile_status"]["travel_limited_fingers"]) == set(FINGER_JOINTS) - set(fingers)
     assert ready["tactile_status"]["contact_fingers"] == list(fingers)
@@ -147,7 +147,7 @@ def test_prepare_transfer_monitor_and_release(test_setup, monkeypatch, fingers):
 
 
 def test_first_ring_contact_releases_position_lag_before_opposition():
-    c = FeedbackGrasp(PROFILES["tissue"], [220] * 20, [0] * 20)
+    c = FeedbackGrasp(PROFILES["output_40"], [220] * 20, [0] * 20)
     empty = {f: Contact(0,0,0,0) for f in FINGER_JOINTS}
     for _ in range(8):
         c.update(empty, c.target, 0, False)
@@ -169,7 +169,7 @@ def test_first_ring_contact_releases_position_lag_before_opposition():
 
 
 def test_wrapped_object_with_weak_tactile_keeps_target_without_tightening():
-    c = FeedbackGrasp(PROFILES["tissue"], [220]*20, [0]*20)
+    c = FeedbackGrasp(PROFILES["output_40"], [220]*20, [0]*20)
     c.seek_contact = False
     empty = {f: Contact(0,0,0,0) for f in FINGER_JOINTS}
     for i in range(8):
@@ -213,7 +213,7 @@ def test_closes_until_tactile_contact_at_object_dependent_position(object_at):
 
 
 def test_transient_contact_can_resume_but_one_missing_frame_is_ignored():
-    control = FeedbackGrasp(PROFILES["tissue"], [220] * 20, [0] * 20)
+    control = FeedbackGrasp(PROFILES["output_40"], [220] * 20, [0] * 20)
     empty = patches(peak=0, total=0)
     touched = dict(empty, thumb=Contact(4, 30, 4, 2))
     for second, sample in enumerate([empty, touched, empty, touched, empty]):
@@ -225,7 +225,7 @@ def test_transient_contact_can_resume_but_one_missing_frame_is_ignored():
 
 @pytest.mark.parametrize("limit", ["travel_limit", "no_progress"])
 def test_limit_and_stall_report_unverified_and_cancel_inward_error(limit):
-    control = FeedbackGrasp(PROFILES["tissue"], [220] * 20, [214] * 20 if limit == "travel_limit" else [0] * 20)
+    control = FeedbackGrasp(PROFILES["output_40"], [220] * 20, [214] * 20 if limit == "travel_limit" else [0] * 20)
     empty = patches(peak=0, total=0)
     for i in range(40):
         actual = control.target.copy() if limit == "travel_limit" else [220] * 20
@@ -376,7 +376,7 @@ def test_alternating_fingers_do_not_confirm_and_new_finger_gets_own_slip_referen
 def test_thumb_at_limit_does_not_stop_other_fingers_searching():
     hard_limit = [0] * 20
     hard_limit[0] = hard_limit[15] = 220
-    c = FeedbackGrasp(PROFILES["tissue"], [220]*20, hard_limit)
+    c = FeedbackGrasp(PROFILES["output_40"], [220]*20, hard_limit)
     empty = patches(peak=0,total=0)
     for i in range(8):
         c.update(empty, c.target.copy(), i / 10, False)
@@ -418,7 +418,7 @@ def test_shared_envelope_accepts_independent_maxima():
 
 
 def test_correction_waits_for_corrected_finger_even_if_another_stays_in_contact():
-    c = FeedbackGrasp(PROFILES["tissue"], [220] * 20, [0] * 20)
+    c = FeedbackGrasp(PROFILES["output_40"], [220] * 20, [0] * 20)
     sample = patches(peak=0, total=0)
     sample.update(index=Contact(8, 60, 2, 2), middle=Contact(8, 60, 3, 3))
     for i in range(3):
@@ -438,8 +438,6 @@ def test_canvas_reports_selected_peak_and_allowed_range_before_motion(test_setup
             "contact_peak": 5, "peak_ceiling": 60}
     schema = plugin.get_tool()["inputSchema"]
     assert "2–150" in schema["properties"]["peak_ceiling"]["description"]
-    assert "纸团可参考 15 左右" in schema["properties"]["peak_ceiling"]["description"]
-    assert "80–100" in schema["properties"]["peak_ceiling"]["description"]
     assert "2–150" in schema["x-action-params"]["prepare"]["description"]
     preview = plugin.dispatch("preview_settings", args)
     assert preview["settings"]["peak_ceiling"] == 60
@@ -539,7 +537,7 @@ def test_early_contact_pressure_shifts_during_wrap_are_not_slip_after_handover()
 
 
 def test_pressure_on_one_finger_cancels_residual_inward_error_on_others():
-    c = FeedbackGrasp(PROFILES["tissue"], [220]*20, [0]*20)
+    c = FeedbackGrasp(PROFILES["output_40"], [220]*20, [0]*20)
     empty = patches(peak=0, total=0)
     for i in range(6):
         c.update(dict(empty, index=Contact(5, 15, 2, 2)), c.target.copy(), i / 10, False)
@@ -598,7 +596,7 @@ def test_raw_saturation_stops_even_when_corrected_peak_is_below_hard_threshold()
     c.update(hit,c.target.copy(),0.,False)
     assert c.paused and c.saturated_fingers == ("thumb",)
 
-def test_best_contact_window_survives_zero_and_holds_before_visual_confirmation():
+def test_best_contact_window_survives_zero_and_holds_position():
     c = FeedbackGrasp(settings_from({"approach_travel": 8}), [220]*20, [0]*20)
     empty = patches(peak=0,total=0)
     for i, v in enumerate([0, 21, 0, 6, 8, 10, 7, 0, 0, 0]):
@@ -616,7 +614,7 @@ def test_best_contact_window_survives_zero_and_holds_before_visual_confirmation(
 
 
 def test_subthreshold_per_finger_means_and_sample_gaps_do_not_latch():
-    c = FeedbackGrasp(PROFILES["tissue"],[220]*20,[0]*20)
+    c = FeedbackGrasp(PROFILES["output_40"],[220]*20,[0]*20)
     empty = patches(peak=0,total=0)
     for i,(t,f,v) in enumerate([(0,"thumb",4),(.1,"index",6),(.2,"thumb",4),
                                  (.3,"middle",4),(.4,"middle",4),(2,"middle",9),(2.1,"middle",0)]):
@@ -625,7 +623,7 @@ def test_subthreshold_per_finger_means_and_sample_gaps_do_not_latch():
 
 
 @pytest.mark.parametrize("drop_when", ["wrapping", "monitoring"])
-def test_contact_fades_before_transfer_card_holds_and_waits_for_visual_confirmation(test_setup, monkeypatch, drop_when):
+def test_contact_fade_preserves_hold_and_contact_evidence(test_setup, monkeypatch, drop_when):
     plugin, client, _, _, _, events, _ = test_setup
     args = {"bound_side": "left", "confirm_motion": True}
     readings = {}
@@ -667,7 +665,7 @@ def test_contact_fades_before_transfer_card_holds_and_waits_for_visual_confirmat
 
 
 def test_historical_contact_cannot_bypass_overpressure_or_start_a_new_grasp():
-    profile = PROFILES["tissue"]
+    profile = PROFILES["output_40"]
     c = FeedbackGrasp(profile,[220]*20,[0]*20)
     empty = patches(peak=0, total=0)
     for n in range(6):
@@ -829,7 +827,7 @@ def test_placement_timer_is_single_use_and_stoppable(test_setup,monkeypatch,repl
         wait_for(state,lambda s:(s.get("last_result") or {}).get("result",{}).get("hand_opened"))
 
 @pytest.mark.parametrize(("trace", "ceiling"), [
-    ([0, 0, 20], 12),  # Cup sleeve: first qualifying window ends on the stop frame.
+    ([0, 0, 20], 12),  # First qualifying window ends on the stop frame.
     ([0, 0, 18], 12),  # Equality also trips the hard stop.
     ([4, 4, 4, 25], 15),  # Already successful before the stop.
 ])

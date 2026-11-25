@@ -1,14 +1,8 @@
 """Motus L20 trajectory player, built entirely on virtual joint positions."""
-import os
-from http.server import ThreadingHTTPServer
 from pathlib import Path
-import signal
-import threading
-import yaml
 
-from common.vendor_runtime import DriverBundle, action_schema, make_handler, tool
-from mujoco_card.playback import Playback
-from mujoco_card.trajectories import FORMAT, SIDE_CONFIG, SIDES, SimulatedMotionCard, MotionPlanner, instance
+from common.vendor_runtime import action_schema, tool
+from mujoco_card.trajectories import FORMAT, SIDE_CONFIG, instance
 
 HERE=Path(__file__).resolve().parent
 CARD='l20_mujoco'
@@ -64,28 +58,3 @@ class Simulation:
         # Virtual playback may continue when the viewport closes.
         if action=='info':r['playing']=r['busy'];r['busy']=False
         return r
-
-
-def main():
-    from common import logsafe
-    from mujoco_card.hand_model import HandModel
-    from mujoco_card.sim_bus import SimulationBus, deny_hardware_sockets
-    logsafe.install()
-    deny_hardware_sockets()
-    models={s:HandModel(HERE/'vendor.zip',s) for s in SIDES}
-    config = yaml.safe_load(Path(os.environ.get("CONFIG_PATH", HERE.parent / "config.yaml")).read_text())
-    planner = MotionPlanner(config)
-    bus=SimulationBus(int(os.getenv('ROS_DOMAIN_ID','42')))
-    rt=Playback(models,planner,bus,os.getenv('SIM_STATE_DIR','/var/lib/l20-sim'))
-    bundle=DriverBundle([Simulation(rt),*(SimulatedMotionCard(n,rt,planner) for n in ('hand_grasp','hand_gesture'))])
-    port = int(config['plugins']['l20_mujoco']['worker_port'])
-    server = ThreadingHTTPServer(('127.0.0.1', port),
-                                 make_handler(lambda: bundle, 'L20 仅仿真', 'linkerhand-g20-simulation'))
-    def halt(*_):
-        threading.Thread(target=server.shutdown,daemon=True).start()
-    signal.signal(signal.SIGTERM,halt);signal.signal(signal.SIGINT,halt)
-    try:server.serve_forever()
-    finally:rt.shutdown();bus.shutdown();server.server_close()
-
-
-if __name__=='__main__': main()

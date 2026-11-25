@@ -19,7 +19,7 @@ COPY main.py           /work/main.py
 COPY can_client.py     /work/can_client.py
 COPY qemu_compat.py    /work/qemu_compat.py
 COPY hand_device.py    /work/hand_device.py
-COPY gesture_device.py /work/gesture_device.py
+COPY gesture_device.py simulated_motion_device.py /work/
 COPY tactile_device.py /work/tactile_device.py
 COPY grasp_feedback.py /work/grasp_feedback.py
 COPY adaptive_grasp_device.py    /work/adaptive_grasp_device.py

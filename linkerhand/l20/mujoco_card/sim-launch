@@ -15,4 +15,4 @@ install -d -m 0750 -o nobody -g nogroup "$SIM_STATE_DIR"
 export HOME=/tmp
 exec setpriv --reuid=nobody --regid=nogroup --clear-groups --no-new-privs \
     --bounding-set=-all --inh-caps=-all --ambient-caps=-all \
-    python3 /work/mujoco_card/simulation.py
+    python3 /work/mujoco_card/worker.py

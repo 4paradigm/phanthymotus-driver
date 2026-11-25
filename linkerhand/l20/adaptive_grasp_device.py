@@ -200,8 +200,7 @@ class AdaptiveGraspPlugin:
         contact = limits["contact_peak"]
         selection = (f"轻握 peak_ceiling 可选 {peak['minimum']}–{peak['maximum']}，"
                      f"contact_peak 可选 {contact['minimum']}–{contact['maximum']}，"
-                     f"output_limit 最高 {limits['output_limit']['maximum']}。"
-                     "调高峰值时选 peak_ceiling。执行 L20 轻柔抓取 Skill 时先激活其完整指令。")
+                     f"output_limit 最高 {limits['output_limit']['maximum']}。")
         schema = action_schema(
             {
                 "adaptive_grasp": (
@@ -211,9 +210,9 @@ class AdaptiveGraspPlugin:
                 "preview_settings": (["bound_side", "gentle_limits", *SETTING_FIELDS],
                     "只读校验拟选参数，返回可选范围和预览数值，不移动手。"+selection),
                 "prepare": (["bound_side", "gentle_limits", *SETTING_FIELDS, "confirm_motion"],
-                    "收到抓取请求，空闲就直接张开并空手准备，旧回执不触发硬件诊断；持物或忙碌则保持。"+selection),
+                    "空手张开到准备姿态并采集触觉基线，返回准备编号与生效参数。"+selection),
                 "close_until_contact": (["bound_side", "prepare_id", "placement_notice", "confirm_motion"],
-                    "右手轻握收到 prepared 后立即调用一次，携带本轮准备编号和摆放提示。驱动等放好或五秒后合手。三帧均值达标即动作成功，完整的过压帧也计入均值并在当帧保护；归零保持，自动监测至释放"),
+                    "按当前准备记录逐指收拢；启用右手摆放倒计时时需传入 prepare_id 和 placement_notice。三帧均值达标即动作成功，完整的过压帧也计入均值并在当帧保护；归零保持，自动监测至释放"),
                 "release": (
                     ["bound_side", "confirm_motion"],
                     "五指同步恢复准备姿态放开物体，再完全张开并卸力",
@@ -258,7 +257,6 @@ class AdaptiveGraspPlugin:
         for name, bounds in limits.items():
             field = schema["properties"][name]
             field["description"] += f"；轻握可选整数 {bounds['minimum']}–{bounds['maximum']}"
-        schema["properties"]["peak_ceiling"]["description"] += "；纸团可参考 15 左右，偏硬且轻按不变形的物品可参考 80–100，每轮仅依当前物品的材质和易变形程度自主选值。极软杯套从低值起，可参考纸团附近或更低。上轮单指过压只提示检查摆位，不得据此提高峰值或增加补夹次数。150 是允许上限"
         schema["properties"]["contact_peak"]["description"] += "；收拢时同一指连续三帧峰值的算术平均达到此值即记本轮动作成功，归零保持，达标后自动监测"
         if self.default_gentle_limits:
             travel = schema["properties"]["approach_travel"]

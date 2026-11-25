@@ -116,7 +116,7 @@ class TactilePlugin:
                 "start": ([], "启动触觉数据后台连续采集与流式推送"),
                 "stop": ([], "停止触觉数据流推送"),
                 "config": ([], "按提供的字段更新实例左右手／CAN 接口或共享采集频率"),
-                "read_contact": (["finger", "threshold"], "按用户需要读取当前接触与原始读数。轻握请求直接用 hand_grasp.prepare 空手准备；单帧或单指过压不能用于认定传感器损坏"),
+                "read_contact": (["finger", "threshold"], "读取指定手指或全部手指的触觉标量、最新有效阵列峰值及给定阈值下的接触状态。无有效采样时返回未知"),
             },
             {"finger": {"type": "string", "enum": ["all", *FINGER_NAMES], "default": "all",
                         "description": "选择要观察的手指"},

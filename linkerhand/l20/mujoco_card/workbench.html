@@ -86,7 +86,7 @@ async function poll(){
   byId('action').textContent=latest.action||'—';
   byId('play').disabled=byId('frame').disabled=!latest.count;
   if(mode==='live'){current=latest.poses;paint();byId('progress').textContent='—';byId('frame').max=Math.max(0,latest.count-1);}
-  status(latest.rejected||(!latest.count&&!latest.busy?'请执行已连线的仅仿真动作卡。':''));
+  status(latest.rejected||(!latest.count&&!latest.busy?'等待已连接的轨迹源发送关节位置。':''));
  }catch(err){status(err.message,true);}
  setTimeout(poll,mode==='live'&&latest.busy?110:450);
 }

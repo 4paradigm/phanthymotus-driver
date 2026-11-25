@@ -38,8 +38,7 @@ SETTING_FIELDS = {
     "max_corrections": (0, 10, 0, "自动保持时最多补夹几次，0 表示只监测"),
 }
 
-# The gentle Skill can interpolate within these task-specific upper bounds. Other
-# callers retain the full parameter range of the generic prepare action.
+# Optional conservative bounds for the same parameterized feedback controller.
 GENTLE_MAX = dict(output_limit=85, speed=40, contact_peak=5, peak_ceiling=150,
                   approach_travel=190, max_corrections=3)
 GENTLE_DEFAULT_TRAVEL = 150

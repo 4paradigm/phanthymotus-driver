@@ -5,22 +5,20 @@ from pathlib import Path
 import subprocess
 import threading
 
-from mujoco_card.simulation import Simulation
-from mujoco_card.trajectories import MotionPlanner, SimulatedMotionCard
+from mujoco_card.worker import build_virtual_cards
 
 
 class PreviewCards:
     PREFIX = "l20_mujoco"
-    routes = {"l20_mujoco": "l20_mujoco", "hand_gesture_sim": "hand_gesture", "hand_grasp_sim": "hand_grasp"}
 
     def __init__(self, config):
         self.port = int(config["plugins"][self.PREFIX]["worker_port"])
-        planner = MotionPlanner(config)
-        self.tools = [Simulation(None).get_tool()]
-        for public, target in self.routes.items():
-            if public != self.PREFIX:
-                definition = SimulatedMotionCard(target, None, planner).get_tool()
-                self.tools.append({**definition, "name": public})
+        self.routes = {}
+        self.tools = []
+        for public, card in build_virtual_cards(config, None).items():
+            definition = card.get_tool()
+            self.routes[public] = definition["name"]
+            self.tools.append({**definition, "name": public})
         self.stopping = threading.Event()
         self.thread = None
 

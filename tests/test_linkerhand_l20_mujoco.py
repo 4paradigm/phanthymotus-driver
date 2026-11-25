@@ -5,7 +5,6 @@ from io import BytesIO
 from pathlib import Path
 import struct
 import sys
-from types import SimpleNamespace
 from unittest.mock import Mock, patch
 import xml.etree.ElementTree as ET
 import zipfile
@@ -22,7 +21,8 @@ from hand_device import build_plugins
 from mujoco_card.playback import Playback
 from mujoco_card.preview_cards import PreviewCards
 from mujoco_card.simulation import Simulation
-from mujoco_card.trajectories import VERSION
+from mujoco_card.trajectories import VERSION, initial_poses
+from mujoco_card.worker import build_virtual_cards
 
 
 def test_primary_registration_lists_and_routes_virtual_cards_without_hardware():
@@ -31,7 +31,7 @@ def test_primary_registration_lists_and_routes_virtual_cards_without_hardware():
     tools = {tool["name"] for tool in bundle.get_all_tools()}
     assert {"l20_mujoco", "hand_gesture_sim", "hand_grasp_sim", "hand_gesture", "hand_grasp"} <= tools
     reply = {"result": {"content": [{"type": "text", "text": '{"simulation_only":true}'}]}}
-    for public, target in PreviewCards.routes.items():
+    for public, target in {"l20_mujoco": "l20_mujoco", "hand_grasp_sim": "hand_grasp", "hand_gesture_sim": "hand_gesture"}.items():
         with patch("mujoco_card.preview_cards.http.client.HTTPConnection") as connection:
             conn = connection.return_value
             conn.getresponse.return_value = BytesIO(json.dumps(reply).encode())
@@ -39,6 +39,45 @@ def test_primary_registration_lists_and_routes_virtual_cards_without_hardware():
             connection.assert_called_once_with("127.0.0.1", config["plugins"]["l20_mujoco"]["worker_port"], timeout=8)
             body = json.loads(conn.request.call_args.args[2])
             assert body["params"] == {"name": target, "arguments": {"action": "info", "instance_id": "my-card"}}
+
+
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_external_trajectory_plays_unmodified_without_motion_sources(side):
+    config = {"plugins": {"l20_mujoco": {"worker_port": 15769}}}
+    # A custom upstream only needs the wire format. No built-in source or feedback controller is installed.
+    absent = {name: None for name in ("simulated_motion_device", "adaptive_grasp_device", "grasp_feedback", "gesture_device")}
+    model = Mock()
+    model.transforms.side_effect = list
+    bus = Mock()
+    runtime = Playback({side: model}, initial_poses(config), bus)
+    runtime.shutdown()  # Advance the same playback clock deterministically below.
+    with patch.dict(sys.modules, absent):
+        registered = PreviewCards(config)
+        assert [tool["name"] for tool in registered.get_tools()] == ["l20_mujoco"]
+        cards = build_virtual_cards(config, runtime)
+        assert set(cards) == {"l20_mujoco"}
+        card = cards["l20_mujoco"]
+        args = {"instance_id": "player"}
+        card.dispatch("config", {**args, "bound_side": side})
+        route = "/custom/joint_sequence"
+        assert card.dispatch("start", {**args, "input_topics": [route]})["state"] == "running"
+        receive = bus.bind.call_args.args[2]
+        frames = [[(j * 11 + k) % 256 for j in range(20)] for k in (23, 181, 5, 137)]
+        packet = dict(schema=VERSION, id="motion-42", side=side, action="calibration_sweep",
+                      frame_ms=250, frames=frames)
+        with patch("mujoco_card.playback.time.monotonic", return_value=10.0) as clock:
+            receive(route, packet)
+            for i, frame in enumerate(frames):
+                clock.return_value = 10 + i * 0.25
+                sample = card.dispatch("live", args)
+                assert sample["pose"] == sample["poses"] == frame
+                assert sample["action"] == "calibration_sweep"
+                if i < len(frames) - 1:
+                    clock.return_value += 0.125
+                    assert card.dispatch("live", args)["pose"] == frame
+            assert sample["last_id"] == packet["id"]
+            assert card.dispatch("inspect", {**args, "run_id": packet["id"]})["frames"] == frames
+        assert card.dispatch("stop", args)["state"] == "idle"
 
 
 def test_unavailable_preview_fails_without_falling_back_to_physical_grasp():
@@ -54,7 +93,7 @@ def test_playback_binding_busy_and_rejection():
     pose = [120] * 20
     bus = Mock()
     model = Mock()
-    rt = Playback({"right": model}, SimpleNamespace(open={"right": pose}), bus)
+    rt = Playback({"right": model}, {"right": pose}, bus)
     topic = "/sim/test"
     try:
         rt.start("first", "right", [topic])
@@ -80,7 +119,7 @@ def test_playback_binding_busy_and_rejection():
 
 
 def test_simulation_lifecycle_reports_bound_instance_state():
-    runtime = Playback({"right": Mock()}, SimpleNamespace(open={"right": [120] * 20}), Mock())
+    runtime = Playback({"right": Mock()}, {"right": [120] * 20}, Mock())
     card = Simulation(runtime)
     args = {"instance_id": "lifecycle-test", "input_topics": ["/sim/trajectory"]}
     try:
@@ -96,11 +135,11 @@ def test_simulation_lifecycle_reports_bound_instance_state():
 
 def test_preview_logs_first_and_hundredth_failure_and_resets_after_success(capsys):
     bus = Mock()
-    planner = SimpleNamespace(open={"right": [120] * 20, "left": [120] * 20})
+    initial = {"right": [120] * 20, "left": [120] * 20}
     error = ValueError("bad\nframe\x1b[31m" + "x" * 400)
     broken = Mock()
     broken.jpeg.side_effect = [error] * 101 + [b"ok", error, error]
-    runtime = Playback({"left": Mock(), "right": broken}, planner, bus)
+    runtime = Playback({"left": Mock(), "right": broken}, initial, bus)
     runtime.shutdown()  # Drive the real render loop synchronously, one scheduled frame at a time.
     for side in ("right", "left"):
         runtime.start(side, side, [])
