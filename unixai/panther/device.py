@@ -45,6 +45,8 @@ from contracts import (
 )
 from common.odom import build_sample, mean_twist, resolve_stamp_ms
 from core_bridge import BridgeWorker, XYZ_POINT_STEP, output_topics
+from joint_display import dedicated_row, display_gripper_row, joint_row, render_model
+from panther_media import VisionCapture
 from spatial_inputs import odom_pose, stamp_ns
 
 
@@ -145,19 +147,22 @@ class PantherDevice:
         self._cache: dict[str, tuple[object, float]] = {}
         self._last_card_publish: dict[str, float] = {}
         self._callback_errors: dict[str, dict] = {}
+        self._laser_lock = threading.Lock()
+        laser = config.get("plugins", {}).get("laser_scan", {})
+        # Prefer the merged scan; fall back to the front lidar on units where
+        # the merger publishes nothing.
+        self._laser_topics = tuple(laser.get("topics", ("/scan", "/lidar_front/scan")))
+        self._laser_source = None
+        self._laser_seen = {}
         self._model_urdf = MODEL_PATH.read_text(encoding="utf-8")
-        self._model_joint_indices = parse_joint_indices(self._model_urdf)
         self._model_joint_limits = parse_joint_limits(self._model_urdf)
         self._urdf = ""
         self._joint_limits: dict[str, tuple[float, float]] = {}
-        self._joint_indices: dict[str, int] = {}
-        # Rendering stays on one internally consistent model/index snapshot.
-        # A live snapshot is activated when the model resource is read, so the
-        # streamed joint indices never switch before the matching URDF has been
-        # delivered to the renderer.
-        self._render_urdf = self._model_urdf
-        self._render_joint_indices = dict(self._model_joint_indices)
-        self._render_source = "bundled verified model"
+        # The live control URDF can have fixed lift and finger joints. Keep the
+        # articulated display model separate from live motion validation.
+        self._render_urdf, self._render_mimics = render_model(self._model_urdf)
+        self._render_joint_indices = parse_joint_indices(self._render_urdf)
+        self._render_source = "bundled articulated display model"
         self._render_model_sha256 = hashlib.sha256(self._render_urdf.encode()).hexdigest()
         self._odom_window: list[list] = []
         self._odom_vendor_ms = None
@@ -255,9 +260,7 @@ class PantherDevice:
         self._laser_cloud_pub = self._node.create_publisher(
             PointCloud2, f"/{namespace}/panther/laser_scan/points", sensor_qos
         )
-        self._node.create_subscription(
-            LaserScan, "/scan", guarded("laser_scan", self._on_laser), sensor_qos,
-        )
+        self._subscribe_laser(LaserScan, sensor_qos)
 
         self._twist_type = Twist
         self._drive_qos = reliable_qos
@@ -297,6 +300,8 @@ class PantherDevice:
         self._camera = PantherCameraRuntime(
             self._node, self._bridge, config.get("plugins", {}).get("camera", {}), sensor_qos
         )
+        self._vision = VisionCapture(self._camera, config.get("plugins", {}).get("vision_capture", {}),
+                                     _notify_completion)
         plugins = config.get("plugins", {})
         self._stereo_camera = None
         if any(plugins.get(card, {}).get("enabled") for card in ("camera_left", "camera_right")):
@@ -331,6 +336,7 @@ class PantherDevice:
         self._closed = True
         self._stop_arm("driver_shutdown", wait_s=20.0)
         self._stop_head("driver_shutdown", wait_s=5.0)
+        self._vision.close()
         if self._stereo_camera is not None:
             self._stereo_camera.close()
         self._camera.close()
@@ -417,7 +423,6 @@ class PantherDevice:
         with self._lock:
             self._urdf = msg.data
             self._joint_limits = limits
-            self._joint_indices = indices
         changed = sorted(
             name for name in set(self._model_joint_limits) | set(limits)
             if self._model_joint_limits.get(name) != limits.get(name)
@@ -455,11 +460,18 @@ class PantherDevice:
 
     def _on_gripper(self, side: str, msg) -> None:
         self._put(f"gripper_{side}", msg)
+        self._publish_cached_joints()
         self._publish_robot_state()
 
     def _on_lifting(self, msg) -> None:
         self._put("lifting", msg)
+        self._publish_cached_joints()
         self._publish_robot_state()
+
+    def _publish_cached_joints(self):
+        msg, received = self._get("joints")
+        if msg is not None and fresh(received):
+            self._publish_limited("joints", self._joints_payload(msg, received), 10.0)
 
     def _on_odom(self, msg) -> None:
         received_ms = time.time_ns() // 1_000_000
@@ -486,6 +498,28 @@ class PantherDevice:
                 "child_frame_id": msg.child_frame_id,
                 "pose": pose, "motus_slam": quality,
             }
+
+    def _subscribe_laser(self, message_type, qos) -> None:
+        """Subscribe to every configured scan topic; each reports its own name."""
+        for topic in self._laser_topics:
+            self._node.create_subscription(
+                message_type, topic,
+                lambda msg, topic=topic: self._safe_callback(
+                    "laser_scan", self._on_laser_topic, msg, topic),
+                qos,
+            )
+
+    def _on_laser_topic(self, msg, topic) -> None:
+        """Use the first fresh topic in preference order, then publish its scan."""
+        with self._laser_lock:
+            now = time.monotonic()
+            self._laser_seen[topic] = now
+            preferred = next(t for t in self._laser_topics
+                             if now - self._laser_seen.get(t, -math.inf) < 1.0)
+            if topic != preferred:
+                return
+            self._laser_source = topic
+        self._on_laser(msg)
 
     def _on_laser(self, msg) -> None:
         self._put("laser_scan", msg)
@@ -540,29 +574,37 @@ class PantherDevice:
             joint_indices = dict(self._render_joint_indices)
             model_source = self._render_source
             model_sha256 = self._render_model_sha256
-        joints = []
+            dedicated = {key: self._cache.get(key, (None, None))
+                         for key in ("lifting", "gripper_left", "gripper_right")}
+        rows = {}
+        sources = {}
         dropped = 0
         for index, name in enumerate(msg.name):
             if name not in joint_indices:
                 continue
-            if index >= len(msg.position):
+            row = joint_row(msg, index)
+            if row is None:
                 dropped += 1
-                continue
-            try:
-                position = float(msg.position[index])
-            except (TypeError, ValueError):
-                dropped += 1
-                continue
-            if not math.isfinite(position):
-                dropped += 1
-                continue
-            item = {"idx": joint_indices[name], "name": name}
-            item["q"] = position
-            if index < len(msg.velocity):
-                item["dq"] = json_float(msg.velocity[index])
-            if index < len(msg.effort):
-                item["tau"] = json_float(msg.effort[index])
-            joints.append(item)
+            else:
+                rows[name] = row
+        for key, name in (("lifting", "body_joint"), ("gripper_left", "joint_lf"),
+                          ("gripper_right", "joint_rf")):
+            feedback, at = dedicated[key]
+            if feedback is not None and fresh(at):
+                row = dedicated_row(feedback, name, gripper=key.startswith("gripper_"))
+                if row is not None:
+                    rows[name] = row
+                    sources[name] = key
+        # Canvas consumes one value per animated joint; resolve the bundled
+        # gripper linkage even when only its master channel is published.
+        for name in ("joint_lf", "joint_rf"):
+            if name in rows:
+                rows[name] = display_gripper_row(rows[name])
+        for name, (master, multiplier, offset) in self._render_mimics.items():
+            if master in rows:
+                rows[name] = {"q": rows[master]["q"] * multiplier + offset}
+        joints = [{"idx": joint_indices[name], "name": name, **row}
+                  for name, row in rows.items() if name in joint_indices]
         payload = {
             "timestamp_ms": int(time.time() * 1000),
             "fresh": fresh(received),
@@ -570,7 +612,11 @@ class PantherDevice:
             "age_ms": age_ms(received),
             "format": "sensor/skeleton",
             "position_unit": "rad",
+            "position_unit_by_joint": {"body_joint": "m"},
             "source_topic": "/joint_states",
+            "feedback_overrides": sources,
+            "missing_display_joints": [name for name in (*HEAD_JOINTS, "body_joint", "joint_lf", "joint_rf")
+                                       if name not in rows],
             "model_source": model_source,
             "model_sha256": model_sha256,
             "joint_count": len(joints),
@@ -642,7 +688,7 @@ class PantherDevice:
         }
 
     @staticmethod
-    def _laser_payload(msg, received) -> dict:
+    def _laser_payload(msg, received, topic="/scan") -> dict:
         raw = list(msg.ranges)
         bins = min(360, max(1, len(raw)))
         stride = max(1, math.ceil(len(raw) / bins))
@@ -656,7 +702,8 @@ class PantherDevice:
             "timestamp_ms": int(time.time() * 1000),
             "fresh": fresh(received),
             "age_ms": age_ms(received),
-            "source_topic": "/scan",
+            "source_topic": topic,
+            "merged": topic == "/scan",
             "frame_id": msg.header.frame_id,
             "angle_min": json_float(msg.angle_min),
             "angle_max": json_float(msg.angle_max),
@@ -684,7 +731,7 @@ class PantherDevice:
         }
 
     def _lifting_limits(self):
-        """Return the SDK limits; Panther's bundled lift joint is fixed in URDF."""
+        """Use configured SDK limits; the live URDF may encode lift as fixed."""
         configured = self._cfg["plugins"]["lifting"]
         configured_min = float(configured.get("min_position_m", 0.0))
         configured_max = float(configured["max_position_m"])
@@ -697,13 +744,6 @@ class PantherDevice:
             return self.robot_state()
         if card == "model":
             with self._lock:
-                if self._urdf:
-                    self._render_urdf = self._urdf
-                    self._render_joint_indices = dict(self._joint_indices)
-                    self._render_source = "live /robot_description"
-                    self._render_model_sha256 = hashlib.sha256(
-                        self._render_urdf.encode()
-                    ).hexdigest()
                 render_urdf = self._render_urdf
                 render_source = self._render_source
                 render_sha256 = self._render_model_sha256
@@ -715,6 +755,7 @@ class PantherDevice:
                 if self._model_joint_limits.get(name) != live_limits.get(name)
             ) if live_limits else []
             return {"model": "UniX AI Panther", "urdf": render_urdf,
+                    "skeleton_visual_links": ["base_link"],
                     "available": True, "source": render_source,
                     "model_sha256": render_sha256,
                     "render_joint_count": render_joint_count,
@@ -733,6 +774,13 @@ class PantherDevice:
                               "clock_mapping_verified": False},
                 **self._callback_health("odom"),
             }
+        if card == "laser_scan":
+            msg, received = self._get(card)
+            if msg is None:
+                return {"available": False, "fresh": False, "source": card,
+                        **self._callback_health(card)}
+            return {"available": True, **self._laser_payload(msg, received, self._laser_source or "/scan"),
+                    **self._callback_health(card)}
         msg, received = self._get(card)
         if msg is None:
             return {"available": False, "fresh": False, "source": card,
@@ -741,7 +789,6 @@ class PantherDevice:
             "joints": self._joints_payload,
             "battery": self._battery_payload,
             "imu": self._imu_payload,
-            "laser_scan": self._laser_payload,
         }
         return {"available": True, **builders[card](msg, received),
                 **self._callback_health(card)}
@@ -1255,7 +1302,6 @@ class PantherDevice:
         if not fresh(received):
             raise RuntimeError("fresh /joint_states is required")
         current = {name: value for name, value in zip(joint_msg.name, joint_msg.position)}
-        max_delta = math.radians(float(cfg["max_target_delta_deg"]))
         hold_limit_tolerance = math.radians(float(cfg.get("hold_limit_tolerance_deg", 0.5)))
         targets: dict[str, list[float]] = {}
 
@@ -1316,14 +1362,11 @@ class PantherDevice:
                     raise ValueError(f"at least one {arm_side} arm joint target is required")
                 values = [updates.get(name, current.get(name)) for name in names]
                 commanded_names = set(updates)
-            # Home is subject to the same per-command delta gate as every
-            # other arm target until the candidate pose is independently
-            # commissioned on hardware.
             effective_limits = intersect_joint_limits(
                 names, self._model_joint_limits, self._joint_limits
             )
             return validate_joint_target(
-                names, values, effective_limits, current, max_delta,
+                names, values, effective_limits, current,
                 commanded_joint_names=commanded_names,
                 hold_limit_tolerance_rad=hold_limit_tolerance,
             )
@@ -1691,4 +1734,7 @@ class PantherDevice:
         if action == "info":
             return self._camera.info(kind)
         raise ValueError(f"unsupported camera action: {action}")
+
+    def vision_capture(self, args: dict) -> dict:
+        return self._vision.dispatch(args)
 

@@ -13,7 +13,10 @@ plugins:
   battery: {enabled: true}
   imu: {enabled: true}
   odom: {enabled: true}
-  laser_scan: {enabled: true}
+  laser_scan:
+    enabled: true
+    # Prefer the robot's fused scan; also support units with only a front scanner.
+    topics: ["/scan", "/lidar_front/scan"]
 
   camera:
     workspace: "/home/unix_ai/orbbec_ws"
@@ -49,6 +52,9 @@ plugins:
     calibration_path: "/proc/1/root/home/unix_ai/work/srt/video/stereo.yaml"
     publish_hz: 10.0
     jpeg_quality: 75
+  vision_capture:
+    enabled: true
+    output_dir: /opt/phanthy-motus/data/vision_capture/panther
 
   audio:
     server: "auto"
@@ -91,14 +97,12 @@ plugins:
     enabled: true
     max_duration_s: 20.0
     min_duration_s: 1.0
+    # Used to estimate trajectory duration when duration_s is omitted.
     speed_deg_s: 20.0
-    # Per-command joint-step cap; URDF hard limits are always enforced too.
-    max_target_delta_deg: 20.0
     # Only implicit hold targets may absorb this much encoder/zero-point noise;
     # explicit user targets remain strictly bounded by the vendor URDF.
     hold_limit_tolerance_deg: 0.5
-    # PR 521-compatible candidate pose; the ordinary per-command delta gate
-    # remains mandatory until this target is independently hardware-verified.
+    # Candidate home pose; all targets must pass the same URDF limits as moves.
     home_pose_deg:
       joint_la0: 0.0
       joint_la1: 0.0

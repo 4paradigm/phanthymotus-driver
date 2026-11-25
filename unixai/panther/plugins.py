@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from common.camera_info import build as build_camera_info
 from contracts import ARM_JOINT_FIELDS, odom_interface
+from panther_media import ENCODE_TIMEOUT_S, MAX_DURATION_S
 
 
 ARM_JOINT_TITLES = (
@@ -71,7 +72,7 @@ class JointsPlugin(SensorPlugin):
     def get_tools(self):
         return [super().get_tool(), {
             "name": "model", "type": "resource", "multiInstance": False,
-            "description": "Panther live URDF from /robot_description, with bundled fallback",
+            "description": "Panther articulated display URDF with matching joint stream",
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
         }]
 
@@ -137,6 +138,8 @@ class ActuatorPlugin:
             self.device.arm({"action": "stop"})
         elif self.name == "head":
             self.device.head({"action": "stop"})
+        elif self.name == "vision_capture":
+            self.device.vision_capture({"action": "stop"})
 
     def dispatch(self, action, args):
         payload = dict(args); payload["action"] = action
@@ -268,7 +271,7 @@ def build_plugins(config, namespace, device):
         return bool(enabled.get(name, {}).get("enabled", False))
 
     if on("joints"):
-        plugins.append(JointsPlugin(device, "joints", "Panther live URDF skeleton and joint state", ["joints"]))
+        plugins.append(JointsPlugin(device, "joints", "Panther skeleton with live joint feedback", ["joints"]))
     for name, description in (
         ("robot_state", "Panther motion readiness, controller, diagnostic and hardware summary"),
         ("battery", "Panther battery percentage, voltage, current, temperature and power status"),
@@ -294,6 +297,25 @@ def build_plugins(config, namespace, device):
     for eye in ("left", "right"):
         if on(f"camera_{eye}"):
             plugins.append(StereoCameraPlugin(device, eye))
+    if on("vision_capture"):
+        schema = _action_schema(
+            ["capture_photo", "record_video", "list", "delete", "start", "info", "stop"],
+            {"duration_s": {"type": "integer", "minimum": 1, "maximum": MAX_DURATION_S, "default": 5,
+                            "description": "Video duration in seconds"},
+             "name": {"type": "string", "description": "Complete filename returned by list"}},
+            {"capture_photo": {"params": [], "description": "Save the next RGB frame as a JPEG"},
+             "record_video": {"params": ["duration_s"], "description": "Record a silent RGB MP4"},
+             "list": {"params": [], "description": "List saved photos and videos"},
+             "delete": {"params": ["name"], "description": "Delete one saved photo or video"},
+             "start": {"params": [], "description": "Check for a running RGB source"},
+             "info": {"params": [], "description": "Read the camera status and media directories"},
+             "stop": {"params": [], "description": "Cancel a recording and discard the unfinished video"}},
+            completion={"actions": ["record_video"], "timeout": MAX_DURATION_S + ENCODE_TIMEOUT_S + 15},
+        )
+        plugins.append(ActuatorPlugin(
+            device, "vision_capture", "Capture, list and delete Panther RGB photos and videos",
+            schema, device.vision_capture,
+        ))
     if on("mic") or on("speaker"):
         from audio import AudioPlugin
         for name in ("mic", "speaker"):
@@ -352,12 +374,8 @@ def build_plugins(config, namespace, device):
 
         def joint_field(name: str, title: str) -> dict:
             lower, upper = joint_limits.get(name, (None, None))
-            prefix = (f"Range {format_range((lower, upper))}; "
-                      if lower is not None and upper is not None
-                      else "Range unavailable; ")
-            max_delta = enabled["arm_control"].get("max_target_delta_deg", 20.0)
             field = {"type": "number", "title": f"{title} (deg)",
-                     "description": prefix + f"max step {max_delta:g} deg"}
+                     "description": f"Range {format_range((lower, upper))}"}
             if lower is not None and upper is not None:
                 field.update(minimum=lower, maximum=upper)
             return field
@@ -373,14 +391,10 @@ def build_plugins(config, namespace, device):
             left = joint_limits.get(f"joint_la{index}", (None, None))
             right = joint_limits.get(f"joint_ra{index}", (None, None))
             bounds = [value for value in (*left, *right) if value is not None]
-            max_delta = enabled["arm_control"].get("max_target_delta_deg", 20.0)
             field = {
                 "type": "number",
                 "title": f"{ARM_JOINT_TITLES[index]} (deg)",
-                "description": (
-                    f"L/B {format_range(left)}; R {format_range(right)}; "
-                    f"max step {max_delta:g} deg"
-                ),
+                "description": f"L/B {format_range(left)}; R {format_range(right)}",
             }
             if len(bounds) == 4:
                 field.update(minimum=min(bounds), maximum=max(bounds))

@@ -8,13 +8,17 @@ import json
 import math
 import os
 import re
+import struct
 import sys
 import threading
 import time
 import unittest
+import xml.etree.ElementTree as ET
 from unittest.mock import patch
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+
+import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 DRIVER = ROOT / "unixai" / "panther"
@@ -125,8 +129,7 @@ class PantherDriverTest(unittest.TestCase):
         config = {"plugins": {
             "base_drive": {"enabled": True, "max_linear_mps": 0.5,
                            "max_angular_deg_s": 45.0, "max_duration_s": 10.0},
-            "arm_control": {"enabled": True, "max_duration_s": 20.0,
-                            "max_target_delta_deg": 20.0},
+            "arm_control": {"enabled": True, "max_duration_s": 20.0},
             "gripper": {"enabled": True},
             "lifting": {"enabled": True, "max_position_m": 0.8, "home_position_m": 0.6},
             "head": {"enabled": True, "low_speed_deg_s": 10.0,
@@ -157,12 +160,10 @@ class PantherDriverTest(unittest.TestCase):
         )
         self.assertTrue(arm["properties"]["j0_deg"]["x-ui-hidden"])
         self.assertNotIn("confirm_motion", arm["properties"])
-        self.assertTrue(arm["properties"]["shoulder_raise"]["description"].startswith(
-            "L/B [0.0, 90.0] deg; R [-90.0, 0.0] deg;"
-        ))
-        self.assertTrue(arm["properties"]["l_elbow_flex"]["description"].startswith(
-            "Range [-127.8, 0.0] deg;"
-        ))
+        self.assertEqual(arm["properties"]["shoulder_raise"]["description"],
+                         "L/B [0.0, 90.0] deg; R [-90.0, 0.0] deg")
+        self.assertEqual(arm["properties"]["l_elbow_flex"]["description"],
+                         "Range [-127.8, 0.0] deg")
         self.assertEqual(arm["properties"]["elbow_flex"]["title"],
                          "Elbow Flexion/Extension (deg)")
         self.assertEqual(arm["properties"]["l_shoulder_rot"]["title"],
@@ -280,11 +281,11 @@ class PantherDriverTest(unittest.TestCase):
         )
 
     def test_arm_runtime_builds_mirrored_and_independent_targets(self):
-        def run(arguments, positions=None, model_limits=None):
+        def run(arguments, positions=None, model_limits=None, expected_duration=1.0):
             device = object.__new__(device_module.PantherDevice)
             device._cfg = {"plugins": {"arm_control": {
                 "max_duration_s": 20.0, "min_duration_s": 1.0,
-                "speed_deg_s": 20.0, "max_target_delta_deg": 20.0,
+                "speed_deg_s": 20.0, "home_pose_deg": {"joint_la1": 0.0},
             }}}
             device._lock = threading.RLock()
             device._arm_lock = threading.RLock()
@@ -309,8 +310,9 @@ class PantherDriverTest(unittest.TestCase):
                 completed.set()
 
             device._run_arm = capture
-            result = device.arm({**arguments, "duration_s": 1.0})
+            result = device.arm(arguments)
             self.assertEqual(result["state"], "queued")
+            self.assertAlmostEqual(result["duration_s"], expected_duration)
             self.assertTrue(completed.wait(1.0))
             return captured
 
@@ -338,6 +340,18 @@ class PantherDriverTest(unittest.TestCase):
         )
         self.assertAlmostEqual(math.degrees(partial["left"][0]), 3.0)
         self.assertEqual(partial["left"][2], 0.0)
+
+        # The original rejection was a 40° displacement of joint_la1.
+        large_move = run({"action": "move", "side": "left", "shoulder_abd": 40.0},
+                         model_limits=vendor_limits, expected_duration=2.0)
+        self.assertAlmostEqual(math.degrees(large_move["left"][1]), 40.0)
+        independent = run({"action": "move_separate", "l_shoulder_abd": 40.0, "r_shoulder_abd": -30.0},
+                          model_limits=vendor_limits, expected_duration=2.0)
+        self.assertAlmostEqual(math.degrees(independent["left"][1]), 40.0)
+        self.assertAlmostEqual(math.degrees(independent["right"][1]), -30.0)
+        home = run({"action": "home", "side": "left"}, {"joint_la1": math.radians(40.0)},
+                   model_limits=vendor_limits, expected_duration=2.0)
+        self.assertEqual(home["left"][1], 0.0)
 
     def test_imu_keeps_finite_vectors_when_zero_covariance_has_no_truth_value(self):
         class Covariance:
@@ -394,12 +408,12 @@ class PantherDriverTest(unittest.TestCase):
     def test_bundled_model_and_standardized_streams_are_packaged(self):
         model = DRIVER / "resource" / "panther.urdf"
         self.assertTrue(model.exists())
-        model_text = model.read_text()
+        model_text = model.read_text(encoding="utf-8")
         self.assertIn('<robot\n  name="pmm_urdf">', model_text)
         self.assertIn("joint_la0", model_text)
         self.assertIn("package://pmm_urdf/meshes/", model_text)
         self.assertEqual(
-            hashlib.sha256(model.read_bytes()).hexdigest(),
+            hashlib.sha256(model_text.encode("utf-8")).hexdigest(),
             "abcd54d188f93c62247816b93c9998e112b1be36cd2bae582910d393c4f4902d",
         )
         dockerfile = (DRIVER / "Dockerfile").read_text()
@@ -443,7 +457,7 @@ class PantherDriverTest(unittest.TestCase):
         device = object.__new__(device_module.PantherDevice)
         device._cfg = {"plugins": {"arm_control": {
             "max_duration_s": 20.0, "min_duration_s": 1.0,
-            "speed_deg_s": 20.0, "max_target_delta_deg": 180.0,
+            "speed_deg_s": 20.0,
         }}}
         device._lock = threading.RLock()
         device._arm_lock = threading.RLock()
@@ -469,12 +483,78 @@ class PantherDriverTest(unittest.TestCase):
                 })
 
     def test_render_model_and_joint_indices_share_one_snapshot(self):
-        device = (DRIVER / "device.py").read_text()
-        self.assertIn("self._render_urdf = self._urdf", device)
-        self.assertIn("self._render_joint_indices = dict(self._joint_indices)", device)
-        self.assertIn("joint_indices = dict(self._render_joint_indices)", device)
-        self.assertIn('"model_sha256": model_sha256', device)
-        self.assertIn('"source": render_source', device)
+        device = object.__new__(device_module.PantherDevice)
+        device._lock = threading.RLock()
+        device._cache = {}
+        device._callback_errors = {}
+        device._model_urdf = (DRIVER / "resource" / "panther.urdf").read_text(encoding="utf-8")
+        device._model_joint_limits = contracts.parse_joint_limits(device._model_urdf)
+        device._render_urdf, device._render_mimics = device_module.render_model(device._model_urdf)
+        device._render_joint_indices = contracts.parse_joint_indices(device._render_urdf)
+        device._render_model_sha256 = hashlib.sha256(device._render_urdf.encode()).hexdigest()
+        device._render_source = "bundled articulated display model"
+        live = '<robot><joint name="body_joint" type="fixed"><parent link="a"/><child link="b"/></joint></robot>'
+        device._on_robot_description(SimpleNamespace(data=live))
+        model = device.sensor_info("model")
+        self.assertNotEqual(model["urdf"], live)
+        self.assertEqual(device._urdf, live)
+
+        def feedback(names, positions):
+            return SimpleNamespace(name=names, position=positions, velocity=[], effort=[])
+
+        device._put("lifting", feedback(["height"], [0.6]))
+        device._put("gripper_left", feedback(["joint_lf"], [0.0]))
+        device._cache["gripper_right"] = (feedback(["joint_rf"], [0.8]), time.monotonic() - 10)
+        payload = device._joints_payload(feedback(["joint_head0", "joint_la0"], [0.2, 0.1]), time.monotonic())
+        self.assertEqual(model["model_sha256"], payload["model_sha256"])
+        rows = {joint["name"]: joint for joint in payload["joints"]}
+        self.assertEqual(rows["body_joint"]["q"], 0.6)
+        self.assertEqual(rows["joint_head0"]["q"], 0.2)
+        self.assertEqual(rows["joint_la0"]["q"], 0.1)
+        self.assertEqual(rows["joint_lf"]["q"], 1.0)
+        self.assertEqual(rows["joint_lf02"]["q"], 1.0)
+        self.assertNotIn("joint_rf", rows)
+        self.assertEqual(rows["joint_lf"]["idx"], contracts.parse_joint_indices(model["urdf"])["joint_lf"])
+
+        device._put("gripper_left", feedback(["joint_lf"], [1.0]))
+        device._put("gripper_right", feedback(["joint_rf"], [0.2]))
+        payload = device._joints_payload(feedback([], []), time.monotonic())
+        rows = {joint["name"]: joint["q"] for joint in payload["joints"]}
+        self.assertEqual(rows["joint_lf02"], 0.0)
+        self.assertAlmostEqual(rows["joint_rf02"], -0.8)
+
+        joints = {j.get("name"): j for j in ET.fromstring(model["urdf"]).findall("joint")}
+        for arm in ("la", "ra"):
+            self.assertEqual(joints[f"joint_{arm}3"].find("axis").get("xyz"), "0 0 1")
+            self.assertEqual(joints[f"joint_{arm}4"].find("axis").get("xyz"), "0 1 0")
+        self.assertEqual(joints["body_joint"].get("type"), "prismatic")
+        self.assertEqual(joints["body_joint"].find("parent").get("link"), "base_link")
+        self.assertEqual(joints["body_joint"].find("child").get("link"), "body_link")
+        self.assertEqual([name for name, j in joints.items() if j.find("parent").get("link") == "base_link"],
+                         ["body_joint"])
+        self.assertFalse({"joint_fl_rev", "joint_fl_con", "joint_front_lidar", "joint_behind_lidar"} & joints.keys())
+        self.assertEqual(model["skeleton_visual_links"], ["base_link"])
+        base = ET.fromstring(model["urdf"]).find("link[@name='base_link']")
+        self.assertEqual(len(base.findall("visual")), 2)
+        box = base.find("visual[@name='display_base']")
+        center_x, center_y, center_z = map(float, box.find("origin").get("xyz").split())
+        length, width, height = map(float, box.find("geometry/box").get("size").split())
+        self.assertEqual((center_y, center_z, width, height), (0.0, 0.1, 0.51, 0.2))
+        self.assertAlmostEqual(center_x + length / 2, 0.325)
+        rear_x = center_x - length / 2
+        rail = base.find("visual[@name='display_column']")
+        rail_x, _, center = map(float, rail.find("origin").get("xyz").split())
+        self.assertAlmostEqual(rail_x - rear_x, (rail_x + 0.325) / 2)
+        half_length = float(rail.find("geometry/cylinder").get("length")) / 2
+        self.assertAlmostEqual(center - half_length, 0.2)
+        self.assertAlmostEqual(center + half_length, 0.62 + 0.785998)
+        for name in ("joint_head0", "joint_head1", "joint_rgbd"):
+            self.assertEqual(float(joints[name].find("origin").get("xyz").split()[1]), 0.0)
+        for name, axis in (("joint_head0", "0 0 1"), ("joint_head1", "0 1 0")):
+            self.assertEqual(joints[name].find("axis").get("xyz"), axis)
+        left_eye, right_eye = (tuple(map(float, joints[f"joint_{side}_eye"].find("origin").get("xyz").split()))
+                               for side in ("left", "right"))
+        self.assertEqual(left_eye, (right_eye[0], -right_eye[1], right_eye[2]))
 
     def test_skeleton_indices_follow_kinematic_urdf_order(self):
         urdf = """<robot name='p'>
@@ -491,12 +571,12 @@ class PantherDriverTest(unittest.TestCase):
 
     def test_joint_target_rejects_missing_limits_instead_of_guessing(self):
         with self.assertRaisesRegex(ValueError, "no limits"):
-            contracts.validate_joint_target(("joint_la0",), [0.0], {}, {"joint_la0": 0.0}, 0.5)
+            contracts.validate_joint_target(("joint_la0",), [0.0], {}, {"joint_la0": 0.0})
 
-    def test_joint_target_rejects_large_per_command_step(self):
-        with self.assertRaisesRegex(ValueError, "per-command limit"):
+    def test_joint_target_rejects_nonfinite_feedback(self):
+        with self.assertRaisesRegex(ValueError, r"current\.joint_la0 must be finite"):
             contracts.validate_joint_target(
-                ("joint_la0",), [0.8], {"joint_la0": (-1.0, 1.0)}, {"joint_la0": 0.0}, 0.35
+                ("joint_la0",), [0.8], {"joint_la0": (-1.0, 1.0)}, {"joint_la0": float("nan")}
             )
 
     def test_partial_arm_target_clamps_small_implicit_hold_limit_error(self):
@@ -508,7 +588,6 @@ class PantherDriverTest(unittest.TestCase):
             [math.radians(3.0), current["joint_la2"]],
             limits,
             current,
-            math.radians(20.0),
             commanded_joint_names={"joint_la0"},
             hold_limit_tolerance_rad=math.radians(0.5),
         )
@@ -521,14 +600,14 @@ class PantherDriverTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "target -0.08 deg"):
             contracts.validate_joint_target(
                 ("joint_la2",), [current["joint_la2"]], limits, current,
-                math.radians(20.0), commanded_joint_names={"joint_la2"},
+                commanded_joint_names={"joint_la2"},
                 hold_limit_tolerance_rad=math.radians(0.5),
             )
         far_current = {"joint_la2": math.radians(-2.0)}
         with self.assertRaisesRegex(ValueError, "calibration or recovery"):
             contracts.validate_joint_target(
                 ("joint_la2",), [far_current["joint_la2"]], limits, far_current,
-                math.radians(20.0), commanded_joint_names=set(),
+                commanded_joint_names=set(),
                 hold_limit_tolerance_rad=math.radians(0.5),
             )
 
@@ -593,14 +672,6 @@ class PantherDriverTest(unittest.TestCase):
             confirmed = device._wait_for_pending_drive_stop(1.0)
         self.assertTrue(confirmed["stop_confirmed"])
         self.assertGreaterEqual(len(publisher.messages), 2)
-
-    def test_arm_home_keeps_the_per_command_delta_gate(self):
-        source = (DRIVER / "device.py").read_text()
-        arm = source.split("    def arm(self, args: dict)", 1)[1].split(
-            "    def _run_arm", 1
-        )[0]
-        self.assertNotIn('step_limit = None if action == "home"', arm)
-        self.assertIn("current, max_delta,", arm)
 
     def test_manifest_lists_expected_cards(self):
         driver_text = (DRIVER / "driver.yaml").read_text()
@@ -697,6 +768,65 @@ class PantherDriverTest(unittest.TestCase):
         self.assertEqual(created["subscriptions"], [])
         self.assertEqual(bytes(created["messages"][0].data),
                          b"\x0c\x00\x00\x00\x01\x00\x00\x00" + bytes(12))
+        with self.assertRaisesRegex(ValueError, "not JPEG"):
+            core_bridge.encode_bridge_payload(
+                "camera_color", {"message_format": "jpeg", "data": b"not-jpeg"}
+            )
+
+    def test_lidar_prefers_merged_scan_and_falls_back_to_front(self):
+        device = object.__new__(device_module.PantherDevice)
+        device._laser_lock = threading.Lock()
+        device._laser_topics = ("/scan", "/lidar_front/scan")
+        device._laser_source = None
+        device._laser_seen = {}
+        seen = []
+        device._on_laser = lambda msg: seen.append((msg, device._laser_source))
+        front = "/lidar_front/scan"
+        with patch.object(device_module.time, "monotonic", return_value=10.0) as clock:
+            device._on_laser_topic("front-1", front)
+            self.assertEqual(seen[-1], ("front-1", front))
+            clock.return_value = 10.1
+            device._on_laser_topic("merged-1", "/scan")
+            self.assertEqual(seen[-1], ("merged-1", "/scan"))
+            clock.return_value = 10.2
+            device._on_laser_topic("front-2", front)
+            self.assertEqual(seen[-1], ("merged-1", "/scan"))
+            clock.return_value = 11.3
+            device._on_laser_topic("front-3", front)
+            self.assertEqual(seen[-1], ("front-3", front))
+
+    def test_every_configured_lidar_topic_is_subscribed_through_the_preference_path(self):
+        config = yaml.safe_load((DRIVER / "config.yaml").read_text(encoding="utf-8"))
+        configured = tuple(config["plugins"]["laser_scan"]["topics"])
+        self.assertEqual(configured, ("/scan", "/lidar_front/scan"))
+        self.assertNotIn("max_points", config["plugins"]["laser_scan"])
+        self.assertNotIn("max_range_m", config["plugins"]["laser_scan"])
+
+        subscriptions = {}
+        device = object.__new__(device_module.PantherDevice)
+        device._node = SimpleNamespace(create_subscription=lambda kind, topic, callback, qos:
+                                       subscriptions.setdefault(topic, (kind, callback, qos)))
+        device._laser_lock = threading.Lock()
+        device._laser_topics = configured
+        device._laser_source = None
+        device._laser_seen = {}
+        device._callback_errors = {}
+        device._lock = threading.RLock()
+        device._cache = {}
+        seen = []
+        device._on_laser = lambda msg: seen.append((msg, device._laser_source))
+
+        device._subscribe_laser("LaserScan", "qos")
+        self.assertEqual(tuple(subscriptions), configured)
+        self.assertTrue(all(kind == "LaserScan" and qos == "qos" for kind, _, qos in subscriptions.values()))
+
+        with patch.object(device_module.time, "monotonic", return_value=10.0):
+            subscriptions["/lidar_front/scan"][1]("front")
+            self.assertEqual(seen[-1], ("front", "/lidar_front/scan"))
+            subscriptions["/scan"][1]("merged")
+            self.assertEqual(seen[-1], ("merged", "/scan"))
+            subscriptions["/lidar_front/scan"][1]("front-again")
+            self.assertEqual(seen[-1], ("merged", "/scan"))
 
     def test_removed_nav_and_ultrasonic_have_no_runtime_code(self):
         plugins = (DRIVER / "plugins.py").read_text()
