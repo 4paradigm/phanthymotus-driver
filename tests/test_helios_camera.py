@@ -56,6 +56,8 @@ def test_capture_drops_before_conversion_without_shell_or_vendor_controls(source
     assert command.index("videorate") < command.index("videoscale") < command.index("videoconvert")
     assert "video/x-raw," + dimensions in command
     assert not any(word in " ".join(command) for word in ("sudo", "gpio", "jetson_clocks", "reset"))
+    assert command[command.index("videoscale") + 1] == "n-threads=4"
+    assert command[command.index("videoconvert") + 1] == "n-threads=4"
 
 
 def test_jpeg_pipe_chunk_boundaries_and_bounded_overflow():
