@@ -131,9 +131,13 @@ class HeliosCamera:
     def _release(self, instance):
         previous = self._active.pop(instance, None)
         if previous:
-            self._streams[previous].detach(instance)
-            if previous not in self._active.values():
-                self._streams.pop(previous).stop()
+            self._drop(instance, previous)
+
+    def _drop(self, instance, source_id):
+        """Detach a card from a source; stop that producer once no card uses it."""
+        self._streams[source_id].detach(instance)
+        if source_id not in self._active.values():
+            self._streams.pop(source_id).stop()
 
     def _acquire(self, instance, source_id):
         if self._active.get(instance) == source_id:
@@ -153,8 +157,12 @@ class HeliosCamera:
             if created:
                 self._streams.pop(source_id).stop()
             raise
-        self._release(instance)
+        # Switch: record the new source first, so the old one is no longer referenced
+        # by this card when deciding whether its producer can be stopped.
+        previous = self._active.get(instance)
         self._active[instance] = source_id
+        if previous is not None:
+            self._drop(instance, previous)
 
     def _info(self, instance, source_id):
         source = SOURCES[source_id]

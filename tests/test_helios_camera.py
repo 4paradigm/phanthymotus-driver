@@ -255,6 +255,24 @@ def test_source_config_switch_keeps_topic_and_failed_switch_keeps_original():
     assert created[1].stopped == 1
 
 
+def test_switching_stops_the_old_producer_unless_another_card_uses_it():
+    camera, created = plugin()
+    camera.dispatch("start", {"instance_id": "a", "camera": "chest_rgb"})
+    for source in ("head_rgb", "head_front_fisheye", "chest_rgb", "head_rgb"):
+        camera.dispatch("config", {"instance_id": "a", "camera": source})
+    # Repeated switching leaves exactly one live producer, owned by card a.
+    live = [s for s in created if s.started > s.stopped]
+    assert [s.source for s in live] == ["head_rgb"] and set(camera._streams) == {"head_rgb"}
+    assert all(not s.attached for s in created if s not in live)
+
+    camera.dispatch("start", {"instance_id": "b", "camera": "head_rgb"})
+    shared = camera._streams["head_rgb"]
+    camera.dispatch("config", {"instance_id": "a", "camera": "chest_rgb"})
+    assert shared.stopped == 0 and set(shared.attached) == {"b"}  # still used by card b
+    camera.dispatch("stop", {"instance_id": "b"})
+    assert shared.stopped == 1 and set(camera._streams) == {"chest_rgb"}
+
+
 @pytest.mark.parametrize("args", [{}, {"instance_id": "a", "camera": "../../video0"},
                                    {"instance_id": "x" * 129}])
 def test_invalid_requests_do_not_open_any_device(args):
