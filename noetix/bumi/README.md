@@ -484,6 +484,11 @@ docker logs -f embodied-noetix-bumi
 - 动作命令和转身脉冲都经 `LocoPlugin` 的共享 `publish_cmd` 限速器发出，
   相邻命令间隔 ≥2 ms；语义动作是 `COMMAND → 10 ms → DEFAULT` 的边沿，
   非动作帧只发 `DEFAULT`，转身脉冲是有限帧速度串并以 `DEFAULT` 收尾。
+- 表演从准备模式开始到 worker 结束一直持有 `LocoPlugin` 的 body 预留，
+  其他 `loco` / 语义动作 / 姿态 / 示教动作在此期间被拒绝；`stop` 先在预留
+  内发出最终 `DEFAULT`，再归还预留，模式准备的每个等待和边沿都可取消。
+- 上传文件用 `O_NOFOLLOW` + `fstat` 打开描述符后读取，路径校验通过后被
+  换成符号链接也无法读到允许目录之外的文件。
 - 开始前用与 `semantic_action` 相同的路径准备行走模式；`workmode=26`
   （保护模式）直接拒绝，`info.protection=true` 且 `info.state=error`。
 - `stop` 设置 generation 与可中断等待，取消后续所有节拍并补一个 `DEFAULT`。
