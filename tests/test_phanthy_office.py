@@ -479,3 +479,29 @@ def test_install_makes_edge_print_to_the_windows_default_printer():
     script = (DRIVER / "windows" / "install.ps1").read_text(encoding="ascii")   # PS 5.1: ASCII only
     assert "SOFTWARE\\Policies\\Microsoft\\Edge" in script
     assert "'PrintPreviewUseSystemDefaultPrinter' -PropertyType DWord -Value 1" in script
+
+
+def test_a_print_reads_headless_first_and_only_then_opens_a_window(monkeypatch):
+    """worker.run's order is what keeps a logged-out print from flashing the
+    login page: `visits()` (headless) has to come before `print_badge()`."""
+    events = []
+
+    class FakeSite:
+        list_url = CONFIG["page_url"]
+
+        def visits(self, day):
+            events.append("visits")
+            raise visitor_site.SiteError("login_required", "访客系统需要登录")
+
+        def print_badge(self, *_):
+            events.append("print_badge")
+
+        def close(self):
+            pass
+
+    w = worker.Worker()
+    w._site = FakeSite()
+    with pytest.raises(visitor_site.SiteError) as exc:
+        w.run({"action": "print", "page_url": CONFIG["page_url"], "name": "张三"})
+    assert exc.value.code == "login_required"
+    assert events == ["visits"], "a logged-out print must stop before the visible Edge opens"
