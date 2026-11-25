@@ -1,0 +1,23 @@
+simulator-mujoco:
+  image: __IMAGE__
+  container_name: embodied-simulator-mujoco
+  network_mode: host
+  volumes:
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+    - ${SIMULATION_STATE_HOST_DIR:-/opt/phanthy-motus/data/simulation}:/var/lib/phanthymotus/simulation
+  environment:
+    - ROS_DOMAIN_ID=42
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+    - ROS_LOCALHOST_ONLY=0
+    - MOTION_SERVICE_URL=${MOTION_SERVICE_URL:-}
+    - MOTION_API_TOKEN=${MOTION_API_TOKEN:-}
+    - MOTION_ENVIRONMENT_URL=${MOTION_ENVIRONMENT_URL:-}
+    - MOTION_ENVIRONMENT_TOKEN=${MOTION_ENVIRONMENT_TOKEN:-}
+    - SIMULATION_WORKBENCH_STATE_DIR=/var/lib/phanthymotus/simulation
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: always

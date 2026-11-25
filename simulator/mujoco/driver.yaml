@@ -1,0 +1,13 @@
+id: simulator-mujoco
+name: 仿真环境 (MuJoCo)
+category: driver
+hardware_provider: simulator
+hardware_model: mujoco
+image_name: simulator-mujoco
+port: 15712
+mcp_url: "http://localhost:15712/mcp"
+description: "远程 MuJoCo 物理仿真与内嵌调试工作台"
+build_context_extras:
+  - ../../common
+cards:
+  - {name: simulation, type: actuator}
