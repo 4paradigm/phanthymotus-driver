@@ -510,3 +510,188 @@ media cards and motion cards keep running.
 
 The output contract, quality states, assumed body-axis calibration, validation
 status and the ROS probe live in [VISUAL_ODOMETRY.md](VISUAL_ODOMETRY.md).
+
+## Camera mount & frame convention
+
+`resource/bumi_model.urdf` declares three extra frames so that vision results can
+hang off the body tf tree instead of floating: `head_center_link` (the head
+geometric-centre datum), `camera_link` (body axes, origin at the camera optical
+centre) and `camera_optical_frame` (optical axes), joined by three `fixed` joints
+hanging off `waist_yaw_link` (the head turns with the waist). They carry no
+`<inertial>` — empty links are valid URDF and this bundle does not run dynamics.
+
+### Where the camera is, and which parent link
+
+The camera sits in the head, which rotates with the waist. Its immediate parent
+is `head_center_link`, which is itself fixed to `waist_yaw_link`; the full static
+chain is `waist_yaw_link -> head_center_link -> camera_link -> camera_optical_frame`.
+
+> **Verified on the robot (A5 acceptance).** Turning the upper body while the
+> robot is disabled makes the head — and therefore the camera image — follow,
+> matching the official parts diagram (camera in the head bezel). The upstream
+> URDF grouping the head into the `base_link.STL` mesh is a motion-control
+> modelling simplification, not the physical mount. Parenting the camera to
+> `base_link` would hold the frames still while the head turns, injecting a
+> systematic error into every downstream vision-to-tf result.
+
+### Mount translation
+
+`head_center_link` is a fixed child of `waist_yaw_link` at
+`xyz = [0.0055, 0, 0.3089]` m. That datum is **DERIVED** from the vendor
+`waist_yaw_link.STL` head-region bounding box (vertices with `z >= 0.24 m`),
+not independently measured. It exists so the camera offset below uses the same
+origin as the on-robot measurement instead of being silently re-based to the
+waist axis.
+
+`camera_mount_joint`'s `xyz` is the camera optical centre relative to
+`head_center_link` (metres), **not** the centroid or the housing face — depth
+back-projection originates at the optical centre, so a wrong value offsets every
+visual target by a constant. Measured on 2026-11-24: `+0.05 m` forward (x),
+`+0.035 m` left (y) and `+0.005 m` up (z), i.e. `0.05 0.035 0.005`.
+
+> **MEASURED translation / ASSUMED rotation.** The translation above is the
+> on-robot measurement supplied for this task. The level-forward quaternion is
+> still an axis assumption, so `config.yaml` keeps `calibration.assumed: true`
+> and `visual_odometry` reports `pose_reference=body_axes`. If your consumer
+> needs a physically surveyed head-centre origin, replace the DERIVED
+> `head_center_joint` origin rather than the measured camera offset.
+
+### Two frames, two input conventions
+
+Vision inputs arrive in more than one convention, so there are two frames and a
+consumer only has to pick the right parent — no extra rotation:
+
+| Input convention | Parent frame |
+| --- | --- |
+| optical axes (x right / y down / z forward) — YOLO, AR tag, external recognition | `camera_optical_frame` |
+| body axes with origin at the camera (x forward / y left / z up) — e.g. a pose whose translation is ignored and whose axes are already body-aligned | `camera_link` |
+
+The `camera_link → camera_optical_frame` rotation is `rpy = (-π/2, 0, -π/2)`,
+the same rotation as `calibration.camera_to_body.quaternion` `[-0.5, 0.5, -0.5,
+0.5]` (xyzw) in `config.yaml`. Changing one side without the other fails
+`tests/test_bumi_camera_mount_urdf.py`.
+
+### One camera, several names (same physical frame)
+
+There is **one** physical camera, but it has more than one name in the running
+system. `camera_link` and `camera_optical_frame` are the *canonical*, repo-wide
+names declared in the URDF; the other names are produced at runtime and carry
+machine-specific or per-start prefixes, so they can never be hard-coded:
+
+| Physical frame | Canonical name (URDF, this task) | Runtime name | Where the runtime name comes from |
+| --- | --- | --- | --- |
+| body axes, origin at the optical centre | `camera_link` | `bumi_visual_<uuid>_base` | `visual_odometry.py` — `self.segment = 'bumi_visual_' + uuid.uuid4().hex` (regenerated on every start) |
+| optical axes (x right / y down / z deep) | `camera_optical_frame` | `<hostname>_rgb_optical` | `visual_inputs.py` — `f'{self.namespace}_rgb_optical'` (hostname from `main.py`) |
+
+These two pairs are the **same physical frames under different names**, not two
+separate cameras. The URDF tree (`base_link → waist_yaw_link → head_center_link → camera_link →
+camera_optical_frame`) is published on `/tf_static` by the embedded tf tree
+below (when enabled), so a `lookup(base_link → camera_optical_frame)` resolves.
+The odometry tree
+(`bumi_visual_<uuid>_base → <hostname>_rgb_optical`) is still estimator-private
+and broadcast separately by `visual_odometry.py`; the two trees remain
+**disconnected** — a `lookup(base_link → <hostname>_rgb_optical)` reports
+`not connected`. Any consumer that needs both must link them explicitly (e.g.
+a `camera_link → bumi_visual_*_base` identity link) rather than assume the
+same-physical name pairs coincide automatically, and must not hard-code a parent
+frame in place of the `frame_id` already carried by the input image header.
+
+## Full-localisation tf is embedded, not a card
+
+Per CTO direction, tf localisation is an **implicit capability of the functional
+card** that produces the pose — here `rgbd_visual_odometry` — rather than a
+chain of scattered canvas cards. The former `vision_tf` and `tf_tree`
+**processor cards are retired**: they are no longer listed in `driver.yaml`,
+no longer registered by `main.py`, and never appear on the canvas. Their pure
+logic stays in `vision_tf_spec.py` / `tf_tree_spec.py` as the libraries the
+embedded tree is built from.
+
+The embedded tree is **OFF by default**. Set
+`plugins.visual_odometry.tf.enabled: true` in `config.yaml` to turn it on;
+enabling the odometry card alone never publishes `/tf`. When on, the odometry
+card hosts a `tf_tree` node on its own executor that publishes:
+
+- the URDF `fixed` joints (including the camera mount chain) on latched
+  `/tf_static`;
+- the 21 revolute joints on `/tf`, driven by `/{ns}/state/joints`;
+- **the camera's own odom pose** — `bumi_visual_<uuid>_odom →
+  bumi_visual_<uuid>_base`, stamped with the estimator's own `stamp_ns` — as a
+  dynamic `/tf` edge, for every accepted tracking sample.
+
+The card's `data/json` and `state/odom` outputs are unchanged by tf being on or
+off. Its `info()` returns a `tf` health snapshot (state, frame counts, parse
+error) and the status lives at `/{ns}/bumi_visual_odometry/tf_status`; there is
+no standalone card to wire up.
+
+### Camera frame and rotation still come from the URDF
+
+The camera's position on the robot is **not invented**. It comes from the
+`camera_link` / `camera_optical_frame` fixed frames in
+`resource/bumi_model.urdf`: `camera_mount_joint` carries the measured offset
+**+5 cm forward (x), +3.5 cm left (y), +0.5 cm up (z)** from `head_center_link`
+(the centre of the head), and `camera_optical_joint` carries the optical→body
+rotation (`rpy = (-π/2, 0, -π/2)`, quaternion `[-0.5, 0.5, -0.5, 0.5]` xyzw).
+The same rotation is the library constant
+`vision_tf_spec.ROTATION_ORDER` / `OPTICAL_TO_BODY_QUAT`, so there is a single
+source of truth.
+
+### The archived vision-localisation adapter (library, not a card)
+
+`vision_tf_spec.py` still offers the pure conversion from "where a vision
+algorithm says an object is" into tf-shaped edges, in case a deployment needs
+to attach external targets (AR marker, stamped pose, pixel+depth, object list)
+to the tree. It is a dependency-free library, not a card: no canvas tool, no
+`start`/`stop`, no left/right link. Its edge shape is:
+
+```json
+{
+  "stamp_ms": 1763551200123,
+  "source": "ar",
+  "parent_frame": "camera_optical_frame",
+  "pose_direction": "object_in_camera",
+  "rotation_order": "xyzw",
+  "units": "m",
+  "transforms": [
+    {
+      "parent": "camera_optical_frame",
+      "child": "vision_ar_17",
+      "stamp_ms": 1763551200100,
+      "stamp_source": "input",
+      "translation": [0.412, -0.108, 1.352],
+      "rotation": [0.0, 0.7071068, 0.0, 0.7071068],
+      "confidence": 0.92
+    }
+  ],
+  "rejected": 0, "sanitized": 0, "dropped": [], "degraded": "", "last_error": ""
+}
+```
+
+Every located object becomes one `parent → child` edge, with a camera frame as
+parent and `vision_<source>_<id>` as child. Quaternions are **xyzw** everywhere.
+The library's adapters are `pose`, `pose_tf_like`, `ar_marker`, `pixel_depth`;
+missing fields are rejected, never zero-filled. It applies no rotation by
+default (`input_frame: optical` leaves numbers untouched so the URDF rotation
+is applied once by the tree); `output_frame: body` opts into converting to
+machine axes via `camera_to_body_point` / `camera_to_body_quaternion`.
+
+### Freshness: consumers must check it themselves
+
+ROS `/tf` has no retract message: once an edge is published, a `tf2_ros` buffer
+keeps it for the consumer's cache duration even after the source stopped
+republishing. A consumer doing `lookup_transform(target, source, Time())`
+(latest available) can therefore get a stale pose with no error. Correct usage
+is to look up at a specific time and validate the returned header stamp with
+the dependency-free
+`tf_tree_spec.transform_is_fresh(header_stamp_ms, now_ms, max_age_ms)` helper.
+Treat a failed check as "not currently localised", never as a live pose.
+
+The embedded tree drives nothing and is not a pose source. Its status topic
+`/{ns}/bumi_visual_odometry/tf_status` is a *health* report (frame counts,
+publish rate, joint-sample age, `degraded` reason); reading it as a transform
+is a bug. It does not join trees that other cards broadcast separately — a
+consumer needing that must publish its own explicit transform rather than
+assume two same-physical frame names coincide.
+
+Configuration for the embedded tree is under
+`plugins.visual_odometry.tf`: `enabled` (false), `urdf_path`,
+`publish_rate_hz`, `max_joint_age_s`.

@@ -206,6 +206,11 @@ class BumiDeviceBundle:
                                                    and media_ctrl is not None)))
             print("[bundle] VisionCapturePlugin loaded")
 
+        # tf publishing is embedded in the visual-odometry card (see
+        # plugins.visual_odometry.tf). vision_tf / tf_tree are no longer
+        # standalone cards: their logic stays in vision_tf_spec / tf_tree_spec
+        # and is hosted by rgbd_visual_odometry when its tf switch is enabled.
+
     def start_all(self) -> None:
         failed = 0
         for i, p in enumerate(self._plugins):

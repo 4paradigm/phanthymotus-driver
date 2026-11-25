@@ -70,17 +70,26 @@ plugins:
     # Invalid values fall back to 10 Hz; the camera-side upper bound is 30 Hz.
     max_rate_hz: 10
     # Permanent body-axis convention for the standard level, forward-facing
-    # camera: robot x forward, y left, z up. This is an axis assumption, not a
-    # measured mount; translation is the camera origin in robot coordinates
-    # (zeros keeps the position origin at the camera). Replace the quaternion
-    # and translation with measured values if the camera is not level/forward.
+    # camera: robot x forward, y left, z up. The quaternion is still an axis
+    # assumption (not a measured mount), hence assumed: true. The translation
+    # IS measured (2026-11-24) and is the camera optical centre relative to the
+    # head geometric centre, which is the origin of `head_center_link` in the
+    # URDF: +5 cm forward (x), +3.5 cm left (y), +0.5 cm up (z).
     calibration:
       calibration_id: assumed-level-forward-optical-to-body
       fixed_mount: true
       assumed: true
       camera_to_body:
-        translation: [0.0, 0.0, 0.0]
+        translation: [0.05, 0.035, 0.005]
         quaternion: [-0.5, 0.5, -0.5, 0.5]
+    # 内置 tf 树（不作为独立卡暴露）：把 URDF 静态链、关节动态边与相机自身的
+    # odom 位姿发到 /tf、/tf_static，供下游用 tf2 自行 lookup。默认关闭：
+    # 开启视觉里程计卡不会自动发 tf，须显式打开此开关。视觉 JSON 输出不受影响。
+    tf:
+      enabled: false
+      urdf_path: /work/resource/bumi_model.urdf
+      publish_rate_hz: 10        # status 话题频率；/tf 由关节样本与视觉位姿驱动
+      max_joint_age_s: 0.5       # 超过此时长判定 joints_stale，不再当作新位姿
   motion_state:
     enabled: true
     # 2 Hz: sufficient for Agent-facing motion telemetry without excessive DDS reads.

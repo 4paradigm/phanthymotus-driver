@@ -154,6 +154,8 @@ COPY visual_odometry_probe.py /work/visual_odometry_probe.py
 COPY odom_spec.py /work/odom_spec.py
 COPY sound_direction.py /work/sound_direction.py
 COPY direction_card.py /work/direction_card.py
+COPY tf_tree_spec.py /work/tf_tree_spec.py
+COPY tf_tree_card.py /work/tf_tree_card.py
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/
 

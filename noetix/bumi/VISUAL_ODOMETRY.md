@@ -14,6 +14,23 @@ config to disable it. When enabled, `main.py` exports
 pyrealsense2 capture process publishes the raw RGB-D branch `visual_inputs.py`
 uses. Disabled means no raw branch, no estimator child, no extra DDS traffic.
 
+## Embedded tf tree (optional, off by default)
+
+Full-localisation tf is an **implicit capability of this card**, not a pair of
+canvas cards. The former `vision_tf` / `tf_tree` processor cards are retired.
+Set `plugins.visual_odometry.tf.enabled: true` to make this card publish:
+
+- URDF `fixed` joints (the camera mount chain included) on latched `/tf_static`;
+- the 21 revolute joints on `/tf` from `/{ns}/state/joints`;
+- the camera's own odom pose `<segment>_odom → <segment>_base` on `/tf`, using
+  the estimator's own `stamp_ns` for every accepted tracking sample.
+
+With the switch off (the default), enabling this card publishes **no** `/tf`.
+The `data/json` / `state/odom` outputs are unchanged either way. Health is
+reported under `info()['tf']` and at `/{ns}/bumi_visual_odometry/tf_status`;
+the tree comes up and tears down with the card. Configuration keys are
+`plugins.visual_odometry.tf.{urdf_path, publish_rate_hz, max_joint_age_s}`.
+
 ## Card
 
 | Field | Value |
@@ -44,8 +61,10 @@ Displacement is the 3-D straight-line distance from the **first tracking pose of
 the current segment**, not accumulated walking distance or validated accuracy.
 The shipping `config.yaml` sets a permanent **body-axis convention** for the
 standard level, forward-facing camera: `x` forward, `y` left, `z` up
-(`pose_reference=body_axes`). It is an axis assumption, not a measured extrinsic;
-the pose origin is the camera because the default translation is zero. Reset
+(`pose_reference=body_axes`). The quaternion is still an axis assumption, but the
+translation is measured: the camera optical centre sits `0.05 0.035 0.005` m
+from the head geometric centre (`head_center_link` in the URDF), so the pose
+origin is that head-centre datum rather than the camera itself. Reset
 starts a new segment and distance origin.
 
 The canvas declares two outputs: the 5 Hz `status` summary (`data/json`) and the
@@ -101,9 +120,11 @@ reset is required.
   results get the 1.5 s grace described above.
 - One segment-scoped static TF `base -> optical` is published before the child
   starts. The default config uses the standard level-forward rotation
-  (`[-0.5, 0.5, -0.5, 0.5]`, xyzw) with zero translation, so `base` carries robot
-  body axes (x forward, y left, z up) at the camera origin; `publish_tf` of the
-  estimator stays false. Removing calibration falls back to `rgb_optical`.
+  (`[-0.5, 0.5, -0.5, 0.5]`, xyzw) with the measured translation
+  `[0.05, 0.035, 0.005]` m from the head geometric centre, so `base` carries
+  robot body axes (x forward, y left, z up) at the head-centre datum;
+  `publish_tf` of the estimator stays false. Removing calibration falls back to
+  `rgb_optical`.
 - With `imu_assisted: false`, the unused `imu` remap prevents an accidental live
   subscription. With body assistance enabled, the segment's private republished
   body orientation topic is remapped to RTAB-Map.
@@ -118,7 +139,7 @@ RTAB-Map's odometry message is a trajectory delta, not a measured body twist.
 
 - `pose`: `{position, quaternion xyzw, frame_id, child_frame_id, covariance[36]}`;
   `child_frame_id` is `<segment>_base`, which carries robot body axes by default
-  (x forward, y left, z up) at the camera origin.
+  (x forward, y left, z up) at the head geometric-centre datum.
 - `vendor`: `status` (`initializing`/`tracking`/`lost`), `reason`, `segment_id`,
   `calibration_id`, `pose_reference` (`body_axes` by the shipped level-forward
   assumption; `body` for a measured mount; `rgb_optical` if calibration is

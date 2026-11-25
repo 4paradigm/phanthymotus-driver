@@ -46,6 +46,16 @@ EXECUTABLE = 'rgbd_odometry'
 OUTPUT_TOPIC = '/bumi_visual_odometry/state/odom'
 STATUS_TOPIC = '/bumi_visual_odometry/status'
 
+# The tf tree used to be two standalone processor cards (vision_tf -> tf_tree).
+# CTO direction is that full-localisation tf is an *implicit capability* of a
+# functional card, not scattered canvas cards. The pure maths stays in
+# vision_tf_spec / tf_tree_spec; the board-facing card is this visual-odometry
+# sensor, which hosts a tf-tree node internally. It is OFF by default
+# (`plugins.visual_odometry.tf.enabled`), so enabling the odometry card never
+# silently starts publishing /tf.
+TF_STATUS_TOPIC = '/bumi_visual_odometry/tf_status'
+_DEFAULT_URDF_PATH = '/work/resource/bumi_model.urdf'
+
 # A gap in RTAB-Map results is not immediately fatal: walking increases its
 # processing time (observed 0.13 s stationary -> 0.37 s walking). Wait for the
 # configured age limit, then start a new segment instead of staying lost.
@@ -220,11 +230,12 @@ def estimate(msg, segment, frame_id):
 class VisualOdometryNode:
     """Quality state machine and process supervisor for one visual estimator."""
 
-    def __init__(self, namespace, config=None, high_ctrl=None):
+    def __init__(self, namespace, config=None, high_ctrl=None, executor=None):
         from rclpy.node import Node
         from rclpy.qos import qos_profile_sensor_data
         from std_msgs.msg import String
         self.namespace = namespace
+        self.executor = executor  # for the optional embedded tf-tree node
         self.node = Node('bumi_visual_odometry')
         self.qos = qos_profile_sensor_data
         self.String = String
@@ -275,6 +286,13 @@ class VisualOdometryNode:
         self.calibration = None
         raw = self.config.get('calibration') or None
         self.calibration = CameraCalibration(raw) if raw else None
+        # Embedded tf tree: OFF unless explicitly enabled. Constructing the
+        # node is deferred to start_tf() so a disabled card never touches the
+        # URDF or /tf broadcasters (and offline tests need no tf2_ros stub).
+        self.tf_config = dict(self.config.get('tf') or {})
+        self.tf_enabled = self.tf_config.get('enabled', False) is True
+        self.tf_node = None
+        self.tf_states = dict(enabled=self.tf_enabled, state='idle' if self.tf_enabled else 'disabled')
         self.restarts = 0
         self.last_restart_monotonic = None
         self._new_segment()
@@ -350,6 +368,95 @@ class VisualOdometryNode:
         # assumed axis mapping for a measured reference point.
         return 'body_axes' if self.calibration.assumed else 'body'
 
+    # -- embedded tf tree ----------------------------------------------------
+    # Full-localisation tf is an implicit capability of this card, not a pair
+    # of canvas cards. The tree maths is reused from tf_tree_spec via the same
+    # _TfTreeNode the standalone card used; only the wiring differs: no vision
+    # topic subscription, and the camera odom pose is pushed in directly from
+    # the accepted estimates below. Publishing is opt-in and starts/stops with
+    # the odometry card so a stopped card leaves no fresh tf behind.
+
+    def start_tf(self):
+        """Start the internal tf-tree node, reusing a paused one (idempotent).
+
+        A canvas stop/reset pauses the node rather than discarding it, so a
+        later start reuses the SAME node instead of adding a second, same-named
+        node to the executor. Only close() destroys it. This is what keeps the
+        executor node count stable across repeated stop/start cycles.
+        """
+        if not self.tf_enabled:
+            return
+        node = self.tf_node
+        if node is not None:
+            if not node.running:
+                node.start('')  # reset of a previously paused node
+            self.tf_states = dict(enabled=True, state='running',
+                                  parse_error=node.parse_error)
+            return
+        from tf_tree_card import _TfTreeNode
+        cfg = self.tf_config
+        urdf_path = str(cfg.get('urdf_path', _DEFAULT_URDF_PATH))
+        publish_rate_hz = float(cfg.get('publish_rate_hz', 10.0))
+        max_joint_age_s = float(cfg.get('max_joint_age_s', 0.5))
+        if not 1.0 <= publish_rate_hz <= 30.0:
+            raise ValueError('tf.publish_rate_hz must be in [1.0, 30.0]')
+        if not 0.1 <= max_joint_age_s <= 5.0:
+            raise ValueError('tf.max_joint_age_s must be in [0.1, 5.0]')
+        status_topic = f'/{self.namespace}'+TF_STATUS_TOPIC
+        node = _TfTreeNode(
+            self.namespace, urdf_path, publish_rate_hz, max_joint_age_s,
+            500,  # no external vision topic; camera pose is pushed directly
+            node_name='bumi_visual_odometry_tf', status_topic=status_topic)
+        if self.executor is not None:
+            self.executor.add_node(node)
+        self.tf_node = node
+        node.start('')
+        self.tf_states = dict(enabled=True, state='running',
+                              parse_error=node.parse_error)
+
+    def stop_tf(self, destroy=False):
+        """Pause the internal tf tree; only close() destroys it.
+
+        Keeping the reference across a stop/reset lets start_tf() reuse the
+        node. ``destroy=True`` (close) additionally removes it from the
+        executor and destroys it, so no stopped node leaks for the driver's
+        lifetime.
+        """
+        node = self.tf_node
+        if node is None:
+            self.tf_states = dict(enabled=self.tf_enabled, state='idle')
+            return
+        node.stop()
+        self.tf_states = dict(enabled=self.tf_enabled, state='idle')
+        if not destroy:
+            return  # keep the reference for reset() to reuse
+        self.tf_node = None
+        if self.executor is not None and hasattr(self.executor, 'remove_node'):
+            try:
+                self.executor.remove_node(node)
+            except Exception:
+                pass  # node already deregistered during teardown
+        node.destroy_node()
+
+    def publish_tf_pose(self, data):
+        """Publish the camera's own odom pose as a dynamic tf edge.
+
+        The edge is ``<segment>_odom -> <segment>_base``, stamped with the
+        estimator's own ``stamp_ns`` — never publish time — for the same
+        reason as the joint path: a late estimate must not look current to a
+        downstream ``lookup_transform``. ``data`` is one accepted estimate.
+        """
+        node = self.tf_node
+        if node is None or not node.running or not isinstance(data, dict):
+            return
+        pose = data.get('pose')
+        if not isinstance(pose, dict):
+            return
+        node.publish_pose(
+            pose.get('frame_id'), pose.get('child_frame_id'),
+            pose.get('position'), pose.get('quaternion'),
+            data.get('stamp_ns', 0))
+
     def publish(self):
         sample = make_sample(self.health, self.now(), self.estimate, self.pose_reference())
         if not self.active:
@@ -385,6 +492,17 @@ class VisualOdometryNode:
         self.status_publisher.publish(self.String(data=json.dumps(summary, allow_nan=False)))
         self.last_summary_ns, self.last_summary_state = now, state
 
+    def _tf_info(self):
+        """Health snapshot of the embedded tree, exposed under this card."""
+        info = dict(self.tf_states)
+        node = self.tf_node
+        if node is not None:
+            try:
+                info.update(node.snapshot())
+            except Exception:  # a health snapshot must never break card info
+                info['error'] = 'tf snapshot unavailable'
+        return info
+
     def info(self):
         from common.odom import build_interface
         sample = self.publish()
@@ -395,10 +513,16 @@ class VisualOdometryNode:
                                 'message_type': 'std_msgs/msg/String'}],
                     odom_topic=self.output,
                     sample=sample,
+                    # Embedded tf is reported on the same card's info, never as
+                    # a separate tool. `tf` is a small health snapshot so an
+                    # operator can tell whether /tf is actually being fed.
+                    tf=self._tf_info(),
                     # The existing canvas details dialog renders info.description.
                     description=('Read-only RGB-D visual odometry. Full odometry: '+self.output+
                                  '\nDisplacement is from the first tracking pose after reset, '
-                                 'not accumulated path length.\nDiagnostics:\n'+
+                                 'not accumulated path length.\nEmbedded tf: '+
+                                 json.dumps(self._tf_info(), ensure_ascii=False)+
+                                 '\nDiagnostics:\n'+
                                  json.dumps(sample, indent=2, allow_nan=False)),
                     odom_interface=build_interface(provides=[], rate_hz=20,
                                                    pose_drift='unbounded'),
@@ -413,6 +537,9 @@ class VisualOdometryNode:
             self._new_segment()
             self.active = True
             self.bind_inputs(self.namespace)
+        # tf is an implicit capability: it comes up with the card, but only
+        # when explicitly enabled in config (never by default).
+        self.start_tf()
         self._set_raw_enabled(True)
         return self.info()
 
@@ -422,6 +549,9 @@ class VisualOdometryNode:
         if self.active:
             self.health.fault(reason)
             self.publish()
+        # Stop tf before clearing the estimate so no accepted pose can be
+        # published after the tree has torn down.
+        self.stop_tf()
         self.active = False
         self.children.stop()
         for sub in self.input_subs+self.result_subs:
@@ -816,6 +946,10 @@ class VisualOdometryNode:
             # Back on the accepted trajectory: a short glitch is dropped, not fatal.
             self._clear_jump()
         self.estimate = data
+        # Push the camera's own odom pose into the embedded tree. This is the
+        # only path that adds a dynamic pose edge; a rejected/stale sample never
+        # reaches /tf, and the tf node stamps it with data['stamp_ns'].
+        self.publish_tf_pose(data)
         self.last_visual_monotonic = now
         self.last_good_monotonic = now
         self.invalid_since = None
@@ -921,6 +1055,10 @@ class VisualOdometryNode:
         with self.lock:
             if self.closed:
                 return
+            # Destroy the embedded tf node before stop() clears tf_node: stop()
+            # only pauses the tree (so reset() can reuse it), while close()
+            # must release the node from the executor for good.
+            self.stop_tf(destroy=True)
             self.stop('bundle shutting down')
             self.closed = True
             self.node.destroy_node()
@@ -936,7 +1074,8 @@ class VisualOdometryPlugin:
 
     def __init__(self, plugin_config, namespace, executor, high_ctrl=None):
         self._namespace = namespace
-        self._node = VisualOdometryNode(namespace, plugin_config, high_ctrl=high_ctrl)
+        self._node = VisualOdometryNode(
+            namespace, plugin_config, high_ctrl=high_ctrl, executor=executor)
         executor.add_node(self._node.node)
 
     def get_tools(self) -> list:
@@ -948,7 +1087,13 @@ class VisualOdometryPlugin:
                             + ('body IMU rotation assistance; no inertial translation/EKF, '
                                if self._node.imu_assisted else 'no IMU/EKF/fusion, ')+
                             'not in the motion path. '
-                            f'Canvas status: {self._node.status_topic}; full odometry: {self._node.output}'),
+                            + ('Embedded tf tree ON: /tf + /tf_static carry the URDF '
+                               'static chain, joint edges and this camera\'s odom pose; '
+                               f'health: {self._node.namespace}/bumi_visual_odometry/tf_status. '
+                               if self._node.tf_enabled else
+                               'Embedded tf tree OFF (plugins.visual_odometry.tf.enabled); '
+                               'no /tf is published by this card. ')
+                            + f'Canvas status: {self._node.status_topic}; full odometry: {self._node.output}'),
             'inputSchema': {
                 'type': 'object',
                 'properties': {

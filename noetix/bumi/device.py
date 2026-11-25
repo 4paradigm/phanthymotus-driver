@@ -279,6 +279,12 @@ class _BumiStateNode(Node):
                     imu = self._high_ctrl.get_imu_data()
                     workmode = self._high_ctrl.get_mode()
                     joints_data = {
+                        # Stamp the reading at read completion, not in the
+                        # subscriber callback: the joint topic is a deep
+                        # best-effort queue, so a consumer that stamps on
+                        # callback could publish seconds-old poses as current.
+                        "stamp_ns": int(self.get_clock().now().nanoseconds),
+                        "timestamp_source": "read_completion",
                         "joints": joints,
                         "imu_quat": [float(imu.ori[3]), float(imu.ori[0]), float(imu.ori[1]), float(imu.ori[2])],  # SDK [x,y,z,w] → renderer [w,x,y,z]
                         "workmode": workmode,
@@ -348,7 +354,7 @@ class StatePlugin:
                 "name": "model",
                 "type": "resource",
                 "multiInstance": False,
-                "description": "Bumi URDF model for 3D skeleton visualization — 21-DOF kinematic chain",
+                "description": "Bumi URDF model for 3D skeleton visualization — 21-DOF kinematic chain plus the camera mount (camera_link) and optical frame (camera_optical_frame) that vision results attach to",
                 "inputSchema": {"type": "object", "properties": {}},
             },
         ]
