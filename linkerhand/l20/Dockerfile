@@ -8,6 +8,12 @@ WORKDIR /work
 COPY requirements.txt /work/requirements.txt
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r /work/requirements.txt
 
+ARG L20_MODEL_URL=https://urdf-view.linkerbot.cn/api/v1/urdf-models/10/download
+RUN mkdir -p /work/mujoco_card \
+    && python3 -c "from urllib.request import urlretrieve; import sys; urlretrieve(sys.argv[1], '/work/mujoco_card/vendor.zip')" "${L20_MODEL_URL}" \
+    && echo 'f5558bc0aa0d70503cd21611efc9e446592aac535dd68c9e61f71754004b2327  /work/mujoco_card/vendor.zip' | sha256sum -c -
+
+COPY mujoco_card/*.py mujoco_card/workbench.html mujoco_card/sim-launch /work/mujoco_card/
 COPY common/           /work/common/
 COPY main.py           /work/main.py
 COPY can_client.py     /work/can_client.py
@@ -31,4 +37,4 @@ ENV PYTHONPATH=/work
 
 EXPOSE 15734
 
-CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && python3 /work/main.py"]
+CMD ["/bin/bash", "-c", "source /opt/ros/humble/setup.bash && source /ros_ws/install/setup.bash && exec python3 /work/main.py"]

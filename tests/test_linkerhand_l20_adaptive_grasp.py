@@ -1006,7 +1006,8 @@ def test_adaptive_grasp_replaces_old_card():
     config = yaml.safe_load((DRIVER / "config.yaml").read_text())
     plugins = build_plugins(config, "", None)
     tools = {tool["name"]: tool for tool in DriverBundle(plugins).get_all_tools()}
-    assert set(tools) == {"hand", "hand_gesture", "hand_grasp", "hand_tactile", "joints", "model"}
+    assert set(tools) == {"hand", "hand_gesture", "hand_grasp", "hand_tactile", "joints", "model",
+                          "l20_mujoco", "hand_gesture_sim", "hand_grasp_sim"}
     assert next(plugin for plugin in plugins if plugin.PREFIX == "hand_grasp").__class__ is AdaptiveGraspPlugin
     schema = tools["hand_grasp"]["inputSchema"]
     assert set(schema["x-action-params"]) == {"adaptive_grasp", "preview_settings", "prepare", "close_until_contact", "release", "get_state", "config"}

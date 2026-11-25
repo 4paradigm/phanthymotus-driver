@@ -9,7 +9,7 @@ import threading
 import time
 import uuid
 
-from trajectories import FORMAT, VERSION, SIDES, FPS, channel, validate_packet
+from mujoco_card.trajectories import FORMAT, VERSION, SIDES, FPS, channel, validate_packet
 
 
 @dataclass

@@ -6,7 +6,7 @@ hardware_model: "l20"
 image_name: linkerhand-l20
 port: 15734
 mcp_url: "http://localhost:15734/mcp"
-description: "灵心巧手 L20 — USB-CAN 1Mbps，16 主动关节控制、数字手势、自适应接触停止抓握、独立触觉传感器与单手关节实时骨架卡片（CAN 接口自动匹配，只输出骨架）"
+description: "灵心巧手 L20 — USB-CAN 1Mbps，16 主动关节控制、数字手势、自适应接触停止抓握、独立触觉传感器、关节骨架和仅仿真的 MuJoCo 轨迹预演（同一服务注册实手和仅仿真卡片）"
 build_context_extras:
   - ../../common
 cards:
@@ -16,3 +16,6 @@ cards:
   - { name: hand_tactile, type: sensor }
   - { name: joints, type: sensor }
   - { name: model, type: resource }
+  - { name: l20_mujoco, type: processor }
+  - { name: hand_gesture_sim, type: actuator }
+  - { name: hand_grasp_sim, type: actuator }

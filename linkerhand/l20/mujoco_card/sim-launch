@@ -1,9 +1,18 @@
 #!/bin/bash
 set -e
-if [[ ! -f "${FASTRTPS_DEFAULT_PROFILES_FILE:-}" || ! -s "${FASTRTPS_DEFAULT_PROFILES_FILE:-}" || ! -r "${FASTRTPS_DEFAULT_PROFILES_FILE:-}" ]]; then
-    echo "L20 simulation requires the readable fleet DDS profile at ${FASTRTPS_DEFAULT_PROFILES_FILE:-/opt/phanthy-motus/dds-local.xml}" >&2
+profile=${FASTRTPS_DEFAULT_PROFILES_FILE:-/opt/phanthy-motus/dds-local.xml}
+if [[ ! -f "$profile" || ! -r "$profile" || ! -s "$profile" ]]; then
+    echo "L20 simulation requires the readable fleet DDS profile at $profile" >&2
     exit 1
 fi
-source /opt/ros/humble/setup.bash
-source /ros_ws/install/setup.bash
-exec python3 /opt/g20-simulation/simulation.py
+export FASTRTPS_DEFAULT_PROFILES_FILE="$profile"
+export SIM_STATE_DIR=${SIM_STATE_DIR:-/opt/phanthy-motus/data/l20-mujoco}
+export ROS_HOME=/tmp/l20-mujoco-ros ROS_LOG_DIR=/tmp/l20-mujoco-ros/log
+export MUJOCO_GL=disable OPENBLAS_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1
+install -d -m 0750 -o nobody -g nogroup "$SIM_STATE_DIR"
+# The colocated physical driver needs CAN access. The preview worker gets none
+# of its capabilities or device handles and additionally blocks CAN in Python.
+export HOME=/tmp
+exec setpriv --reuid=nobody --regid=nogroup --clear-groups --no-new-privs \
+    --bounding-set=-all --inh-caps=-all --ambient-caps=-all \
+    python3 /work/mujoco_card/simulation.py

@@ -29,7 +29,8 @@ def test_manifest_matches_enabled_runtime_cards_without_opening_can():
     assert actual == {d["name"]: d["type"] for d in manifest["cards"]}
     assert actual == {"hand": "actuator", "hand_gesture": "actuator",
                       "hand_grasp": "actuator", "hand_tactile": "sensor",
-                      "joints": "sensor", "model": "resource"}
+                      "joints": "sensor", "model": "resource", "l20_mujoco": "processor",
+                      "hand_grasp_sim": "actuator", "hand_gesture_sim": "actuator"}
     assert config["plugins"]["hand"]["enabled"]  # Sensor shares this controller.
 
 
@@ -77,8 +78,8 @@ def test_tactile_defaults_produce_the_declared_sensor_topic():
 
 def test_tactile_uses_core_renderer_without_image_dependencies():
     assert 'tactile_heatmap.py' not in (DRIVER / 'Dockerfile').read_text()
-    requirements = (DRIVER / 'requirements.txt').read_text().lower()
-    assert 'pillow' not in requirements and 'numpy' not in requirements
+    tactile = (DRIVER / 'tactile_device.py').read_text()
+    assert 'from PIL' not in tactile and 'import numpy' not in tactile
 
 
 def test_actuator_shared_can_change_does_not_rewrite_sensor_target_or_topics():

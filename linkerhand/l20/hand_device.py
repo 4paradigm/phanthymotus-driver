@@ -837,6 +837,10 @@ def build_plugins(config: dict, _namespace: str, _ros2) -> list:
         from tactile_device import TactilePlugin
         plugins.append(TactilePlugin(hand_plugin, tactile_config, global_config=config, ros2=_ros2, namespace=_namespace))
 
+    if config.get("plugins", {}).get("l20_mujoco", {}).get("enabled", False):
+        from mujoco_card.preview_cards import PreviewCards
+        plugins.append(PreviewCards(config))
+
     joints_config = config.get("plugins", {}).get("joints")
     if joints_config and joints_config.get("enabled", True):
         from joints_device import JointsPlugin

@@ -1,4 +1,4 @@
-# LinkerHand L20 USB-CAN 驱动与五张卡片
+# LinkerHand L20 USB-CAN 驱动与 MuJoCo 仿真卡片
 
 本目录适配第四范式 Agent Core / PhanthyMotus，当前开发和实测设备为 **L20-10**：16 个主动关节、USB-CAN、五指指尖触觉反馈。L20 Lite（又称 L10）的 RS-485/Modbus 驱动位于相邻的 `l20_lite` 目录。
 
@@ -9,6 +9,9 @@
 | `hand_grasp` | `actuator` | 自适应接触停止抓取、释放和状态读取 |
 | `hand_tactile` | `sensor` | 按卡片选择采集左右手触觉，发布供 Core 渲染的实时触觉数据 |
 | `joints` | `sensor` | 每张卡片选择左手或右手，CAN 接口自动匹配，持续读取 16 主动关节实测位置，只输出该手的实时骨架 |
+| `model` | `resource` | 查询该手的模型资源 |
+| `l20_mujoco` | `processor` | 实时播放左右手的关节轨迹，并回放最近完整动作 |
+| `hand_grasp_sim`、`hand_gesture_sim` | `actuator` | 仅向虚拟手发送抓取或手势轨迹 |
 
 另有 `model`（`resource`）向 Core 提供左右手骨架 URDF，不是画布卡片。
 
@@ -236,7 +239,7 @@ PYTHONPATH=. python3 linkerhand/l20/hardware_smoke.py --tactile-matrix
 
 2026-10-30 验证：以上固定组合完成 `linux/arm64` 镜像构建，镜像内核对依赖版本后，离线回归为 1001 项通过、1 项跳过（旧协议不适用的五指位置回复用例）。新增 ACP 回归使用实际工作线程入口，覆盖有／无卡片 ID 时完成通知失败、终态查询及同一物理目标后续运动被拒绝；不连接真实 CAN。
 
-`Dockerfile` 包含五张卡片的 Python 模块及 `resource/` 模型文件。完整构建时需把仓库 `common/` 加入构建上下文；`driver.yaml` 已通过 `build_context_extras` 声明该目录，并列出三张 actuator、两张 sensor 和 `model` 资源。以下命令在仓库根目录构建本地 ARM64 镜像，不推送镜像仓库：
+`Dockerfile` 包含实手与仿真卡片的 Python 模块及 `resource/` 模型文件。完整构建时需把仓库 `common/` 加入构建上下文；`driver.yaml` 已通过 `build_context_extras` 声明该目录，并列出五张 actuator、两张 sensor、一张 processor 和 `model` 资源。以下命令在仓库根目录构建本地 ARM64 镜像，不推送镜像仓库：
 
 ```bash
 l20_build_context=$(mktemp -d /tmp/linkerhand-l20-build.XXXXXX)
@@ -261,7 +264,7 @@ docker restart embodied-linkerhand-l20
 docker logs --since 1m --tail 60 embodied-linkerhand-l20
 ```
 
-底层通信模块等文件也有变更时应一并复制。`docker cp` 修改容器可写层，不更新原镜像；以后删除并重建容器，应使用包含最新文件的 ARM64 镜像。重启会清空内存中的运行任务和抓握模式，不保留执行器绑定；刷新页面后应看到五张卡片，执行器按动作区选择左右手，`hand_grasp` 提供 `adaptive_grasp`、`release`、`get_state` 三个公开动作。
+底层通信模块等文件也有变更时应一并复制。`docker cp` 修改容器可写层，不更新原镜像；以后删除并重建容器，应使用包含最新文件的 ARM64 镜像。重启会清空内存中的运行任务和抓握模式，不保留执行器绑定；刷新页面后可在同一 L20 服务下查看卡片，执行器按动作区选择左右手，`hand_grasp` 提供 `adaptive_grasp`、`release`、`get_state` 三个公开动作。
 
 ## 5. 执行目标、共享 CAN 与停止行为
 

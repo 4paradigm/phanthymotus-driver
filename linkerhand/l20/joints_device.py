@@ -323,13 +323,18 @@ class _JointsStream:
                 # Waiting for a free hand: publish nothing, just keep looking
                 # for a hand that appeared since the last look.
                 now = time.monotonic()
-                if now >= next_match:
-                    next_match = now + MATCH_RETRY_INTERVAL_S
-                    target = self.plugin._match(self.instance_id, self.side)
-                    if target is not None:
-                        self.set_channel(target[1])
-                        continue
-                    self.waiting_reason = self.plugin._match_reason(self.side)
+                # stop() joins this worker while holding the lifecycle lock. If a
+                # lifecycle change is in progress, retry on the next loop tick.
+                if now >= next_match and self.plugin._lifecycle_lock.acquire(blocking=False):
+                    try:
+                        next_match = now + MATCH_RETRY_INTERVAL_S
+                        target = self.plugin._match(self.instance_id, self.side)
+                        if target is not None:
+                            self.set_channel(target[1])
+                            continue
+                        self.waiting_reason = self.plugin._match_reason(self.side)
+                    finally:
+                        self.plugin._lifecycle_lock.release()
                 if self._skeleton_pub is None and now - self._last_publisher_attempt >= 2.0:
                     self._setup_publishers()
                 self._stop_event.wait(0.05)
