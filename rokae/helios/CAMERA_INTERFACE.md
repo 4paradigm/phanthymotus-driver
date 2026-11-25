@@ -12,7 +12,7 @@ Five upper-body colour channels were independently captured and then read concur
 | `head_rear_left_fisheye` | head, rear left, fisheye | `vi-output, shw3h 10-0021` | UYVY, 1920×1536, 60 fps | 640×512, 15 fps |
 | `head_rear_right_fisheye` | head, rear right, fisheye | `vi-output, shw3h 10-0022` | UYVY, 1920×1536, 60 fps | 640×512, 15 fps |
 
-G300 MJPEG capture did not produce a frame in the probe; raw YUY2 capture did. Native input rates are negotiated camera formats, not claims about measured delivery rate. Positions were confirmed on site by the operator (2026-11-22); left/right are from the robot's own perspective. Intrinsics, distortion, FOV and extrinsics are unknown; `motus.camera/1` declares `source=unknown` and only reports output dimensions after a frame has arrived. Receive timestamps are not manufacturer hardware sample times or synchronised timestamps across cameras.
+G300 MJPEG capture did not produce a frame in the probe; raw YUY2 capture did. Native input rates are negotiated camera formats, not claims about measured delivery rate. Positions were confirmed on site by the operator (2026-11-22); left/right are from the robot's own perspective. Intrinsics, distortion, FOV and extrinsics are unknown; `motus.camera/1` declares `source=unknown` with the fixed output size (640×400 for G300, 640×512 for SHW3H), reported even before a card starts streaming. Receive timestamps are not manufacturer hardware sample times or synchronised timestamps across cameras.
 
 ## Chassis cameras are not included
 
