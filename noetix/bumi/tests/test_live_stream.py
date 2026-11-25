@@ -90,7 +90,7 @@ def jpeg(tmp_path_factory):
 def test_tool_keeps_the_address_a_setting_and_takes_camera_and_mic():
     tool = _load().LiveStreamPlugin({}, "robot", _Executor()).get_tool()
     field = tool["configSchema"]["properties"]["rtmp_url"]
-    assert field["x-sensitive"] is True and field["format"] == "password"
+    assert field["x-sensitive"] is True and field.get("format") != "password"
     # Agent Core turns every x-action-params entry into an LLM tool.
     assert set(tool["inputSchema"]["x-action-params"]) == {"go_live", "end_live", "info"}
     assert {p["format"] for p in tool["topic_in"]} == {"image/jpeg", "audio/pcm-16k"}
