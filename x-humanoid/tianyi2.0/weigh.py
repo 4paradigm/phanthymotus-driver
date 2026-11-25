@@ -1,10 +1,11 @@
 """x-humanoid/tianyi2.0/weigh.py — 天轶2.0 腕部六维力托举称重卡（实验性）。
 
-卡片上只有两个动作（side 选 right / left，默认 right）：
+卡片上只有两个动作（side 选 right / left / both，默认 right；both = 两只手各放一件、重量相加）：
   - ``weigh``：一次走完整个流程，不需要大模型编排——
       1. 手臂已在托举姿态、cup 手型、去皮有效：直接进入第 2 步；
          否则把手臂抬到托举姿态（掌心朝上），四指立起围住掌心（cup），空手去皮；
-      2. 语音提示「请在 5 秒内把物品放到右手掌心」，播完才开始计时；
+         开始时先播报在做什么、大约要多久，并说明"听到请放物品再放"（去皮时掌心必须空着）；
+      2. 语音提示「请放物品。5秒内放到右手掌心」，播完才开始计时；
       3. 检测到物品后等读数稳定，测量；
       4. 语音播报重量。称完手臂保持举起，可以接着称下一件。
   - ``reset``：张开手指、放下手臂、清除去皮（掌上还有物品时拒绝，并提示先取走）。
@@ -21,8 +22,8 @@
 经 MCP 直接调用，同步返回。
 
 已知限制：零点只存在内存里。驱动重启时如果手臂还举着，本卡不知道掌上有没有东西，
-下一次 weigh 会直接重新去皮（开头会播报「请先不要往手上放东西」）；此时掌上若有物品，
-读数会错。重启后先 reset（勾选 confirm_empty）再称最稳妥。
+下一次 weigh 会直接重新去皮（开头会播报「这段时间请不要碰我的手」）；此时掌上若有物品，
+读数会错。重启后先 reset 再称最稳妥（零点丢失时 reset 会提示确认，10 秒内再点一次 reset 才动）。
 
 只有 ``weigh`` / ``reset`` 会让手臂和手指运动，而且不自己发指令：经 bundle 调用 arm 卡的
 ``move_pos``（复用它的急停/故障/限位预检、电流上限和运动反馈）、hand 卡的
@@ -134,13 +135,33 @@ DEFAULTS = {
     "hand_settle_s": 1.5,            # 手指动作后静置再去皮 / 再动手臂
     # ── 一键称重（卡片的 weigh 动作）──
     "place_window_s": 5.0,           # 提示播完后，等人把物品放到掌心的时间
+    "place_window_both_s": 8.0,      # side=both 时两只手都要放，多给一点时间
+    # 开场播报里说的准备时间（只是告诉人大概要等多久）。2026-11-25 实测：从垂下到去皮完成约 18 s；
+    # 手臂已举着、只需重新摆手势和去皮约 6 s。
+    "prepare_long_s": 20,
+    "prepare_short_s": 10,
     "detect_kg": 0.05,               # 掌上读数超过此值算"放上了物品"（与 retract_max_load_kg 一致）
     "measure_timeout_s": 10.0,       # 检测到物品后，等读数稳定并测量的上限
     "announce": True,                # 语音提示和播报结果（经 tts 卡）；False = 不出声
-    "announce_timeout_s": 30.0,      # 等一句话播完的上限
+    # 等一句话播完的上限。语音卡是单队列：前面排着别的长句（例如大模型在说话）时要等它说完，
+    # 2026-11-25 实测被一段 34 s 的话挡住、30 s 超时，所以放宽到 60 s。
+    "announce_timeout_s": 60.0,
     # reset 判断"掌上是否还有物品"时，同一姿态下的旧零点最多沿用多久。比去皮有效期长：
     # 称完手臂保持举起，过了 15 分钟再复位很常见；零点 20 分钟漂移 ≤ 8 g，远小于 50 g 的判据。
     "empty_check_max_age_s": 3600.0,
+    # reset 无法判断掌上有没有东西（例如驱动重启后零点丢了）时，先语音提示；这么多秒内
+    # 再调用一次 reset（同一个 side）才真正动作。代替原来卡片上的 confirm_empty 参数。
+    "reset_confirm_window_s": 10.0,
+    # 轻物体偏高的修正（分段线性）。每只手一张表 [[原始读数 kg, 修正系数], ...]，按原始读数升序：
+    # mass = raw / (scale × f(raw))，f 在表内线性插值，低于第一个点取第一个点的值，高于最后一个点取 1。
+    # 数据：2026-11-25 电子秤实测（水瓶 102–813 g，每个点 3 次、每组之前重新去皮）。400 g 以上
+    # 原始读数和真实重量是同一个比例（右 1.066、左 1.075，写在比例文件里），越轻越偏高：
+    # 100 g 时右手高约 11%、左手高约 17%。原因还没查清（三个方向分量没有记录），先按实测曲线修正；
+    # 留一法估计，表内没测过的重量误差约 ±2.5%。
+    "low_load_correction": {
+        "right": [[0.1213, 1.115], [0.2296, 1.0845], [0.5397, 1.0]],
+        "left": [[0.1308, 1.1695], [0.2291, 1.0758], [0.3381, 1.0242], [0.4310, 1.0]],
+    },
 }
 
 SIDE_NAMES = {"right": "右手", "left": "左手", "both": "双手"}
@@ -270,6 +291,7 @@ class WeighEngine:
         self._seq = 0
         self._results = {s: None for s in (*SIDES, "both")}
         self._attempt = None
+        self._reset_confirm = {}                     # side → reset 提示"无法确认"后可以确认的截止时间
         self._scales = self._load_scales()
 
     # ── 数据输入（ROS 回调线程调用，必须很快） ─────────────────────────────
@@ -587,13 +609,30 @@ class WeighEngine:
             return "tare_expired", age
         return None, age
 
+    def _low_load_factor(self, side, raw) -> float:
+        """low_load_correction 表在 raw（kg，未除比例）处的修正系数；没有表或表无效时为 1。"""
+        table = (self.cfg.get("low_load_correction") or {}).get(side) or []
+        try:
+            pts = sorted((float(r), float(f)) for r, f in table)
+        except (TypeError, ValueError):
+            return 1.0
+        if not pts or any(not (0.5 <= f <= 2.0) for _, f in pts):
+            return 1.0
+        if raw <= pts[0][0]:
+            return pts[0][1]
+        for (r0, f0), (r1, f1) in zip(pts, pts[1:]):
+            if raw <= r1:
+                return f0 + (f1 - f0) * (raw - r0) / (r1 - r0) if r1 > r0 else f1
+        return 1.0
+
     def _measure(self, side, a, tare, scale):
         cfg = self.cfg
         dF = _sub(a["F"][:3], tare["F"][:3])
         dT = _sub(a["F"][3:6], tare["F"][3:6])
         n = _norm(dF)
         raw = n / G
-        mass = raw / scale
+        f = self._low_load_factor(side, raw)
+        mass = raw / (scale * f)
         lever = None
         if n > 0.5:
             lever = _norm(_cross(dF, dT)) / (n * n)
@@ -605,7 +644,7 @@ class WeighEngine:
             reasons.append("current_high")
         if cfg["load_limit_kg"] and mass > cfg["load_limit_kg"]:
             reasons.append("over_load_limit")
-        return {"raw_kg": raw, "mass_kg": mass, "lever_arm_m": lever,
+        return {"raw_kg": raw, "mass_kg": mass, "low_load_factor": f, "lever_arm_m": lever,
                 "max_joint_dev_deg": dev, "reasons": reasons,
                 "force_direction": [x / n for x in dF] if n > 0.5 else None}
 
@@ -623,7 +662,8 @@ class WeighEngine:
             "state": "weighed", "side": side, "experimental": True,
             "valid": not m["reasons"], "stable": True, "reasons": m["reasons"],
             "mass_kg": _r(m["mass_kg"]), "mass_g": _r(m["mass_kg"] * 1000, 1),
-            "raw_kg": _r(m["raw_kg"]), **{k: (_r(v) if isinstance(v, float) else v) for k, v in sc.items()},
+            "raw_kg": _r(m["raw_kg"]), "low_load_factor": _r(m["low_load_factor"], 4),
+            **{k: (_r(v) if isinstance(v, float) else v) for k, v in sc.items()},
             "lever_arm_m": _r(m["lever_arm_m"], 3),
             "max_joint_dev_deg": _r(m["max_joint_dev_deg"], 3),
             "max_current_ratio": a["max_current_ratio"],
@@ -742,7 +782,8 @@ class WeighEngine:
             if blocking:
                 return self._error("calibration_rejected", side,
                                    "测量无效：" + ",".join(blocking), reasons=blocking)
-            new = m["raw_kg"] / known
+            # 比例系数对应 400 g 以上的直线段；轻物体先扣掉 low_load_correction 的修正
+            new = m["raw_kg"] / (known * m.get("low_load_factor", 1.0))
             if not self._scale_ok(new):
                 return self._error("scale_out_of_range", side,
                                    f"算出 scale={new:.4f}，不在 {lo}–{hi} 之间。检查物体是否放稳、"
@@ -1279,20 +1320,23 @@ class WeighEngine:
         return _FAIL_SPEECH.get(res.get("code"), "称重没有完成，请查看卡片上的提示")
 
     def _wait_for_object(self, sides, window):
-        """等掌上读数之和超过 detect_kg。返回 (load_kg, problem)；problem 为 None、no_object，
+        """等每只手的读数都超过 detect_kg（both 时两只手都放上了）；到时间只放了一部分也照样测，
+        一件都没有才是 no_object。返回 (load_kg, problem)；problem 为 None、no_object，
         或零点不能用的原因（例如有人把手臂推离了去皮时的姿态）。"""
         t0 = self._clock()
+        detect = self.cfg["detect_kg"]
         while True:
-            total = 0.0
+            loads = []
             for s in sides:
                 load, problem = self._palm_load(s, self.cfg["tare_ttl_s"])
                 if problem:
                     return None, problem
-                total += load
-            if total >= self.cfg["detect_kg"]:
+                loads.append(load)
+            total = sum(loads)
+            if all(x >= detect for x in loads):
                 return total, None
             if self._clock() - t0 >= window:
-                return total, "no_object"
+                return total, (None if any(x >= detect for x in loads) else "no_object")
             self._sleep(self.cfg["poll_s"])
 
     def auto_weigh(self, args: dict) -> dict:
@@ -1325,14 +1369,20 @@ class WeighEngine:
                             "object_on_hand", side,
                             f"{SIDE_NAMES[s]}掌上还有约 {load * 1000:.0f} g，去皮时须空着；请先取走再调用 weigh",
                             load_kg=_r(load)), "prepare", side, seq, notes, say)
-            say(f"开始称重，请先不要往{where}上放东西", wait=False)
+            # 边动边说（不等播完）：告诉人现在在做什么、要等多久、什么时候才能放。
+            # 只等"请放物品"这个信号——手势摆好以后还要去皮，提前放上去会被当成零点。
+            if all(self._in_pose(s) for s in sides):
+                prep = f"我先摆好手势、校准一下，大约{cfg['prepare_short_s']:g}秒"
+            else:
+                prep = f"我先抬起{where}、摆好手势，大约{cfg['prepare_long_s']:g}秒"
+            say(f"开始称重。{prep}。这段时间请不要碰我的手，听到请放物品再放", wait=False)
             prepared = self.pose({"side": side})
             if prepared.get("state") != "posed":
                 return self._finish_auto(prepared, "prepare", side, seq, notes, say)
         loads = [self._palm_load(s, cfg["tare_ttl_s"])[0] for s in sides]
-        if sum(x for x in loads if x is not None) < cfg["detect_kg"]:
-            window = cfg["place_window_s"]
-            say(f"请在{window:g}秒内把物品放到{where}掌心")
+        if not all(x is not None and x >= cfg["detect_kg"] for x in loads):
+            window = cfg["place_window_both_s"] if len(sides) > 1 else cfg["place_window_s"]
+            say(f"请放物品。{window:g}秒内放到{where}掌心")
             _, problem = self._wait_for_object(sides, window)
             if problem == "no_object":
                 return self._finish_auto(self._error(
@@ -1369,19 +1419,32 @@ class WeighEngine:
         return res
 
     def reset(self, args: dict) -> dict:
-        """卡片的 reset：张开手指、放下手臂、清除去皮。掌上还有物品时拒绝并语音提示。"""
-        res = self.retract(args)
+        """卡片的 reset：张开手指、放下手臂、清除去皮。掌上还有物品时拒绝并语音提示。
+
+        判断不了掌上有没有东西（load_unknown，例如驱动重启后零点丢了）时也先拒绝并提示；
+        reset_confirm_window_s 秒内对同一个 side 再调用一次 reset，视为人已确认掌心是空的。"""
+        side = self._side_arg(args)
+        window = self.cfg["reset_confirm_window_s"]
+        deadline = self._reset_confirm.pop(side, None)
+        confirmed = deadline is not None and self._clock() <= deadline
+        res = self.retract({"side": side, "confirm_empty": confirmed})
         if res.get("state") == "retracted":
             for s in self._sides_of(res["side"]):
                 self._tare[s] = None
                 self._last[s] = None
-            return dict(res, state="reset")
+            return dict(res, state="reset", **({"confirmed_empty": True} if confirmed else {}))
         speech = {"object_on_hand": "手上还有东西，请先拿走，再复位",
-                  "load_unknown": "无法确认手上有没有东西，请先拿走物品，再勾选确认后复位"}.get(res.get("code"))
+                  "load_unknown": f"无法确认手上有没有东西。确认是空的话，请在{window:g}秒内再点一次复位"
+                  }.get(res.get("code"))
         if speech:
             problem = self._announce(speech)
             if problem:
                 res = dict(res, announce_problems=[problem])
+        if res.get("code") == "load_unknown":
+            # 提示播完才开始计时，人听完再点
+            self._reset_confirm[side] = self._clock() + window
+            res = dict(res, error=f"无法判断掌上是否有物体；确认掌心已空后，{window:g} 秒内再调用一次 reset",
+                       confirm_within_s=window)
         return res
 
     def snapshot(self) -> dict:
@@ -1480,8 +1543,8 @@ ASYNC_ACTIONS = CARD_ACTIONS
 MAINTENANCE_ACTIONS = ("calibrate", "read")
 ENGINE_METHODS = {"weigh": "auto_weigh", "reset": "reset", "calibrate": "calibrate"}
 RUNNING_STATE = {"weigh": "weighing", "reset": "resetting"}
-# 最坏情况：两段摆臂各约 13 s + 手指 + 去皮 ≤ 10 s + 两次播报各 ≤ 30 s + 放物品 5 s + 测量 ≤ 10 s。
-COMPLETION_TIMEOUT_S = 180
+# 最坏情况：两段摆臂各约 13 s + 手指 + 去皮 ≤ 10 s + 两次播报各 ≤ 60 s + 放物品 ≤ 8 s + 测量 ≤ 10 s。
+COMPLETION_TIMEOUT_S = 240
 SYNC_GRACE_S = 0.5
 
 
@@ -1519,6 +1582,9 @@ class WeighPlugin:
 
     # ── 卡片定义 ────────────────────────────────────────────────────────────
 
+    def _side_choices(self) -> list:
+        return list(self._sides) + (["both"] if len(self._sides) == 2 else [])
+
     def get_tool(self) -> dict:
         cfg = self._engine.cfg
         window = cfg["place_window_s"]
@@ -1527,11 +1593,13 @@ class WeighPlugin:
             "type": "actuator",
             "description": (
                 "天轶2.0 掌心称重（实验性）。weigh：机器人自己抬起手臂、四指立起托住掌心并去皮，"
-                f"语音提示「请在{window:g}秒内把物品放到右手掌心」，物品放稳后测量并播报重量；"
+                f"语音提示「请放物品。{window:g}秒内放到右手掌心」，物品放稳后测量并播报重量；"
                 "称完手臂保持举起，可以接着称下一件。reset：张开手指、放下手臂（掌上还有物品时拒绝）。"
-                "side 选 right（默认）或 left。调用前手臂须垂下或已在托举姿态，周围无人无物。"
-                "重量由机器人播报，完成通知里不含重量；需要数值时，weigh 完成后读取 weigh_state 传感器"
-                "（sides.<side>.last.mass_kg，valid=true 才可用，用 seq / measured_at_ms 确认是这一次的结果）。"
+                "side 选 right（默认）、left，或 both（两只手各放一件，重量相加）。"
+                "调用前手臂须垂下或已在托举姿态，周围无人无物。"
+                "重量由机器人播报；完成时不会另外通知（静默完成），需要数值时读取 weigh_state 传感器，"
+                "等 last_attempt.seq 变成这次调用对应的值、state 不再是进行中，再看 sides.<side>.last.mass_kg"
+                "（both 看 both_last；valid=true 才可用）。"
                 f"适用约 {cfg['detect_kg']} kg 以上的静止物体，不能替代电子秤计量。"
             ),
             "inputSchema": {
@@ -1539,22 +1607,23 @@ class WeighPlugin:
                 "properties": {
                     "action": {"type": "string", "enum": list(CARD_ACTIONS),
                                "description": "weigh=称重（全自动） reset=复位：张开手指、放下手臂"},
-                    "side": {"type": "string", "enum": list(self._sides),
+                    "side": {"type": "string", "enum": self._side_choices(),
                              "default": "right" if "right" in self._sides else self._sides[0],
-                             "description": "用哪只手，默认右手"},
-                    "confirm_empty": {"type": "boolean", "default": False,
-                                      "description": "仅 reset：机器人提示无法确认手上有没有东西时"
-                                                     "（例如驱动重启过），确认掌心已空后勾选"},
+                             "description": "用哪只手，默认右手；both=两只手各放一件"},
                 },
                 "required": ["action"],
                 "x-action-params": {
                     "weigh": {"params": ["side"],
                               "description": "称重：必要时抬臂并去皮（约 15 秒），语音提示放物品，"
                                              "放稳后测量并播报重量；称完手臂保持举起"},
-                    "reset": {"params": ["side", "confirm_empty"],
-                              "description": "复位：张开手指、放下手臂、清除去皮；掌上有物品时拒绝"},
+                    "reset": {"params": ["side"],
+                              "description": "复位：张开手指、放下手臂、清除去皮；掌上有物品时拒绝。"
+                                             "提示无法确认手上有没有东西时，确认是空的再点一次"},
                 },
-                "x-completion": {"actions": list(ASYNC_ACTIONS), "timeout": COMPLETION_TIMEOUT_S},
+                # silent_completion：完成通知只解锁资源、不唤醒大模型。不加时 Agent Core 自带的主代理
+                # 每收到一条完成通知就醒一次（2026-11-25 实测连续称重时它开始长篇解读、挡住播报）。
+                "x-completion": {"actions": list(ASYNC_ACTIONS), "timeout": COMPLETION_TIMEOUT_S,
+                                 "silent_completion": True},
                 # 经 arm 卡驱动双臂指令（未选中的手臂保持原位）、经 hand 卡设手型、经 tts 卡说话。
                 "x-resource": ["arm_l", "arm_r", "hand_l", "hand_r", "mouth"],
             },
@@ -1696,13 +1765,15 @@ class WeighPlugin:
         if action not in (*CARD_ACTIONS, *MAINTENANCE_ACTIONS):
             return {"error": f"unknown action: {action}"}
         if action in CARD_ACTIONS:
-            # 卡片动作：side 可省略，默认右手；只接受卡片上列出的手。
+            # 卡片动作：side 可省略，默认右手；只接受卡片上列出的选项。confirm_empty 不再对外
+            # 提供（reset 改成"提示后 10 秒内再点一次"），外部传进来也忽略。
+            args.pop("confirm_empty", None)
             side = args.get("side")
             if side in (None, ""):
                 args["side"] = "right" if "right" in self._sides else self._sides[0]
-            elif side not in self._sides:
+            elif side not in self._side_choices():
                 result = {"state": "error", "code": "bad_side", "experimental": True,
-                          "error": f"side 只能是 {list(self._sides)}，收到 {side!r}"}
+                          "error": f"side 只能是 {self._side_choices()}，收到 {side!r}"}
                 print(f"[weigh] {action} args={args} -> {_brief(result)}", flush=True)
                 return result
         try:
