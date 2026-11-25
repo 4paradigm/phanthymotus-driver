@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import struct
 import sys
 import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -155,11 +157,15 @@ class LynxM20ContractTests(unittest.TestCase):
             streams = {
                 "motion_info": {"robot_topic": "/MOTION_INFO", "topic": "/host/lynx_m20/motion_info", "format": "data/json"},
                 "imu": {"robot_topic": "/IMU", "topic": "/host/lynx_m20/imu", "format": "data/json"},
-                "lidar": {"robot_topic": "/LIDAR/POINTS", "topic": "/host/lynx_m20/lidar", "format": "sensor/pointcloud"},
+                "lidar": {"robot_topic": "/grid_map_3d", "topic": "/host/lynx_m20/lidar", "format": "sensor/pointcloud"},
             }
             rtsp_streams = {
                 "camera_front": {"url": "rtsp://10.21.31.103:8554/video1", "format": "video/h265"},
             }
+            reset_called = False
+
+            def reset_lidar_accumulation(self):
+                self.reset_called = True
 
         plugin = m20.M20StatePlugin(FakeStateNodes())
         static_topics = {
@@ -177,6 +183,9 @@ class LynxM20ContractTests(unittest.TestCase):
             info = plugin.dispatch("info", {"_tool_name": name})
             self.assertEqual("ready", info["state"])
             self.assertEqual(static_topics[name], info["topic_out"])
+        self.assertEqual("running", plugin.dispatch("start", {"_tool_name": "lidar"})["state"])
+        self.assertTrue(plugin.nodes.reset_called)
+        self.assertEqual("ready", plugin.dispatch("start", {"_tool_name": "camera_front"})["state"])
 
     def test_json_state_stream_publishes_string_payload_and_keeps_snapshot_value(self):
         class FakePublisher:
@@ -205,7 +214,203 @@ class LynxM20ContractTests(unittest.TestCase):
         source = (DRIVER / "device.py").read_text()
         self.assertNotIn('("imu", Imu, "/IMU", "data/imu"', source)
         self.assertIn('("imu", Imu, "/IMU", "data/json"', source)
-        self.assertIn("core_msg_type = String if as_json else msg_type", source)
+        self.assertIn("core_msg_type = String if as_json else UInt8MultiArray if as_pointcloud else msg_type", source)
+
+    def test_fused_lidar_stream_uses_live_ros_compatible_topic(self):
+        source = (DRIVER / "device.py").read_text()
+        self.assertIn('("lidar", PointCloud2, "/grid_map_3d", "sensor/pointcloud"', source)
+        self.assertNotIn('("lidar_rear", PointCloud2', source)
+        self.assertNotIn('"pointcloud/ros2"', source)
+
+    def test_lidar_pointcloud_is_encoded_for_canvas_renderer(self):
+        class Field:
+            def __init__(self, name, offset):
+                self.name = name
+                self.offset = offset
+                self.datatype = 7
+
+        first = struct.pack("<fffI", 1.0, 2.0, 3.0, 10)
+        second = struct.pack("<fffI", 4.0, 5.0, 6.0, 20)
+        msg = SimpleNamespace(
+            point_step=16,
+            width=1,
+            height=2,
+            row_step=20,
+            fields=[Field("x", 0), Field("y", 4), Field("z", 8)],
+            data=first + b"pad!" + second,
+        )
+        payload, point_count = m20.encode_pointcloud(msg)
+        self.assertEqual((12, 2), struct.unpack_from("<II", payload))
+        self.assertEqual(2, point_count)
+        self.assertEqual(
+            (-1.0, 2.0, -3.0, -4.0, 5.0, -6.0),
+            struct.unpack_from("<ffffff", payload, 8),
+        )
+
+    def test_lidar_pointcloud_rejects_unsupported_xyz_layout(self):
+        field = lambda name, offset: SimpleNamespace(name=name, offset=offset, datatype=7)
+        msg = SimpleNamespace(
+            point_step=16, width=1, height=1, row_step=16,
+            fields=[field("x", 4), field("y", 8), field("z", 12)],
+            data=bytes(16),
+        )
+        with self.assertRaisesRegex(ValueError, "offsets 0/4/8"):
+            m20.encode_pointcloud(msg)
+
+    def test_lidar_pointcloud_rejects_big_endian_data(self):
+        field = lambda name, offset: SimpleNamespace(name=name, offset=offset, datatype=7)
+        msg = SimpleNamespace(
+            point_step=16, width=1, height=1, row_step=16, is_bigendian=True,
+            fields=[field("x", 0), field("y", 4), field("z", 8)],
+            data=struct.pack(">fffI", 1.0, 2.0, 3.0, 0),
+        )
+        with self.assertRaisesRegex(ValueError, "little-endian"):
+            m20.encode_pointcloud(msg)
+
+    def test_lidar_callback_publishes_encoded_canvas_payload(self):
+        class FakePublisher:
+            def __init__(self): self.messages = []
+            def publish(self, message): self.messages.append(message)
+
+        class FakeUInt8MultiArray:
+            def __init__(self): self.data = []
+
+        field = lambda name, offset: SimpleNamespace(name=name, offset=offset, datatype=7)
+        msg = SimpleNamespace(
+            header=SimpleNamespace(frame_id="base_link"),
+            point_step=16, width=1, height=1, row_step=16, is_bigendian=False,
+            fields=[field("x", 0), field("y", 4), field("z", 8)],
+            data=struct.pack("<fffI", 1.0, 2.0, 3.0, 0),
+        )
+        nodes = object.__new__(m20.M20Nodes)
+        nodes.config = {"lidar_visualization": {
+            "accumulate_frames": 5, "min_points": 1,
+            "max_points": 100, "publish_hz": 5.0,
+        }}
+        nodes.lock = threading.Lock()
+        nodes.values = {}
+        nodes._pointcloud_lock = threading.Lock()
+        nodes._pointcloud_frames = {}
+        nodes._pointcloud_last_publish = {}
+        nodes._lidar_pose = None
+        nodes._lidar_voxels = {}
+        publisher = FakePublisher()
+        callback = nodes._callback(
+            "lidar", publisher, as_pointcloud=True,
+            pointcloud_type=FakeUInt8MultiArray,
+        )
+        callback(msg)
+
+        self.assertEqual(1, len(publisher.messages))
+        payload = bytes(publisher.messages[0].data)
+        self.assertEqual((12, 1), struct.unpack_from("<II", payload))
+        self.assertEqual((-1.0, 2.0, -3.0), struct.unpack_from("<fff", payload, 8))
+        self.assertEqual(1, nodes.values["lidar"]["point_count"])
+
+        nodes._pointcloud_last_publish["lidar"] = float("-inf")
+        msg.data = struct.pack("<fffI", 4.0, 5.0, 6.0, 0)
+        callback(msg)
+        payload = bytes(publisher.messages[-1].data)
+        self.assertEqual((12, 2), struct.unpack_from("<II", payload))
+        self.assertEqual(
+            (-1.0, 2.0, -3.0, -4.0, 5.0, -6.0),
+            struct.unpack_from("<ffffff", payload, 8),
+        )
+
+        nodes._lidar_pose = {
+            "x": 10.0, "y": 20.0, "z": 0.0,
+            "qx": 0.0, "qy": 0.0, "qz": 0.0, "qw": 1.0,
+        }
+        nodes._pointcloud_last_publish["lidar"] = float("-inf")
+        msg.data = struct.pack("<fffI", 1.0, 2.0, 3.0, 0)
+        callback(msg)
+        payload = bytes(publisher.messages[-1].data)
+        self.assertEqual((12, 1), struct.unpack_from("<II", payload))
+        self.assertEqual((-11.0, 22.0, -3.0), struct.unpack_from("<fff", payload, 8))
+
+        published = len(publisher.messages)
+        original_sampler = m20.evenly_sample_points
+        try:
+            m20.evenly_sample_points = lambda *args: self.fail(
+                "throttled lidar callback must not sample the accumulated map"
+            )
+            callback(msg)
+        finally:
+            m20.evenly_sample_points = original_sampler
+        self.assertEqual(published, len(publisher.messages))
+        self.assertEqual("map", nodes.values["lidar"]["frame_id"])
+
+        nodes.config["lidar_visualization"]["max_points"] = 1
+        nodes._pointcloud_last_publish["lidar"] = float("-inf")
+        msg.data = struct.pack("<fffI", 4.0, 5.0, 6.0, 0)
+        callback(msg)
+        payload = bytes(publisher.messages[-1].data)
+        self.assertEqual((12, 1), struct.unpack_from("<II", payload))
+        self.assertEqual((-11.0, 22.0, -3.0), struct.unpack_from("<fff", payload, 8))
+
+    def test_lidar_slam_transform_rotates_points_into_map(self):
+        half = 2 ** -0.5
+        pose = {
+            "x": 10.0, "y": 20.0, "z": 0.0,
+            "qx": 0.0, "qy": 0.0, "qz": half, "qw": half,
+        }
+        transformed = m20.transform_point((1.0, 0.0, 0.0), pose)
+        self.assertAlmostEqual(10.0, transformed[0], places=6)
+        self.assertAlmostEqual(21.0, transformed[1], places=6)
+        self.assertAlmostEqual(0.0, transformed[2], places=6)
+
+    def test_lidar_odometry_accepts_fixed_odom_frame(self):
+        nodes = object.__new__(m20.M20Nodes)
+        nodes._pointcloud_lock = threading.Lock()
+        nodes._lidar_pose = None
+        pose = SimpleNamespace(
+            position=SimpleNamespace(x=1.0, y=2.0, z=3.0),
+            orientation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0),
+        )
+        msg = SimpleNamespace(
+            header=SimpleNamespace(frame_id="odom"),
+            pose=SimpleNamespace(pose=pose),
+        )
+        nodes._lidar_odometry_callback(msg)
+        self.assertEqual("odom", nodes._lidar_pose["frame_id"])
+
+    def test_default_lidar_odometry_source_is_continuous_odom(self):
+        config_path = Path(m20.__file__).with_name("config.yaml")
+        config_text = config_path.read_text(encoding="utf-8")
+        self.assertIn(
+            'slam_odometry: "/ODOM"',
+            config_text,
+        )
+        self.assertIn("max_points: 500000", config_text)
+        self.assertIn("publish_max_points: 80000", config_text)
+
+    def test_lidar_canvas_sampling_covers_complete_accumulation(self):
+        points = list(range(20))
+        self.assertEqual(points, m20.evenly_sample_points(iter(points), 20, 20))
+        sampled = m20.evenly_sample_points(iter(points), 20, 5)
+        self.assertEqual([0, 4, 8, 12, 16], sampled)
+
+    def test_lidar_legacy_external_limit_is_migrated(self):
+        self.assertEqual(
+            (500000, 80000, True),
+            m20.lidar_point_limits({"max_points": 50000}, 32),
+        )
+        self.assertEqual(
+            (50000, 40000, False),
+            m20.lidar_point_limits(
+                {"max_points": 50000, "publish_max_points": 40000}, 32,
+            ),
+        )
+
+    def test_lidar_pointcloud_rejects_frames_without_valid_points(self):
+        field = lambda name, offset: SimpleNamespace(name=name, offset=offset, datatype=7)
+        msg = SimpleNamespace(
+            point_step=16, width=2, height=1, row_step=32, is_bigendian=False,
+            fields=[field("x", 0), field("y", 4), field("z", 8)],
+            data=struct.pack("<fffIfffI", 0.0, 0.0, 0.0, 0, float("nan"), 1.0, 2.0, 0),
+        )
+        with self.assertRaisesRegex(ValueError, "no finite non-zero"):
+            m20.encode_pointcloud(msg)
 
     def test_motion_events_separate_request_acceptance_from_feedback(self):
         nodes = FakeNodes()
@@ -311,7 +516,7 @@ class LynxM20ContractTests(unittest.TestCase):
     def test_ros2_uses_official_fastdds_topics_and_pinned_drdds(self):
         config = (DRIVER / "config.yaml").read_text()
         dockerfile = (DRIVER / "Dockerfile").read_text()
-        for topic in ("/MOTION_STATE", "/GAIT", "/NAV_CMD", "/MOTION_INFO", "/IMU", "/LIDAR/POINTS", "/HES_STATUS", "/CHARGE", "/JOINTS_DATA"):
+        for topic in ("/MOTION_STATE", "/GAIT", "/NAV_CMD", "/MOTION_INFO", "/IMU", "/grid_map_3d", "/HES_STATUS", "/CHARGE", "/JOINTS_DATA"):
             self.assertIn(topic, config)
         self.assertIn("rmw_fastrtps_cpp", dockerfile)
         self.assertIn("a0d1a29eec5c4db5a9107595bb51e3be8122b86c", dockerfile)
