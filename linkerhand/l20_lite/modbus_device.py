@@ -187,6 +187,7 @@ class HandPlugin:
         if not 0.02 <= self.poll_interval_s <= 1:
             raise ValueError("poll_interval_s must be in 0.02..1 seconds")
         self._motion_lock = motion_lock if motion_lock is not None else threading.RLock()
+        self.mimic_side = lambda: None
         self._stop_requested = threading.Event()
         self._state_lock = threading.Lock()
         self._active: dict | None = None
@@ -291,7 +292,7 @@ class HandPlugin:
 
     def _move(self, target: list[int], action: str, *, side: str | None = None,
               speed: int | None = None, torque: int | None = None,
-              release_torque: bool = False) -> dict:
+              release_torque: bool = False, interruptible_midpoint: bool = False) -> dict:
         with self._motion_lock:
             if self._stop_requested.is_set():
                 raise InterruptedError("hand motion stopped")
@@ -320,7 +321,10 @@ class HandPlugin:
                     raise InterruptedError("hand motion stopped")
                 halfway = [(a + b) // 2 for a, b in zip(current, target)]
                 client.set_positions(halfway)
-                time.sleep(0.8)
+                if interruptible_midpoint:
+                    self._stop_requested.wait(0.8)
+                else:
+                    time.sleep(0.8)
                 if self._stop_requested.is_set():
                     raise InterruptedError("hand motion stopped")
                 client.set_positions(target)
@@ -409,6 +413,8 @@ class HandPlugin:
                 if self._stop_requested.is_set():
                     raise InterruptedError("hand motion stopped")
                 active_side = side or self.connection.side
+                if self.mimic_side() == active_side:
+                    raise RuntimeError("该灵巧手正在由手势模仿卡控制")
                 if active_side not in self.poses_by_side:
                     raise RuntimeError(f"{active_side}-hand motion requires explicit calibrated open and fist poses")
                 client = self.connection.get(side) if side is not None else self.connection.get()
@@ -542,6 +548,8 @@ class HandPlugin:
             with self._motion_lock:
                 # Canvas stop may arrive before the serial device was ever used.
                 client = self.connection._client
+                if client is not None and self.mimic_side() == client.side:
+                    return {"state": "idle", "torque_released": False}
                 if client is None:
                     return {"state": "idle", "torque_released": True}
                 client.set_torques([0] * JOINT_COUNT)
@@ -565,6 +573,10 @@ def build_plugins(config: dict, namespace: str, ros2) -> list:
 
         plugins.append(LiteTactilePlugin(hand, tactile_config, global_config=config,
                                          ros2=ros2, namespace=namespace))
+    if config.get("plugins", {}).get("gesture_mimic", {}).get("enabled", False):
+        from gesture_mimic import GestureMimicPlugin, MimicMotion
+
+        plugins.append(GestureMimicPlugin(MimicMotion(hand, gesture_config), namespace, ros2))
     return plugins
 
 
@@ -580,6 +592,7 @@ class MultiHandPlugin:
         # Serial discovery and motion never overlap. Two cards may be queued,
         # but no second controller may open/probe a moving RS-485 port.
         self._bus_lock = threading.RLock()
+        self._mimic_side = None
         self._serial_ports: dict[str, _SerialPort] = {}
         self._serial_port_lock = threading.RLock()
         self._tactile_ports: dict[str, str] = {}
@@ -590,6 +603,10 @@ class MultiHandPlugin:
         self._legacy_owner: str | None = None
         self._legacy = HandPlugin(self._connection(), hand_config,
                                   motion_lock=self._bus_lock)
+        self._legacy.mimic_side = self._get_mimic_side
+
+    def _get_mimic_side(self):
+        return self._mimic_side
 
     def _connection(self, **overrides) -> L20LiteConnection:
         return L20LiteConnection({**self.config, **overrides}, ports=self._serial_ports,
@@ -684,6 +701,7 @@ class MultiHandPlugin:
             connection = self._connection(side=side, serial_port=port)
             single_config = {**self.hand_config, "auto_detect_gestures": False}
             controller = HandPlugin(connection, single_config, motion_lock=self._bus_lock)
+            controller.mimic_side = self._get_mimic_side
             self._controllers[instance_id] = controller
             return controller
 

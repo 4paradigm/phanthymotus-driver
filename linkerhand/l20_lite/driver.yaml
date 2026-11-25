@@ -12,4 +12,5 @@ build_context_extras:
 cards:
   - { name: hand, type: actuator }
   - { name: hand_gesture, type: actuator }
+  - { name: gesture_mimic, type: actuator }
   - { name: hand_tactile, type: sensor }
