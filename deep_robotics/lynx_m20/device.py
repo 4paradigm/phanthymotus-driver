@@ -4,8 +4,12 @@
 from __future__ import annotations
 
 import json
+import math
+import os
+import struct
 import threading
 import time
+from array import array
 
 from basic_server import BasicServerClient
 from common.vendor_runtime import action_schema, jsonable, tool
@@ -15,12 +19,123 @@ GAITS = {"basic": 0x1001, "standard_stairs": 0x1003, "agile_flat": 0x3002, "agil
 MOTION_STATES = {"idle": 0, "stand": 1, "soft_estop": 2, "damping": 3, "lie": 4, "rl_control": 17}
 
 
+def _yaw_from_quaternion(quaternion) -> float:
+    x = float(getattr(quaternion, "x", 0.0))
+    y = float(getattr(quaternion, "y", 0.0))
+    z = float(getattr(quaternion, "z", 0.0))
+    w = float(getattr(quaternion, "w", 1.0))
+    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+
+def _mapping_packet(points, pose=None, metadata=None) -> bytes:
+    values = array("f")
+    for point in points:
+        values.extend((float(point[0]), float(point[1]), float(point[2])))
+    if values.itemsize != 4:
+        raise RuntimeError("sensor/mapping requires 32-bit floats")
+    if os.sys.byteorder != "little":
+        values.byteswap()
+    robot_x = float((pose or {}).get("x", 0.0))
+    robot_y = float((pose or {}).get("y", 0.0))
+    robot_yaw = -float((pose or {}).get("yaw", 0.0))
+    meta_bytes = b"" if metadata is None else json.dumps(metadata, ensure_ascii=False).encode("utf-8")
+    flags = 0x03 | (0x04 if meta_bytes else 0)
+    payload = struct.pack("<fffBI", robot_x, robot_y, robot_yaw, flags, len(values) // 3)
+    payload += values.tobytes()
+    if meta_bytes:
+        payload += struct.pack("<I", len(meta_bytes)) + meta_bytes
+    return payload
+
+
+def _pointcloud_xyz(msg):
+    """Extract finite XYZ float32 points from a standard PointCloud2 message."""
+    fields = {field.name: field for field in msg.fields}
+    if any(name not in fields for name in ("x", "y", "z")):
+        raise ValueError("PointCloud2 requires x/y/z fields")
+    if any(int(fields[name].datatype) != 7 or int(fields[name].count) != 1 for name in ("x", "y", "z")):
+        raise ValueError("PointCloud2 x/y/z fields must be FLOAT32 scalars")
+    point_step = int(msg.point_step)
+    if point_step <= 0:
+        raise ValueError("PointCloud2 point_step must be positive")
+    offsets = [int(fields[name].offset) for name in ("x", "y", "z")]
+    if any(offset < 0 or offset + 4 > point_step for offset in offsets):
+        raise ValueError("PointCloud2 field offset exceeds point_step")
+    raw = bytes(msg.data)
+    point_count = min(int(msg.width) * int(msg.height), len(raw) // point_step)
+    endian = ">" if bool(msg.is_bigendian) else "<"
+    points = []
+    for index in range(point_count):
+        base = index * point_step
+        point = tuple(struct.unpack_from(f"{endian}f", raw, base + offset)[0] for offset in offsets)
+        if all(math.isfinite(value) for value in point):
+            points.append(point)
+    return points
+
+
+def _transform_point(point, pose):
+    """Transform a base_link point into map coordinates using SLAM odometry."""
+    x, y, z = point
+    qx, qy, qz, qw = (float(pose[key]) for key in ("qx", "qy", "qz", "qw"))
+    xx, yy, zz = qx * qx, qy * qy, qz * qz
+    xy, xz, yz = qx * qy, qx * qz, qy * qz
+    wx, wy, wz = qw * qx, qw * qy, qw * qz
+    return (
+        float(pose["x"]) + (1 - 2 * (yy + zz)) * x + 2 * (xy - wz) * y + 2 * (xz + wy) * z,
+        float(pose["y"]) + 2 * (xy + wz) * x + (1 - 2 * (xx + zz)) * y + 2 * (yz - wx) * z,
+        float(pose.get("z", 0.0)) + 2 * (xz - wy) * x + 2 * (yz + wx) * y + (1 - 2 * (xx + yy)) * z,
+    )
+
+
+def _validate_occupancy_grid(msg):
+    width = int(msg.info.width)
+    height = int(msg.info.height)
+    resolution = float(msg.info.resolution)
+    if width <= 0 or height <= 0 or resolution <= 0 or len(msg.data) < width * height:
+        raise ValueError("invalid occupancy grid dimensions")
+    return width, height, resolution
+
+
+def encode_occupancy_grid(msg, pose=None, *, occupied_threshold=50, max_points=50000, metadata=None) -> bytes:
+    """Convert nav_msgs/OccupancyGrid into the Canvas sensor/mapping packet."""
+    width, height, resolution = _validate_occupancy_grid(msg)
+
+    if not 0 <= occupied_threshold <= 100:
+        raise ValueError("occupied_threshold must be between 0 and 100")
+    if max_points <= 0:
+        raise ValueError("max_points must be positive")
+    cell_count = width * height
+    occupied_count = sum(1 for value in msg.data[:cell_count] if int(value) >= occupied_threshold)
+    stride = max(1, math.ceil(occupied_count / max_points))
+    origin = msg.info.origin
+    origin_yaw = _yaw_from_quaternion(origin.orientation)
+    cos_yaw, sin_yaw = math.cos(origin_yaw), math.sin(origin_yaw)
+    points = []
+    occupied_index = 0
+    for index, value in enumerate(msg.data[:cell_count]):
+        if int(value) < occupied_threshold:
+            continue
+        selected = occupied_index % stride == 0
+        occupied_index += 1
+        if not selected:
+            continue
+        column, row = index % width, index // width
+        local_x = (column + 0.5) * resolution
+        local_y = (row + 0.5) * resolution
+        points.append((
+            float(origin.position.x) + cos_yaw * local_x - sin_yaw * local_y,
+            float(origin.position.y) + sin_yaw * local_x + cos_yaw * local_y,
+            0.0,
+        ))
+    return _mapping_packet(points, pose, metadata)
+
+
 class M20Nodes:
     def __init__(self, config, namespace, ros2):
         from drdds.msg import Gait, JointsData, MotionInfo, MotionState, NavCmd, NavSat, StdMsgInt32, StdStatus
-        from nav_msgs.msg import Odometry
+        from nav_msgs.msg import OccupancyGrid, Odometry
+        from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
         from sensor_msgs.msg import Imu, PointCloud2
-        from std_msgs.msg import String
+        from std_msgs.msg import String, UInt8MultiArray
         from rclpy.node import Node
 
         self.config = config
@@ -41,6 +156,25 @@ class M20Nodes:
         self._header_lock = threading.Lock()
         self.values = {}
         self.streams = {}
+        self._mapping_pose = None
+        self._mapping_lock = threading.Lock()
+        self._mapping_voxels = {}
+        self._mapping_last_points = []
+        self._mapping_last_grid_msg = None
+        self._mapping_uint8_type = None
+        self._mapping_last_publish = 0.0
+        self._mapping_runtime = {
+            "state": "idle",
+            "requested_map": None,
+            "active_map": None,
+            "source": None,
+            "source_frame": None,
+            "target_frame": "map",
+            "update_count": 0,
+            "point_count": 0,
+            "buffer_point_count": 0,
+            "last_update_time": None,
+        }
         self.frame_id = 0
         self.native_velocity_command = 25
         self._motion_condition = threading.Condition(threading.Lock())
@@ -88,6 +222,47 @@ class M20Nodes:
                 depth,
             )
             self.streams[key] = {"robot_topic": robot_topic, "topic": core_topic, "format": fmt}
+        if self.is_pro:
+            self.mapping_topic = f"/{namespace}/lynx_m20/mapping_view"
+            self.mapping_pub = self.core.create_publisher(UInt8MultiArray, self.mapping_topic, 1)
+            self._mapping_uint8_type = UInt8MultiArray
+            final_map_callback = self._final_mapping_callback(UInt8MultiArray)
+            live_qos = QoSProfile(
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+                durability=DurabilityPolicy.VOLATILE,
+                history=HistoryPolicy.KEEP_LAST,
+                depth=1,
+            )
+            latched_qos = QoSProfile(
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                history=HistoryPolicy.KEEP_LAST,
+                depth=1,
+            )
+            self.robot.create_subscription(
+                OccupancyGrid,
+                topics.get("grid_map", "/GRID_MAP"),
+                final_map_callback,
+                live_qos,
+            )
+            self.robot.create_subscription(
+                OccupancyGrid,
+                topics.get("grid_map", "/GRID_MAP"),
+                final_map_callback,
+                latched_qos,
+            )
+            self.robot.create_subscription(
+                PointCloud2,
+                topics.get("grid_map_3d", "/grid_map_3d"),
+                self._live_mapping_callback(UInt8MultiArray),
+                live_qos,
+            )
+            self.robot.create_subscription(
+                Odometry,
+                topics.get("slam_odometry", "/SLAM_ODOM"),
+                self._slam_odometry_callback,
+                live_qos,
+            )
 
     def _callback(self, key, publisher, *, as_json=False, string_type=None):
         def callback(msg):
@@ -119,6 +294,166 @@ class M20Nodes:
                     self._last_gait = gait
                     self.publish_motion_event("gait_changed", previous=previous, current=gait, confirmed=True)
         return callback
+
+    def _slam_odometry_callback(self, msg):
+        pose = msg.pose.pose
+        frame_id = str(getattr(msg.header, "frame_id", ""))
+        if frame_id and frame_id != "map":
+            print(f"[mapping_view] ignored SLAM pose in unexpected frame: {frame_id}", flush=True)
+            return
+        quaternion = pose.orientation
+        value = {
+            "x": float(pose.position.x),
+            "y": float(pose.position.y),
+            "z": float(pose.position.z),
+            "qx": float(quaternion.x),
+            "qy": float(quaternion.y),
+            "qz": float(quaternion.z),
+            "qw": float(quaternion.w),
+            "yaw": _yaw_from_quaternion(quaternion),
+        }
+        with self._mapping_lock:
+            self._mapping_pose = value
+
+    def _mapping_metadata_locked(self):
+        return {"version": 3, **self._mapping_runtime}
+
+    def _publish_mapping_payload(self, uint8_type, points, pose, metadata):
+        payload = _mapping_packet(points, pose, metadata)
+        output = uint8_type()
+        try:
+            output.data = array("B", payload)
+        except TypeError:
+            output.data = list(payload)
+        self.mapping_pub.publish(output)
+
+    def _live_mapping_callback(self, uint8_type):
+        def callback(msg):
+            try:
+                config = self.config.get("mapping_visualization", {})
+                with self._mapping_lock:
+                    if self._mapping_runtime["state"] not in ("starting", "live_mapping", "saving"):
+                        return
+                    pose = dict(self._mapping_pose) if self._mapping_pose else None
+                if pose is None:
+                    return
+                frame_id = str(getattr(msg.header, "frame_id", ""))
+                if frame_id != "base_link":
+                    raise ValueError(f"expected grid_map_3d frame base_link, got {frame_id or 'empty'}")
+                local_points = _pointcloud_xyz(msg)
+                voxel_size = float(config.get("voxel_size", 0.08))
+                max_buffer_points = int(config.get("max_buffer_points", 200000))
+                max_points = int(config.get("max_points", 50000))
+                publish_interval = 1.0 / max(0.1, float(config.get("publish_hz", 2.0)))
+                if voxel_size <= 0 or max_buffer_points <= 0 or max_points <= 0:
+                    raise ValueError("mapping visualization limits must be positive")
+                transformed = [_transform_point(point, pose) for point in local_points]
+                now = time.monotonic()
+                with self._mapping_lock:
+                    for point in transformed:
+                        voxel = tuple(math.floor(value / voxel_size) for value in point)
+                        self._mapping_voxels[voxel] = point
+                    excess = len(self._mapping_voxels) - max_buffer_points
+                    if excess > 0:
+                        for voxel in list(self._mapping_voxels)[:excess]:
+                            self._mapping_voxels.pop(voxel, None)
+                    self._mapping_runtime.update({
+                        "state": "live_mapping" if self._mapping_runtime["state"] == "starting" else self._mapping_runtime["state"],
+                        "source": "grid_map_3d",
+                        "source_frame": frame_id,
+                        "target_frame": "map",
+                        "update_count": self._mapping_runtime["update_count"] + 1,
+                        "buffer_point_count": len(self._mapping_voxels),
+                        "last_update_time": time.time(),
+                    })
+                    if now - self._mapping_last_publish < publish_interval:
+                        return
+                    all_points = list(self._mapping_voxels.values())
+                    stride = max(1, math.ceil(len(all_points) / max_points))
+                    points = all_points[::stride]
+                    self._mapping_runtime["point_count"] = len(points)
+                    self._mapping_last_points = points
+                    self._mapping_last_publish = now
+                    metadata = self._mapping_metadata_locked()
+                self._publish_mapping_payload(uint8_type, points, pose, metadata)
+                with self.lock:
+                    self.values["mapping_view"] = dict(metadata)
+            except Exception as exc:
+                print(f"[mapping_view] skipped invalid live cloud: {exc}", flush=True)
+        return callback
+
+    def _final_mapping_callback(self, uint8_type):
+        def callback(msg):
+            try:
+                config = self.config.get("mapping_visualization", {})
+                _validate_occupancy_grid(msg)
+                with self._mapping_lock:
+                    self._mapping_last_grid_msg = msg
+                    if self._mapping_runtime["state"] in ("starting", "live_mapping"):
+                        return
+                    pose = dict(self._mapping_pose) if self._mapping_pose else None
+                    self._mapping_runtime.update({
+                        "state": "saved_map",
+                        "source": "GRID_MAP",
+                        "source_frame": str(getattr(msg.header, "frame_id", "map")) or "map",
+                        "target_frame": "map",
+                        "update_count": self._mapping_runtime["update_count"] + 1,
+                        "last_update_time": time.time(),
+                    })
+                    metadata = self._mapping_metadata_locked()
+                payload = encode_occupancy_grid(
+                    msg,
+                    pose,
+                    occupied_threshold=int(config.get("occupied_threshold", 50)),
+                    max_points=int(config.get("max_points", 50000)),
+                    metadata=metadata,
+                )
+                point_count = struct.unpack_from("<I", payload, 13)[0]
+                with self._mapping_lock:
+                    self._mapping_runtime["point_count"] = point_count
+                    metadata = self._mapping_metadata_locked()
+                payload = encode_occupancy_grid(
+                    msg,
+                    pose,
+                    occupied_threshold=int(config.get("occupied_threshold", 50)),
+                    max_points=int(config.get("max_points", 50000)),
+                    metadata=metadata,
+                )
+                output = uint8_type()
+                try:
+                    output.data = array("B", payload)
+                except TypeError:
+                    output.data = list(payload)
+                self.mapping_pub.publish(output)
+                with self.lock:
+                    self.values["mapping_view"] = dict(metadata)
+            except Exception as exc:
+                print(f"[mapping_view] skipped invalid final grid: {exc}", flush=True)
+        return callback
+
+    def start_mapping_view(self):
+        with self._mapping_lock:
+            self._mapping_voxels.clear()
+            self._mapping_last_points = []
+            self._mapping_last_publish = 0.0
+            self._mapping_runtime.update({
+                "state": "live_mapping", "requested_map": None, "active_map": None,
+                "source": "grid_map_3d", "source_frame": "base_link", "target_frame": "map",
+                "update_count": 0, "point_count": 0, "last_update_time": None,
+                "buffer_point_count": 0,
+            })
+
+    def stop_mapping_view(self):
+        with self._mapping_lock:
+            self._mapping_runtime["state"] = "idle"
+            final_grid = self._mapping_last_grid_msg
+            uint8_type = self._mapping_uint8_type
+        if final_grid is not None and uint8_type is not None:
+            self._final_mapping_callback(uint8_type)(final_grid)
+
+    def mapping_view_snapshot(self):
+        with self._mapping_lock:
+            return dict(self._mapping_runtime)
 
     def publish_motion_event(self, event: str, **data) -> dict:
         from std_msgs.msg import String
@@ -546,8 +881,45 @@ class M20ProNavigationPlugin:
         return self.nodes.native.request(1003, 1, items)
 
 
+class M20MappingViewPlugin:
+    def __init__(self, nodes):
+        self.nodes = nodes
+        self.topic_out = [{"topic": nodes.mapping_topic, "format": "sensor/mapping"}]
+
+    def get_tool(self):
+        return tool(
+            "mapping_view",
+            "sensor",
+            "仅 M20 Pro：实时累积 /grid_map_3d 并通过 /SLAM_ODOM 转换到 map 坐标；停止后显示最终 /GRID_MAP",
+            topic_out=self.topic_out,
+        )
+
+    def start(self): pass
+    def stop(self): pass
+
+    def dispatch(self, action, args):
+        if action == "stop":
+            self.nodes.stop_mapping_view()
+            return {"state": "idle"}
+        if action == "start":
+            self.nodes.start_mapping_view()
+            snapshot = getattr(self.nodes, "mapping_view_snapshot", lambda: {"state": "ready"})()
+            return {
+                **snapshot,
+                "state": "running",
+                "mapping_state": snapshot.get("state", "ready"),
+                "topic_out": self.topic_out,
+            }
+        if action == "info":
+            snapshot = getattr(self.nodes, "mapping_view_snapshot", lambda: {"state": "ready"})()
+            return {**snapshot, "topic_out": self.topic_out}
+        raise ValueError(f"unsupported mapping_view action: {action}")
+
+
 def build_plugins(config, namespace, ros2):
     nodes = M20Nodes(config, namespace, ros2)
     plugins = [M20StatePlugin(nodes), M20MotionPlugin(nodes), M20MotionEventsPlugin(nodes), M20ChargePlugin(nodes), M20DevicePlugin(nodes)]
-    if nodes.is_pro: plugins.append(M20ProNavigationPlugin(nodes))
+    if nodes.is_pro:
+        plugins.append(M20ProNavigationPlugin(nodes))
+        plugins.append(M20MappingViewPlugin(nodes))
     return plugins
