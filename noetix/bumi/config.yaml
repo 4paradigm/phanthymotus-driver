@@ -2,6 +2,33 @@ mcp_port: 15704
 ros_namespace: ""   # 留空则自动使用 hostname
 
 plugins:
+  tf_integrity_monitor:
+    enabled: true
+    use_sim_time: false
+    required_frames: [base_link]
+    required_chains:
+      - [base_link, l_elbow_pitch_link]
+      - [base_link, r_elbow_pitch_link]
+      - [base_link, l_ankle_roll_link]
+      - [base_link, r_ankle_roll_link]
+    stale_s: 2.0
+    future_s: 0.25
+    skew_s: 0.5
+    translation_floor: 0.02
+    rotation_floor: 0.1
+    translation_rate: 8.0
+    rotation_rate: 25.0
+    publish_hz: 2.0
+    visual_check: false
+    vision: null
+  vision_tf:
+    enabled: true
+  tf_tree:
+    enabled: true
+    # Fill from the robot's measured calibration (see TF.md). The bare URDF
+    # can be used immediately for the 21 joints. Vision requires a known mount.
+    camera_mount: null
+    hand_frames: []
   state:
     enabled: true
   loco:

@@ -265,6 +265,7 @@ class _BumiStateNode(Node):
                 if now - last_joints_time >= self._JOINTS_INTERVAL:
                     last_joints_time = now
                     joint_state = self._high_ctrl.get_joint_state()
+                    joint_stamp = self.get_clock().now().to_msg()
                     joints = []
                     for i in range(21):
                         js = joint_state[i]
@@ -280,6 +281,7 @@ class _BumiStateNode(Node):
                     workmode = self._high_ctrl.get_mode()
                     joints_data = {
                         "joints": joints,
+                        "stamp": {"sec": joint_stamp.sec, "nanosec": joint_stamp.nanosec},
                         "imu_quat": [float(imu.ori[3]), float(imu.ori[0]), float(imu.ori[1]), float(imu.ori[2])],  # SDK [x,y,z,w] → renderer [w,x,y,z]
                         "workmode": workmode,
                     }

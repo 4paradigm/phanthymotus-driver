@@ -170,3 +170,13 @@ def test_existing_bumi_plugin_loading_is_unchanged(bundle_module):
     assert [tool["name"] for tool in bundle.get_all_tools()] == [
         "loco", "loco_servo", "speaker"]
 
+
+
+def test_tf_integrity_sensor_is_registered_by_bundle(bundle_module):
+    bundle = bundle_module.BumiDeviceBundle(
+        {"plugins": {"tf_integrity_monitor": {"enabled": True}}},
+        "bumi", object(), None, None)
+    tools = [plugin.get_tool() for plugin in bundle._plugins]
+    sensor = next(tool for tool in tools if tool["name"] == "tf_integrity_monitor")
+    assert sensor["type"] == "sensor"
+    assert sensor["topic_out"] == [{"topic": "/bumi/tf_integrity_monitor", "format": "data/json"}]

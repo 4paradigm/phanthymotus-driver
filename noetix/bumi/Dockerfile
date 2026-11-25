@@ -148,6 +148,7 @@ COPY imu_distance_control.py /work/imu_distance_control.py
 COPY leg_odometry.py /work/leg_odometry.py
 COPY camera_specs.py /work/camera_specs.py
 COPY visual_inputs.py /work/visual_inputs.py
+COPY vision_tf.py tf_cards.py calibrate_camera_mount.py tf_integrity.py tf_integrity_monitor.py /work/
 COPY visual_odometry.py /work/visual_odometry.py
 COPY visual_odometry_contract.py /work/visual_odometry_contract.py
 COPY visual_odometry_probe.py /work/visual_odometry_probe.py
@@ -156,6 +157,10 @@ COPY sound_direction.py /work/sound_direction.py
 COPY direction_card.py /work/direction_card.py
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/
+
+# The pinned ARM64 ros-base already ships this executable (layer 049dff30aaed).
+# Reusing it adds 0 compressed or uncompressed package bytes to the TF cards.
+RUN test -x /opt/ros/humble/lib/robot_state_publisher/robot_state_publisher
 
 # Add SDK DDS libs + pybind modules to paths
 ENV LD_LIBRARY_PATH=/work/noetix_sdk_bumi/dds/aarch64/lib:${LD_LIBRARY_PATH}
