@@ -579,8 +579,9 @@ move the centre of mass; the first runs belong on a supported robot.
 What it does to stay inside that envelope:
 
 - mechanical stops are read from the shipped `resource/bumi_model.urdf` (all
-  eight arm joints, yaw included), with a 10° inward margin so the elbow never
-  fully straightens;
+  eight arm joints, yaw included). Moving targets keep a 10° inward margin so
+  the elbow never straightens under command; the measured pose the card starts
+  from is held as-is, never rewritten to the margin on the first tick;
 - motion follows PR #485's preview bounds: **2 rad/s velocity and 6 rad/s²
   acceleration** per joint, applied to the commanded pose with a trapezoidal
   profile that brakes before the stop instead of reversing instantly;
@@ -588,7 +589,10 @@ What it does to stay inside that envelope:
   enabling the card never snaps the arms to zero;
 - `tracked: false`, a missing or non-finite axis, or a stream older than
   `lost_timeout_s` returns the arms to the **safe pose** (arms down, elbow
-  slightly bent). The last human command is never held;
+  slightly bent). The last human command is never held. A card armed before
+  the first tracked frame is the one exception: it holds the measured pose,
+  because "no operator seen yet" is not "the operator walked away", and the
+  camera may simply not be wired yet;
 - only workmode 2 (`walking`) is allowed, checked on every tick. Any exit —
   protection (26), disabled (30), unreadable mode — stops commanding and needs
   a fresh `start`;

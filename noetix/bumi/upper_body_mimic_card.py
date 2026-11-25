@@ -156,6 +156,11 @@ class UpperBodyMimicPlugin:
 
         self._commanded_deg = None
         self._velocity_deg_s = {key: 0.0 for key in spec.ZERO_TARGETS_DEG}
+        #: Whether this run has ever seen a tracked operator. Until it has,
+        #: "lost" means "not started yet", not "the operator walked away":
+        #: a card armed before the camera is wired must hold the measured pose
+        #: rather than immediately drive the arms down.
+        self._ever_tracked = False
         self._low_ctrl = None
         self._motor_cmd_cls = None
 
@@ -345,6 +350,7 @@ class UpperBodyMimicPlugin:
         self._ticks = 0
         self._last_error = None
         self._lost = True
+        self._ever_tracked = False
         self._last_workmode = mode
         with self._lock:
             self._latest_targets = dict(spec.ZERO_TARGETS_DEG)
@@ -392,6 +398,7 @@ class UpperBodyMimicPlugin:
         with self._lock:
             tracked = self._latest_tracked
             last_at = self._latest_at
+            ever_tracked = self._ever_tracked
         age_ms = None if not last_at else round((time.monotonic() - last_at) * 1000.0, 1)
         return {
             "state": self._status,
@@ -403,6 +410,7 @@ class UpperBodyMimicPlugin:
             "commanded_deg": commanded,
             "measured_deg": measured,
             "tracked": tracked,
+            "ever_tracked": ever_tracked,
             "lost": self._lost,
             "angles_age_ms": age_ms,
             "workmode": mode,
@@ -492,6 +500,8 @@ class UpperBodyMimicPlugin:
             self._latest_targets = targets
             self._latest_tracked = tracked
             self._latest_at = time.monotonic()
+            if tracked:
+                self._ever_tracked = True
 
     def _control_loop(self, token) -> None:
         period = 1.0 / self._control_hz
@@ -517,14 +527,24 @@ class UpperBodyMimicPlugin:
                 targets = dict(self._latest_targets)
                 tracked = self._latest_tracked
                 last_at = self._latest_at
+                ever_tracked = self._ever_tracked
 
             # Low confidence (`tracked=false`) and a stale stream are the same
             # state: return to the safe pose. Never keep the last human
             # command — an unobserved arm must not stay frozen mid-air.
+            #
+            # Before the first tracked frame there is nothing to return from:
+            # the card may have been armed before the camera was wired, and
+            # lowering the arms then is movement nobody asked for. Hold the
+            # pose the card started in until mirroring has actually begun.
             lost = (not tracked) or (last_at == 0.0) or \
                    (now - last_at > self._lost_timeout_s)
-            desired = spec.safe_pose_deg() if lost else targets
-            desired = spec.clamp_targets(desired, self._margin_deg)
+            if lost and ever_tracked:
+                desired = spec.clamp_targets(spec.safe_pose_deg(), self._margin_deg)
+            elif lost:
+                desired = dict(self._commanded_deg)
+            else:
+                desired = spec.clamp_targets(targets, self._margin_deg)
 
             self._commanded_deg, self._velocity_deg_s = spec.accel_limited_targets(
                 self._commanded_deg, self._velocity_deg_s, desired, period,
@@ -536,7 +556,6 @@ class UpperBodyMimicPlugin:
                     measured, self._commanded_deg,
                     keep_kp=self._keep_kp, keep_kd=self._keep_kd,
                     arm_kp=self._arm_kp, arm_kd=self._arm_kd,
-                    margin=self._margin_deg,
                 )
                 self._send(commands)
             except Exception as exc:  # noqa: BLE001 - stop rather than keep writing

@@ -221,14 +221,20 @@ def measured_arm_deg(measured_rad) -> dict:
 
 
 def build_joint_commands(measured_rad, targets_deg, *, keep_kp, keep_kd,
-                         arm_kp, arm_kd,
-                         margin: float = LIMIT_MARGIN_DEG) -> list:
+                         arm_kp, arm_kd) -> list:
     """All 21 motor commands for one tick, as plain dicts.
 
     Fifteen joints hold the position they are measured at with the holding
     gains; the six observable arm joints get the retargeted targets with the
     tracking gains. A missing or non-finite target moves that axis toward the
     safe pose instead of preserving the last human command.
+
+    Arm targets are clamped to the **hard** URDF stops, not the trajectory
+    margin. The margin belongs to `clamp_targets`, which every moving target
+    passes through before the rate limiter; applying it again here would
+    rewrite the measured pose the card seeds its first command from. A real
+    elbow measured at 0° (straight) would then be emitted as -10° in the first
+    tick — a 10° jump the rate limiter never produced.
     """
     if len(measured_rad) != JOINT_COUNT:
         raise ValueError(f"expected {JOINT_COUNT} measured positions, got {len(measured_rad)}")
@@ -257,7 +263,7 @@ def build_joint_commands(measured_rad, targets_deg, *, keep_kp, keep_kd,
                     or float(target) == UNMEASURED_DEG:
                 target = ZERO_TARGETS_DEG[key]
             commands[index]["pos"] = deg_to_rad(
-                clamp_arm(side, axis, target, margin))
+                clamp_arm(side, axis, target, margin=0.0))
             commands[index]["kp"] = float(arm_kp)
             commands[index]["kd"] = float(arm_kd)
     return commands

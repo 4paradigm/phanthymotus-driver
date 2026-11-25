@@ -552,8 +552,13 @@ def test_a_lost_operator_drifts_back_toward_zero(monkeypatch):
         plugin.dispatch("stop", {})
 
 
-def test_a_card_started_with_nobody_in_frame_returns_to_the_safe_pose(monkeypatch):
-    """No tracking means no human command to keep: return to the safe pose."""
+def test_a_card_started_with_nobody_in_frame_holds_its_pose(monkeypatch):
+    """Lowering the arms before mirroring began is movement nobody asked for.
+
+    `start` takes over all 21 motors, possibly before the camera is wired.
+    Until a tracked frame arrives there is no "operator left" event to react
+    to, so the card must hold the measured pose instead of driving to zero.
+    """
     import time
 
     pose = [0.0] * 21
@@ -562,12 +567,13 @@ def test_a_card_started_with_nobody_in_frame_returns_to_the_safe_pose(monkeypatc
         monkeypatch, pose=pose, config={"lost_timeout_s": 0.1})
     plugin.dispatch("start", {"confirm": True})
     try:
-        time.sleep(0.3)  # well past the lost timeout, nothing was ever tracked
+        time.sleep(0.3)  # well past the lost timeout, but nothing was ever tracked
         assert low.calls, "control loop never sent a command"
-        assert low.calls[-1][0].pos < math.radians(30.0), \
-            "arm did not move toward the safe pose"
+        assert low.calls[-1][0].pos == pytest.approx(math.radians(40.0), abs=1e-3), \
+            "the card moved the arm before it had ever tracked anyone"
         info = plugin.dispatch("info", {})
         assert info["lost"] is True
+        assert info["ever_tracked"] is False
     finally:
         plugin.dispatch("stop", {})
 
@@ -877,3 +883,75 @@ def test_a_long_swing_also_obeys_the_acceleration_bound_to_arrival():
         if abs(position - 40.0) < 1e-9 and abs(velocity) < 1e-9:
             break
     assert position == pytest.approx(40.0, abs=1e-6)
+
+
+# ── the first command must not be re-clamped (review High #1) ────────────────
+
+def test_a_straight_elbow_is_commanded_where_it_was_measured():
+    """0° is the legal hard stop but inside the 10° margin.
+
+    The trajectory layer keeps *targets* off the margin. Applying that margin
+    again at command time rewrote the measured seed: an elbow measured at 0°
+    came out as -10°, a 10° first-tick jump the rate limiter never produced.
+    """
+    measured = _measured(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)  # elbow joints at 0°
+    start_pose = spec.measured_arm_deg(measured)
+    commands = spec.build_joint_commands(
+        measured, start_pose,
+        keep_kp=10.0, keep_kd=0.5, arm_kp=5.0, arm_kd=0.5)
+    elbow_index = spec.ARM_JOINT_INDEX["left"]["elbow"]
+    assert commands[elbow_index]["pos"] == pytest.approx(measured[elbow_index], abs=1e-9)
+    assert spec.rad_to_deg(commands[elbow_index]["pos"]) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_a_roll_inside_the_margin_is_not_rewritten_at_command_time():
+    measured = _measured(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    start_pose = spec.measured_arm_deg(measured)
+    # Nudge one axis into the margin band but still inside the hard stop.
+    low, high = spec.HARD_LIMIT_DEG["left"]["roll"]
+    start_pose["l_roll"] = low + 5.0          # margin is 10°, so this is inside it
+    commands = spec.build_joint_commands(
+        measured, start_pose,
+        keep_kp=10.0, keep_kd=0.5, arm_kp=5.0, arm_kd=0.5)
+    index = spec.ARM_JOINT_INDEX["left"]["roll"]
+    assert spec.rad_to_deg(commands[index]["pos"]) == pytest.approx(low + 5.0, abs=1e-9)
+
+
+def test_a_target_beyond_the_hard_stop_is_still_clamped():
+    """Dropping the margin must not drop the mechanical backstop."""
+    measured = _measured(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    commands = spec.build_joint_commands(
+        measured, _targets(l_pitch=1000.0),
+        keep_kp=10.0, keep_kd=0.5, arm_kp=5.0, arm_kd=0.5)
+    index = spec.ARM_JOINT_INDEX["left"]["pitch"]
+    assert spec.rad_to_deg(commands[index]["pos"]) == pytest.approx(
+        spec.HARD_LIMIT_DEG["left"]["pitch"][1], abs=1e-6)
+
+
+def test_the_first_command_is_the_measured_pose_even_at_the_margin(monkeypatch):
+    """Card-level counterpart to the command-layer regressions above.
+
+    Seed a straight elbow (0°, legal hard stop but inside the 10° margin) and
+    a roll inside its margin, arm the card with nobody in frame, and check the
+    very first command is exactly the measured pose — no 10° first-tick jump.
+    """
+    import time
+
+    pose = [0.0] * 21
+    pose[0] = math.radians(0.0)    # left pitch
+    low_roll, _high_roll = spec.HARD_LIMIT_DEG["left"]["roll"]
+    pose[1] = math.radians(low_roll + 5.0)   # inside the 10° margin
+    pose[3] = math.radians(0.0)    # left elbow straight
+    _card, plugin, _high, low = _plugin(monkeypatch, pose=pose,
+                                        config={"lost_timeout_s": 0.1})
+    plugin.dispatch("start", {"confirm": True})
+    try:
+        time.sleep(0.15)
+        assert low.calls, "control loop never sent a command"
+        first = low.calls[0]
+        assert first[3].pos == pytest.approx(pose[3], abs=1e-6), \
+            "a straight elbow was bent to the margin on the first tick"
+        assert first[1].pos == pytest.approx(pose[1], abs=1e-6), \
+            "a measured roll inside the margin was rewritten on the first tick"
+    finally:
+        plugin.dispatch("stop", {})
