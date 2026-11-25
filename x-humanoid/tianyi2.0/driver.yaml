@@ -6,7 +6,7 @@ hardware_model: "tianyi2.0"
 image_name: tianyi2
 port: 15707
 mcp_url: "http://localhost:15707/mcp"
-description: "天轶2.0 Pro — 35DOF 人形机器人 (轮式底盘 + 双臂 + 灵巧手 + 头部 + 导航 + 腕部 USB RGB/深度相机)"
+description: "天轶2.0 Pro — 35DOF 人形机器人 (轮式底盘 + 双臂 + 灵巧手 + 头部 + 导航 + 腕部 USB RGB/深度相机)；支持范式+群消息上报，通过预先配置的 Webhook 和目标群 ID 发送文字及 PNG/JPEG 图片。"
 build_context_extras:
   - ../../common
 # Cards this bundle exposes, for resource-center's driver marketplace listing.
@@ -15,6 +15,7 @@ build_context_extras:
 # tool of its own, and ext_devices.py's ExtCameraPlugin is dead code (never
 # registered in main.py, no `ext_camera` key in config.yaml) so it is excluded.
 cards:
+  - { name: fanshi_group_send,  type: actuator }
   - { name: joints,             type: sensor }
   - { name: battery,            type: sensor }
   - { name: estop,              type: sensor }
