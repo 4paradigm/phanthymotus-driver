@@ -1,8 +1,8 @@
-# PiPER Arm control, Joints and On camera
+# PiPER arm control and monitoring
 
-The current bundle provides three canvas cards: **Arm control** (`arm_control`),
-**Joints** (`joints`) and **On camera** (`piper_camera_live`). Joints and On camera
-are independent read-only sensors. They share the existing driver lifecycle and
+The canvas provides **Arm control** (`arm_control`), **Joints** (`joints`),
+**On camera** (`piper_camera_live`) and **Depth camera** (`piper_camera_depth`).
+The three sensors are read-only. They share the existing driver lifecycle and
 keep monitoring when the control card stops. No Parameters or
 `state/parameters` stream is published; **Get status** returns feedback, limits,
 motor state, faults, capabilities and actual task outcomes.
@@ -48,6 +48,11 @@ stale-feedback freezing. `model` returns `{"urdf":"..."}`. Finger translation is
 not animated by the current Core; real opening width is available in Get status.
 On camera publishes the existing JPEG topic when its configured live stream and
 camera permission are enabled. Optional photo capture/import remains available.
+Depth camera publishes `image/depth-zlib` on the sibling `/camera/depth` topic.
+Its 640×480 little-endian `uint16` samples are millimetres, with zero for invalid
+depth. They use the native depth optical frame. The live `camera_info` reports
+the SDK intrinsics for that profile. RGB pixel coordinates require registration
+before sampling this stream.
 
 Long-running requests return a unique `action_id`; their real completed, error
 or cancelled result is POSTed to Core. Receipt timeout is 90 seconds, allowing
@@ -113,6 +118,25 @@ not expose USB buses, other cameras or host device directories. Keep the color
 serial/interface binding; generic `video-index0` may select a depth interface.
 After re-enumeration to a new device number, recreate only the PiPER service to
 refresh the device mapping. Broad hotplug access is deliberately not granted.
+
+### Optional RealSense depth
+
+Identify the D435 by serial on the host. Use `v4l2-ctl --list-devices` and
+`v4l2-ctl -d /dev/videoN --list-formats-ext` to locate its Z16 capture node.
+Identify the associated V4L2 metadata node and USB device node for the same
+serial. Set `PIPER_DEPTH_SERIAL`, `PIPER_DEPTH_VIDEO_DEVICE`,
+`PIPER_DEPTH_METADATA_DEVICE` and `PIPER_DEPTH_USB_DEVICE` in the site's Compose
+environment. Add [depth.compose.yml](deploy/depth.compose.yml) to the Compose
+files. Combine it with `camera.compose.yml` to run both previews. The depth
+override maps those three exact nodes. Recreate the service with updated paths
+after device re-enumeration. Use the production Dockerfile for depth support.
+The pinned offline development base predates the RealSense dependency.
+
+Open **Depth camera** → **View data stream** in the canvas. The depth card's
+`info` reports stream state and camera intrinsics when frames arrive. Check a
+stationary target at two known distances, then stop and restart the depth card
+while watching the color stream. A depth outage is reported through `info`, and
+the shared capture supervisor retries the same configured device.
 
 Image-only upgrades preserve old Compose grants. When adopting this fragment,
 remove old `privileged` and `/dev:/dev` entries from the site service as well.

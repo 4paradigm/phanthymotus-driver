@@ -4,4 +4,5 @@ piper-sdk @ https://github.com/agilexrobotics/piper_sdk/archive/8d4dc29bd6e75306
 python-can==4.6.1
 numpy==1.26.4
 opencv-python-headless==4.11.0.86
+pyrealsense2==2.56.5.9235; platform_system == "Linux"
 PyYAML==6.0.2

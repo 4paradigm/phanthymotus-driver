@@ -231,6 +231,8 @@ def build_plugins(config, namespace, ros2):
     from agilex.piper.unified_control import UnifiedControlPlugin
     from agilex.piper.intent_monitor import add_intent_monitor
     from agilex.piper.camera_live import add_camera_live
+    from agilex.piper.camera_depth import PiperCameraDepth
 
-    plugins = add_intent_monitor([UnifiedControlPlugin(config, namespace, ros2)], config, ros2, joints_card=True)
-    return add_camera_live(plugins, config, ros2, sensor_card=True)
+    runtime = UnifiedControlPlugin(config, namespace, ros2)
+    plugins = add_intent_monitor([runtime], config, ros2, joints_card=True)
+    return [*add_camera_live(plugins, config, ros2, sensor_card=True), PiperCameraDepth(runtime, ros2)]

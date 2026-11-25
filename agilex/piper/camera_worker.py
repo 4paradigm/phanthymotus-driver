@@ -1,13 +1,14 @@
 """Isolated V4L2 reader with a bounded, latest-frame shared-memory mailbox."""
 from dataclasses import dataclass
 from datetime import datetime
+import json
 import multiprocessing as mp
 import struct
 import time
 from zoneinfo import ZoneInfo
 
 
-MAX_JPEG_BYTES = 4 * 1024 * 1024
+MAX_FRAME_BYTES = 4 * 1024 * 1024
 
 
 @dataclass
@@ -16,20 +17,29 @@ class Mailbox:
     values: object
     image: object
     error: object
+    metadata: object
 
     @classmethod
     def create(cls, context):
-        # sequence, wall timestamp, width, height, capture FPS, JPEG length
+        # sequence, wall timestamp, width, height, capture FPS, payload length
         return cls(context.Lock(), context.RawArray('d', 6),
-                   context.RawArray('B', MAX_JPEG_BYTES), context.RawArray('B', 1024))
+                   context.RawArray('B', MAX_FRAME_BYTES), context.RawArray('B', 1024),
+                   context.RawArray('B', 2048))
 
-    def write(self, jpeg, stamp, width, height, capture_fps):
-        if not jpeg or len(jpeg) > MAX_JPEG_BYTES:
-            raise ValueError('JPEG frame exceeds mailbox capacity')
+    def write(self, payload, stamp, width, height, capture_fps):
+        if not payload or len(payload) > MAX_FRAME_BYTES:
+            raise ValueError('Camera frame exceeds mailbox capacity')
         with self.lock:
-            memoryview(self.image).cast('B')[:len(jpeg)] = jpeg
-            self.values[1:] = (stamp, width, height, capture_fps, len(jpeg))
+            memoryview(self.image).cast('B')[:len(payload)] = payload
+            self.values[1:] = (stamp, width, height, capture_fps, len(payload))
             self.values[0] += 1
+
+    def set_metadata(self, metadata):
+        encoded = json.dumps(metadata, allow_nan=False).encode('utf-8')
+        if len(encoded) >= len(self.metadata):
+            raise ValueError('Camera metadata exceeds mailbox capacity')
+        with self.lock:
+            self.metadata[:] = encoded + bytes(len(self.metadata) - len(encoded))
 
     def fail(self, error):
         message = str(error).replace('\n', ' ').encode('utf-8')[:1020]
@@ -44,9 +54,11 @@ class Mailbox:
             sequence, stamp, width, height, fps, length = self.values[:]
             error = bytes(self.error[:]).split(b'\0', 1)[0].decode('utf-8', errors='replace')
             frame = None
-            if sequence and 0 < length <= MAX_JPEG_BYTES:
+            if sequence and 0 < length <= MAX_FRAME_BYTES:
+                metadata = bytes(self.metadata).split(b'\0', 1)[0]
                 frame = dict(sequence=int(sequence), timestamp=stamp, width=int(width), height=int(height),
-                             capture_fps=fps, jpeg=bytes(memoryview(self.image).cast('B')[:int(length)]))
+                             capture_fps=fps, payload=bytes(memoryview(self.image).cast('B')[:int(length)]),
+                             metadata=json.loads(metadata) if metadata else None)
             return frame, error or None
         finally:
             self.lock.release()
@@ -71,6 +83,30 @@ def encode_frame(frame, stamp, quality):
     return encoded[:2] + b'\xff\xef' + struct.pack('>H', len(payload) + 2) + payload + encoded[2:]
 
 
+def capture_frames(settings, mailbox, stop, read, encode):
+    window = time.monotonic()
+    next_frame = window + settings['warmup_seconds']
+    frames = 0
+    capture_fps = 0.
+    while not stop.is_set():
+        frame = read()
+        if frame is None:
+            continue
+        now = time.monotonic()
+        frames += 1
+        if now - window >= 1:
+            capture_fps = frames / (now - window)
+            window, frames = now, 0
+        if now < next_frame:
+            continue
+        stamp = time.time()
+        payload = encode(frame, stamp)
+        if stop.is_set():
+            break
+        mailbox.write(payload, stamp, frame.shape[1], frame.shape[0], capture_fps)
+        next_frame = now + 1 / settings['fps']
+
+
 def capture_worker(settings, mailbox, stop):
     from common import logsafe
     logsafe.install(check_fd=False)
@@ -85,27 +121,14 @@ def capture_worker(settings, mailbox, stop):
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, settings['height'])
         cap.set(cv2.CAP_PROP_FPS, 30)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        started = window = time.monotonic()
-        next_frame = started + settings['warmup_seconds']
-        frames = 0
-        capture_fps = 0.
-        while not stop.is_set():
+        def read():
             ok, frame = cap.read()  # A USB stall is terminated by the parent watchdog.
-            now = time.monotonic()
-            if not ok:
+            if not ok or frame is None:
                 raise RuntimeError('相机读取失败，请检查彩色接口或 USB 连接')
-            frames += 1
-            if now - window >= 1:
-                capture_fps = frames / (now - window)
-                window, frames = now, 0
-            if now < next_frame:
-                continue
-            stamp = time.time()
-            jpeg = encode_frame(frame, stamp, settings['jpeg_quality'])
-            if stop.is_set():
-                break
-            mailbox.write(jpeg, stamp, frame.shape[1], frame.shape[0], capture_fps)
-            next_frame = now + 1 / settings['fps']
+            return frame
+
+        capture_frames(settings, mailbox, stop, read,
+                       lambda frame, stamp: encode_frame(frame, stamp, settings['jpeg_quality']))
     except Exception as exc:
         mailbox.fail(exc)
     finally:
@@ -114,12 +137,12 @@ def capture_worker(settings, mailbox, stop):
 
 
 class CameraSession:
-    def __init__(self, settings, *, worker_target=capture_worker):
+    def __init__(self, settings, *, worker_target=capture_worker, name='piper-color-camera'):
         context = mp.get_context('spawn')
         self.mailbox = Mailbox.create(context)
         self.stop_event = context.Event()
         self.process = context.Process(target=worker_target, args=(settings, self.mailbox, self.stop_event),
-                                       daemon=True, name='piper-color-camera')
+                                       daemon=True, name=name)
         self.process.start()
 
     def read(self):
