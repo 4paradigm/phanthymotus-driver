@@ -132,7 +132,7 @@ slew limit, not a verified physical acceleration controller; an explicit zero
 axis stops immediately, including stopping forward travel while still turning.
 The S10 receive watchdog sends zero when a reader tick sees 1000 ms or more
 without an applied command. The reader polls every 50 ms. The descriptor caps
-command TTL at 600 ms. The reader sends zero at the first poll after an applied
+command TTL at 1000 ms. The reader sends zero at the first poll after an applied
 command reaches its effective TTL or its observation reaches 800 ms, whichever
 comes first. Time already elapsed before receipt counts against both limits.
 The watchdog counts a strike after 1000 ms without an applied command. Incoming

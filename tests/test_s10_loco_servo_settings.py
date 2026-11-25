@@ -153,7 +153,7 @@ def test_servo_watchdog_fires_at_1000_ms_without_admitting_stale_commands(servo,
     assert p._sink.stats()['watchdog_strikes'] == 1
     rate = started['control_interface']['rate']
     assert rate['watchdog_ms'] == 1000
-    assert rate['max_command_ttl_ms'] == 600
+    assert rate['max_command_ttl_ms'] == 1000
     assert rate['max_obs_age_ms'] == 800
     assert p.dispatch('info', {})['control_interface']['rate'] == rate
 
@@ -176,15 +176,15 @@ def test_s10_admits_delayed_observations_only_with_time_left(servo, monkeypatch,
     assert len(servo.native.calls) == sent + (verdict == 'APPLIED')
 
 
-@pytest.mark.parametrize(('age_ms', 'verdict'), [(599, 'APPLIED'), (600, 'DROPPED'), (601, 'DROPPED')])
-def test_servo_caps_command_ttl_at_600_ms(servo, monkeypatch, age_ms, verdict):
+@pytest.mark.parametrize(('age_ms', 'verdict'), [(999, 'APPLIED'), (1000, 'DROPPED'), (1001, 'DROPPED')])
+def test_servo_caps_command_ttl_at_1000_ms(servo, monkeypatch, age_ms, verdict):
     p = servo.plugin
     monkeypatch.setattr(p, '_read_loop', lambda: None)
     assert p.dispatch('start', {'input_topic': '/policy/cmd', 'dry_run': False})['state'] == 'ready'
     stamp = p._barrier_ms + 1
     monkeypatch.setattr(p._sink, '_wall_clock', lambda: stamp + age_ms)
 
-    submit(p, {**command(p, [.02, 0, 0, 0, 0, 0], stamp=stamp), 'ttl_ms': 1000})
+    submit(p, {**command(p, [.02, 0, 0, 0, 0, 0], stamp=stamp), 'ttl_ms': 1500})
 
     last = p.dispatch('info', {})['last_command']
     assert last['verdict'] == verdict
@@ -194,7 +194,7 @@ def test_servo_caps_command_ttl_at_600_ms(servo, monkeypatch, age_ms, verdict):
 
 @pytest.mark.parametrize(('ttl_ms', 'obs_age_ms', 'remaining_ms'), [
     (250, None, 180),  # 70 ms already elapsed in transit
-    (1000, None, 530),  # descriptor caps TTL before subtracting transit
+    (1500, None, 930),  # descriptor caps TTL before subtracting transit
     (1000, 600, 200),  # observation expires before the command
 ])
 def test_s10_sends_zero_at_active_command_expiry_before_watchdog(
