@@ -9,6 +9,16 @@ linkerhand-l20-mujoco:
     - ALL
   security_opt:
     - no-new-privileges:true
+  environment:
+    - ROS_DOMAIN_ID=42
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
   volumes:
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
     - /opt/phanthy-motus/data/l20-mujoco:/var/lib/l20-sim
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
   restart: unless-stopped

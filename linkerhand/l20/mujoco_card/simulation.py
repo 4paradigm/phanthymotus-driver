@@ -68,7 +68,9 @@ class Simulation:
 
 
 def main():
+    from common import logsafe
     from sim_bus import SimulationBus, deny_hardware_sockets
+    logsafe.install()
     deny_hardware_sockets()
     models={s:HandModel(HERE/'vendor.zip',s) for s in SIDES}
     config=yaml.safe_load(Path('/work/config.yaml').read_text())

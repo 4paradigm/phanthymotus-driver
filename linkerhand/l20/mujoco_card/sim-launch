@@ -1,5 +1,9 @@
 #!/bin/bash
 set -e
+if [[ ! -f "${FASTRTPS_DEFAULT_PROFILES_FILE:-}" || ! -s "${FASTRTPS_DEFAULT_PROFILES_FILE:-}" || ! -r "${FASTRTPS_DEFAULT_PROFILES_FILE:-}" ]]; then
+    echo "L20 simulation requires the readable fleet DDS profile at ${FASTRTPS_DEFAULT_PROFILES_FILE:-/opt/phanthy-motus/dds-local.xml}" >&2
+    exit 1
+fi
 source /opt/ros/humble/setup.bash
 source /ros_ws/install/setup.bash
 exec python3 /opt/g20-simulation/simulation.py
