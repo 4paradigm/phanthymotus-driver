@@ -1070,6 +1070,10 @@ class WeighEngine:
         now = self._clock()
         if any(self._arm_deg(s, now) is None for s in SIDES):
             return self._error("joint_data_unavailable", side, "没有新鲜的 /arm/status")
+        # 每条 move_pos 都带两只手臂（未选中的保持原位），所以两只手臂任一报错都不动
+        faulted = [s for s in SIDES if self._arm_state(s)["error"]]
+        if faulted:
+            return self._error("joint_error", side, f"{','.join(faulted)} 臂电机报错，不运动")
         hand = str(args.get("hand") or cfg["default_hand"])
         if hand != "keep" and hand not in cfg["hand_shapes"]:
             return self._error("bad_hand", side, f"未知手型 {hand!r}（可选 {sorted(cfg['hand_shapes'])} 或 keep）")
@@ -1160,6 +1164,9 @@ class WeighEngine:
         now = self._clock()
         if any(self._arm_deg(s, now) is None for s in SIDES):
             return self._error("joint_data_unavailable", side, "没有新鲜的 /arm/status")
+        faulted = [s for s in SIDES if self._arm_state(s)["error"]]
+        if faulted:
+            return self._error("joint_error", side, f"{','.join(faulted)} 臂电机报错，不运动")
         tol = cfg["arrive_tol_deg"]
         per_side = {}
         for s in sides:

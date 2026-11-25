@@ -43,6 +43,7 @@ class Rig:
         self.mass_left = 0.0         # 左手掌上物体真实质量（kg）
         self.left_target = None
         self.left_error = 0
+        self.left_status = True      # False = /arm/status 里没有左臂（模拟左臂数据缺失）
         self.gain = weigh.DEFAULT_SCALE   # 传感器比例误差
         self.lever = 0.12            # 物体到传感器的力臂（m，沿 x）
         self.noise = 0.02            # 力噪声 sd（N）
@@ -152,8 +153,8 @@ class Rig:
             self.engine.add_motor_status(
                 [(mid, math.radians(self.pose[i]), spd, self.current_ratio * RATED[i], self.error)
                  for i, mid in enumerate(ids)]
-                + [(mid, math.radians(self.left[i]), 0.3 if left_moving else 0.0, 0.5, self.left_error)
-                   for i, mid in enumerate(weigh.ARM_JOINT_IDS["left"])])
+                + ([(mid, math.radians(self.left[i]), 0.3 if left_moving else 0.0, 0.5, self.left_error)
+                    for i, mid in enumerate(weigh.ARM_JOINT_IDS["left"])] if self.left_status else []))
 
     def warm(self, seconds=4.0):
         self.advance(seconds)
@@ -1739,3 +1740,49 @@ def test_calibrate_with_a_light_object_accounts_for_the_correction(tmp_path):
     res = r.engine.calibrate({"side": "right", "known_mass_kg": 0.20})
     # 不扣修正会算出 1.26（超出 1.15 的上限被拒），扣掉之后是直线段的 1.05
     assert res["state"] == "calibrated" and res["scale"] == pytest.approx(1.05, abs=0.01), res
+
+
+# ── 未选中的那只手臂：数据缺失或报错时，选中的手臂也不动 ─────────────────────────
+
+def _no_motion(rig):
+    return not rig.moves() and not [c for c in rig.hand_calls if c["action"] == "set_fingers_raw"]
+
+
+def test_weigh_right_refuses_when_left_arm_status_is_missing(tmp_path):
+    r = _hanging_rig(tmp_path)
+    r.left_status = False
+    r.warm(2)                                           # 左臂数据过期
+    res = r.engine.auto_weigh({"side": "right"})
+    assert res["code"] == "joint_data_unavailable", res
+    assert _no_motion(r)
+
+
+def test_weigh_right_refuses_when_left_arm_is_faulted(hanging):
+    hanging.left_error = 1
+    hanging.warm(1)
+    res = hanging.engine.auto_weigh({"side": "right"})
+    assert res["code"] == "joint_error" and "left" in res["error"], res
+    assert _no_motion(hanging)
+
+
+def test_reset_right_refuses_when_left_arm_is_faulted(hanging):
+    place_after_prompt(hanging, 0.59)
+    hanging.engine.auto_weigh({})
+    hanging.mass = 0.0
+    hanging.left_error = 1
+    hanging.warm(1)
+    n_moves, n_hand = len(hanging.moves()), len(hanging.hand_calls)
+    res = hanging.engine.reset({"side": "right"})
+    assert res["code"] == "joint_error" and "left" in res["error"], res
+    assert len(hanging.moves()) == n_moves and len(hanging.hand_calls) == n_hand
+
+
+def test_reset_right_refuses_when_left_arm_status_is_missing(hanging):
+    place_after_prompt(hanging, 0.59)
+    hanging.engine.auto_weigh({})
+    hanging.mass = 0.0
+    hanging.left_status = False
+    hanging.warm(2)
+    n_moves, n_hand = len(hanging.moves()), len(hanging.hand_calls)
+    assert hanging.engine.reset({"side": "right"})["code"] == "joint_data_unavailable"
+    assert len(hanging.moves()) == n_moves and len(hanging.hand_calls) == n_hand
