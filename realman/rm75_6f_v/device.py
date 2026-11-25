@@ -251,13 +251,22 @@ class RM75Plugin:
             raise RuntimeError(f"all seven joints must be enabled before motion: {enabled}")
         return state
 
+    def _current_joint_degrees(self):
+        values = self.client.call("rm_get_joint_degree")
+        if not isinstance(values, list) or len(values) != 7:
+            raise RuntimeError("controller did not return seven measured joints")
+        current = [float(value) for value in values]
+        if not all(math.isfinite(value) for value in current):
+            raise RuntimeError("controller returned non-finite joint state")
+        return current
+
     def _prepare_target(self, args):
         if not self.client.motion_enabled:
             raise PermissionError("motion is locked; set RM_MOTION_ENABLED=1 only for supervised hardware testing")
         if args.get("confirm_motion") is not True:
             raise ValueError("confirm_motion must be true")
         joint_fields = [f"joint{i}_deg" for i in range(1, 8)]
-        current = [float(value) for value in self.client.call("rm_get_joint_degree")]
+        current = self._current_joint_degrees()
         if len(current) != 7 or not all(math.isfinite(value) for value in current):
             raise RuntimeError(f"invalid current joint state: {current!r}")
         requested = {
@@ -268,6 +277,8 @@ class RM75Plugin:
         controller_max = [float(value) for value in self.client.call("rm_get_joint_drive_max_pos")]
         if len(controller_min) != 7 or len(controller_max) != 7:
             raise RuntimeError("controller did not return seven joint limits")
+        if not all(math.isfinite(value) for value in controller_min + controller_max):
+            raise RuntimeError("controller returned non-finite joint limits")
         target = [0.0] * 7
         for index, raw in requested.items():
             value = float(raw)
@@ -319,7 +330,7 @@ class RM75Plugin:
                     status, result = "cancelled", {"reason": "stopmotion"}
                     break
                 self._preflight()
-                current = [float(value) for value in self.client.call("rm_get_joint_degree")]
+                current = self._current_joint_degrees()
                 error = max(abs(actual - expected) for actual, expected in zip(current, target))
                 now = time.monotonic()
                 if error <= self.target_tolerance_deg:
@@ -1925,6 +1936,7 @@ class CartesianPlugin:
 def build_plugins(config, namespace, ros2):
     from pick_place import PickPlacePlugin
     from servo import RM75ServoPlugin
+    from waypoint import WaypointPlugin
 
     client = RM75SDKClient(config)
     shared = client.shared_client()
@@ -1936,6 +1948,7 @@ def build_plugins(config, namespace, ros2):
         RM75ServoPlugin(shared, config, namespace=namespace, ros2=ros2),
         CartesianPlugin(shared, config, arm_plugin=arm, namespace=namespace, ros2=ros2),
         PickPlacePlugin(client.exclusive_client(), config, namespace, ros2),
+        WaypointPlugin(shared, config, arm),
     ]
     camera_config = config.get("ext_camera", {})
     ext_camera_plugin = None

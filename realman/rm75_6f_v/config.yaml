@@ -2,6 +2,8 @@ mcp_port: 15718
 ros_namespace: ""
 name: "睿曼 RM75-6F-V"
 arm_dof: 7
+# waypoint 卡片使用此七轴配置；存储固定为 /opt/phanthy-motus/data/waypoints/realman，
+# 不接受卡片参数或网页配置中的文件路径。部署须挂载该专用目录为可写。
 arm_ip: ""
 tcp_port: 8080
 ext_camera:
