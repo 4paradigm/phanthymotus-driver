@@ -81,7 +81,7 @@ class ObserveTests(unittest.TestCase):
         self.assertEqual(p.config['observation_joints_deg'],ANGLES)
         self.assertEqual((p.address,p.serial),('172.16.0.3','right-camera'))
         self.assertEqual(p.config['z_compensation_mm'],0)
-        for value in (float('nan'),0,True):
+        for value in (float('nan'),0,True,10.5,float('inf')):
             self.assertEqual(p.dispatch('config',{'speed_deg_s':value})['code'],'INVALID_CONFIG')
 
     def test_arm_specific_observation_fields_and_legacy_offset(self):

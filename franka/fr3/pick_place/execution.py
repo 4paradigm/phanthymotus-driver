@@ -5,7 +5,9 @@ import time
 OBSERVATION_TOLERANCE_DEG = 1.0
 
 SPEED_CONFIG = {
-    'speed_deg_s': (.1, math.inf, 5, 'Arm joint speed limit (deg/s)'),
+    # Same ceiling as joint_control; the native side also enforces libfranka's
+    # per-joint velocity limits on every timed segment.
+    'speed_deg_s': (.1, 10, 5, 'Arm joint speed limit (deg/s)'),
     'speed_mm_s': (.1, 100, 20, 'Gripper opening and closing speed (mm/s)'),
 }
 

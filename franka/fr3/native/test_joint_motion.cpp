@@ -138,6 +138,17 @@ int main() {
     high_acceleration.speed = 1.;
     high_acceleration.timed.front().end = .15;
     rejects([&] { fr3::TimedTrajectory invalid(start, high_acceleration); });
+    // The requested speed is unbounded by the parser; the physical limit is not.
+    const fr3::VelocityLimits upper = [](const fr3::Joints&) {
+      fr3::Joints limit; limit.fill(.06); return limit; };
+    const fr3::VelocityLimits lower = [](const fr3::Joints&) {
+      fr3::Joints limit; limit.fill(-.06); return limit; };
+    const fr3::TimedTrajectory within_limits(start, command, upper, lower);
+    require(within_limits.duration() == timed.duration(), "Velocity limits changed a legal TIMED path");
+    rejects([&] { fr3::TimedTrajectory invalid(start, faster_timed, upper, lower); });
+    const fr3::VelocityLimits no_allowance = [](const fr3::Joints&) {
+      fr3::Joints limit; limit.fill(std::numeric_limits<double>::quiet_NaN()); return limit; };
+    rejects([&] { fr3::TimedTrajectory invalid(start, command, no_allowance, lower); });
     auto high_jerk = command;
     high_jerk.timed.front().end = .002;
     for (size_t i = 3; i < 6; ++i) high_jerk.timed.front().controls[i][6] = .0000005;

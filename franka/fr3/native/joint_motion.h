@@ -146,13 +146,18 @@ class Trajectory {
   double duration_;
 };
 
+// libfranka's position-dependent joint velocity limits (computeUpper/Lower
+// LimitsJointVelocity). Optional so the trajectory maths can be tested alone.
+using VelocityLimits = std::function<Joints(const Joints&)>;
+
 // Execute the same quintic Bernstein polynomials checked by the planner.
 class TimedTrajectory {
   static constexpr double kAccelerationLimit = 10.0;  // FR3 FCI, rad/s²
   static constexpr double kJerkLimit = 5000.0;  // FR3 FCI, rad/s³
 
  public:
-  TimedTrajectory(const Joints& start, const Command& command)
+  TimedTrajectory(const Joints& start, const Command& command,
+                  VelocityLimits upper = {}, VelocityLimits lower = {})
       : segments_(command.timed), lead_(start, lead_command(command)) {
     const auto& first = segments_.front().controls.front();
     const auto& last = segments_.back().controls.back();
@@ -161,15 +166,35 @@ class TimedTrajectory {
     for (const auto& segment : segments_) {
       const auto& c = segment.controls;
       const double dt = segment.end - previous;
+      // The caller's speed is a request, not a physical bound. A segment stays
+      // in its control-point hull and its velocity in the hull of the
+      // derivative control points, so checking those against the limits at
+      // the hull edge nearest each joint limit bounds the whole segment.
+      Joints positive{}, negative{};
+      if (upper && lower) {
+        Joints lo = c.front(), hi = c.front();
+        for (const auto& point : c)
+          for (size_t j = 0; j < 7; ++j) {
+            lo[j] = std::min(lo[j], point[j]);
+            hi[j] = std::max(hi[j], point[j]);
+          }
+        positive = upper(hi);
+        negative = lower(lo);
+      }
       for (size_t j = 0; j < 7; ++j) {
         if (std::abs(start[j] - first[j]) > .001 ||
             std::abs(c[0][j] - p[j]) > 1e-8 ||
             std::abs(5 * (c[1][j] - c[0][j]) / dt - v[j]) > 1e-6 ||
             std::abs(20 * (c[2][j] - 2*c[1][j] + c[0][j]) / (dt*dt) - a[j]) > 1e-4)
           throw std::invalid_argument("TIMED start or segment derivatives are discontinuous");
-        for (size_t k = 0; k < 5; ++k)
-          if (std::abs(5 * (c[k+1][j] - c[k][j]) / dt) > command.speed * 1.001)
+        for (size_t k = 0; k < 5; ++k) {
+          const double velocity = 5 * (c[k+1][j] - c[k][j]) / dt;
+          if (std::abs(velocity) > command.speed * 1.001)
             throw std::invalid_argument("TIMED joint velocity exceeds requested speed");
+          if (upper && lower && (!std::isfinite(positive[j]) || !std::isfinite(negative[j]) ||
+                                 velocity > positive[j] || velocity < negative[j]))
+            throw std::invalid_argument("TIMED joint velocity exceeds FR3 joint velocity limit");
+        }
         for (size_t k = 0; k < 4; ++k)
           if (std::abs(20 * (c[k+2][j] - 2*c[k+1][j] + c[k][j]) / (dt*dt)) >= kAccelerationLimit)
             throw std::invalid_argument("TIMED joint acceleration exceeds limit");
@@ -224,7 +249,6 @@ class TimedTrajectory {
 // and acceleration. The curve stays in each four-point convex hull.
 class PathTrajectory {
  public:
-  using VelocityLimits = std::function<Joints(const Joints&)>;
   PathTrajectory(const Joints& start, const Command& command,
                  VelocityLimits upper = {}, VelocityLimits lower = {}) {
     if (command.path.empty()) {

@@ -383,7 +383,8 @@ class Session {
           path.emplace(initial.q_d, command, franka::computeUpperLimitsJointVelocity,
                        franka::computeLowerLimitsJointVelocity);
         } else {
-          timed.emplace(initial.q_d, command);
+          timed.emplace(initial.q_d, command, franka::computeUpperLimitsJointVelocity,
+                        franka::computeLowerLimitsJointVelocity);
         }
         const double duration = timed ? timed->duration() : path->duration();
         double elapsed = 0.0;
