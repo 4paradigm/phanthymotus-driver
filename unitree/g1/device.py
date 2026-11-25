@@ -44,8 +44,11 @@ from std_msgs.msg import Header, String
 from audio_msgs.msg import AudioChunk
 
 from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
-from pointcloud_utils import gravity_align_inplace
+from pointcloud_utils import gravity_align_inplace, pack_slam_cloud
+from slam_odometry import MappingOdometry
+from sport_odometry import SportOdometry
 import sport_mode_state as _SMS
+from common.slam_input import input_declaration, native_frame_metadata, validate_extrinsic_candidate
 
 # ── 常量 ──────────────────────────────────────────────────────────────────────
 
@@ -1224,16 +1227,27 @@ class _LocoStateNode(Node):
     Subscribing to the latter with the go type silently never matches.
     """
 
-    _ODOM_INTERVAL = 0.1  # 10 Hz throttle
+    _ODOM_INTERVAL = 0.1   # Existing /loco/state JSON at ~10 Hz.
+    _SPORT_INTERVAL = 0.05  # Independent /slam/odom diagnostic at ~20 Hz.
 
-    def __init__(self, odom_topic: str, motion_topic: str):
+    def __init__(self, odom_topic: str, motion_topic: str, mapping_topic: str,
+                 sport_topic: str = None, sport_config: dict = None):
         super().__init__("g1_loco_state")
         self._odom_pub   = self.create_publisher(String, odom_topic,   _LOW_LAT_QOS)
         self._motion_pub = self.create_publisher(String, motion_topic, _LOW_LAT_QOS)
+        # SLAM candidate now comes from regular sport odometry (rt/odommodestate).
+        # The old vendor SLAM mapping source is retained only for diagnostics.
+        self._sport_adapter = SportOdometry(**(sport_config or {}))
+        self._sport_pub = (self.create_publisher(String, sport_topic, _LOW_LAT_QOS)
+                           if sport_topic else None)
+        self._sport_sample = None
+        self._sport_error = None
         self._last_state: dict = {}
+        self._last_native_state: dict = {}
         self._last_fsm: dict = {}
         self._lock       = threading.Lock()
         self._last_odom_time: float = 0.0
+        self._last_sport_time: float = 0.0
 
         try:
             from unitree_sdk2py.core.channel import ChannelSubscriber
@@ -1252,6 +1266,66 @@ class _LocoStateNode(Node):
             self.get_logger().info(f"LocoStateNode subscribed rt/sportmodestate → {motion_topic}")
         except Exception as e:
             self.get_logger().warn(f"LocoStateNode: failed to subscribe rt/sportmodestate: {e}")
+
+        self._mapping_adapter = MappingOdometry()
+        self._mapping_sample = None
+        self._mapping_error = None
+        self._mapping_pub = self._mapping_sub = None
+        try:
+            from unitree_sdk2py.core.channel import ChannelSubscriber
+            from unitree_sdk2py.idl.nav_msgs.msg.dds_ import Odometry_
+            self._mapping_pub = self.create_publisher(String, mapping_topic, _LOW_LAT_QOS)
+            self._mapping_sub = ChannelSubscriber("rt/unitree/slam_mapping/odom", Odometry_)
+            self._mapping_sub.Init(self._on_mapping_odom, 10)
+        except Exception as exc:
+            self._mapping_error = str(exc)
+            self.get_logger().warn(f"LocoStateNode: mapping odometry unavailable: {exc}")
+
+    def _on_mapping_odom(self, msg) -> None:
+        with self._lock:
+            sample = self._mapping_adapter.convert(msg)
+            self._mapping_sample = sample
+        try:
+            out = String()
+            out.data = json.dumps(sample, allow_nan=False)
+            self._mapping_pub.publish(out)
+            with self._lock:
+                self._mapping_error = None
+        except Exception as exc:
+            with self._lock:
+                self._mapping_error = str(exc)
+
+    def get_regular_child_frame(self):
+        """Only an explicitly configured frame can be used for a URDF mount."""
+        with self._lock:
+            if (self._sport_adapter._last_stamp_ns is None or
+                    self._sport_adapter._continuity_quarantined):
+                return None
+            return self._sport_adapter.child_frame_id
+
+    def get_regular_info(self, topic: str) -> dict:
+        from copy import deepcopy
+        with self._lock:
+            return {"available": False, "sample": deepcopy(self._sport_sample),
+                    "error": self._sport_error,
+                    "observation": self._sport_adapter.observation_status(),
+                    "input_metadata": [self._sport_adapter.declaration(topic)]}
+
+    def get_mapping_child_frame(self):
+        """Latest valid mapping pose child frame, never inferred from leg odom."""
+        with self._lock:
+            if self._mapping_adapter._continuity_latched:
+                return None
+            frames = self._mapping_adapter._frames
+            return frames[1] if frames else None
+
+    def get_mapping_info(self, topic: str) -> dict:
+        from copy import deepcopy
+        with self._lock:
+            return {"available": False, "sample": deepcopy(self._mapping_sample),
+                    "error": self._mapping_error,
+                    "observation": self._mapping_adapter.observation_status(),
+                    "input_metadata": [self._mapping_adapter.declaration(topic)]}
 
     def _format_state(self, msg) -> dict:
         imu = msg.imu_state
@@ -1272,14 +1346,52 @@ class _LocoStateNode(Node):
         }
 
     def _on_odom(self, msg) -> None:
+        # G1 rt/odommodestate can arrive at ~500 Hz. Cap the diagnostic
+        # candidate conversion AND JSON serialization at ~20 Hz, independently
+        # of the legacy /loco/state 10 Hz stream. No interpolation or timing
+        # provenance is inferred from this rate limiter.
         now = time.monotonic()
+        sample = None
+        with self._lock:
+            # Reserve the interval atomically if the SDK delivers callbacks
+            # on multiple DDS worker threads.
+            if now - self._last_sport_time >= self._SPORT_INTERVAL:
+                self._last_sport_time = now
+                try:
+                    sample = self._sport_adapter.convert(msg)
+                    self._sport_sample = sample
+                except Exception as error:
+                    # A diagnostic adapter failure must not break /loco/state.
+                    self._sport_error = str(error)
+        if sample is not None and self._sport_pub is not None:
+            try:
+                out = String()
+                out.data = json.dumps(sample, allow_nan=False)
+                self._sport_pub.publish(out)
+                with self._lock:
+                    self._sport_error = None
+            except (TypeError, ValueError, RuntimeError, AttributeError) as error:
+                with self._lock:
+                    self._sport_error = str(error)
+
         if now - self._last_odom_time < self._ODOM_INTERVAL:
             return
         self._last_odom_time = now
 
         state = self._format_state(msg)
+        # rt/odommodestate uses the generated unitree_go SportModeState_
+        # dataclass (idl/unitree_go/msg/dds_/_SportModeState_.py), including
+        # nested TimeSpec_, IMUState_ and PathPoint_. Keep their order untouched.
+        from dataclasses import asdict
+        native_state = {
+            "source_topic": "rt/odommodestate",
+            "source_type": "unitree_go.msg.dds_.SportModeState_",
+            "native": asdict(msg), "received_ns": time.time_ns(),
+            "received_monotonic_ns": time.monotonic_ns(),
+        }
         with self._lock:
             self._last_state = state
+            self._last_native_state = native_state
         out = String()
         out.data = json.dumps(state)
         self._odom_pub.publish(out)
@@ -1306,6 +1418,11 @@ class _LocoStateNode(Node):
         with self._lock:
             return dict(self._last_state)
 
+    def get_native_state(self) -> dict:
+        from copy import deepcopy
+        with self._lock:
+            return deepcopy(self._last_native_state)
+
     def get_fsm(self) -> dict:
         """Latest rt/sportmodestate snapshot, or {} if the topic has not been seen."""
         with self._lock:
@@ -1318,7 +1435,11 @@ class LocoStatePlugin:
     def __init__(self, plugin_config: dict, namespace: str, executor):
         self._odom_topic   = f"/{namespace}/loco/state"
         self._motion_topic = f"/{namespace}/loco/motion_state"
-        self._node = _LocoStateNode(self._odom_topic, self._motion_topic)
+        self._mapping_topic = f"/{namespace}/slam/mapping/odom"
+        self._sport_topic = f"/{namespace}/slam/odom"
+        sport_cfg = (plugin_config or {}).get('slam_regular_odometry') or {}
+        self._node = _LocoStateNode(self._odom_topic, self._motion_topic,
+                                    self._mapping_topic, self._sport_topic, sport_cfg)
         executor.add_node(self._node)
 
     def get_tools(self) -> list:
@@ -1331,7 +1452,10 @@ class LocoStatePlugin:
             "multiInstance": False,
             "description": f"G1 locomotion state (always active) — mode, velocity, position, body_height, foot_force, IMU. Publishes at 10Hz to {self._odom_topic}",
             "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{"topic": self._odom_topic, "format": "data/json"}],
+            "topic_out": [{"topic": self._odom_topic, "format": "data/json"},
+                          {"topic": self._sport_topic, "format": "state/odom"}],
+            "input_metadata": self._node.get_regular_info(self._sport_topic)['input_metadata'],
+            "odom_interface": self._node._sport_adapter.interface(),
         }
 
     def _motion_tool(self) -> dict:
@@ -1367,7 +1491,23 @@ class LocoStatePlugin:
             tool_name = args.get('_tool_name', '')
             if tool_name == 'loco_motion_state':
                 return {"state": "running", "topic_out": [{"topic": self._motion_topic, "format": "data/json"}]}
-            return {"state": "running", "topic_out": [{"topic": self._odom_topic, "format": "data/json"}]}
+            tool = self._odom_tool()
+            return {"state": "running", "topic_out": tool['topic_out'],
+                    "input_metadata": tool['input_metadata'],
+                    "odom_interface": tool['odom_interface'],
+                    "regular_odom": self._node.get_regular_info(self._sport_topic),
+                    "mapping_odom": self._node.get_mapping_info(self._mapping_topic),
+                    "native_snapshot": self._node.get_native_state(),
+                    "slam_pose": {"available": False,
+                                  "documented_facts": {
+                                      "source": "https://support.unitree.com/home/en/G1_developer/odometer_service_interface",
+                                      "length_unit": "m", "quaternion_order": "wxyz",
+                                      "pose_reference": "robot_base_center",
+                                      "axes": ["forward", "left", "up"],
+                                      "requires_high_level_motion_control": True,
+                                      "minimum_state_estimator_version": "1.0.0.1"},
+                                  "missing_facts": list(self._node._sport_adapter.interface()[
+                                      "slam_pose"]["missing_facts"])}}
         return None
 
 
@@ -2077,6 +2217,8 @@ class _LowStateNode(Node):
         self._last_battery: dict = {}
         self._last_posture: dict = {}
         self._lock = threading.Lock()
+        self._imu_publish_lock = threading.RLock()
+        self._imu_enabled = True
         self._low_state = low_state
         self._last_lowstate_sample = None
         self._state_samples = 0
@@ -2125,7 +2267,9 @@ class _LowStateNode(Node):
 
         imu_out = String()
         imu_out.data = json.dumps(imu_data)
-        self._imu_pub.publish(imu_out)
+        with self._imu_publish_lock:
+            if self._imu_enabled:
+                self._imu_pub.publish(imu_out)
 
         # One 20 Hz timer; every second new sample publishes joints at 10 Hz.
         self._state_samples += 1
@@ -2248,6 +2392,7 @@ class StatePlugin:
     PREFIX = "state"
 
     def __init__(self, plugin_config: dict, namespace: str, executor, *, low_state):
+        self._camera = None
         self._imu_topic       = f"/{namespace}/state/imu"
         self._battery_topic   = f"/{namespace}/state/battery"
         self._joints_topic    = f"/{namespace}/state/joints"
@@ -2280,13 +2425,17 @@ class StatePlugin:
         }
 
     def _imu_tool(self) -> dict:
+        camera = getattr(self, '_camera', None)
         return {
             "name": "imu",
             "type": "sensor",
             "multiInstance": False,
-            "description": f"G1 IMU sensor — quaternion, gyroscope, accelerometer, rpy, temperature. Publishes to {self._imu_topic}",
+            "description": f"G1 body IMU at {self._imu_topic}; optional camera_imu is a separate camera motion source.",
             "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{"topic": self._imu_topic, "format": "data/json"}],
+            "topic_out": [{"topic": self._imu_topic, "format": "data/json"}] +
+                         ([camera.camera_imu_port()] if camera is not None else []),
+            "imu_status": (camera._rgbd_info()['imu_status'] if camera is not None else
+                           dict(state='unavailable', reason='camera plugin disabled')),
         }
 
     def _battery_tool(self) -> dict:
@@ -2335,6 +2484,19 @@ class StatePlugin:
         pass
 
     def dispatch(self, action: str, args: dict) -> dict | None:
+        if args.get('_tool_name') == 'imu':
+            camera = getattr(self, '_camera', None)
+            if action in ('info', 'start', 'stop', 'imu'):
+                # Share the publish lock so stop waits for an in-flight body
+                # packet, while low-state caching and sibling telemetry continue.
+                with self._node._imu_publish_lock:
+                    if action in ('start', 'stop'):
+                        self._node._imu_enabled = action == 'start'
+                        if camera is not None:
+                            camera.dispatch(action, {'_tool_name': 'imu'})
+                    state = 'running' if self._node._imu_enabled else 'idle'
+                tool = self._imu_tool()
+                return dict(state=state, topic_out=tool['topic_out'], imu_status=tool['imu_status'])
         if action == "posture":
             posture = self._node.get_posture()
             if not posture:
@@ -2379,6 +2541,20 @@ class _LidarNode(Node):
         super().__init__("g1_lidar")
         from std_msgs.msg import UInt8MultiArray
         self._cloud_pub = self.create_publisher(UInt8MultiArray, cloud_topic, _LOW_LAT_QOS)
+        self._source_generation = uuid4().hex
+        self._native_source_header = None
+        self._native_error = None
+        self._display_error = None
+        self._native_pub = self._native_meta_pub = None
+        try:
+            from sensor_msgs.msg import PointCloud2
+            native_qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                                    history=HistoryPolicy.KEEP_LAST, depth=2,
+                                    durability=DurabilityPolicy.VOLATILE)
+            self._native_pub = self.create_publisher(PointCloud2, cloud_topic+'_native', native_qos)
+            self._native_meta_pub = self.create_publisher(String, cloud_topic+'_native/metadata', native_qos)
+        except Exception as exc:
+            self._native_error = str(exc)
         self._last_cloud_time: float = 0.0
         self._imu_roll:  float = 0.0
         self._imu_pitch: float = 0.0
@@ -2421,6 +2597,12 @@ class _LidarNode(Node):
         Runs directly in CycloneDDS receive thread (queueLen=0).
         """
         self._cb_count += 1
+        header = getattr(msg, 'header', None)
+        stamp = getattr(header, 'stamp', None)
+        self._native_source_header = (
+            {'frame_id': getattr(header, 'frame_id', None),
+             'stamp': {'sec': getattr(stamp, 'sec', None), 'nanosec': getattr(stamp, 'nanosec', None)}}
+            if header is not None else None)
         now = time.monotonic()
         if now - self._last_cloud_time < LIDAR_CLOUD_INTERVAL:
             return
@@ -2432,12 +2614,48 @@ class _LidarNode(Node):
 
         point_step = msg.point_step
         total_points = msg.width * msg.height
-        data = msg.data if isinstance(msg.data, (bytes, bytearray)) else bytes(msg.data)
+        # 显示旋转也必须使用独立缓冲，避免污染后续原生订阅读到的 SDK 数据。
+        data = bytes(msg.data)
+        native = metadata = None
+        try:
+            if (self._native_pub is not None and self._native_meta_pub is not None and
+                    self._native_pub.get_subscription_count() > 0):
+                import array as _array
+                from sensor_msgs.msg import PointCloud2, PointField
+                raw = PointCloud2()
+                raw.header.stamp.sec = msg.header.stamp.sec
+                raw.header.stamp.nanosec = msg.header.stamp.nanosec
+                raw.header.frame_id = msg.header.frame_id
+                raw.height, raw.width = msg.height, msg.width
+                raw.is_bigendian, raw.is_dense = False, msg.is_dense
+                raw.point_step, raw.row_step = msg.point_step, msg.width * msg.point_step
+                raw.fields = [PointField(name=f.name, offset=f.offset, datatype=f.datatype, count=f.count)
+                              for f in msg.fields]
+                raw.data = _array.array('B', pack_slam_cloud(msg))
+                metadata = native_frame_metadata(raw, source_generation=self._source_generation)
+                native = raw
+                self._native_error = None
+        except Exception as exc:
+            self._native_error = str(exc)
 
+        try:
+            # 显示包要求 XYZ float32 LE 在前三列；行填充不能交给旋转函数。
+            fields = getattr(msg, 'fields', None)
+            if fields is not None and any(
+                    not any(f.name == name and f.offset == offset and f.datatype == 7 and f.count == 1
+                            for f in fields) for name, offset in (('x', 0), ('y', 4), ('z', 8))):
+                raise ValueError('display requires float32 XYZ at offsets 0/4/8')
+            if native is not None:
+                data = bytes(native.data)
+            elif msg.row_step != msg.width * point_step or msg.is_bigendian:
+                data = pack_slam_cloud(msg)
+        except Exception as exc:
+            self._display_error = str(exc)
+            data = None
         # Non-blocking put; drop frame if worker is busy
         try:
             self._cloud_queue.put_nowait((point_step, total_points, data,
-                                         self._imu_roll, self._imu_pitch))
+                                         self._imu_roll, self._imu_pitch, native, metadata))
         except queue.Full:
             self._cb_dropped += 1
 
@@ -2460,20 +2678,32 @@ class _LidarNode(Node):
             item = self._cloud_queue.get()
             if item is None:
                 break
-            point_step, total_points, data, roll, pitch = item
+            point_step, total_points, data, roll, pitch, native, metadata = item
             t0 = time.monotonic()
 
-            # Apply gravity alignment (returns bytearray, avoids extra copy)
-            data = gravity_align_inplace(data, point_step, total_points, roll, pitch)
+            if native is not None:
+                try:
+                    self._native_pub.publish(native)
+                    packet = String()
+                    packet.data = json.dumps(metadata, allow_nan=False)
+                    self._native_meta_pub.publish(packet)
+                except Exception as exc:
+                    self._native_error = str(exc)
 
-            # Publish — pre-allocate buffer to avoid header + data concat copy
-            header = struct.pack('<II', point_step, total_points)
-            buf = bytearray(8 + len(data))
-            buf[:8] = header
-            buf[8:] = data
-            ros_msg = UInt8MultiArray()
-            ros_msg.data = _array.array('B', buf)
-            self._cloud_pub.publish(ros_msg)
+            # 显示转换或发布失败只丢这一帧显示，不能终止原生点云的工作线程。
+            try:
+                if data is not None:
+                    data = gravity_align_inplace(data, point_step, total_points, roll, pitch)
+                    header = struct.pack('<II', point_step, total_points)
+                    buf = bytearray(8 + len(data))
+                    buf[:8] = header
+                    buf[8:] = data
+                    ros_msg = UInt8MultiArray()
+                    ros_msg.data = _array.array('B', buf)
+                    self._cloud_pub.publish(ros_msg)
+                    self._display_error = None
+            except Exception as exc:
+                self._display_error = str(exc)
 
             elapsed_ms = (time.monotonic() - t0) * 1000
             self._worker_count += 1
@@ -2495,8 +2725,41 @@ class _LidarNode(Node):
 class LidarPlugin:
     PREFIX = "lidar"
 
-    def __init__(self, plugin_config: dict, namespace: str, executor):
+    def __init__(self, plugin_config: dict, namespace: str, executor,
+                 pose_frame_provider=None):
+        from common.slam_input import calibrated_urdf_mount
         self._cloud_topic = f"/{namespace}/lidar/cloud"
+        self._native_topic = f"/{namespace}/lidar/cloud_native"
+        self._pose_frame_provider = pose_frame_provider
+        self._urdf_path = Path(__file__).parent / "resource" / "g1_model.urdf"
+        self._urdf_frame_aliases = (plugin_config or {}).get('slam_urdf_frame_aliases') or {}
+        self._urdf_mount = None
+        self._urdf_mount_error = None
+        if (not isinstance(self._urdf_frame_aliases, dict) or
+                any(not isinstance(k, str) or not k.strip() or
+                    not isinstance(v, str) or not v.strip()
+                    for k, v in self._urdf_frame_aliases.items())):
+            self._urdf_mount_error = 'slam_urdf_frame_aliases must map real frame names to URDF links'
+            self._urdf_frame_aliases = {}
+        try:
+            # The operator has already verified this installed G1's URDF
+            # mount. Expose the model transform as calibrated, but attach it
+            # as a SLAM input only once both native source frames are known.
+            if self._urdf_mount_error is None:
+                self._urdf_mount = calibrated_urdf_mount(
+                    self._urdf_path, 'torso_link', 'mid360_link')
+        except (OSError, ValueError) as error:
+            self._urdf_mount_error = str(error)
+        # Store optional operator measurements as UNVERIFIED diagnostics only.
+        # Do not populate the authoritative 'extrinsic' input declaration.
+        self._extrinsic_candidate = None
+        self._extrinsic_candidate_error = None
+        candidate = (plugin_config or {}).get('slam_extrinsic_candidate')
+        if candidate is not None:
+            try:
+                self._extrinsic_candidate = validate_extrinsic_candidate(candidate)
+            except (TypeError, ValueError) as error:
+                self._extrinsic_candidate_error = str(error)
         self._node = _LidarNode(self._cloud_topic)
         executor.add_node(self._node)
 
@@ -2504,16 +2767,86 @@ class LidarPlugin:
         return [self._cloud_tool()]
 
     def _cloud_tool(self) -> dict:
+        from copy import deepcopy
+        source_header = deepcopy(self._node._native_source_header)
+        candidate = deepcopy(self._extrinsic_candidate)
+        candidate_error = self._extrinsic_candidate_error
+        if (candidate is not None and source_header is not None and
+                source_header.get('frame_id') and
+                candidate['child_frame'] != source_header['frame_id']):
+            candidate_error = ('candidate cloud frame differs from observed source header: ' +
+                               str(source_header['frame_id']))
+            candidate = None
+        calibrated = None
+        calibration_error = self._urdf_mount_error
+        cloud_frame = source_header.get('frame_id') if source_header else None
+        try:
+            pose_frame = (self._pose_frame_provider()
+                          if callable(self._pose_frame_provider) else None)
+            if self._urdf_mount is not None and pose_frame and cloud_frame:
+                from common.slam_input import calibrated_urdf_mount
+                calibrated = calibrated_urdf_mount(
+                    self._urdf_path, pose_frame, cloud_frame,
+                    urdf_parent_frame=self._urdf_frame_aliases.get(pose_frame),
+                    urdf_child_frame=self._urdf_frame_aliases.get(cloud_frame))
+                # A manually supplied transform cannot silently override the
+                # calibrated model. Conflicts require operator resolution.
+                if (candidate is not None and
+                        candidate['parent_frame'] == calibrated['parent_frame'] and
+                        candidate['child_frame'] == calibrated['child_frame'] and
+                        any(abs(candidate['matrix'][i][j] - calibrated['matrix'][i][j])
+                            > 1e-6 for i in range(4) for j in range(4))):
+                    calibrated = None
+                    calibration_error = 'manual candidate conflicts with calibrated G1 URDF'
+            elif self._urdf_mount is not None:
+                calibration_error = 'awaiting live odometry child frame and lidar header frame'
+        except (OSError, ValueError, TypeError) as error:
+            calibration_error = str(error)
         return {
             "name": "lidar_cloud",
             "type": "sensor",
             "multiInstance": False,
             "description": f"Livox Mid-360 full point cloud passthrough at 10Hz. Binary format: [uint32 point_step][uint32 total_points][raw PointCloud2 bytes]. Publishes to {self._cloud_topic}",
             "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{"topic": self._cloud_topic, "format": "sensor/pointcloud"}],
+            "topic_out": [{"topic": self._cloud_topic, "format": "sensor/pointcloud"},
+                          {"topic": self._native_topic, "format": "sensor/pointcloud2"}],
+            "input_metadata": [input_declaration(
+                self._native_topic, 'sensor/pointcloud2', 'cloud', self._native_topic,
+                frame_metadata_topic=self._native_topic+'/metadata',
+                source_topic='rt/utlidar/cloud_livox_mid360',
+                source_type='sensor_msgs.msg.dds_.PointCloud2_',
+                frame_id=source_header['frame_id'] if source_header else None,
+                source_header=source_header,
+                extrinsic=calibrated,
+                extrinsic_candidate=candidate)],
+            "urdf_mount": deepcopy(self._urdf_mount),
+            "urdf_calibration_error": calibration_error,
+            "extrinsic_candidate_error": candidate_error,
             "configSchema": {
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "slam_urdf_frame_aliases": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"},
+                        "description": ("Explicit operator-confirmed mapping from exact native "
+                                        "frame_id to URDF link name; no inferred aliases"),
+                    },
+                    "slam_extrinsic_candidate": {
+                        "type": "object",
+                        "title": "Unverified lidar-to-odometry transform candidate",
+                        "description": ("Measured 4x4 rigid transform in meters, parent=odometry "
+                                        "child frame and child=raw lidar frame. Diagnostic only; "
+                                        "does not assert calibration or enable mapping."),
+                        "properties": {
+                            "parent_frame": {"type": "string"},
+                            "child_frame": {"type": "string"},
+                            "source": {"type": "string"},
+                            "version": {"type": "string"},
+                            "matrix": {"type": "array"},
+                        },
+                        "required": ["parent_frame", "child_frame", "source", "version", "matrix"],
+                    },
+                },
             },
         }
 
@@ -2529,7 +2862,13 @@ class LidarPlugin:
         if action == "stop":
             return {"state": "idle"}
         if action == "info":
-            return {"state": "running", "topic_out": [{"topic": self._cloud_topic, "format": "sensor/pointcloud"}]}
+            tool = self._cloud_tool()
+            return {"state": "running", "topic_out": tool['topic_out'],
+                    "input_metadata": tool['input_metadata'], "native_error": self._node._native_error,
+                    "display_error": self._node._display_error,
+                    "urdf_mount": tool['urdf_mount'],
+                    "urdf_calibration_error": tool['urdf_calibration_error'],
+                    "extrinsic_candidate_error": tool['extrinsic_candidate_error']}
         return None
 
 
@@ -3840,15 +4179,16 @@ class _CameraFrameNode(Node):
                 "data": data,
                 "received_monotonic": time.monotonic(),
                 "frame_sequence": self._sequence,
+                "stamp_ns": msg.header.stamp.sec * 1_000_000_000 + msg.header.stamp.nanosec,
             }
             self._condition.notify_all()
 
-    def wait_for_frame(self, after_sequence=None, timeout_s=5.0):
+    def wait_for_frame(self, after_sequence=None, timeout_s=5.0, *, min_stamp_ns=0):
         deadline = time.monotonic() + max(0.0, timeout_s)
         with self._condition:
             while True:
                 frame = self._latest
-                if frame is not None and (
+                if frame is not None and frame['stamp_ns'] >= min_stamp_ns and (
                         after_sequence is None or self._sequence > after_sequence):
                     return dict(frame), self._sequence
                 remaining = deadline - time.monotonic()
@@ -3861,14 +4201,63 @@ class RealSensePlugin:
     PREFIX = "camera"
 
     def __init__(self, plugin_config: dict, namespace: str, executor):
+        import multiprocessing as mp
+        self._card_epochs = mp.get_context('spawn').Array('q', [0, 0, 0, 0])
+        self._lifecycle_lock = threading.RLock()
         self._namespace   = namespace
         self._color_topic = f"/{namespace}/camera/rgb"
         self._depth_topic = f"/{namespace}/camera/depth"
         self._dist_topic  = f"/{namespace}/camera/distance"
         self._executor = executor
         self._proc = None
+        self._rgbd_status_queue = None
+        self._rgbd_status = None
         self._frame_node = None
+        self._intrinsics_lock = threading.Lock()
+        self._intrinsics = {}
+        self._intrinsics_reader = None
+        self._intrinsics_thread = None
         self._ensure_frame_node()
+
+    def _camera_info(self, tool_name, topic, fmt):
+        """Declare the original display RGB profile, never a guessed K."""
+        from camera_specs import declare
+        with self._intrinsics_lock:
+            profiles = {name: dict(value) for name, value in self._intrinsics.items()}
+        return declare(tool_name, topic, fmt, profiles)
+
+    def _adopt_intrinsics(self, payload, process=None):
+        """Adopt negotiated profiles for the original display RGB declaration."""
+        from camera_specs import validated_profiles
+        profiles = validated_profiles(payload)
+        with self._intrinsics_lock:
+            if process is not None and self._proc is not process:
+                return
+            self._intrinsics = profiles
+        if profiles:
+            print("[camera] G1 RealSense active intrinsics: " +
+                  ", ".join(sorted(profiles)), flush=True)
+        else:
+            print("[camera] G1 RealSense intrinsics missing or invalid; K unavailable",
+                  flush=True)
+
+    def _receive_intrinsics(self, receiver, process):
+        """Read one small camera-profile message from the isolated child process."""
+        try:
+            while True:
+                if receiver.poll(0.25):
+                    try:
+                        payload = receiver.recv()
+                    except EOFError:
+                        return
+                    self._adopt_intrinsics(payload, process)
+                    return
+                if not process.is_alive():
+                    return
+        except (EOFError, OSError) as exc:
+            print(f"[camera] RealSense calibration channel closed: {exc}", flush=True)
+        finally:
+            receiver.close()
 
     def _ensure_frame_node(self) -> None:
         """Create the cache subscription once for this plugin lifecycle."""
@@ -3881,6 +4270,33 @@ class RealSensePlugin:
     def get_tools(self) -> list:
         return [self._color_tool(), self._depth_tool(), self._dist_tool()]
 
+    def _rgbd_info(self):
+        status_queue = self._rgbd_status_queue
+        if status_queue is not None:
+            while True:
+                try:
+                    self._rgbd_status = status_queue.get_nowait()
+                except queue.Empty:
+                    break
+        status = dict(self._rgbd_status or {})
+        if not self.is_running() or not 0 <= time.time_ns() - status.get('last_capture_ns', 0) <= 1_000_000_000:
+            status.update(state='unavailable', camera_info=[])
+            status['reason'] = status.get('reason') or 'waiting for live calibrated RGB-D capture'
+        root = f"/{self._namespace}/camera/rgbd"
+        status['topic_out'] = [{'topic': root + '/color', 'format': 'image/jpeg'},
+                               {'topic': f'/{self._namespace}/camera/depth', 'format': 'image/depth-zlib'},
+                               {'topic': root + '/imu', 'format': 'sensor/imu', 'optional': True},
+                               {'topic': root + '/body_mount', 'format': 'state/extrinsic', 'optional': True}]
+        status.setdefault('body_mount_status', dict(status='unavailable', reason='waiting for body mount source'))
+        imu = status.setdefault('imu_status', dict(state='unavailable', reason='waiting for camera motion'))
+        if not self.is_running() or not -50_000_000 <= time.time_ns() - imu.get('last_capture_ns', 0) <= 500_000_000:
+            imu.update(state='unavailable', reason=imu.get('reason') or 'motion capture stale')
+        return status
+
+    def camera_imu_port(self):
+        return dict(topic=f'/{self._namespace}/camera/rgbd/imu', format='sensor/imu',
+                    name='camera_imu', optional=True)
+
     def _color_tool(self) -> dict:
         return {
             "name": "camera_rgb",
@@ -3888,7 +4304,12 @@ class RealSensePlugin:
             "multiInstance": False,
             "description": f"RealSense color camera — {RS_COLOR_W}x{RS_COLOR_H} JPEG @ {RS_COLOR_FPS}fps. Publishes CompressedImage to {self._color_topic}",
             "inputSchema": {"type": "object", "properties": {}},
-            "topic_out": [{"topic": self._color_topic, "format": "image/jpeg"}],
+            "topic_out": [{"topic": self._color_topic, "format": "image/jpeg"},
+                          {"topic": f"/{self._namespace}/camera/rgbd/color", "format": "image/jpeg"}],
+            "camera_info": self._camera_info("camera_rgb", self._color_topic, "image/jpeg") +
+                           [entry for entry in self._rgbd_info().get('camera_info', [])
+                            if entry['format'] == 'image/jpeg'],
+            "body_mount_status": self._rgbd_info()['body_mount_status'],
         }
 
     def _depth_tool(self) -> dict:
@@ -3899,6 +4320,9 @@ class RealSensePlugin:
             "description": f"RealSense depth camera — {RS_DEPTH_W}x{RS_DEPTH_H} 16UC1 zlib (mm) @ {RS_DEPTH_FPS}fps. Publishes to {self._depth_topic}",
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._depth_topic, "format": "image/depth-zlib"}],
+            "camera_info": [entry for entry in self._rgbd_info().get('camera_info', [])
+                            if entry['topic'] == self._depth_topic],
+            "body_mount_status": self._rgbd_info()['body_mount_status'],
         }
 
     def _dist_tool(self) -> dict:
@@ -3912,28 +4336,75 @@ class RealSensePlugin:
         }
 
     def start(self) -> None:
+        with self._lifecycle_lock:
+            self._start_owner()
+
+    def _start_owner(self):
         import multiprocessing as mp
         # A stopped plugin may be started again in the same driver process.
-        # Recreate the cache node that stop() explicitly destroyed.
         self._ensure_frame_node()
         if self._proc is not None and self._proc.is_alive():
             return
+        with self._card_epochs.get_lock():
+            restarted_ns = time.time_ns()
+            for index, epoch in enumerate(self._card_epochs):
+                if epoch:
+                    self._card_epochs[index] = restarted_ns
         ctx = mp.get_context("spawn")
-        self._proc = ctx.Process(
-            target=run_realsense_process, args=(self._namespace,),
+        receiver, sender = ctx.Pipe(duplex=False)
+        with self._intrinsics_lock:
+            self._intrinsics = {}  # Never reuse a prior device's calibration.
+        self._rgbd_status = None
+        self._rgbd_status_queue = ctx.Queue(maxsize=2)
+        process = ctx.Process(
+            target=run_realsense_process, args=(self._namespace, sender, self._rgbd_status_queue, self._card_epochs),
             name="realsense", daemon=True,
         )
-        self._proc.start()
-        print(f"[bundle] RealSense capture forked → pid={self._proc.pid}")
+        try:
+            process.start()
+        except Exception:
+            sender.close()
+            receiver.close()
+            raise
+        sender.close()
+        self._proc = process
+        self._intrinsics_reader = receiver
+        self._intrinsics_thread = threading.Thread(
+            target=self._receive_intrinsics, args=(receiver, process),
+            name="g1_realsense_intrinsics", daemon=True)
+        self._intrinsics_thread.start()
+        print(f"[bundle] RealSense capture forked → pid={process.pid}")
 
     def stop(self) -> None:
-        if self._proc is not None and self._proc.is_alive():
-            self._proc.terminate()
-            self._proc.join(timeout=3.0)
-            if self._proc.is_alive():
-                self._proc.kill()
-                self._proc.join(timeout=2.0)
+        with self._lifecycle_lock:
+            self._stop_owner()
+
+    def _stop_owner(self):
+        with self._card_epochs.get_lock():
+            self._card_epochs[:] = [0, 0, 0, 0]
+        process = self._proc
         self._proc = None
+        if process is not None and process.is_alive():
+            process.terminate()
+            process.join(timeout=3.0)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=2.0)
+        receiver = self._intrinsics_reader
+        self._intrinsics_reader = None
+        if receiver is not None:
+            receiver.close()
+        thread = self._intrinsics_thread
+        self._intrinsics_thread = None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=0.5)
+        with self._intrinsics_lock:
+            self._intrinsics = {}
+        status_queue = getattr(self, "_rgbd_status_queue", None)
+        self._rgbd_status_queue = None
+        self._rgbd_status = None
+        if status_queue is not None:
+            status_queue.close()
         node = self._frame_node
         self._frame_node = None
         if node is not None:
@@ -3954,26 +4425,72 @@ class RealSensePlugin:
 
     def wait_for_color_frame(self, after_sequence=None, timeout_s=5.0):
         node = self._frame_node
-        if node is None:
+        epoch = self._card_epochs[0]
+        if node is None or not epoch:
             return None, 0
-        return node.wait_for_frame(after_sequence, timeout_s)
+        frame, sequence = node.wait_for_frame(after_sequence, timeout_s, min_stamp_ns=epoch)
+        if self._card_epochs[0] != epoch:
+            return None, sequence
+        return frame, sequence
+
+    def _start_card(self, index):
+        with self._lifecycle_lock:
+            self.start()  # Acquisition never activates sibling card outputs.
+            with self._card_epochs.get_lock():
+                if not self._card_epochs[index]:
+                    self._card_epochs[index] = time.time_ns()
+
+    def ensure_rgb_output(self):
+        """Enable display RGB for media without waiting for RGB-D calibration."""
+        self._start_card(0)
 
     def dispatch(self, action: str, args: dict) -> dict | None:
-        if action == "start":
-            return {"state": "running"}
-        if action == "stop":
-            return {"state": "idle"}
-        if action == "info":
-            tool_name = args.get('_tool_name', '')
-            if tool_name == 'camera_depth':
-                return {"state": "running", "topic_out": [{"topic": self._depth_topic, "format": "image/depth-zlib"}]}
-            if tool_name == 'camera_distance':
-                return {"state": "running", "topic_out": [{"topic": self._dist_topic, "format": "data/json"}]}
-            return {"state": "running", "topic_out": [{"topic": self._color_topic, "format": "image/jpeg"}]}
-        return None
+        name = args.get('_tool_name', 'camera_rgb')
+        indices = {'camera_rgb': 0, 'camera_depth': 1, 'camera_distance': 2, 'imu': 3}
+        if name not in indices:
+            return None
+        index = indices[name]
+        if action == 'start':
+            self._start_card(index)
+        elif action == 'stop':
+            # The child holds this same lock through publication: no output can
+            # escape after stop returns, even if encoding was already in flight.
+            with self._lifecycle_lock, self._card_epochs.get_lock():
+                self._card_epochs[index] = 0
+        elif action not in ('info', name):
+            return None
+        if action == 'start' and name in ('camera_rgb', 'camera_depth'):
+            epoch = self._card_epochs[index]
+            topic = (f'/{self._namespace}/camera/rgbd/color'
+                     if name == 'camera_rgb' else self._depth_topic)
+            deadline = time.monotonic() + 10.
+            while self._card_epochs[index] == epoch:
+                status = self._rgbd_info()
+                if (status.get('last_capture_ns', 0) >= epoch and
+                        any(entry['topic'] == topic for entry in status.get('camera_info', []))):
+                    break
+                if not self.is_running() or status.get('configuration_error'):
+                    break
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(.05)
+        active = bool(self._card_epochs[index])
+        if name == 'imu':
+            return dict(state='running' if active else 'idle',
+                        topic_out=[self.camera_imu_port()], imu_status=self._rgbd_info()['imu_status'])
+        tool = {'camera_rgb': self._color_tool, 'camera_depth': self._depth_tool,
+                'camera_distance': self._dist_tool}[name]()
+        status = self._rgbd_info()
+        state = 'running' if active else 'idle'
+        if active and (name == 'camera_depth' or name == 'camera_rgb' and action == 'start'):
+            state = status['state']
+        return dict(state=state,
+                    topic_out=tool['topic_out'],
+                    **{key: tool[key] for key in ('camera_info', 'body_mount_status') if key in tool},
+                    **({'reason': status.get('reason')} if active and name in ('camera_rgb', 'camera_depth') else {}))
 
 
-def run_realsense_process(namespace: str) -> None:
+def run_realsense_process(namespace: str, calibration_sender=None, rgbd_status_queue=None, card_epochs=None) -> None:
     """RealSense subprocess entry — independent GIL for full 1080p@15fps throughput.
 
     All heavy imports (cv2, numpy, pyrealsense2, sensor_msgs) happen here
@@ -3989,6 +4506,9 @@ def run_realsense_process(namespace: str) -> None:
     import cv2
     import numpy as np
     import pyrealsense2 as rs
+    from rgbd_camera import RgbdSource
+    from common.camera_mount import BodyMountSource
+    from common.realsense_imu import MotionSource, start_optional_motion
     import rclpy
     from rclpy.node import Node as _Node
     from rclpy.executors import SingleThreadedExecutor
@@ -4012,16 +4532,31 @@ def run_realsense_process(namespace: str) -> None:
             self._dist_pub  = self.create_publisher(_String, dist_topic, _QOS)
 
             self._pipeline = None
+            self._capture_profile = None
+            self._imu_card_epoch = 0
             self._last_ts        = 0.0
             self._last_dist_time = 0.0
-
-            self._depth_q = queue.Queue(maxsize=1)
-            self._depth_worker = None
 
             self._color_q = queue.Queue(maxsize=1)
             self._color_worker = None
 
             self._worker_stop = threading.Event()
+            root = f"/{namespace}/camera/rgbd"
+            body_mount = BodyMountSource(self, root,
+                body_frame=os.environ.get('CAMERA_BODY_FRAME', 'pelvis'),
+                camera_frame='camera_depth_optical_frame', clock_id='realsense_sdk_global_time_unix')
+            self._rgbd = RgbdSource(root, rs, body_mount=body_mount, depth_topic=depth_topic)
+            self._imu_pub = self.create_publisher(_String, root + '/imu', _QOS)
+            self._imu = MotionSource(root + '/imu', 'camera_depth_optical_frame', rs,
+                                     self._rgbd.motion_stamp, self._publish_imu,
+                                     clock_id=lambda: 'realsense_sdk_global_time_unix')
+            self._rgbd_pubs = [self.create_publisher(CompressedImage, root + '/color', _QOS),
+                               self._depth_pub]
+            self._rgbd_q = queue.Queue(maxsize=1)
+            self._rgbd_worker = None
+            self._rgbd_configured = False
+            self._rgbd_configuration_error = None
+            self._publish_rgbd_status()
 
             self.get_logger().info(
                 f"RealSenseNode ready — color:{color_topic} depth:{depth_topic} dist:{dist_topic}"
@@ -4044,16 +4579,54 @@ def run_realsense_process(namespace: str) -> None:
             config.enable_stream(rs.stream.color, RS_COLOR_W, RS_COLOR_H, rs.format.bgr8, RS_COLOR_FPS)
 
             self._worker_stop.clear()
-            self._depth_worker = threading.Thread(target=self._depth_loop, name="rs_depth", daemon=True)
-            self._depth_worker.start()
             self._color_worker = threading.Thread(target=self._color_loop, name="rs_color", daemon=True)
             self._color_worker.start()
 
-            pipeline.start(config, self._on_frame)
+            # Request SDK mapping of hardware capture time to the system epoch.
+            # Unverified capture clocks gate shared depth and registered RGB.
+            for sensor in devs[0].query_sensors():
+                try:
+                    if sensor.supports(rs.option.global_time_enabled):
+                        sensor.set_option(rs.option.global_time_enabled, 1.)
+                except Exception as exc:
+                    self.get_logger().warn(f"RGB-D capture clock: {exc}")
+            profile, imu_error = start_optional_motion(rs, pipeline, config, devs[0], self._on_frame)
+            if imu_error:
+                self._imu.unavailable(imu_error)
+            else:
+                try:
+                    self._imu.configure(profile)
+                except Exception as exc:
+                    self._imu.unavailable(exc)
             self._pipeline = pipeline
+            self._capture_profile = profile
+            try:
+                self._rgbd.configure(profile)
+                self._rgbd_configuration_error = None
+                self._rgbd_configured = True
+                self._rgbd_worker = threading.Thread(target=self._rgbd_loop, name="rs_rgbd", daemon=True)
+                self._rgbd_worker.start()
+            except Exception as exc:
+                self._rgbd.reason = str(exc)
+                self._rgbd_configuration_error = str(exc)
+                self._publish_rgbd_status()
+            # The original display RGB keeps its independently negotiated K.
+            # Shared depth declarations come only from the rectified encoder.
+            try:
+                from camera_specs import active_stream_profiles
+                profiles = active_stream_profiles(profile, rs)
+                if calibration_sender is not None:
+                    calibration_sender.send(profiles)
+                self.get_logger().info(
+                    "G1 RealSense negotiated intrinsics: " +
+                    ", ".join(sorted(profiles)))
+            except Exception as error:
+                self.get_logger().warning(
+                    f"G1 RealSense capture active, but intrinsics unavailable: {error}")
             self.get_logger().info(f"RealSense capture started — device {serial}")
 
         def stop_capture(self):
+            self._capture_profile = None
             if self._pipeline is not None:
                 try:
                     self._pipeline.stop()
@@ -4061,41 +4634,73 @@ def run_realsense_process(namespace: str) -> None:
                     pass
                 self._pipeline = None
             self._worker_stop.set()
-            if self._depth_worker is not None:
-                self._depth_worker.join(timeout=2.0)
-                self._depth_worker = None
+            if self._rgbd_worker is not None:
+                self._rgbd_worker.join(timeout=2.0)
+                self._rgbd_worker = None
             if self._color_worker is not None:
                 self._color_worker.join(timeout=2.0)
                 self._color_worker = None
             self.get_logger().info("RealSense capture stopped")
 
-        def _depth_loop(self):
+        def _publish_for(self, card, message, capture_ns, publisher, *, acquired_ns=None):
+            index = {'camera_rgb': 0, 'camera_depth': 1, 'camera_distance': 2, 'imu': 3}[card]
+            if card_epochs is None:
+                return False
+            with card_epochs.get_lock():
+                epoch = card_epochs[index]
+                if not epoch or capture_ns < epoch or (acquired_ns is not None and acquired_ns < epoch):
+                    return False
+                publisher.publish(message)
+                return True
+
+        def _publish_imu(self, packet):
+            msg = _String()
+            msg.data = json.dumps(packet, allow_nan=False)
+            self._publish_for('imu', msg, min(packet['stamp_ns'], packet['accel_stamp_ns']), self._imu_pub)
+
+        def _publish_rgbd_status(self):
+            if rgbd_status_queue is None:
+                return
+            status = self._rgbd.info()
+            status['imu_status'] = self._imu.status()
+            status['configuration_error'] = self._rgbd_configuration_error
+            try:
+                rgbd_status_queue.put_nowait(status)
+            except queue.Full:
+                try:
+                    rgbd_status_queue.get_nowait()
+                    rgbd_status_queue.put_nowait(status)
+                except (queue.Empty, queue.Full):
+                    pass
+
+        def _rgbd_loop(self):
             while not self._worker_stop.is_set():
                 try:
-                    depth_np, stamp = self._depth_q.get(timeout=0.5)
+                    frames, acquired_ns = self._rgbd_q.get(timeout=0.5)
                 except queue.Empty:
                     continue
                 try:
-                    # zlib 压缩，不发原始 z16：640x480 的原始帧是 ~614 KB，DDS 序列化在 ARM64 上会打满 CPU，压缩后 ~10-15 KB。转换与 agibot/A3 的 _to_zlib 同形。
-                    import zlib as _zlib
-                    from sensor_msgs.msg import CompressedImage as _CI
-                    msg = _CI()
-                    msg.header.stamp = stamp
-                    msg.header.frame_id = "camera_depth_optical_frame"
-                    msg.format = "16UC1; compressedDepth zlib"
-                    # The size is the format's contract (640x480 little-endian
-                    # uint16 mm), not a field on the wire — the RealSense is
-                    # configured at exactly that, see RS_DEPTH_W/RS_DEPTH_H.
-                    msg.data = _zlib.compress(
-                        depth_np.astype("<u2", copy=False).tobytes(), 1)
-                    self._depth_pub.publish(msg)
-                except Exception as e:
-                    self.get_logger().error(f"[realsense] depth publish error: {e}")
+                    pair = self._rgbd.encode(frames, time.time_ns(), publish_mount=False)
+                    # Publish capture-time sidecars before the matching pair,
+                    # under the same stop/restart lock as all card outputs.
+                    with card_epochs.get_lock():
+                        if any(epoch and min(acquired_ns, payload['stamp_ns']) >= epoch
+                               for epoch, payload in zip(card_epochs[:2], pair)):
+                            self._rgbd.publish_mount(pair[1]['stamp_ns'])
+                        for card, pub, payload in zip(('camera_rgb', 'camera_depth'), self._rgbd_pubs, pair):
+                            msg = CompressedImage()
+                            msg.header.stamp.sec, msg.header.stamp.nanosec = divmod(payload['stamp_ns'], 1_000_000_000)
+                            msg.header.frame_id = payload['frame_id']
+                            msg.format, msg.data = payload['format'], payload['data']
+                            self._publish_for(card, msg, payload['stamp_ns'], pub, acquired_ns=acquired_ns)
+                except Exception as exc:
+                    self._rgbd.reason = str(exc)
+                self._publish_rgbd_status()
 
         def _color_loop(self):
             while not self._worker_stop.is_set():
                 try:
-                    color_np, stamp = self._color_q.get(timeout=0.5)
+                    color_np, stamp, captured_ns = self._color_q.get(timeout=0.5)
                 except queue.Empty:
                     continue
                 try:
@@ -4106,17 +4711,39 @@ def run_realsense_process(namespace: str) -> None:
                         cmsg.header.frame_id = "camera_color_optical_frame"
                         cmsg.format = "jpeg"
                         cmsg.data = jpg.tobytes()
-                        self._color_pub.publish(cmsg)
+                        self._publish_for('camera_rgb', cmsg, captured_ns, self._color_pub)
                 except Exception as e:
                     self.get_logger().error(f"[realsense] color publish error: {e}")
 
         def _on_frame(self, frame):
             try:
+                if card_epochs is not None:
+                    with card_epochs.get_lock():
+                        epoch = card_epochs[3]
+                        if epoch and self._capture_profile is not None:
+                            if self._imu_card_epoch != epoch:
+                                # A card restart needs a new gyro/accel pair and
+                                # epoch even when the shared video owner stays up.
+                                try:
+                                    self._imu.configure(self._capture_profile)
+                                except Exception as exc:
+                                    self._imu.unavailable(exc)
+                                self._imu_card_epoch = epoch
+                            self._imu.on_frame(frame)
                 if not frame.is_frameset():
                     return
                 fs = frame.as_frameset()
                 color_frame = fs.get_color_frame()
                 depth_frame = fs.get_depth_frame()
+                if not color_frame and not depth_frame:
+                    return
+                acquired_ns = time.time_ns()
+                if self._rgbd_configured and color_frame and depth_frame:
+                    try:
+                        self._rgbd_q.get_nowait()
+                    except queue.Empty:
+                        pass
+                    self._rgbd_q.put_nowait((fs, acquired_ns))
                 stamp = self.get_clock().now().to_msg()
 
                 if color_frame:
@@ -4125,7 +4752,7 @@ def run_realsense_process(namespace: str) -> None:
                         self._color_q.get_nowait()
                     except queue.Empty:
                         pass
-                    self._color_q.put((color_np, stamp))
+                    self._color_q.put_nowait((color_np, stamp, acquired_ns))
 
                 dist = 0.0
                 if depth_frame:
@@ -4133,12 +4760,6 @@ def run_realsense_process(namespace: str) -> None:
                         depth_frame.get_width() // 2,
                         depth_frame.get_height() // 2,
                     )
-                    depth_np = np.array(depth_frame.get_data())
-                    try:
-                        self._depth_q.get_nowait()
-                    except queue.Empty:
-                        pass
-                    self._depth_q.put((depth_np, stamp))
 
                 now = time.monotonic()
                 if now - self._last_dist_time >= RS_DIST_INTERVAL:
@@ -4147,7 +4768,7 @@ def run_realsense_process(namespace: str) -> None:
                     self._last_ts = now
                     out = _String()
                     out.data = json.dumps({"distance_m": round(dist, 3), "fps": round(fps, 1)})
-                    self._dist_pub.publish(out)
+                    self._publish_for('camera_distance', out, acquired_ns, self._dist_pub)
                 else:
                     self._last_ts = now
             except Exception as e:
@@ -4174,6 +4795,7 @@ def run_realsense_process(namespace: str) -> None:
             print(f"[realsense-proc] executor stopped: {e}", flush=True)
     finally:
         node.stop_capture()
+        node._rgbd.close()
         try:
             node.destroy_node()
         except Exception:
@@ -4183,6 +4805,8 @@ def run_realsense_process(namespace: str) -> None:
                 rclpy.shutdown()
             except Exception:
                 pass
+        if calibration_sender is not None:
+            calibration_sender.close()
         print("[realsense-proc] stopped", flush=True)
 
 
@@ -4337,6 +4961,9 @@ class VisionCapturePlugin:
             return self._precondition_error()
         path = None
         try:
+            if not self._camera_ready():
+                raise RuntimeError("G1 camera_rgb worker is unavailable")
+            self._camera.ensure_rgb_output()
             frame, _ = self._frame()
             directory = self._output_dir / "photos"
             directory.mkdir(parents=True, exist_ok=True)
@@ -4525,6 +5152,7 @@ class VisionCapturePlugin:
                 return {"ok": False, "code": "RECORD_IN_PROGRESS",
                         "message": "A video recording is already in progress",
                         "action_id": self._active_recording["action_id"]}
+            self._camera.ensure_rgb_output()
             action_id = f"vision_capture_record_video_{uuid4().hex}"
             active = {
                 "action_id": action_id, "state": "recording",

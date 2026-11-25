@@ -25,6 +25,10 @@
 
 旧 `slam` 插件默认关闭。独立 `motion_control` 卡片入口已移除；双臂遥操使用 `teleop_control`。旧配置显式启用 `motion_control` 时，驱动会报迁移错误。
 
+## SLAM 传感器采集与外参
+
+G1 的通用 SLAM 输入从普通 `rt/odommodestate` 构建，**不依赖原厂建图里程计**。 G1 RealSense 相机启动后，驱动会从协商后的独立深度/RGB 流读取实测 K、D，并通过 `camera_depth.info().camera_info` 和 `camera_rgb.info().camera_info` 提供给点云卡；深度图未对齐 RGB，不能共用 RGB 的 K。若未能取得标定，声明为 `source: unknown`，不填猜测内参。**相机回调时间尚未验证为曝光时间**，因此补全 K 不代表 `metric_cloud` 或 SLAM 已满足时间同步校验。原生点云、普通里程计候选协议、已测试 URDF 固定外参与数据采集参见 [SLAM 离线适配与数据采集](SLAM_CAPTURE.md)。URDF 的标定标志不代表里程计跟踪、时钟关系或 RTAB-Map 已通过实机验收。
+
 ## 构建
 
 G1 使用 `unitree/g1/Dockerfile`，默认从 `bj-warehouse.tencentcloudcr.com/phanthy-motus/ros-base:latest` 安装系统库、数值依赖、Pinocchio wheel 和 CycloneDDS，再复制业务源码。普通 pip 依赖统一维护在 `requirements.txt`，Dockerfile 在编译 CycloneDDS 库后通过 `pip install -r` 安装，包括从源码安装其 Python 绑定。依赖步骤位于业务源码 COPY 之前，正常构建可复用 Docker 缓存。
@@ -89,6 +93,24 @@ python3 unitree/g1/main.py eth0
 - `servo` 和 `servo_eef` 默认关闭。启用前核对关节布局、夹爪和腰部配置，并阅读对应模块说明。驱动没有统一的多控制器仲裁，不要让多个控制源同时控制同一组关节。
 - SDK 请求成功与实测动作完成是不同状态。检查返回结果和本体反馈；软件检查不能替代物理动作验收。
 
+## RGB-D 里程计计算输入
+
+计算输入使用已有 `camera_rgb`、`camera_depth` 和 `imu` 三张卡，移除独立 `camera_rgbd` 卡：
+
+- `camera_rgb` 保留原显示端口 `/{namespace}/camera/rgb`（1920×1080 JPEG），追加配准后的 `/{namespace}/camera/rgbd/color`（640×480 JPEG）计算端口；两个端口分别声明自己的真实 `camera_info`。
+- `camera_depth` 仍只有原端口 `/{namespace}/camera/depth`，同时供显示、通用 RGB-D 里程计和 Point Cloud 使用。其内容现在统一为校正后的 640×480、小端 uint16 轴向毫米 zlib，零值无效；不再另发 `/camera/rgbd/depth`，也不再编码原始 Z16 为显示深度。
+- `imu` 保留 `/{namespace}/state/imu` 的机体 `data/json`，追加明确命名的 `camera_imu` 可选 `sensor/imu` 端口；两者不能替代。
+
+迁移旧画布时，把 `camera_rgbd` 的 RGB 线移到 `camera_rgb` 的第二个端口，深度线移到 `camera_depth` 的唯一端口，可选运动线移到 `imu` 的 `camera_imu`。Point Cloud 与里程计必须连接同一深度端口，配准 RGB 与深度的声明共享真实 K、帧、时钟和来源标识。SLAM 使用里程计和带来源信息的实测 metric pointcloud；机体导航精度仍未验收。
+
+相机仅有一个 RealSense 采集进程。驱动启动采集不会自动激活所有卡片输出；分别启动需要的卡片，重复启动不重建采集进程。RGB/深度卡启动最多等待 10 秒取得本轮有效采集的计算标定；明确标定配置错误或采集退出会提前结束，短暂缺帧或采集时钟尚未就绪会继续等待，不把空声明当作计算就绪。停止一张卡只暂停该卡的图像或 IMU 输出，其他已启动卡继续工作；停止 IMU 卡同时暂停机体及相机 IMU 的公开输出，低状态接收、内部姿态缓存和电池、关节、主板遥测继续；重启会拒绝前一轮排队图像或旧运动样本。`vision_capture` 拍照或录像请求会按需启用现有 `camera_rgb` 显示输出，无需手动先启卡或等待计算标定；不会启用深度、距离或相机 IMU，也不会读取停卡前的旧缓存图像。整个 bundle 关闭时释放共享相机和缓存订阅。
+
+SDK 先把彩色图配准到深度光学平面，再用实测深度内参对两个图应用同一校正映射；输出声明共享 `camera_depth_optical_frame`、K 和零畸变。深度单位按 SDK 实际 `depth_scale` 换算，保留每张图自己的采集时间。仅接受 SDK `global_time`，不使用接收时间拟合偏移。两帧最大时间差 20 ms，重复、过期或未来时间会拒绝输出。
+
+共享深度及配准 RGB 的 `info` 仅在有效采集后返回 `motus.camera/1` 声明；缺少标定、时钟或数据失效时，已启动深度卡返回 `state=unavailable`、原因和空 `camera_info`，共享显示深度也暂停，不回退到未校正图像或接收时间。原显示 RGB 仍使用独立的显示标定及接收时间声明，不能当作配准计算输入。支持无畸变、标准 Brown，以及系数全零的 inverse/modified Brown 深度内参；其他模型明确不可用。当前仅完成离线验证，未执行实机验收。
+
+相机实际支持 gyro 和 accel 时，同一采集管线还输出可选 `/{namespace}/camera/rgbd/imu`（`sensor/imu`，ROS `std_msgs/String` JSON，`motus.imu/1`）。仅在通用卡启用 IMU 辅助时连接此端口。原始角速度和加速度保留各自 SDK 坐标轴，随包携带实际 motion→depth 工厂旋转（SDK 列优先数组正确转换为行优先矩阵）、采集代次和与 RGB-D 完全一致的全局时钟标识；不提供虚构的姿态或机体安装关系。`imu_status` 独立报告可用性。驱动按实际 SDK motion profiles 探测，不假定 D435 含 IMU；不支持或 motion 启动失败会保留视频/RGB-D，后者使用同一管线重试视频配置。未执行相机硬件验证。
+
 ## 开发与验证入口
 
 - [仓库构建流程](../../CONTRIBUTING.md#building-docker-images)：业务镜像构建与发布入口。
@@ -97,3 +119,38 @@ python3 unitree/g1/main.py eth0
 - [G1 测试目录](tests/)：音频、视觉、状态和遥操测试；[共享测试目录](../../tests/)另含 G1 SDK、连续控制和导航测试。
 
 测试环境要求和结果边界以对应测试说明为准。离线测试通过不代表设备、DDS 通信或机器人动作已验收。
+
+### 采集时刻机体与相机外参
+
+配准 RGB 和共享深度的 `camera_info.vendor.body_mount` 自动声明可选 `state/extrinsic` 旁路话题 `/{namespace}/camera/rgbd/body_mount`，无需增加深度端口或手填矩阵。至少一张对应图像卡激活时，旁路才随有效图像采集发布。驱动使用相机现有 ROS 节点的 TF 缓冲区，按原始深度采集纳秒时间查询 `pelvis <- camera_depth_optical_frame`，并先于匹配图像发布 `motus.camera_mount/1` JSON。`CAMERA_BODY_FRAME` 只覆盖机体帧名，不能提供矩阵。活动腰关节导致的变换逐帧更新，不作为重新标定。
+
+`body_mount_status` 独立报告所选帧和 TF 可用性；缺少 TF 包、帧、该采集时刻的变换或发布失败时，视频、RGB-D、IMU 继续工作，不回退到 SDK 内部外参、URDF 猜测、恒等矩阵或最新 TF。ROS 节点仍使用现有域 42；没有验证实机 TF 是否在同一域中、是否含真实光学标定链或是否具备足够精度。容器增加标准 `tf2_ros` 依赖和构建时导入检查，本次未构建镜像或部署。主里程计仍以相机光学帧为参考；可用外参只支持另行标注的派生机体位姿。
+
+### Generic RGB-D short-term compensation
+
+Perception's generic `rgbd_odometry` card supports the instance settings
+`imu_assisted=true`, `short_term_compensation=true`, `depth_geometry=true`.
+Connect the same RGB-D pair and optional camera IMU port. The driver reports
+full factory/TF sensor-origin translations in `motus.imu/1`; inspect
+`imu_status.fusion` for calibration availability. Rotation-only or unsupported
+motion sources still support the existing video/attitude modes but cannot
+provide translational compensation. No extra SDK owner or robot-specific
+fusion algorithm is added.
+
+Keep the camera still for at least0.5s of visual/IMU initialization. The
+consumer estimates camera pose using ESKF and conditionally uses observable
+depth geometry. Inertial/depth predictions are explicitly non-mapping; SLAM
+pauses during coasting/recovery. The hard visual correction timeout is1s
+and modeled position sigma limit0.10m; these are software/model thresholds,
+not measured robot accuracy. Source clock/mount identity must remain fixed.
+Only code/offline tests have been completed; hardware verification and
+deployment remain pending explicit user instruction.
+
+### Shared-depth RGB pixel consumers
+
+Consumers that combine RGB pixel coordinates with the shared depth must use
+`/<ns>/camera/rgbd/color` (the registered RGB port), not the unchanged display
+RGB. This also applies to VOP/Measure connections. If Measure overlays an RGB
+image, set its existing `camera_topic` to that registered RGB topic; its default
+`/camera/color` or `/camera/rgb` guess refers to the native display image.
+No camera-to-body matrix or guessed calibration is introduced by this wiring.

@@ -91,17 +91,15 @@ class VisionCaptureRaceTests(unittest.TestCase):
 
     def test_realsense_stop_removes_and_destroys_cache_node(self):
         plugin_class = _load_class("RealSensePlugin")
-        plugin = plugin_class.__new__(plugin_class)
         removed = []
         added = []
-        plugin._executor = type("Executor", (), {
+        executor = type("Executor", (), {
             "add_node": lambda self, node: added.append(node),
             "remove_node": lambda self, node: removed.append(node),
         })()
-        plugin._color_topic = "/g1/camera/rgb"
-        plugin._proc = None
-        old_node = _CameraFrameNode(plugin._color_topic)
-        plugin._frame_node = old_node
+        plugin = plugin_class({}, 'g1', executor)
+        added.clear()
+        old_node = plugin._frame_node
 
         plugin.stop()
 
