@@ -116,8 +116,9 @@ def _select_profile() -> None:
         raise RuntimeError(f"cannot write constrained DDS profile {profile}: {exc}") from exc
     os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = profile
     print(f"[ros2] robot DDS profile: {profile} "
-          f"(robot-domain-232 whitelist {robot_ip}; domain-42 publishing is "
-          "handled by the isolated bridge process)")
+          f"(robot-domain-232 whitelist {robot_ip}; discovery servers "
+          f"{os.environ.get('ROS_DISCOVERY_SERVER', '<unset>')}; domain-42 publishing is handled by the "
+          "isolated bridge process)")
 
 
 def main() -> None:
