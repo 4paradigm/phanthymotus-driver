@@ -145,7 +145,11 @@ def _make_plugin(module, monkeypatch, tmp_path, *, mode=2, config=None,
 
 @pytest.fixture
 def card_module(monkeypatch):
-    return _load_card(monkeypatch)
+    module = _load_card(monkeypatch)
+    calls: list[tuple] = []
+    monkeypatch.setattr(module, "_acp_notify", lambda *args: calls.append(args))
+    module._acp_calls = calls
+    return module
 
 
 # ── declaration / wiring ─────────────────────────────────────────────────────
@@ -169,7 +173,11 @@ def test_tool_declares_an_actuator_with_audio_output_and_uploaded_file(card_modu
     assert audio_file["uploadTo"] == "mcp"
     assert set(audio_file["accept"].split(",")) == {".wav", ".pcm"}
     assert set(tool["inputSchema"]["x-resource"]) == {"base", "arm_l", "arm_r"}
-    assert set(tool["inputSchema"]["x-action-params"]["start"]["params"]) == {"audio_file"}
+    assert set(tool["inputSchema"]["x-action-params"]["start"]["params"]) == {
+        "audio_file", "confirm"}
+    assert tool["inputSchema"]["x-completion"] == {
+        "actions": ["start"], "timeout": 165}
+    assert "confirm" in tool["inputSchema"]["properties"]
 
 
 def test_both_new_modules_reach_the_image():
@@ -220,7 +228,10 @@ def test_a_full_run_fires_actions_on_the_beat_and_publishes_all_audio_frames(
         module, monkeypatch, tmp_path,
         config={"action_every_beats": 2, "action_cooldown_s": 0.5,
                 "turn_every_beats": 4, "turn_cooldown_s": 0.5})
-    assert plugin.dispatch("start", {"audio_file": upload}) == {"state": "running"}
+    started = plugin.dispatch("start", {"audio_file": upload, "confirm": True})
+    assert started["state"] == "running"
+    assert started["action_id"].startswith("bumi_beat_performance_")
+    assert started["expected_duration_s"] == 120.0
     # 2 seconds of audio, 20 ms frames.  Join the worker rather than sleeping.
     thread = plugin._thread
     thread.join(timeout=8.0)
@@ -236,6 +247,7 @@ def test_a_full_run_fires_actions_on_the_beat_and_publishes_all_audio_frames(
     assert info["last_action_drift_ms"] is not None
     assert info["last_action_drift_ms"] < 100
     assert ctrl.forbidden_writes == []
+    assert [call[1] for call in module._acp_calls] == ["completed"]
     # Both audio frames and commands use the shared, spaced publisher.
     assert loco.commands[0][0] == ("preempt", "beat_performance.start")
     edges = [item for item, _, _ in loco.commands if item[0] == "edge"]
@@ -258,7 +270,7 @@ def test_stop_cancels_all_later_beats_and_releases_the_command(
         module, monkeypatch, tmp_path, pcm=pcm,
         config={"action_every_beats": 2, "action_cooldown_s": 0.5,
                 "turn_every_beats": 2, "turn_cooldown_s": 0.5})
-    plugin.dispatch("start", {"audio_file": upload})
+    plugin.dispatch("start", {"audio_file": upload, "confirm": True})
     time.sleep(0.25)
     assert plugin.dispatch("stop", {}) == {"state": "idle"}
     time.sleep(0.8)  # past several scheduled beats that must never fire
@@ -268,6 +280,23 @@ def test_stop_cancels_all_later_beats_and_releases_the_command(
     assert actions_after_stop == []
     assert plugin.dispatch("info", {})["events_fired"] == 0
     assert plugin._thread is None
+    assert [call[1] for call in module._acp_calls] == ["cancelled"]
+
+
+def test_an_unconfirmed_start_never_prepares_the_body_or_sends_a_command(
+        card_module, monkeypatch, tmp_path):
+    module = card_module
+    plugin, _, loco, upload = _make_plugin(module, monkeypatch, tmp_path)
+
+    missing = plugin.dispatch("start", {"audio_file": upload})
+    rejected = plugin.dispatch("start", {"audio_file": upload, "confirm": False})
+    for result in (missing, rejected):
+        assert result["state"] == "error"
+        assert result["command_sent"] is False
+    assert loco.commands == []
+    assert plugin._thread is None
+    assert plugin.dispatch("info", {})["workmode"] == 2
+    assert module._acp_calls == []
 
 
 def test_protection_mode_sends_no_action_and_reports_it_honestly(
@@ -281,7 +310,7 @@ def test_protection_mode_sends_no_action_and_reports_it_honestly(
 
     plugin, _, loco, upload = _make_plugin(
         module, monkeypatch, tmp_path, mode=26)
-    plugin.dispatch("start", {"audio_file": upload})
+    plugin.dispatch("start", {"audio_file": upload, "confirm": True})
     plugin._thread.join(timeout=3.0)
 
     assert loco.edges == []
@@ -291,6 +320,8 @@ def test_protection_mode_sends_no_action_and_reports_it_honestly(
     assert info["state"] == "error"
     assert "protection mode" in info["last_error"]
     assert info["workmode"] == 26
+    assert [call[1] for call in module._acp_calls] == ["error"]
+    assert module._acp_calls[0][2]["state"] == "error"
 
 
 def test_a_superseded_worker_cannot_publish_after_restart(
@@ -304,7 +335,7 @@ def test_a_superseded_worker_cannot_publish_after_restart(
 
     pcm = _click_track([0.0, 0.5, 1.0], 2.0)
     plugin, _, _, upload = _make_plugin(module, monkeypatch, tmp_path, pcm=pcm)
-    plugin.dispatch("start", {"audio_file": upload})
+    plugin.dispatch("start", {"audio_file": upload, "confirm": True})
     first_thread = plugin._thread
     plugin.dispatch("stop", {})
     first_thread.join(timeout=2.0)
@@ -322,7 +353,7 @@ def test_config_is_rejected_while_running(card_module, monkeypatch, tmp_path):
     monkeypatch.setattr(module, "decode_audio", local_decode)
 
     plugin, _, _, upload = _make_plugin(module, monkeypatch, tmp_path)
-    plugin.dispatch("start", {"audio_file": upload})
+    plugin.dispatch("start", {"audio_file": upload, "confirm": True})
     assert plugin.dispatch("config", {"action_every_beats": 8})["state"] == "error"
     plugin.dispatch("stop", {})
     assert plugin.dispatch("config", {"action_every_beats": 8})["state"] == "configured"

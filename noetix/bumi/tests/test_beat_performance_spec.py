@@ -61,6 +61,39 @@ def test_upload_paths_are_confined_to_the_driver_upload_dir(tmp_path):
             validate_audio_path(bad, allowed)
 
 
+def test_a_link_inside_the_upload_dir_cannot_read_an_outside_file(tmp_path):
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+    outside = tmp_path / "secret.pcm"
+    outside.write_bytes(b"\x01\x00" * 100)
+    link = uploads / "song.pcm"
+    try:
+        link.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are unavailable in this environment")
+
+    with pytest.raises(BeatSpecError, match="symbolic link"):
+        validate_audio_path(str(link), (str(uploads),))
+    with pytest.raises(BeatSpecError, match="symbolic link"):
+        decode_audio(str(link), allowed_dirs=(str(uploads),))
+
+
+def test_a_linked_parent_directory_cannot_expand_the_allowed_root(tmp_path):
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "song.pcm").write_bytes(b"\x01\x00" * 100)
+    linked = uploads / "linked"
+    try:
+        linked.symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("directory symlinks are unavailable in this environment")
+
+    with pytest.raises(BeatSpecError):
+        validate_audio_path(str(linked / "song.pcm"), (str(uploads),))
+
+
 def test_raw_pcm_is_decoded_as_16k_s16le_mono(tmp_path):
     pcm = _pcm_at_beats([0.5, 1.0], 2.0)
     path = tmp_path / "click.pcm"

@@ -108,11 +108,17 @@ def validate_audio_path(
         raise BeatSpecError(
             f"audio_file must end with one of {', '.join(ALLOWED_SUFFIXES)}"
         )
+    # A link inside the upload dir can still point at /etc.  Reject links
+    # outright and check containment against the *resolved* target, including
+    # any linked parent directory, before the file is ever opened.
+    if os.path.islink(candidate):
+        raise BeatSpecError("audio_file must not be a symbolic link")
+    real_candidate = os.path.realpath(candidate)
     for raw_root in allowed_dirs:
-        root = os.path.abspath(os.path.normpath(raw_root))
+        root = os.path.realpath(os.path.abspath(os.path.normpath(raw_root)))
         try:
-            if os.path.commonpath((root, candidate)) == root:
-                return candidate
+            if os.path.commonpath((root, real_candidate)) == root:
+                return real_candidate
         except ValueError:
             continue
     raise BeatSpecError(
@@ -151,8 +157,10 @@ def decode_audio(
 ) -> DecodedAudio:
     """Decode a validated WAV or raw PCM16 file without touching ROS."""
     candidate = validate_audio_path(path, allowed_dirs)
-    if not os.path.isfile(candidate):
-        raise BeatSpecError("audio_file does not exist")
+    # Re-check after validation: a link swapped in between the two calls must
+    # not turn a confined upload into a read of an arbitrary host file.
+    if os.path.islink(candidate) or not os.path.isfile(candidate):
+        raise BeatSpecError("audio_file does not exist or is a symbolic link")
     size = os.path.getsize(candidate)
     if not 0 < size <= max_bytes:
         raise BeatSpecError(f"audio_file must be 1..{max_bytes} bytes")

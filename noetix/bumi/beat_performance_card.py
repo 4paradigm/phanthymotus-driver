@@ -13,9 +13,13 @@ configuration -- the 500 ms ``set_*`` red line stays entirely inside speaker.
 
 from __future__ import annotations
 
+import json
+import os
+import ssl
 import threading
 import time
-from typing import Any
+import urllib.request
+import uuid
 
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
@@ -46,6 +50,28 @@ _LOW_LAT_QOS = QoSProfile(
 # protection and is refused explicitly; everything else is treated as unsafe.
 _ACTION_WORKMODES = frozenset((2, 5, 8, 9, 10, 31, 32, 33))
 _PROTECTION_MODE = 26
+
+
+def _acp_notify(action_id: str, status: str, result: dict) -> None:
+    """Report the terminal state of a long performance through ACP.
+
+    Same endpoint and envelope as the bundle's other asynchronous actuators;
+    kept local so this card module stays independently loadable in tests.
+    """
+    try:
+        url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
+        payload = json.dumps({
+            "action_id": action_id, "status": status, "result": result,
+            "tool": "beat_performance", "ts": time.time(),
+        }).encode()
+        request = urllib.request.Request(
+            f"{url}/api/acp/complete", data=payload,
+            headers={"Content-Type": "application/json"}, method="POST")
+        context = ssl._create_unverified_context() if url.startswith("https://") else None
+        with urllib.request.urlopen(request, timeout=5, context=context) as response:
+            response.read()
+    except Exception as exc:
+        print(f"[Bumi ACP] callback failed for {action_id}: {exc}", flush=True)
 
 
 class _BeatPerformanceNode(Node):
@@ -100,6 +126,9 @@ class BeatPerformancePlugin:
         self._stop_event = threading.Event()
         self._generation = 0
         self._thread: threading.Thread | None = None
+        # One ACP action per run.  The worker claims it under the lock before
+        # notifying so a concurrent stop cannot produce a second terminal POST.
+        self._active_action: dict | None = None
 
     # ── tool declaration ─────────────────────────────────────────────────────
 
@@ -133,12 +162,22 @@ class BeatPerformancePlugin:
                             "裸 PCM 解释为 16 kHz 16-bit 小端单声道。最长 120 秒。"
                         ),
                     },
+                    "confirm": {
+                        "type": "boolean",
+                        "description": (
+                            "必须显式传 true 才会驱动机器人。未确认或为 false 时直接拒绝，"
+                            "不准备模式、不发送任何命令。"
+                        ),
+                    },
                 },
                 "required": ["action"],
                 "x-action-params": {
                     "start": {
-                        "params": ["audio_file"],
-                        "description": "解码上传文件、分析节拍，开始连播音频与踩点动作",
+                        "params": ["audio_file", "confirm"],
+                        "description": (
+                            "解码上传文件、分析节拍，开始连播音频与踩点动作；"
+                            "confirm 必须为 true，确认已留出安全空间并使用吊架"
+                        ),
                     },
                     "stop": {"params": [], "description": "立即停止：取消后续节拍并复位命令"},
                     "info": {"params": [], "description": "查询节拍数、已触发动作、漂移与保护模式状态"},
@@ -150,6 +189,10 @@ class BeatPerformancePlugin:
                 },
                 "x-is-dangerous": True,
                 "x-resource": ["base", "arm_l", "arm_r"],
+                "x-completion": {
+                    "actions": ["start"],
+                    "timeout": 165,
+                },
             },
             "configSchema": {
                 "type": "object",
@@ -220,9 +263,18 @@ class BeatPerformancePlugin:
             return {"state": "configured", "action_cycle": ",".join(self._config["action_cycle"])}
 
     def _start(self, args: dict) -> dict:
+        # An x-is-dangerous card must never move the body on an implicit
+        # confirmation.  Refuse before even decoding or preparing workmode.
+        if args.get("confirm") is not True:
+            return {
+                "state": "error", "command_sent": False,
+                "error": "start requires confirm=true; no command was sent",
+            }
         audio_file = args.get("audio_file")
         if not isinstance(audio_file, str) or not audio_file.strip():
             return {"state": "error", "error": "audio_file is required"}
+        action_id = f"bumi_beat_performance_{uuid.uuid4().hex}"
+        active = {"id": action_id, "notified": False}
         with self._lock:
             if self._state == "running":
                 return {"state": "error", "error": "performance already running; stop it first"}
@@ -231,13 +283,15 @@ class BeatPerformancePlugin:
             generation = self._generation
             self._state = "running"
             self._audio_file = audio_file.strip()
+            self._active_action = active
             self._reset_statistics()
             self._thread = threading.Thread(
-                target=self._run, args=(generation, self._audio_file),
+                target=self._run, args=(generation, self._audio_file, active),
                 daemon=True, name="bumi_beat_performance",
             )
             self._thread.start()
-        return {"state": "running"}
+        return {"state": "running", "action_id": action_id,
+                "expected_duration_s": self._config["max_duration_s"]}
 
     def _stop(self) -> dict:
         with self._lock:
@@ -308,7 +362,16 @@ class BeatPerformancePlugin:
                 self._state = "error"
                 self._last_error = message
 
-    def _run(self, generation: int, audio_file: str) -> None:
+    def _complete(self, active: dict, status: str, result: dict) -> None:
+        """Publish exactly one ACP terminal event for this run."""
+        with self._lock:
+            if active is not self._active_action or active["notified"]:
+                return
+            active["notified"] = True
+            self._active_action = None
+        _acp_notify(active["id"], status, result)
+
+    def _run(self, generation: int, audio_file: str, active: dict) -> None:
         try:
             self._loco.preempt_for("beat_performance.start")
             prepared = self._loco.prepare_walking_mode("beat_performance")
@@ -344,6 +407,19 @@ class BeatPerformancePlugin:
             with self._lock:
                 if generation == self._generation and self._state == "running":
                     self._state = "idle"
+                terminal = {
+                    "state": self._state,
+                    "events_fired": self._events_fired,
+                    "frames_published": self._frames_published,
+                    "error": self._last_error,
+                }
+            if terminal["state"] == "error":
+                status = "error"
+            elif self._cancelled(generation):
+                status = "cancelled"
+            else:
+                status = "completed"
+            self._complete(active, status, terminal)
 
     def _perform(self, generation: int, pcm: bytes, events: list, config: dict) -> None:
         """One clock drives both outputs; commands precede each audio frame."""
