@@ -140,6 +140,7 @@ class PantherDevice:
         self.namespace = namespace
         self._lock = threading.RLock()
         self._base_gate = threading.RLock()
+        self._tabletop_owner = None
         self._base_servo = None
         self._controlled_spatial = None
         self._cache: dict[str, tuple[object, float]] = {}
@@ -1023,12 +1024,32 @@ class PantherDevice:
         """Called under _base_gate: a resource label alone is not a motor lock."""
         if self._closed:
             raise RuntimeError("Panther device is closing")
+        if owner != "tabletop_pick" and getattr(self, "_tabletop_owner", None) is not None:
+            raise RuntimeError("tabletop_pick owns the chassis")
         if owner != "base_servo" and self._base_servo is not None and self._base_servo._reserved:
             raise RuntimeError("base_servo owns the chassis; confirm its stop first")
         if owner != "controlled_spatial" and self._controlled_spatial is not None and self._controlled_spatial.nav:
             raise RuntimeError("Nav2 owns the chassis; stop navigation and await its terminal result")
         if self._drive_stop_request is not None or (owner != "base_drive" and self._drive_action_id is not None):
             raise RuntimeError("base_drive motion or its zero-output stop is still active")
+
+    def claim_tabletop(self, cancel):
+        with self._base_gate, self._arm_lock, self._head_lock:
+            self.base_check_available("tabletop_pick")
+            self._require_tabletop_free()
+            if self._arm_active or self._head_active:
+                raise RuntimeError("stop arm and head motion before tabletop_pick")
+            self._tabletop_owner = cancel
+
+    def release_tabletop(self, cancel):
+        with self._base_gate, self._arm_lock, self._head_lock:
+            if self._tabletop_owner is cancel:
+                self._tabletop_owner = None
+
+    def _require_tabletop_free(self, owner=None):
+        active = getattr(self, "_tabletop_owner", None)
+        if active is not None and (active is not owner or active.is_set()):
+            raise RuntimeError("tabletop_pick owns the motion resources or is stopping")
 
     def servo_prepare(self, dry_run=False):
         if not dry_run:
@@ -1346,6 +1367,7 @@ class PantherDevice:
             raise ValueError(f"duration_s must be in [1.0, {max_duration}]")
 
         with self._arm_lock:
+            self._require_tabletop_free()
             if self._arm_active:
                 raise RuntimeError("an arm move is already active; call stop first")
             action_id = str(args.get("action_id") or f"panther_arm_{uuid4().hex[:12]}")
@@ -1454,7 +1476,7 @@ class PantherDevice:
         return {"state": "idle" if not thread or not thread.is_alive() else "stopping",
                 "stopped": True, "reason": reason, "action_id": action_id}
 
-    def gripper(self, args: dict) -> dict:
+    def gripper(self, args: dict, *, owner=None) -> dict:
         action = args.get("action", "set")
         if action == "stop":
             return {
@@ -1493,11 +1515,13 @@ class PantherDevice:
         if not 0.0 <= position <= 1.0:
             raise ValueError("position must be in [0, 1]")
         mode = "parallel"
-        for item in sides:
-            message = GripperCommand(); message.mode = mode
-            command = JointState(); command.name = [""]; command.position = [position]
-            message.command = command
-            (self._left_gripper_pub if item == "left" else self._right_gripper_pub).publish(message)
+        with self._base_gate:
+            self._require_tabletop_free(owner)
+            for item in sides:
+                message = GripperCommand(); message.mode = mode
+                command = JointState(); command.name = [""]; command.position = [position]
+                message.command = command
+                (self._left_gripper_pub if item == "left" else self._right_gripper_pub).publish(message)
         return {"state": "commanded", "side": side, "mode": mode, "position": position}
 
     def lifting(self, args: dict) -> dict:
@@ -1535,7 +1559,9 @@ class PantherDevice:
         message.header.stamp = self._node.get_clock().now().to_msg()
         message.name = [""]; message.position = [position]
         message.velocity = []; message.effort = []
-        self._lifting_pub.publish(message)
+        with self._base_gate:
+            self._require_tabletop_free()
+            self._lifting_pub.publish(message)
         return {"state": "commanded", "action": action, "position_m": position,
                 "limits_m": [minimum, maximum], "limit_source": limit_source,
                 "joint_name": joint_name}
@@ -1618,6 +1644,7 @@ class PantherDevice:
                   "speed_deg_s": speed_deg_s, "publish_rate_hz": publish_rate_hz,
                   "stop": threading.Event(), "thread": None}
         with self._head_lock:
+            self._require_tabletop_free()
             self._head_active = active
             thread = threading.Thread(target=self._run_head_motion,
                                       args=(active, [float(current[name]) for name in HEAD_JOINTS], target),

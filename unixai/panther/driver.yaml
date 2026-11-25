@@ -6,7 +6,7 @@ hardware_model: panther
 image_name: unixai-panther
 port: 15792
 mcp_url: "http://localhost:15792/mcp"
-description: "UniX AI Panther mobile manipulator — joints, robot and battery state, IMU, odometry, merged lidar, lazy RGB-D camera, microphone, speaker, omnidirectional base, dual-arm P2P, grippers, lifting, head, controlled SLAM mapping, tagged navigation and map display"
+description: "UniX AI Panther mobile manipulator — joints, robot and battery state, IMU, odometry, merged lidar, lazy RGB-D camera, microphone, speaker, omnidirectional base, dual-arm P2P, grippers, lifting, head, one-shot tabletop picking (tabletop_pick), controlled SLAM mapping, tagged navigation and map display"
 build_context_extras:
   - ../../common
 cards:
@@ -29,6 +29,7 @@ cards:
   - {name: gripper, type: actuator}
   - {name: lifting, type: actuator}
   - {name: head, type: actuator}
+  - {name: tabletop_pick, type: actuator}
 
   - {name: controlled_spatial, type: actuator}
   - {name: spatial_map, type: actuator}

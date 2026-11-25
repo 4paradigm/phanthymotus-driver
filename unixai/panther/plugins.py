@@ -475,5 +475,9 @@ def build_plugins(config, namespace, device):
             {"actions": ["look", "home"], "timeout": 30}, True,
         )
         plugins.append(ActuatorPlugin(device, "head", "Panther head pan/tilt control using live URDF limits", schema, device.head))
+    if on("tabletop_pick"):
+        from tabletop_pick import TabletopPick
+
+        plugins.append(TabletopPick(enabled["tabletop_pick"], device))
     return plugins
 
