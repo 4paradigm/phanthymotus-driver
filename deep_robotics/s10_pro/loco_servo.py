@@ -66,7 +66,7 @@ def build_descriptor(expected_hz=10.0, settings=None):
         "frame": "base_link",
         # Estimated standing width and the existing longitudinal sweep extent.
         "footprint": {"half_width": 0.20, "half_length": 0.23, "source": "estimate"},
-        "rate": {"max_hz": 20.0, "expected_hz": float(expected_hz), "watchdog_ms": 600,
+        "rate": {"max_hz": 20.0, "expected_hz": float(expected_hz), "watchdog_ms": 1000,
                  "max_command_ttl_ms": 600, "max_obs_age_ms": 800},
         "force_torque": None,
     }

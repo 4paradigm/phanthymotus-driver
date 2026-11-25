@@ -103,7 +103,7 @@ def test_servo_reports_static_standing_footprint_as_an_estimate(servo):
     assert descriptor['footprint'] == {'half_width': 0.20, 'half_length': 0.23, 'source': 'estimate'}
 
 
-def test_servo_watchdog_holds_at_600_ms_without_admitting_stale_commands(servo, monkeypatch):
+def test_servo_watchdog_fires_at_1000_ms_without_admitting_stale_commands(servo, monkeypatch):
     p = servo.plugin
     monkeypatch.setattr(p, '_read_loop', lambda: None)
     started = p.dispatch('start', {'input_topic': '/policy/cmd', 'dry_run': False})
@@ -139,8 +139,20 @@ def test_servo_watchdog_holds_at_600_ms_without_admitting_stale_commands(servo, 
     assert len(servo.native.calls) == commands_sent + 1
     assert servo.native.calls[-1] == (0x00100001, 0x00110002, dict.fromkeys(
         ('X', 'Y', 'Z', 'Roll', 'Pitch', 'Yaw'), 0.0))
+    assert p._sink.stats()['watchdog_strikes'] == 0
+
+    elapsed_ms[0] = 999
+    p._tick()
+    assert len(servo.native.calls) == commands_sent + 1
+    assert p._sink.stats()['watchdog_strikes'] == 0
+
+    elapsed_ms[0] = 1000
+    p._tick()
+    assert len(servo.native.calls) == commands_sent + 2
+    assert servo.native.calls[-1] == servo.native.calls[-2]
+    assert p._sink.stats()['watchdog_strikes'] == 1
     rate = started['control_interface']['rate']
-    assert rate['watchdog_ms'] == 600
+    assert rate['watchdog_ms'] == 1000
     assert rate['max_command_ttl_ms'] == 600
     assert rate['max_obs_age_ms'] == 800
     assert p.dispatch('info', {})['control_interface']['rate'] == rate
