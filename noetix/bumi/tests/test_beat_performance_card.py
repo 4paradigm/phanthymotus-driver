@@ -304,6 +304,28 @@ def test_stop_cancels_all_later_beats_and_releases_the_command(
     assert [call[1] for call in module._acp_calls] == ["cancelled"]
 
 
+def test_an_invalid_upload_never_preempts_prepares_or_writes_the_body(
+        card_module, monkeypatch, tmp_path):
+    module = card_module
+    parse = module.decode_audio
+
+    def local_decode(path, **kwargs):
+        return parse(path, allowed_dirs=(str(tmp_path),), **kwargs)
+    monkeypatch.setattr(module, "decode_audio", local_decode)
+
+    plugin, _, loco, _ = _make_plugin(module, monkeypatch, tmp_path)
+    plugin.dispatch("start", {
+        "audio_file": str(tmp_path / "missing.pcm"), "confirm": True})
+    plugin._thread.join(timeout=3.0)
+
+    assert loco.commands == []
+    assert loco.reserved is False
+    info = plugin.dispatch("info", {})
+    assert info["state"] == "error"
+    assert info["workmode"] == 2
+    assert [call[1] for call in module._acp_calls] == ["error"]
+
+
 def test_a_stop_before_preparation_sends_no_mode_edge_after_release(
         card_module, monkeypatch, tmp_path):
     module = card_module

@@ -278,11 +278,8 @@ class BeatPerformancePlugin:
         with self._lock:
             if self._state == "running":
                 return {"state": "error", "error": "performance already running; stop it first"}
-            # Hold the body for the whole run: the shared 2 ms limiter alone
-            # does not stop another card from issuing competing motion.
-            if not self._loco.reserve_body_action("beat_performance"):
-                return {"state": "error", "command_sent": False,
-                        "error": "body is reserved by another action; no command was sent"}
+            # The worker validates and decodes the upload before it reserves
+            # or prepares the body: a bad file must never change workmode.
             self._stop_event.clear()
             self._generation += 1
             generation = self._generation
@@ -374,9 +371,33 @@ class BeatPerformancePlugin:
         _acp_notify(active["id"], status, result)
 
     def _run(self, generation: int, audio_file: str, active: dict) -> None:
+        owns_body = False
         try:
-            # A stop can land before this worker is scheduled at all.  No
-            # preemption, preparation or command may follow it.
+            if self._cancelled(generation):
+                return
+            # Validate the entire plan first.  A missing file, a bad WAV or an
+            # over-long clip must not send START/SWITCH/WALK and leave the
+            # robot in a different workmode with no performance to run.
+            config = dict(self._config)
+            audio = decode_audio(
+                audio_file, max_duration_s=config["max_duration_s"])
+            beats, beat_source = detect_beats(
+                audio, fallback_bpm=config["fallback_bpm"])
+            events = build_choreography(beats, config)
+            with self._lock:
+                self._beat_count = len(beats)
+                self._beat_source = beat_source
+                self._event_count = len(events)
+                self._duration_s = audio.duration_s
+            if self._cancelled(generation):
+                return
+
+            # Only a fully validated performance ever touches the body.
+            if not self._loco.reserve_body_action("beat_performance"):
+                self._fail(generation,
+                           "body is reserved by another action; no command was sent")
+                return
+            owns_body = True
             if self._cancelled(generation):
                 return
             self._loco.preempt_for("beat_performance.start")
@@ -395,35 +416,21 @@ class BeatPerformancePlugin:
             if self._cancelled(generation):
                 return
 
-            config = dict(self._config)
-            audio = decode_audio(
-                audio_file, max_duration_s=config["max_duration_s"])
-            beats, beat_source = detect_beats(
-                audio, fallback_bpm=config["fallback_bpm"])
-            events = build_choreography(beats, config)
-            with self._lock:
-                self._beat_count = len(beats)
-                self._beat_source = beat_source
-                self._event_count = len(events)
-                self._duration_s = audio.duration_s
-            if self._cancelled(generation):
-                return
-
             self._perform(generation, audio.pcm, events, config)
         except BeatSpecError as exc:
             self._fail(generation, str(exc))
         except Exception as exc:  # a worker must never die without a status
             self._fail(generation, f"performance error: {exc}")
         finally:
-            # Release the command with the reservation still held, then give
-            # the body back.  A stop therefore cannot be followed by a mode
-            # edge or a velocity from another card interleaving with ours.
-            try:
-                self._loco.publish_velocity(0.0, 0.0, 0.0)
-            except Exception as exc:  # a dead SDK must not wedge the cleanup
-                with self._lock:
-                    self._last_error = f"final release: {exc}"
-            self._loco.release_body_action("beat_performance")
+            # Only a run that actually took the body may emit a DEFAULT or
+            # release it.  A rejected upload leaves the robot untouched.
+            if owns_body:
+                try:
+                    self._loco.publish_velocity(0.0, 0.0, 0.0)
+                except Exception as exc:  # dead SDK must not wedge cleanup
+                    with self._lock:
+                        self._last_error = f"final release: {exc}"
+                self._loco.release_body_action("beat_performance")
             with self._lock:
                 if generation == self._generation and self._state == "running":
                     self._state = "idle"
