@@ -61,6 +61,25 @@ class FakeSpeakerPlugin:
         pass
 
 
+class FakeBeatPerformancePlugin:
+    def __init__(self, plugin_config, namespace, executor, high_ctrl, loco_plugin):
+        self.plugin_config = plugin_config
+        self.namespace = namespace
+        self.executor = executor
+        self.high_ctrl = high_ctrl
+        self.loco = loco_plugin
+        self.stopped = False
+
+    def get_tool(self):
+        return {"name": "beat_performance", "type": "actuator"}
+
+    def start(self):
+        pass
+
+    def stop(self):
+        self.stopped = True
+
+
 @pytest.fixture
 def bundle_module(monkeypatch):
     """Load the real bundle and servo card with hardware imports replaced."""
@@ -74,6 +93,9 @@ def bundle_module(monkeypatch):
     fake_device.LocoPlugin = FakeLocoPlugin
     fake_device.SpeakerPlugin = FakeSpeakerPlugin
     monkeypatch.setitem(sys.modules, "device", fake_device)
+    fake_beat_card = types.ModuleType("beat_performance_card")
+    fake_beat_card.BeatPerformancePlugin = FakeBeatPerformancePlugin
+    monkeypatch.setitem(sys.modules, "beat_performance_card", fake_beat_card)
     monkeypatch.syspath_prepend(str(BUMI))
     previous_loco_servo = sys.modules.pop("loco_servo", None)
 
@@ -169,4 +191,58 @@ def test_existing_bumi_plugin_loading_is_unchanged(bundle_module):
 
     assert [tool["name"] for tool in bundle.get_all_tools()] == [
         "loco", "loco_servo", "speaker"]
+
+
+def test_beat_performance_registers_and_shares_the_loco_command_path(bundle_module):
+    config = _config()
+    config["plugins"]["beat_performance"] = {"enabled": True, "action_every_beats": 2}
+    executor = object()
+    high_ctrl = FakeHighCtrl()
+
+    bundle = bundle_module.BumiDeviceBundle(
+        config, "bumi_test", executor, high_ctrl, media_ctrl=None)
+    loco, _, beat = bundle._plugins
+
+    assert isinstance(beat, FakeBeatPerformancePlugin)
+    assert beat.loco is loco
+    assert beat.high_ctrl is high_ctrl
+    assert beat.executor is executor
+    assert beat.namespace == "bumi_test"
+    assert beat.plugin_config["action_every_beats"] == 2
+    assert "beat_performance" in [tool["name"] for tool in bundle.get_all_tools()]
+
+
+@pytest.mark.parametrize("loco_enabled,high_ctrl", [(False, FakeHighCtrl()), (True, None)])
+def test_beat_performance_is_skipped_without_loco_or_controller(
+        bundle_module, loco_enabled, high_ctrl):
+    config = _config(loco=loco_enabled, loco_servo=False)
+    config["plugins"]["beat_performance"] = {"enabled": True}
+
+    bundle = bundle_module.BumiDeviceBundle(
+        config, "bumi_test", object(), high_ctrl, media_ctrl=None)
+
+    assert bundle.get_all_tools() == []
+
+
+def test_beat_performance_lifecycle_stops_with_the_bundle(bundle_module):
+    config = _config(loco_servo=False)
+    config["plugins"]["beat_performance"] = {"enabled": True}
+    bundle = bundle_module.BumiDeviceBundle(
+        config, "bumi_test", object(), FakeHighCtrl(), media_ctrl=None)
+    bundle.start_all()
+    bundle.stop_all()
+    assert bundle._plugins[-1].stopped is True
+
+
+def test_bundle_metadata_matches_the_registered_card():
+    import yaml
+
+    repo = Path(__file__).resolve().parents[1]
+    driver = yaml.safe_load(
+        (repo / "noetix" / "bumi" / "driver.yaml").read_text(encoding="utf-8"))
+    config = yaml.safe_load(
+        (repo / "noetix" / "bumi" / "config.yaml").read_text(encoding="utf-8"))
+
+    assert {"name": "beat_performance", "type": "actuator"} in driver["cards"]
+    assert config["plugins"]["beat_performance"]["enabled"] is True
 

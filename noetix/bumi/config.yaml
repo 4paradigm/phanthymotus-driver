@@ -36,6 +36,21 @@ plugins:
     min_wz_rads: 0.33           # 归一化边界 0.40 × 0.83
     # 已经在走的时候的偏航死区。
     min_wz_moving_rads: 0.25    # 归一化边界 0.30 × 0.83
+  # 音乐节拍表演：上传 WAV/16k PCM，输出 audio/pcm-16k 供 speaker 播放，
+  # 同时在节拍点按 spec 发送语义动作边沿和小幅转身脉冲。动作命令经 loco 的
+  # 共享限速器发出（>=2ms、边沿触发）；不读写 MediaController、不碰音量。
+  beat_performance:
+    enabled: true
+    action_cycle: wave,cheer,dance_1,dance_2
+    action_every_beats: 4
+    turn_every_beats: 8
+    action_cooldown_s: 3.0
+    turn_cooldown_s: 4.0
+    turn_vyaw: 0.5
+    turn_frames: 3
+    frame_ms: 20
+    fallback_bpm: 120.0
+    max_duration_s: 120.0
   mic:
     enabled: true
   sound_direction:
