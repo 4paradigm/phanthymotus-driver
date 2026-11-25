@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import re
 import threading
 
@@ -124,9 +123,17 @@ class HeliosCamera:
         return source_id
 
     def _topic(self, instance):
-        # Stable when the user selects another camera; no stale Core subscription.
-        suffix = hashlib.sha256(instance.encode()).hexdigest()[:24] if instance else "preview"
-        return f"/{self._namespace}/camera/card_{suffix}/rgb"
+        # One readable topic per card, named after the card id like go1/go2 cameras
+        # (card-mwvl5yh15sat -> card_mwvl5yh15sat). ROS names allow only ASCII letters,
+        # digits and "_", and a token must not start with a digit. The topic does not
+        # change when the card switches camera, so Core's subscription stays valid.
+        if not instance:
+            return f"/{self._namespace}/camera/preview/rgb"
+        safe = "".join(ch if ch.isascii() and (ch.isalnum() or ch == "_") else "_" for ch in instance)
+        safe = re.sub("_+", "_", safe).strip("_") or "card"  # ROS 2 forbids "__"
+        if safe[0].isdigit():
+            safe = "card_" + safe
+        return f"/{self._namespace}/camera/{safe}/rgb"
 
     def _release(self, instance):
         previous = self._active.pop(instance, None)

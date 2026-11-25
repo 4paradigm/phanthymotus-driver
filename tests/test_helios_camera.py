@@ -305,3 +305,14 @@ def test_default_publish_rate_is_15_fps():
 def test_start_waits_at_most_2_5_s_for_the_first_frame():
     from rokae.helios.camera_capture import STARTUP_TIMEOUT_S
     assert STARTUP_TIMEOUT_S <= 2.5
+
+
+@pytest.mark.parametrize("instance, topic", [
+    ("card-mwvl5yh15sat", "/rokae_helios/camera/card_mwvl5yh15sat/rgb"),
+    ("9abc", "/rokae_helios/camera/card_9abc/rgb"),
+    ("卡片-1", "/rokae_helios/camera/card_1/rgb"),
+    ("a--b", "/rokae_helios/camera/a_b/rgb"),
+])
+def test_topic_is_readable_and_a_valid_ros_name(instance, topic):
+    camera, _ = plugin()
+    assert camera.dispatch("info", {"instance_id": instance})["topic_out"][0]["topic"] == topic
