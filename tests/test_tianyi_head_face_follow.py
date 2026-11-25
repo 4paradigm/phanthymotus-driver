@@ -1,7 +1,6 @@
 """Head following through the bundle, with ROS transport replaced by stubs."""
 
 import importlib.util
-import json
 import math
 import sys
 from types import ModuleType, SimpleNamespace as NS
@@ -35,6 +34,7 @@ def setup(monkeypatch):
                           ReliabilityPolicy=enum, DurabilityPolicy=enum),
         "rclpy.exceptions": {"InvalidTopicNameException": TypeError},
         "rclpy.validate_full_topic_name": {"validate_full_topic_name": lambda topic: None},
+        "sensor_msgs.msg": {"CompressedImage": NS},
         "std_msgs.msg": dict(String=NS, Bool=NS, UInt32MultiArray=NS),
         "bodyctrl_msgs.msg": dict(CmdSetMotorPosition=NS, SetMotorPosition=NS,
                                   MotorStatusMsg=NS, PowerBoardKeyStatus=NS),
@@ -72,13 +72,27 @@ def setup(monkeypatch):
     def call(action, **kwargs):
         return bundle.dispatch("head_face_follow", dict(action=action, **kwargs))
 
-    assert call("start", input_topic="/test/face_tracking/i_test")["armed"] is False
+    class DecodeError(Exception):
+        pass
+
+    def detect(frame):
+        offset, delay = frame
+        clock.advance(delay)
+        if offset is None:
+            return [], (200, 200)
+        x, y = (round((1 + value) * 100 - 10) for value in offset)
+        return [(x, y, 20, 20)], (200, 200)
+
+    monkeypatch.setattr(sys.modules["head_face_follow"], "_Detector",
+                        lambda: NS(detect=detect, cv2=NS(error=DecodeError)))
+    started = call("start")
+    assert started["armed"] is False
+    assert started["topic_in"][0]["topic"] == "/tianyi/camera/head"
     callback = follow._node.subscriptions[0][2]
 
-    def send(state="tracking", track=1, offset=(0.8, 0.8), delay=0, step=0.125):
+    def send(offset=(0.8, 0.8), delay=0, step=0.125):
         clock.advance(step)
-        callback(NS(data=json.dumps(dict(state=state, frame_ts=clock.time() - delay,
-                                         target=dict(track_id=track, offset=list(offset))))))
+        callback(NS(data=(offset, delay)))
 
     yield NS(bundle=bundle, clock=clock, head=head, call=call, send=send,
              feedback=feedback, commands=head._publisher.messages)
@@ -114,7 +128,7 @@ def test_loss_stale_frames_and_fault_require_safe_reacquisition(setup):
     s.feedback()
     assert s.call("arm")["armed"]
     s.send()
-    s.send(state="lost")
+    s.send(offset=None)
     s.send()
     s.send(delay=1)
     s.send()
@@ -133,4 +147,4 @@ def test_loss_stale_frames_and_fault_require_safe_reacquisition(setup):
     s.send(offset=(0.1, -0.1))
     assert not s.commands
     s.clock.advance(1)
-    assert s.call("info")["reason"] == "tracking_timeout"
+    assert s.call("info")["reason"] == "camera_timeout"

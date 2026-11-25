@@ -1,8 +1,7 @@
-"""Tianyi head actuator for the perception face_tracking stream."""
+"""Tianyi head actuator with built-in anonymous face tracking."""
 
 from __future__ import annotations
 
-import json
 import math
 import threading
 import time
@@ -10,26 +9,99 @@ import time
 from rclpy.node import Node
 from rclpy.exceptions import InvalidTopicNameException
 from rclpy.validate_full_topic_name import validate_full_topic_name
-from std_msgs.msg import String
+from rclpy.qos import QoSProfile, ReliabilityPolicy
+from sensor_msgs.msg import CompressedImage
 
 FRAME_MAX_AGE = 0.4
 COMMAND_PERIOD = 0.2
 DEADBAND = 0.12
-INPUT = {"format": "data/json", "desc": "face_tracking 输出"}
+INPUT = {"format": "image/jpeg", "desc": "可选 RGB 相机，默认使用天轶头部相机"}
 
 
-def _offset(value):
-    if not isinstance(value, list) or len(value) != 2:
-        return None
-    if not all(type(v) in (int, float) and -1 <= v <= 1 for v in value):
-        return None
-    return value
+def _iou(a, b):
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    width = max(0, min(ax + aw, bx + bw) - max(ax, bx))
+    height = max(0, min(ay + ah, by + bh) - max(ay, by))
+    intersection = width * height
+    return intersection / (aw * ah + bw * bh - intersection)
+
+
+class _Tracker:
+    def __init__(self):
+        self.bbox = None
+        self.track_id = 0
+        self.last_seen = 0.0
+        self.size = None
+
+    def update(self, boxes, size, now):
+        if size != self.size or now - self.last_seen >= FRAME_MAX_AGE:
+            self.bbox = None
+        self.size = size
+        if not boxes:
+            return None
+        if self.bbox is None:
+            self.bbox = max(boxes, key=lambda box: box[2] * box[3])
+            self.track_id += 1
+        else:
+            ranked = sorted(((_iou(self.bbox, box), box) for box in boxes), reverse=True)
+            score, candidate = ranked[0]
+            if score < 0.2 or (len(ranked) > 1 and score - ranked[1][0] < 0.1):
+                return None
+            self.bbox = candidate
+        self.last_seen = now
+        x, y, w, h = self.bbox
+        width, height = size
+        return {
+            "track_id": self.track_id,
+            "bbox": list(self.bbox),
+            "offset": [round((2 * x + w) / width - 1, 4),
+                       round((2 * y + h) / height - 1, 4)],
+        }
+
+
+class _Detector:
+    def __init__(self):
+        import cv2
+        import numpy as np
+
+        self.np = np
+        self.cv2 = cv2
+        path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        self.cascade = self.cv2.CascadeClassifier(str(path))
+        if self.cascade.empty():
+            raise RuntimeError(f"OpenCV could not load face cascade: {path}")
+
+    def detect(self, data):
+        gray = self.cv2.imdecode(self.np.frombuffer(data, dtype=self.np.uint8),
+                                 self.cv2.IMREAD_GRAYSCALE)
+        if gray is None:
+            raise ValueError("undecodable frame")
+        height, width = gray.shape
+        small_w, small_h = width, height
+        if max(width, height) > 640:
+            scale = 640 / max(width, height)
+            small_w, small_h = max(1, round(width * scale)), max(1, round(height * scale))
+            gray = self.cv2.resize(gray, (small_w, small_h), interpolation=self.cv2.INTER_AREA)
+        boxes = []
+        for x, y, w, h in self.cascade.detectMultiScale(
+            gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30)
+        ):
+            left, right = round(x * width / small_w), round((x + w) * width / small_w)
+            top, bottom = round(y * height / small_h), round((y + h) * height / small_h)
+            boxes.append((left, top, right - left, bottom - top))
+        return boxes, (width, height)
 
 
 class HeadFaceFollowPlugin:
-    def __init__(self, ros2, head):
+    def __init__(self, ros2, head, namespace, camera=None):
         self._ros2 = ros2
         self._head = head
+        self._camera = camera
+        self._default_topic = f"/{namespace}/camera/head"
+        self._detector = None
+        self._tracker = None
+        self._last_sample = -math.inf
         self._lock = threading.Lock()
         self._node = None
         self._topic = ""
@@ -44,18 +116,18 @@ class HeadFaceFollowPlugin:
         return {
             "name": "head_face_follow",
             "type": "actuator",
-            "description": "天轶头部随动。连接 face_tracking，显式开启后跟随目标转头。",
+            "description": "天轶头部随动。内置人脸检测和跟踪，开启后使用头部相机跟随人脸。",
             "topic_in": [INPUT],
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string", "enum": ["start", "arm", "stop", "info"]},
-                    "input_topic": {"type": "string", "description": "face_tracking ROS 话题"},
+                    "input_topic": {"type": "string", "description": "可选 JPEG 相机话题，留空使用内置头部相机"},
                 },
                 "required": ["action"],
                 "x-resource": "head",
                 "x-action-params": {
-                    "start": {"params": ["input_topic"], "description": "接入跟踪结果，等待开启"},
+                    "start": {"params": ["input_topic"], "description": "启动相机订阅，等待开启"},
                     "arm": {"params": [], "description": "开启头部随动"},
                     "stop": {"params": [], "description": "停止发送随动指令并断开订阅"},
                     "info": {"params": [], "description": "查看是否已开启及等待原因"},
@@ -75,6 +147,8 @@ class HeadFaceFollowPlugin:
         with self._lock:
             node = self._node
             self._node = None
+            self._detector = None
+            self._tracker = None
             self._topic = ""
             self._armed = False
             self._track = None
@@ -90,9 +164,9 @@ class HeadFaceFollowPlugin:
             return {"state": "idle"}
         with self._lock:
             if action == "start":
-                topic = args.get("input_topic")
+                topic = args.get("input_topic") or self._default_topic
                 if not isinstance(topic, str) or not topic.startswith("/"):
-                    return {"state": "error", "error": "Connect face_tracking first"}
+                    return {"state": "error", "error": "Expected an absolute JPEG camera topic"}
                 try:
                     validate_full_topic_name(topic)
                 except (InvalidTopicNameException, ValueError) as error:
@@ -102,13 +176,19 @@ class HeadFaceFollowPlugin:
                 if self._node is None:
                     node = Node("tianyi2_head_face_follow", context=self._ros2.ctx_core)
                     try:
-                        node.create_subscription(String, topic, lambda msg: self._on_frame(node, msg), 1)
+                        detector = _Detector()
+                        qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+                        node.create_subscription(
+                            CompressedImage, topic, lambda msg: self._on_frame(node, msg), qos)
+                        if topic == self._default_topic and self._camera is not None:
+                            self._camera.start()
                         if not self._ros2.executor_core.add_node(node):
                             raise RuntimeError("Could not register face follow node")
                     except Exception as error:
                         node.destroy_node()
                         return {"state": "error", "error": str(error)}
                     self._node = node
+                    self._detector = detector
                     self._topic = topic
                     self._reason = "awaiting_arm"
             elif action == "arm":
@@ -119,16 +199,19 @@ class HeadFaceFollowPlugin:
                     if check:
                         return check
                     self._armed = True
-                    self._armed_at = time.time()
+                    self._armed_at = time.monotonic()
+                    self._tracker = _Tracker()
+                    self._last_sample = -math.inf
                     self._reason = "waiting_for_face"
                     self._track = None
                     self._last_frame = None
             elif action != "info":
                 return None
             reason = self._reason
-            if self._armed and self._last_frame is not None:
-                if time.time() - self._last_frame > FRAME_MAX_AGE:
-                    reason = "tracking_timeout"
+            if self._armed and time.monotonic() - max(
+                self._armed_at, self._last_sample
+            ) > FRAME_MAX_AGE:
+                reason = "camera_timeout"
             return {
                 "state": "running" if self._node else "idle",
                 "armed": self._armed,
@@ -137,37 +220,35 @@ class HeadFaceFollowPlugin:
             }
 
     def _on_frame(self, node, message):
+        received = time.monotonic()
         with self._lock:
-            if self._node is not node or not self._armed:
+            if self._node is not node or not self._armed or received < self._armed_at:
                 return
-            try:
-                packet = json.loads(message.data)
-            except (ValueError, RecursionError):
-                packet = None
-            if not isinstance(packet, dict):
+            if received - self._last_sample < 0.12:
+                return
+            self._last_sample = received
+            detector, tracker = self._detector, self._tracker
+        try:
+            boxes, size = detector.detect(message.data)
+        except (ValueError, detector.cv2.error):
+            boxes, size = (), None
+        with self._lock:
+            if self._node is not node or not self._armed or self._tracker is not tracker:
+                return
+            if size is None or time.monotonic() - received > FRAME_MAX_AGE:
                 self._track = None
-                self._reason = "invalid_tracking_data"
+                self._reason = "invalid_or_stale_frame"
                 return
-            frame_ts = packet.get("frame_ts")
-            target = packet.get("target")
-            if packet.get("state") != "tracking" or not isinstance(target, dict):
+            target = tracker.update(boxes, size, received)
+            if target is None:
                 self._track = None
                 self._reason = "waiting_for_face"
                 return
-
-            age = time.time() - frame_ts if type(frame_ts) is float else math.inf
-            track = target.get("track_id")
-            offset = _offset(target.get("offset"))
-            if (not 0 <= age <= FRAME_MAX_AGE or frame_ts < self._armed_at
-                    or type(track) is not int or track <= 0 or offset is None):
-                self._track = None
-                self._reason = "invalid_or_stale_tracking"
-                return
+            track = target["track_id"]
+            offset = target["offset"]
             last = self._last_frame
-            if last is not None and frame_ts <= last:
-                return
-            confirmed = self._track == track and last is not None and frame_ts - last <= FRAME_MAX_AGE
-            self._last_frame = frame_ts
+            confirmed = self._track == track and last is not None and received - last <= FRAME_MAX_AGE
+            self._last_frame = received
             self._track = track
             if not confirmed:
                 self._reason = "confirming_target"

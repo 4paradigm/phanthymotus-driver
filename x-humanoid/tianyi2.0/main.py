@@ -325,9 +325,11 @@ class TianyiDeviceBundle:
             self._plugins.append(StatePlugin(state_cfg, namespace, ros2))
             print("[bundle] StatePlugin loaded")
 
+        camera = None
         if plugins_cfg.get("camera", {}).get("enabled", False):
             from device import CameraPlugin
-            self._plugins.append(CameraPlugin(plugins_cfg["camera"], namespace, ros2))
+            camera = CameraPlugin(plugins_cfg["camera"], namespace, ros2)
+            self._plugins.append(camera)
             print("[bundle] CameraPlugin loaded")
 
         if plugins_cfg.get("camera_snapshot", {}).get("enabled", False):
@@ -405,7 +407,7 @@ class TianyiDeviceBundle:
             if follow_enabled:
                 from head_face_follow import HeadFaceFollowPlugin
                 head_gesture.start()
-                self._head_follow = HeadFaceFollowPlugin(ros2, head_gesture)
+                self._head_follow = HeadFaceFollowPlugin(ros2, head_gesture, namespace, camera)
                 self._plugins.append(self._head_follow)
 
         if plugins_cfg.get("arm", {}).get("enabled", False):
