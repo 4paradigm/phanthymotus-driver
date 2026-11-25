@@ -955,3 +955,43 @@ def test_the_first_command_is_the_measured_pose_even_at_the_margin(monkeypatch):
             "a measured roll inside the margin was rewritten on the first tick"
     finally:
         plugin.dispatch("stop", {})
+
+
+# ── stop vs an in-flight tick (review High) ──────────────────────────────────
+
+def test_a_stop_during_a_blocked_joint_read_cannot_be_followed_by_a_command(monkeypatch):
+    """`stop` returned `idle` while a stale worker then wrote all 21 motors.
+
+    The token was only checked at the top of the loop. Block the joint-state
+    read, stop, then release it: the worker resumes after `stop` has returned
+    and must not call `set_joint`.
+    """
+    import threading
+    import time
+
+    _card, plugin, high, low = _plugin(monkeypatch)
+    entered = threading.Event()
+    release = threading.Event()
+    original = high.get_joint_state
+
+    def blocked_read():
+        entered.set()
+        release.wait(5.0)
+        return original()
+
+    high.get_joint_state = blocked_read
+    plugin.dispatch("start", {"confirm": True})
+    try:
+        assert entered.wait(2.0), "the control loop never entered the joint read"
+        before = len(low.calls)
+        result = plugin.dispatch("stop", {})
+        # The worker is still inside the blocked SDK call: stop must not claim
+        # a clean idle while a command can still follow.
+        assert result["state"] in ("idle", "stopping")
+        release.set()
+        time.sleep(0.3)
+        assert len(low.calls) == before, \
+            "the stopped worker sent a motor command after stop had returned"
+    finally:
+        release.set()
+        plugin.dispatch("stop", {})

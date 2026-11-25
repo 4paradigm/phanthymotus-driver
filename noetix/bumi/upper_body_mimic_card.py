@@ -280,8 +280,8 @@ class UpperBodyMimicPlugin:
         return {"state": "ready"}
 
     def stop(self):
-        self._teardown()
-        return {"state": "idle"}
+        stopped = self._teardown()
+        return {"state": "idle" if stopped else "stopping"}
 
     def dispatch(self, action: str, args: dict):
         if action == "start":
@@ -381,8 +381,11 @@ class UpperBodyMimicPlugin:
         }
 
     def _stop(self) -> dict:
-        self._teardown()
-        return {"state": "idle"}
+        if self._teardown():
+            return {"state": "idle"}
+        return {"state": "stopping",
+                "error": ("control loop is still unwinding inside an SDK call; "
+                          "it is fenced and will not command again")}
 
     def _info(self) -> dict:
         mode = self._read_workmode()
@@ -557,6 +560,13 @@ class UpperBodyMimicPlugin:
                     keep_kp=self._keep_kp, keep_kd=self._keep_kd,
                     arm_kp=self._arm_kp, arm_kd=self._arm_kd,
                 )
+                # Fence immediately before the only call that moves the robot.
+                # The loop condition alone is not enough: a tick can be blocked
+                # in `get_joint_state()` while `stop` invalidates the token and
+                # returns, and would then send one more command from the stopped
+                # run. Re-checking here makes a stopped run unable to write.
+                if self._stop_event.is_set() or token is not self._run_token:
+                    break
                 self._send(commands)
             except Exception as exc:  # noqa: BLE001 - stop rather than keep writing
                 self._last_error = f"{type(exc).__name__}: {exc}"
@@ -576,7 +586,14 @@ class UpperBodyMimicPlugin:
                 # Fell behind: resynchronise instead of accumulating a backlog.
                 next_at = time.monotonic()
 
-    def _teardown(self) -> None:
+    def _teardown(self) -> bool:
+        """Stop the control loop; True only once the worker has really exited.
+
+        Clearing the token before the join makes a mid-tick loop skip its send.
+        If the worker is stuck inside an SDK call the join can time out, and
+        the caller must not be told "idle" while that call may still return and
+        write: that is why the result is reported instead of assumed.
+        """
         # Clear the run token first: a loop that is mid-tick will see it change
         # and exit at the top of its next iteration instead of sending one more
         # command from a run the operator already stopped.
@@ -584,12 +601,15 @@ class UpperBodyMimicPlugin:
         self._stop_event.set()
         worker = self._worker
         self._worker = None
+        stopped = True
         if worker is not None and worker.is_alive():
             worker.join(timeout=2.0)
+            stopped = not worker.is_alive()
         if self._angles_sub is not None:
             try:
                 self._node.destroy_subscription(self._angles_sub)
             except Exception:  # noqa: BLE001
                 pass
             self._angles_sub = None
-        self._status = "idle"
+        self._status = "idle" if stopped else "stopping"
+        return stopped
