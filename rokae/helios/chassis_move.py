@@ -35,6 +35,9 @@ WORKER_READY_TIMEOUT_S = 8.0
 # exception_state subscription; a move waits this long for its first report.
 EXCEPTION_STATE_TIMEOUT_S = 3.0
 WATCHDOG_MARGIN_S = 3.0
+# Before the worker reports move_acquired it may still be retrying set_third_speed_ctrl
+# while the chassis wakes its motors (3 attempts x 3 s RPC timeout, see the worker).
+ACQUIRE_BUDGET_S = 10.0
 
 
 def acp_notify(action_id, status, result):
@@ -71,9 +74,10 @@ def _limit(value, maximum, name, unit):
 class SdkWorkerLink:
     """Owns the vendor SDK worker process and its JSON-lines protocol."""
 
-    def __init__(self, config, on_move_done, popen=subprocess.Popen):
+    def __init__(self, config, on_move_done, popen=subprocess.Popen, on_move_acquired=None):
         self._config = config
         self._on_move_done = on_move_done
+        self._on_move_acquired = on_move_acquired or (lambda move_id: None)
         self._popen = popen
         self._lock = threading.Lock()
         self._proc = None
@@ -156,6 +160,8 @@ class SdkWorkerLink:
             elif kind == "odom":
                 self.odometry = {k: event[k] for k in ("x", "y", "theta", "vx", "vy", "w") if k in event}
                 self.odometry["received_monotonic"] = time.monotonic()
+            elif kind == "move_acquired":
+                self._on_move_acquired(event.get("id"))
             elif kind == "move_done":
                 self._on_move_done(event.get("id"), event.get("status", "error"), event.get("message", ""),
                                    event.get("odometry"))
@@ -231,7 +237,7 @@ class HeliosChassisMove:
         # Off unless the deployment opts in: charging interlock, controller command timeout and
         # obstacle-avoidance behaviour under SDK speed control are not yet verified.
         self._enabled = (enabled == "1") if enabled is not None else bool(config.get("chassis_motion_enabled", False))
-        self.link = link or SdkWorkerLink(config, self._on_move_done)
+        self.link = link or SdkWorkerLink(config, self._on_move_done, on_move_acquired=self._on_move_acquired)
 
     # ── tool definition ──────────────────────────────────────────────────
     def get_tools(self):
@@ -356,7 +362,9 @@ class HeliosChassisMove:
         with self._lock:
             if self._active is not None:
                 return {"error": "a timed base move is already running; send stop first"}
-            self._active = {"id": action_id, "deadline": self._clock() + duration + WATCHDOG_MARGIN_S}
+            # Until the worker holds speed control, allow for the chassis waking its motors.
+            self._active = {"id": action_id, "duration": duration,
+                            "deadline": self._clock() + ACQUIRE_BUDGET_S + duration + WATCHDOG_MARGIN_S}
         try:
             self.link.send({"op": "move", "id": action_id, "vx": vx, "vy": vy,
                             "wz": math.radians(vyaw), "duration_s": duration})
@@ -384,6 +392,13 @@ class HeliosChassisMove:
         out = {k: v for k, v in odom.items() if k != "received_monotonic"}
         out["age_s"] = round(age, 2)
         return out if age < 3.0 else {**out, "stale": True}
+
+    def _on_move_acquired(self, action_id):
+        """Speed control acquired: the move runs for its duration from now."""
+        with self._lock:
+            active = self._active
+            if active is not None and active["id"] == action_id:
+                active["deadline"] = self._clock() + active["duration"] + WATCHDOG_MARGIN_S
 
     def _on_move_done(self, action_id, status, message, odometry=None):
         result = {"message": message} if message else {}

@@ -78,6 +78,44 @@ def test_session_refuses_without_speed_control_and_never_sends():
     speed, _ = session(nav)
     status, message = speed.run(0.1, 0, 0, 1.0, threading.Event())
     assert status == "error" and "set_third_speed_ctrl" in message and nav.sent == []
+    assert nav.calls == ["acquire"] * 3 + ["release"]
+
+
+def test_session_retries_acquire_rpc_timeouts_then_moves():
+    # Seen on the robot after a restart: the first call times out while the chassis wakes.
+    nav = FakeNav()
+    failures = [RuntimeError("RPC call timeout: set_third_speed_ctrl")] * 2
+
+    def acquire():
+        nav.calls.append("acquire")
+        if failures:
+            raise failures.pop()
+        return True
+    nav.set_third_speed_ctrl = acquire
+    acquired = []
+    speed, _ = session(nav)
+    status, _ = speed.run(0.1, 0, 0, 1.0, threading.Event(), on_acquired=lambda: acquired.append(1))
+    assert status == "completed" and acquired == [1] and nav.calls[:3] == ["acquire"] * 3
+
+
+def test_session_reports_acquire_timeouts_instead_of_crashing():
+    nav = FakeNav()
+
+    def acquire():
+        raise RuntimeError("RPC call timeout: set_third_speed_ctrl")
+    nav.set_third_speed_ctrl = acquire
+    speed, _ = session(nav)
+    status, message = speed.run(0.1, 0, 0, 1.0, threading.Event(), on_acquired=lambda: pytest.fail("not acquired"))
+    assert status == "error" and "RPC call timeout" in message and "waking" in message
+    assert nav.sent == [] and nav.calls == ["release"]
+
+
+def test_worker_always_reports_move_done_even_if_the_session_raises():
+    events = []
+    worker = Worker(FakeNav(), events.append, 50)
+    worker._session.run = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+    worker._run("m1", threading.Event(), 0.1, 0, 0, 1.0)
+    assert events[-1]["event"] == "move_done" and events[-1]["status"] == "error" and "boom" in events[-1]["message"]
 
 
 def test_session_stops_on_cancel_block_send_failure_and_exception():
@@ -86,7 +124,13 @@ def test_session_stops_on_cancel_block_send_failure_and_exception():
     stop = threading.Event()
     stop.set()
     assert speed.run(0.1, 0, 0, 5.0, stop)[0] == "cancelled"
-    assert nav.sent == [(0.0, 0.0, 0.0)] * 5 and nav.calls[-1] == "release"
+    assert nav.sent == [] and nav.calls == ["release"]  # stopped before acquiring: nothing sent
+
+    nav = FakeNav()
+    speed, _ = session(nav)
+    stop = threading.Event()
+    speed.run(0.1, 0, 0, 5.0, stop, on_acquired=stop.set)  # cancelled after acquiring
+    assert nav.sent == [(0.0, 0.0, 0.0)] * 5 and nav.calls == ["acquire", "release"]
 
     nav = FakeNav()
     speed, _ = session(nav)
@@ -285,11 +329,30 @@ def test_stop_cancels_active_move_and_worker_exit_finishes_it():
     assert notes[-1][:2] == (second["action_id"], "error")
 
 
+def test_watchdog_allows_motor_wake_up_until_speed_control_is_acquired():
+    clock = FakeClock()
+    move, link, notes = card(clock=clock)
+    result = move.dispatch("move", {"vx": 0.1, "duration_s": 1})
+    clock.now = 9.0  # still acquiring (chassis waking): not cut off
+    time.sleep(0.5)
+    assert link.killed == 0 and not notes
+    move._on_move_acquired(result["action_id"])  # acquired at t=9: 1 s move + 3 s margin from now
+    clock.now = 12.5
+    time.sleep(0.5)
+    assert link.killed == 0 and not notes
+    clock.now = 13.5
+    for _ in range(50):
+        if notes:
+            break
+        time.sleep(0.05)
+    assert link.killed == 1 and notes[-1][:2] == (result["action_id"], "error")
+
+
 def test_watchdog_kills_worker_when_completion_never_arrives():
     clock = FakeClock()
     move, link, notes = card(clock=clock)
     result = move.dispatch("move", {"vx": 0.1, "duration_s": 1})
-    clock.now = 10.0
+    clock.now = 20.0
     for _ in range(50):
         if notes:
             break

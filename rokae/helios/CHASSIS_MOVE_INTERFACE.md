@@ -13,7 +13,7 @@ Vendor VMR AMR SDK 2.1.51 (`VMR_AMR_SDK_arm_SDK-2.1.51_e22f4_py312`), module `na
 
 - Card contract follows `agilex/bunker-mini` `base_drive`: bounded `move`, `stop`, ACP completion, `x-resource: base`. `vyaw` is degrees/s on the card and converted to rad/s for the SDK.
 - The vendor Python extension is ABI-specific and is loaded only in `chassis_sdk_worker.py`, started on the first `move` (not at Driver start). The worker owns the 50 Hz loop and the per-move deadline, and on every exit path sends zero five times and releases speed control. stdin EOF stops it.
-- The Driver keeps one active move; a second `move` is refused until `stop`. A watchdog kills the worker if completion is not reported within duration + 3 s.
+- The Driver keeps one active move; a second `move` is refused until `stop`. Acquiring SDK speed control is retried up to 3 times (each bounded by the 3 s RPC timeout): after a restart the first `set_third_speed_ctrl` timed out while the chassis woke its idle motors. The worker reports `move_acquired`, and the watchdog then kills the worker if completion is not reported within duration + 3 s; before that it allows a further 10 s for acquisition. An exception in the move thread is still reported as a failed move.
 - Movement is **off by default**. A deployment opts in with `HELIOS_CHASSIS_MOTION_ENABLED=1` (or `chassis_motion_enabled: true`); until then `move` is refused and `info` shows `motion_enabled: false`. With the bot's quick-test script the variable is passed through `sudo`, which `docker compose` interpolates into the service fragment:
 
   ```bash

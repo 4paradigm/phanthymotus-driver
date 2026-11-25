@@ -26,6 +26,11 @@ import time
 
 ZERO_REPEAT = 5
 MAX_SEND_FAILURES = 3
+# Acquiring SDK speed control can time out while the chassis wakes and enables its
+# idle motors (seen on the robot after a restart: "RPC call timeout: set_third_speed_ctrl").
+# Each attempt is bounded by the RPC call timeout (3 s), so acquisition takes at most ~10 s.
+ACQUIRE_ATTEMPTS = 3
+ACQUIRE_RETRY_DELAY_S = 0.5
 
 
 def _twist(nav, vx, vy, wz):
@@ -48,13 +53,38 @@ class SpeedSession:
         self._clock = clock
         self._sleep = sleep
 
-    def run(self, vx, vy, wz, duration_s, stop_event, blocked=lambda: None):
+    def _acquire(self, stop_event):
+        """Return (acquired, reason). Retries; an SDK exception is a failed attempt, not a crash."""
+        reason = "set_third_speed_ctrl failed"
+        for attempt in range(ACQUIRE_ATTEMPTS):
+            if stop_event.is_set():
+                return False, "cancelled"
+            try:
+                if self._nav.set_third_speed_ctrl():
+                    return True, ""
+                reason = "set_third_speed_ctrl returned false"
+            except Exception as exc:
+                reason = f"set_third_speed_ctrl: {type(exc).__name__}: {exc}"
+            if attempt + 1 < ACQUIRE_ATTEMPTS:
+                self._sleep(ACQUIRE_RETRY_DELAY_S)
+        return False, reason
+
+    def run(self, vx, vy, wz, duration_s, stop_event, blocked=lambda: None, on_acquired=lambda: None):
         """Return (status, message); status is completed, cancelled or error."""
         for value in (vx, vy, wz, duration_s):
             if not math.isfinite(value):
                 return "error", "non-finite command"
-        if not self._nav.set_third_speed_ctrl():
-            return "error", "set_third_speed_ctrl failed"
+        acquired, reason = self._acquire(stop_event)
+        if not acquired:
+            try:  # release anything a timed-out call may have half-acquired; no speed was sent
+                self._nav.close_third_speed_ctrl()
+            except Exception:
+                pass
+            if reason == "cancelled":
+                return "cancelled", ""
+            return "error", (f"could not acquire SDK speed control after {ACQUIRE_ATTEMPTS} attempts "
+                             f"({reason}); the chassis may still be waking its motors, retry shortly")
+        on_acquired()
         status, message = "completed", ""
         try:
             twist = _twist(self._nav, vx, vy, wz)
@@ -207,7 +237,12 @@ class Worker:
     def _run(self, move_id, stop_event, vx, vy, wz, duration_s):
         start = self._odom.snapshot() if self._odom else None
         self._emit({"event": "move_started", "id": move_id})
-        status, text = self._session.run(vx, vy, wz, duration_s, stop_event, self._blocked)
+        try:
+            status, text = self._session.run(
+                vx, vy, wz, duration_s, stop_event, self._blocked,
+                on_acquired=lambda: self._emit({"event": "move_acquired", "id": move_id}))
+        except Exception as exc:  # always report: a silent thread death left the Driver waiting
+            status, text = "error", f"{type(exc).__name__}: {exc}"
         if self._odom:
             time.sleep(0.3)  # let the final odometry sample arrive after zero speed
         end = self._odom.snapshot() if self._odom else None
