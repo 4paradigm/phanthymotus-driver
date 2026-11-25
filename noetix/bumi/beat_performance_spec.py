@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import math
 import os
+import stat
 import struct
 import wave
 from dataclasses import dataclass
@@ -148,6 +149,31 @@ def _wav_to_mono_pcm16(wav: wave.Wave_read) -> bytes:
     return struct.pack(f"<{len(mono)}h", *mono)
 
 
+def _open_confined(candidate: str, max_bytes: int) -> tuple[int, int]:
+    """Open once through O_NOFOLLOW and trust fstat, not the pathname.
+
+    A second islink() check before open() is still check-to-open: the upload
+    can be replaced by a symlink in between.  The descriptor is the object we
+    actually read, so refusing to follow links at open time and validating the
+    opened inode closes that race.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(candidate, flags)
+    except OSError as exc:
+        raise BeatSpecError(f"cannot open audio_file: {exc}") from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise BeatSpecError("audio_file must be a regular file")
+        if not 0 < info.st_size <= max_bytes:
+            raise BeatSpecError(f"audio_file must be 1..{max_bytes} bytes")
+        return fd, info.st_size
+    except Exception:
+        os.close(fd)
+        raise
+
+
 def decode_audio(
     path: str,
     *,
@@ -157,25 +183,18 @@ def decode_audio(
 ) -> DecodedAudio:
     """Decode a validated WAV or raw PCM16 file without touching ROS."""
     candidate = validate_audio_path(path, allowed_dirs)
-    # Re-check after validation: a link swapped in between the two calls must
-    # not turn a confined upload into a read of an arbitrary host file.
-    if os.path.islink(candidate) or not os.path.isfile(candidate):
-        raise BeatSpecError("audio_file does not exist or is a symbolic link")
-    size = os.path.getsize(candidate)
-    if not 0 < size <= max_bytes:
-        raise BeatSpecError(f"audio_file must be 1..{max_bytes} bytes")
-
-    if candidate.lower().endswith(".wav"):
-        try:
-            with wave.open(candidate, "rb") as wav:
-                pcm = _wav_to_mono_pcm16(wav)
-        except (wave.Error, EOFError, struct.error) as exc:
-            raise BeatSpecError(f"cannot decode WAV: {exc}") from exc
-        source = "wav"
-    else:
-        with open(candidate, "rb") as handle:
+    fd, _size = _open_confined(candidate, max_bytes)
+    with os.fdopen(fd, "rb") as handle:
+        if candidate.lower().endswith(".wav"):
+            try:
+                with wave.open(handle, "rb") as wav:
+                    pcm = _wav_to_mono_pcm16(wav)
+            except (wave.Error, EOFError, struct.error) as exc:
+                raise BeatSpecError(f"cannot decode WAV: {exc}") from exc
+            source = "wav"
+        else:
             pcm = handle.read()
-        source = "pcm"
+            source = "pcm"
 
     if len(pcm) < SAMPLE_WIDTH or len(pcm) % SAMPLE_WIDTH:
         raise BeatSpecError("audio stream must contain whole 16-bit samples")

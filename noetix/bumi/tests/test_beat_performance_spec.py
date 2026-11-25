@@ -94,6 +94,35 @@ def test_a_linked_parent_directory_cannot_expand_the_allowed_root(tmp_path):
         validate_audio_path(str(linked / "song.pcm"), (str(uploads),))
 
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="O_NOFOLLOW is a POSIX open flag")
+def test_a_file_swapped_for_a_link_after_validation_is_still_refused(
+        tmp_path, monkeypatch):
+    """Check-to-open race: the descriptor must be the thing we trust."""
+    spec = sys.modules["beat_performance_spec"]
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+    upload = uploads / "song.pcm"
+    upload.write_bytes(b"\x01\x00" * 100)
+    outside = tmp_path / "secret.pcm"
+    outside.write_bytes(b"\x02\x00" * 100)
+
+    original_validate = spec.validate_audio_path
+    swapped = {"done": False}
+
+    def validate_then_swap(path, allowed_dirs):
+        resolved = original_validate(path, allowed_dirs)
+        if not swapped["done"]:
+            swapped["done"] = True
+            upload.unlink()
+            upload.symlink_to(outside)
+        return resolved
+
+    monkeypatch.setattr(spec, "validate_audio_path", validate_then_swap)
+    with pytest.raises(BeatSpecError):
+        spec.decode_audio(str(upload), allowed_dirs=(str(uploads),))
+
+
 def test_raw_pcm_is_decoded_as_16k_s16le_mono(tmp_path):
     pcm = _pcm_at_beats([0.5, 1.0], 2.0)
     path = tmp_path / "click.pcm"

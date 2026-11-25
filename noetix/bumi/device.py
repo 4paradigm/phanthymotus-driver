@@ -439,24 +439,45 @@ class LocoPlugin:
         time.sleep(hold_s)
         self._publish_cmd(0, 0, 0, _get_default_cmd(), 0)
 
-    def prepare_walking_mode(self, requested_action: str) -> dict:
-        """Bring the body to walking via the guarded semantic-action path.
+    def reserve_body_action(self, owner: str) -> bool:
+        """Hold the body/chassis exclusively for an externally driven action.
 
-        Reservation and protection checks stay here rather than in the caller
-        so an externally driven card cannot bypass workmode=26 or start while
-        a rotation still owns the chassis.
+        ``LocoPlugin.dispatch`` already refuses body actions while
+        ``_body_action`` is set.  The reservation must therefore span the
+        whole performance, not just its mode preparation, or a competing
+        semantic/posture/loco call could interleave commands with the beat
+        edges.  Returns False when another action already owns the body.
         """
         with self._rotate_lock:
-            self._body_action = requested_action
+            if self._body_action:
+                return False
+            self._body_action = owner
             self._rotate_stop_event.set()
-        try:
-            if not self._wait_for_rotate_idle():
-                return {"state": "error", "command_sent": False,
-                        "error": "rotation has not stopped; body was not prepared"}
-            return self._prepare_workmode(2, requested_action)
-        finally:
-            with self._rotate_lock:
+            return True
+
+    def release_body_action(self, owner: str) -> None:
+        with self._rotate_lock:
+            if self._body_action == owner:
                 self._body_action = None
+
+    def prepare_walking_mode(self, requested_action: str,
+                             cancel_event=None) -> dict:
+        """Bring the body to walking; caller holds the body reservation.
+
+        Every wait and every mode edge is cancellation-aware: a stop arriving
+        mid-preparation must not write SWITCH/WALK after its release.  This
+        method never reserves or releases -- the caller owns that for the
+        full lifetime of the action.
+        """
+        cancelled = lambda: cancel_event is not None and cancel_event.is_set()
+        if cancelled():
+            return {"state": "error", "command_sent": False, "cancelled": True,
+                    "error": "preparation cancelled before any mode command"}
+        if not self._wait_for_rotate_idle(cancel_event=cancel_event):
+            return {"state": "error", "command_sent": False,
+                    "error": "rotation has not stopped; body was not prepared"}
+        return self._prepare_workmode(2, requested_action,
+                                      cancel_event=cancel_event)
 
     def _distance_full_scale(self):
         """Measured normalised-command-to-m/s calibration from the servo card.
@@ -707,7 +728,8 @@ class LocoPlugin:
         self._stop_move()
         self._wait_for_rotate_idle()
 
-    def _wait_for_rotate_idle(self, timeout_s: float = 6.0) -> bool:
+    def _wait_for_rotate_idle(self, timeout_s: float = 6.0,
+                              cancel_event=None) -> bool:
         # Cover the dispatch-acceptance window: stop may land after the
         # reservation (state=running) but before the worker thread exists
         # (mid-preflight, or between assigning _rotate_worker and start()).
@@ -716,6 +738,8 @@ class LocoPlugin:
         # action was ever opened and there is nothing to join.
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
+            if cancel_event is not None and cancel_event.is_set():
+                return False
             with self._rotate_lock:
                 state_running = self._rotate_state["state"] == "running"
                 worker = self._rotate_worker
@@ -1567,19 +1591,40 @@ class LocoPlugin:
             ),
         }
 
-    def _prepare_workmode(self, target_mode: int, requested_action: str) -> dict:
-        """Automatically reach ready(1) or walking(2) through documented steps."""
+    @staticmethod
+    def _cancelled_preparation(requested_action: str, steps: list[dict]) -> dict:
+        return {
+            "state": "error", "command_sent": bool(steps),
+            "requested_action": requested_action,
+            "preparation_steps": steps, "cancelled": True,
+            "error": "preparation cancelled before the next mode command",
+        }
+
+    def _prepare_workmode(self, target_mode: int, requested_action: str,
+                          cancel_event=None) -> dict:
+        """Automatically reach ready(1) or walking(2) through documented steps.
+
+        ``cancel_event`` makes every wait and every mode edge interruptible so
+        a stop can never be followed by a late SWITCH/WALK command.  Existing
+        callers pass no event and keep the original behaviour.
+        """
+        cancelled = lambda: cancel_event is not None and cancel_event.is_set()
+        if cancelled():
+            return self._cancelled_preparation(requested_action, [])
         # Public dispatch owns the chassis until its action handler returns.
         # Also wait through a rotation's acceptance window before mode edges.
         with self._rotate_lock:
             self._rotate_stop_event.set()
-        if not self._wait_for_rotate_idle():
+        if not self._wait_for_rotate_idle(cancel_event=cancel_event):
             return {"state": "error", "command_sent": False,
+                    "cancelled": cancelled(),
                     "error": "rotation has not stopped; workmode was not changed"}
 
         self._move_stop_event.set()
         if self._move_thread and self._move_thread.is_alive():
             self._move_thread.join(timeout=1)
+        if cancelled():
+            return self._cancelled_preparation(requested_action, [])
 
         steps = []
         mode = int(self._high_ctrl.get_mode())
@@ -1588,7 +1633,10 @@ class LocoPlugin:
 
         stable_modes = {0, 1, 2, 30}
         if mode not in stable_modes:
-            mode = self._wait_for_workmode(stable_modes, timeout_s=15.0)
+            mode = self._wait_for_workmode(
+                stable_modes, timeout_s=15.0, cancel_event=cancel_event)
+            if cancelled():
+                return self._cancelled_preparation(requested_action, steps)
             steps.append({
                 "step": "wait_for_current_action",
                 "result_workmode": mode,
@@ -1602,6 +1650,8 @@ class LocoPlugin:
                     "The current robot action has not finished. No further mode transition was sent; wait for the action to finish and try again.")
 
         if mode == 30:
+            if cancelled():
+                return self._cancelled_preparation(requested_action, steps)
             mode = self._run_preparation_step("enable", "START", {0}, steps)
             if mode == 26:
                 return self._protection_error(requested_action, steps, mode)
@@ -1609,8 +1659,12 @@ class LocoPlugin:
                 return self._preparation_error(requested_action, steps, mode, "The robot did not enter enabled mode.")
 
         if target_mode == 1 and mode == 2:
+            if cancelled():
+                return self._cancelled_preparation(requested_action, steps)
             mode = self._run_preparation_step("prepare", "SWITCH", {1}, steps)
         elif mode == 0:
+            if cancelled():
+                return self._cancelled_preparation(requested_action, steps)
             mode = self._run_preparation_step("prepare", "SWITCH", {1}, steps)
 
         if mode == 26:
@@ -1621,6 +1675,8 @@ class LocoPlugin:
             return {"state": "completed", "steps": steps, "workmode": mode}
 
         if mode == 1:
+            if cancelled():
+                return self._cancelled_preparation(requested_action, steps)
             mode = self._run_preparation_step("enter_walking", "WALK", {2}, steps)
         if mode == 26:
             return self._protection_error(requested_action, steps, mode)
@@ -1730,10 +1786,13 @@ class LocoPlugin:
             return "Keep the robot standing with both feet on a flat non-slip floor and keep people and obstacles outside its movement range while returning to walking mode."
         return "Use only when the robot is standing normally and steadily with both feet on a flat non-slip floor, with no people or obstacles in its movement range."
 
-    def _wait_for_workmode(self, expected_modes: set[int], timeout_s: float) -> int:
+    def _wait_for_workmode(self, expected_modes: set[int], timeout_s: float,
+                           cancel_event=None) -> int:
         deadline = time.monotonic() + timeout_s
         observed = int(self._high_ctrl.get_mode())
         while observed not in expected_modes and observed != 26 and time.monotonic() < deadline:
+            if cancel_event is not None and cancel_event.is_set():
+                break
             time.sleep(0.05)
             observed = int(self._high_ctrl.get_mode())
         return observed

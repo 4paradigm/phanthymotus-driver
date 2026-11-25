@@ -278,6 +278,11 @@ class BeatPerformancePlugin:
         with self._lock:
             if self._state == "running":
                 return {"state": "error", "error": "performance already running; stop it first"}
+            # Hold the body for the whole run: the shared 2 ms limiter alone
+            # does not stop another card from issuing competing motion.
+            if not self._loco.reserve_body_action("beat_performance"):
+                return {"state": "error", "command_sent": False,
+                        "error": "body is reserved by another action; no command was sent"}
             self._stop_event.clear()
             self._generation += 1
             generation = self._generation
@@ -298,13 +303,10 @@ class BeatPerformancePlugin:
             self._stop_event.set()
             self._generation += 1
             thread = self._thread
+        # The worker owns the final DEFAULT and the reservation release, and
+        # both happen before join returns -- nothing can write after stop.
         if thread is not None and thread.is_alive():
-            thread.join(timeout=2.0)
-        # One final DEFAULT: a stop must leave no action or velocity held.
-        try:
-            self._loco.publish_velocity(0.0, 0.0, 0.0)
-        except Exception as exc:  # never let a stop fail because SDK is down
-            self._last_error = f"stop release: {exc}"
+            thread.join(timeout=8.0)
         with self._lock:
             if self._state == "running":
                 self._state = "idle"
@@ -373,8 +375,17 @@ class BeatPerformancePlugin:
 
     def _run(self, generation: int, audio_file: str, active: dict) -> None:
         try:
+            # A stop can land before this worker is scheduled at all.  No
+            # preemption, preparation or command may follow it.
+            if self._cancelled(generation):
+                return
             self._loco.preempt_for("beat_performance.start")
-            prepared = self._loco.prepare_walking_mode("beat_performance")
+            if self._cancelled(generation):
+                return
+            prepared = self._loco.prepare_walking_mode(
+                "beat_performance", cancel_event=self._stop_event)
+            if prepared.get("cancelled") or self._cancelled(generation):
+                return
             if prepared.get("state") == "error":
                 if prepared.get("protection"):
                     with self._lock:
@@ -404,6 +415,15 @@ class BeatPerformancePlugin:
         except Exception as exc:  # a worker must never die without a status
             self._fail(generation, f"performance error: {exc}")
         finally:
+            # Release the command with the reservation still held, then give
+            # the body back.  A stop therefore cannot be followed by a mode
+            # edge or a velocity from another card interleaving with ours.
+            try:
+                self._loco.publish_velocity(0.0, 0.0, 0.0)
+            except Exception as exc:  # a dead SDK must not wedge the cleanup
+                with self._lock:
+                    self._last_error = f"final release: {exc}"
+            self._loco.release_body_action("beat_performance")
             with self._lock:
                 if generation == self._generation and self._state == "running":
                     self._state = "idle"

@@ -47,6 +47,7 @@ class FakeLoco:
         self.commands: list[tuple] = []
         self._lock = threading.Lock()
         self._last = None
+        self.reserved = False
 
     def _record(self, item) -> None:
         with self._lock:
@@ -55,11 +56,26 @@ class FakeLoco:
             self.commands.append((item, now, gap))
             self._last = now
 
+    def reserve_body_action(self, owner: str) -> bool:
+        if self.reserved:
+            return False
+        self.reserved = True
+        self._record(("reserve", owner))
+        return True
+
+    def release_body_action(self, owner: str) -> None:
+        if self.reserved:
+            self.reserved = False
+            self._record(("release_reservation", owner))
+
     def preempt_for(self, reason: str) -> bool:
         self._record(("preempt", reason))
         return True
 
-    def prepare_walking_mode(self, requested_action: str) -> dict:
+    def prepare_walking_mode(self, requested_action: str,
+                             cancel_event=None) -> dict:
+        if cancel_event is not None and cancel_event.is_set():
+            return {"state": "error", "cancelled": True, "error": "cancelled"}
         self._record(("prepare", requested_action))
         if self.ctrl.get_mode() == 26:
             return {"state": "error", "protection": True,
@@ -248,8 +264,13 @@ def test_a_full_run_fires_actions_on_the_beat_and_publishes_all_audio_frames(
     assert info["last_action_drift_ms"] < 100
     assert ctrl.forbidden_writes == []
     assert [call[1] for call in module._acp_calls] == ["completed"]
-    # Both audio frames and commands use the shared, spaced publisher.
-    assert loco.commands[0][0] == ("preempt", "beat_performance.start")
+    # The body reservation spans preparation and the entire playback.
+    assert loco.commands[0][0] == ("reserve", "beat_performance")
+    assert any(item == ("preempt", "beat_performance.start")
+               for item, _, _ in loco.commands)
+    assert ("release_reservation", "beat_performance") in [
+        item for item, _, _ in loco.commands]
+    assert loco.reserved is False
     edges = [item for item, _, _ in loco.commands if item[0] == "edge"]
     releases = [item for item, _, _ in loco.commands if item[0] == "release"]
     assert len(edges) == info["action_count"]
@@ -283,6 +304,60 @@ def test_stop_cancels_all_later_beats_and_releases_the_command(
     assert [call[1] for call in module._acp_calls] == ["cancelled"]
 
 
+def test_a_stop_before_preparation_sends_no_mode_edge_after_release(
+        card_module, monkeypatch, tmp_path):
+    module = card_module
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_preempt(reason):
+        entered.set()
+        release.wait(3.0)
+        return True
+
+    parse = module.decode_audio
+
+    def local_decode(path, **kwargs):
+        return parse(path, allowed_dirs=(str(tmp_path),), **kwargs)
+    monkeypatch.setattr(module, "decode_audio", local_decode)
+
+    plugin, _, loco, upload = _make_plugin(module, monkeypatch, tmp_path)
+    monkeypatch.setattr(loco, "preempt_for", blocked_preempt)
+    plugin.dispatch("start", {"audio_file": upload, "confirm": True})
+    assert entered.wait(2.0)
+    # Let the join inside stop finish once the worker unblocks.
+    threading.Timer(0.1, release.set).start()
+    plugin.dispatch("stop", {})
+
+    assert not any(item[0] == "prepare" for item, _, _ in loco.commands)
+    assert loco.edges == []
+    assert [item for item, _, _ in loco.commands if item[0] == "velocity"] == [
+        ("velocity", 0.0, 0.0, 0.0)]
+    assert [call[1] for call in module._acp_calls] == ["cancelled"]
+
+
+def test_a_competing_body_action_is_rejected_while_the_beat_card_holds_the_body(
+        monkeypatch):
+    from test_mic_card import _load_device
+
+    device_module, _ = _load_device(monkeypatch)
+    loco = device_module.LocoPlugin.__new__(device_module.LocoPlugin)
+    loco._rotate_lock = threading.Lock()
+    loco._rotate_state = {"state": "idle", "last_result": None}
+    loco._rotate_stop_event = threading.Event()
+    loco._move_stop_event = threading.Event()
+    loco._move_thread = None
+    loco._body_action = None
+    loco._servo = None
+
+    assert loco.reserve_body_action("beat_performance") is True
+    refused = loco.dispatch("wave", {"_tool_name": "semantic_action"})
+    assert refused["state"] == "error"
+    assert "reserved" in refused["error"]
+    loco.release_body_action("beat_performance")
+    assert loco._body_action is None
+
+
 def test_an_unconfirmed_start_never_prepares_the_body_or_sends_a_command(
         card_module, monkeypatch, tmp_path):
     module = card_module
@@ -314,7 +389,9 @@ def test_protection_mode_sends_no_action_and_reports_it_honestly(
     plugin._thread.join(timeout=3.0)
 
     assert loco.edges == []
-    assert not any(item[0] == "velocity" for item, _, _ in loco.commands)
+    # Only the final zero-velocity release is allowed; no action edge runs.
+    assert [item for item, _, _ in loco.commands if item[0] == "velocity"] == [
+        ("velocity", 0.0, 0.0, 0.0)]
     info = plugin.dispatch("info", {})
     assert info["protection"] is True
     assert info["state"] == "error"
