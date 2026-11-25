@@ -1,0 +1,6 @@
+schedulers:
+  - scheduler_type: multi
+    nodes:
+      - package_name: audio_sense_controller
+        class_name: audio_sense_controller::AudioSenseController
+        extra_info: /run/u1-doa/controller.yaml
