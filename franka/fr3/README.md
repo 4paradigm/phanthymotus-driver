@@ -117,6 +117,35 @@ The renderer loads `model` automatically. The instance topic is
 radians. A retained pose can be stale. Use `info` to check connection and
 sample freshness.
 
+## Shared controller configuration
+
+With a PNP controller, **Controller Configuration** reads the left and right
+arm addresses from the controller over SSH. Joint state, joint control, Franka
+Hand, Teach and visual pick-and-place then take `arm: left|right` instead of an
+IP, and motion is refused until the controller has confirmed the mapping.
+
+The driver logs in only to a host whose key it already trusts. Nothing creates
+that file, so put the controller's host key on the Orin before starting the
+driver, under the fixed alias the driver checks:
+
+```bash
+sudo mkdir -p /opt/phanthy-motus/franka-controller-access
+ssh-keyscan -t ed25519 <controller-ip> \
+  | sed 's/^[^ ]*/franka-pnp-controller/' \
+  | sudo tee /opt/phanthy-motus/franka-controller-access/known_hosts
+```
+
+Check the fingerprint against the controller's own
+`ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` before trusting it. Then
+restart the driver and enter the SSH login on the card. The password is stored
+as `0600` under `/opt/phanthy-motus/franka-ip-sync/` and is never shown again.
+Leave the field empty to keep it.
+
+Without that file the driver starts without the controller: `vision_pick_and_drop`
+and `controller_configuration` are not offered, and the joint cards take a
+robot IP as described above. The left/right IPs in `config.yaml` are not used
+as a fallback, because they describe one installation.
+
 ## Joint control
 
 | Action | Parameters |
