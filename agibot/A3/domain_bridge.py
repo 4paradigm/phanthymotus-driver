@@ -53,17 +53,29 @@ class CoreBridge:
 
     def start(self):
         for lane, messages in self._queues.items():
-            proc = self._ctx.Process(target=_run, args=(messages, self._profile, self._domain, lane),
-                                     name=f"a3-core-domain-bridge-{lane}", daemon=True)
-            proc.start()
-            self._procs.append(proc)
+            self._start_worker(lane, messages)
         print(f"[dds-bridge] started workers={[p.pid for p in self._procs]} domain={self._domain}", flush=True)
+
+    def _start_worker(self, lane, messages):
+        proc = self._ctx.Process(target=_run, args=(messages, self._profile, self._domain, lane),
+                                 name=f"a3-core-domain-bridge-{lane}", daemon=True)
+        proc.start()
+        self._procs.append(proc)
+
+    def enable_hand_tactile(self):
+        # One pending JSON/JPEG pair; tactile previews must not replace other streams.
+        if "hand_tactile" not in self._queues:
+            messages = self._ctx.Queue(maxsize=2)
+            self._start_worker("hand_tactile", messages)
+            self._queues["hand_tactile"] = messages
 
     def publish(self, topic, msg, msg_type):
         try:
             from rclpy.serialization import serialize_message
             type_name = _type_name(msg_type)
-            if "lidar" in topic or "pointcloud" in topic:
+            if topic.endswith(("/hand/tactile", "/hand/tactile_preview")):
+                lane = "hand_tactile"
+            elif "lidar" in topic or "pointcloud" in topic:
                 lane = "pointcloud"
             elif "camera" in topic:
                 # Keep each configured camera on its own process.  The explicit

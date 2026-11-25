@@ -13,7 +13,7 @@ ARG A3_AIMDK_SHA256=2ce4ede82a5e82f4724414c0cb82f9966538b7232eef6cf70c96c1b6dd55
 # Fetch the official AimDK wheel from COS at build time instead of committing a
 # binary artifact to Git. ros2_plugin_proto remains built from this source tree.
 # Camera conversion is performed by the host Jazzy relay in the deployed
-# service, so image codec wheels are intentionally not installed in this image.
+# service. The driver uses Pillow only for the synthetic tactile preview.
 # A manually selected non-relay development run must provide numpy/OpenCV in
 # that interpreter before using the local re-encoding fallback.
 COPY requirements.txt /tmp/agibot-a3-requirements.txt
@@ -30,7 +30,7 @@ RUN cd /tmp/a3_ws && \
 
 WORKDIR /work
 COPY common/ /work/common/
-COPY main.py device.py domain_bridge.py config.yaml driver.yaml /work/agibot/A3/
+COPY main.py device.py domain_bridge.py hand_tactile.py config.yaml driver.yaml /work/agibot/A3/
 COPY zenoh_bridge.sh jazzy_relay.py jazzy_relay.sh /work/agibot/A3/
 RUN chmod 0755 /work/agibot/A3/zenoh_bridge.sh /work/agibot/A3/jazzy_relay.sh
 COPY resource/ /work/agibot/A3/resource/

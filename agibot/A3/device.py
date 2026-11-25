@@ -43,8 +43,10 @@ from uuid import uuid4
 from common.vendor_runtime import action_schema, jsonable, tool
 try:
     from .domain_bridge import BridgePublisher, CoreBridge
+    from .hand_tactile import HandTactilePlugin
 except ImportError:  # main.py loads this module as a top-level file in the image
     from domain_bridge import BridgePublisher, CoreBridge
+    from hand_tactile import HandTactilePlugin
 
 
 def _core_topic(namespace: str, suffix: str) -> str:
@@ -4585,6 +4587,8 @@ def build_plugins(config, namespace, ros2):
         plugins["joints"] = JointsPlugin(nodes)
     if enabled("joint_state"):
         plugins["joint_state"] = JointStatePlugin(nodes)
+    if enabled("hand_tactile"):
+        plugins["hand_tactile"] = HandTactilePlugin(nodes)
     if enabled("imu"):
         plugins["imu"] = ImuPlugin(nodes)
     camera_cfg = plugins_cfg.get("camera", {})
