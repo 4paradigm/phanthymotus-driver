@@ -146,7 +146,7 @@ def deployment_calibration(rig, **changes):
 
 def test_canvas_has_no_topic_frame_or_matrix_settings(rig):
     properties = rig.plugin.get_tool()["configSchema"]["properties"]
-    assert set(properties) == {"min_depth_m", "max_depth_m", "rate_hz"}
+    assert set(properties) == {"min_depth_m", "max_depth_m", "rate_hz", "allow_standard_extrinsics"}
 
 
 def test_unavailable_packaged_intrinsics_surfaces_the_resource_reason(rig, monkeypatch):
@@ -218,8 +218,10 @@ def test_confirmed_robot_mounting_record_projects_front_right_and_up(rig):
     path = DRIVER / "resource/calibration/s10_pro_standard_front.json"
     plugin = module().FrontDepthPlugin({}, "robot", rig.nodes,
                                       config_path=rig.path, extrinsics_path=path)
+    assert plugin.dispatch("start", {})["code"] == "STANDARD_EXTRINSICS_DISABLED"
+    assert plugin.dispatch("config", {"allow_standard_extrinsics": True})["state"] == "configured"
     result = plugin.dispatch("start", {})
-    assert result["state"] == "running", result
+    assert result["state"] == "running" and result["calibration_warning"]
     # Body points: two metres in front of the optical centre, then right/up.
     points = [(2.27065, 0, .04673), (2.27065, -1, .04673), (2.27065, 0, 1.04673)]
     message = cloud(frame="lidar_link")
@@ -255,9 +257,18 @@ def automatic_plugin(rig, monkeypatch, identity):
     return plugin
 
 
-def test_empty_data_volume_automatically_loads_standard_model_calibration(rig, monkeypatch):
+def test_empty_data_volume_requires_explicit_opt_in_before_using_standard_calibration(rig, monkeypatch):
     plugin = automatic_plugin(rig, monkeypatch,
         '482fc8b97c9e88f56cad0e892fc3ebfecddc47c570d078588e448d81945b6640')
+    assert plugin.get_tool()['configSchema']['properties']['allow_standard_extrinsics']['default'] is False
+    result = plugin.dispatch('start', {})
+    assert result['code'] == 'CALIBRATION_MISSING'
+    assert not rig.subscriptions and not rig.publishers and not rig.relays
+    assert not rig.path.exists()
+    assert plugin.dispatch('config', {'allow_standard_extrinsics': 'false'})['state'] == 'error'
+    assert plugin.dispatch('config', {'allow_standard_extrinsics': True})['state'] == 'configured'
+    plugin = module().FrontDepthPlugin({}, 'robot', rig.nodes, config_path=rig.path)
+    plugin.extrinsics_path = rig.extrinsics_path
     result = plugin.dispatch('start', {})
     try:
         assert result['state'] == 'running', result
@@ -266,13 +277,18 @@ def test_empty_data_volume_automatically_loads_standard_model_calibration(rig, m
             [0, -1, 0, 0], [0, 0, -1, .04673],
             [1, 0, 0, -.27065], [0, 0, 0, 1]]
         assert result['camera_info'][0]['vendor']['extrinsics_source'].startswith('bundled:')
-        assert not rig.extrinsics_path.exists() and not rig.path.exists()
+        assert not rig.extrinsics_path.exists()
+        assert result['calibration_warning']
+        assert result['camera_info'][0]['vendor']['reprojection_verified'] is False
+        assert plugin.dispatch('config', {'allow_standard_extrinsics': False})['state'] == 'configured'
+        assert plugin.dispatch('start', {})['code'] == 'CALIBRATION_MISSING'
     finally:
         plugin.stop()
 
 
 def test_another_standard_robot_reuses_model_calibration(rig, monkeypatch):
     plugin = automatic_plugin(rig, monkeypatch, '0' * 64)
+    assert plugin.dispatch('config', {'allow_standard_extrinsics': True})['state'] == 'configured'
     try:
         result = plugin.dispatch('start', {})
         assert result['state'] == 'running', result
@@ -286,6 +302,7 @@ def test_another_standard_robot_reuses_model_calibration(rig, monkeypatch):
 
 def test_standard_profile_does_not_require_identity_ssh(rig, monkeypatch):
     plugin = automatic_plugin(rig, monkeypatch, None)
+    assert plugin.dispatch('config', {'allow_standard_extrinsics': True})['state'] == 'configured'
     def unavailable(config):
         raise RuntimeError('identity unavailable')
     monkeypatch.setattr(module(), 'read_robot_identity', unavailable, raising=False)
@@ -306,6 +323,7 @@ def test_missing_or_invalid_standard_profile_is_explicit(rig, monkeypatch, tmp_p
         (directory / 's10_pro_standard_front.json').write_text(contents)
     monkeypatch.setattr(module(), 'BUNDLED_CALIBRATIONS', directory)
     plugin = automatic_plugin(rig, monkeypatch, '0' * 64)
+    assert plugin.dispatch('config', {'allow_standard_extrinsics': True})['state'] == 'configured'
     result = plugin.dispatch('start', {})
     assert result['code'] == code, result
     assert 's10_pro_standard_front.json' in result['message']
@@ -314,6 +332,7 @@ def test_missing_or_invalid_standard_profile_is_explicit(rig, monkeypatch, tmp_p
 
 def test_deployment_override_takes_precedence_over_standard_profile(rig, monkeypatch):
     plugin = automatic_plugin(rig, monkeypatch, '0' * 64)
+    assert plugin.dispatch('config', {'allow_standard_extrinsics': True})['state'] == 'configured'
     record = deployment_calibration(rig)
     try:
         result = plugin.dispatch('start', {})
@@ -328,12 +347,14 @@ def test_explicit_missing_calibration_path_does_not_use_bundled_record(rig, monk
     def unexpected(config):
         pytest.fail('an explicit missing calibration must not perform identity discovery')
     monkeypatch.setattr(module(), 'read_robot_identity', unexpected, raising=False)
+    assert rig.plugin.dispatch('config', {'allow_standard_extrinsics': True})['state'] == 'configured'
     assert rig.plugin.dispatch('start', {})['code'] == 'CALIBRATION_MISSING'
 
 
 def test_present_invalid_deployment_record_does_not_use_bundled_record(rig, monkeypatch):
     plugin = automatic_plugin(rig, monkeypatch,
         '482fc8b97c9e88f56cad0e892fc3ebfecddc47c570d078588e448d81945b6640')
+    assert plugin.dispatch('config', {'allow_standard_extrinsics': True})['state'] == 'configured'
     rig.extrinsics_path.write_text('{}')
     assert plugin.dispatch('start', {})['code'] == 'CALIBRATION_INVALID'
     assert not rig.subscriptions
@@ -347,6 +368,7 @@ def test_standard_profile_is_reloaded_after_stop(rig, monkeypatch, tmp_path):
     shutil.copy(DRIVER / 'resource/calibration/s10_pro_standard_front.json', path)
     monkeypatch.setattr(module(), 'BUNDLED_CALIBRATIONS', directory)
     plugin = automatic_plugin(rig, monkeypatch, '0' * 64)
+    assert plugin.dispatch('config', {'allow_standard_extrinsics': True})['state'] == 'configured'
     assert plugin.dispatch('start', {})['state'] == 'running'
     plugin.stop()
     path.write_text('{}')
@@ -375,6 +397,7 @@ def test_image_copied_calibration_can_start_with_an_empty_volume(rig, monkeypatc
     assert calibrations['deeprobotics/s10_pro/camera_front']['K'][0] == 314.963248
     plugin = automatic_plugin(rig, monkeypatch,
         '482fc8b97c9e88f56cad0e892fc3ebfecddc47c570d078588e448d81945b6640')
+    assert plugin.dispatch('config', {'allow_standard_extrinsics': True})['state'] == 'configured'
     try:
         result = plugin.dispatch('start', {})
         assert result['state'] == 'running', result
@@ -594,7 +617,7 @@ def test_missing_ros_cloud_automatically_uses_ssh_without_canvas_settings(rig, m
     output = rig.publications[-1]
     assert (output.header.stamp.sec, output.header.stamp.nanosec) == RECEIPT_STAMP
     assert rig.plugin.dispatch('info', {})['input']['state'] == 'live'
-    assert set(rig.plugin.get_tool()['configSchema']['properties']) == {'rate_hz', 'min_depth_m', 'max_depth_m'}
+    assert set(rig.plugin.get_tool()['configSchema']['properties']) == {'rate_hz', 'min_depth_m', 'max_depth_m', 'allow_standard_extrinsics'}
 
 
 def test_healthy_direct_ros_does_not_start_ssh(rig, monkeypatch):

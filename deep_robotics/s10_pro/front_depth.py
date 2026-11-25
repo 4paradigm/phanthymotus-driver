@@ -44,7 +44,7 @@ INPUT_ERROR_CODES = (None, "CLOUD_PUBLISHER_UNAVAILABLE", "CLOUD_DATA_TIMEOUT",
                      "CLOUD_RELAY_FAILED", "CLOUD_RELAY_STALE", "CLOUD_RELAY_DATA_TIMEOUT")
 DEFAULTS = {
     "cloud_topic": "/LIDAR/POINTS", "cloud_frame_id": "",
-    "camera_optical_from_cloud": None,
+    "camera_optical_from_cloud": None, "allow_standard_extrinsics": False,
     "min_depth_m": 0.1, "max_depth_m": 50.0, "rate_hz": 5.0,
 }
 
@@ -62,6 +62,8 @@ def _settings(values):
     if unknown:
         raise ValueError("unsupported depth setting: " + ", ".join(sorted(unknown)))
     out = {**DEFAULTS, **values}
+    if type(out["allow_standard_extrinsics"]) is not bool:
+        raise ValueError("allow_standard_extrinsics must be a boolean")
     topic = out["cloud_topic"]
     if (not isinstance(topic, str) or len(topic) > 256 or
             not re.fullmatch(r"/[A-Za-z_][A-Za-z0-9_]*(?:/[A-Za-z_][A-Za-z0-9_]*)*", topic)):
@@ -257,7 +259,7 @@ class FrontDepthPlugin:
                          "/opt/phanthy-motus/data/s10_pro/camera_front_depth.json")
         self.extrinsics_path = Path(extrinsics_path or os.environ.get("S10_FRONT_CAMERA_EXTRINSICS") or
                                    "/opt/phanthy-motus/data/s10_pro/camera_front_extrinsics.json")
-        self._allow_bundled_extrinsics = not (extrinsics_path or os.environ.get("S10_FRONT_CAMERA_EXTRINSICS"))
+        self._explicit_extrinsics_path = bool(extrinsics_path or os.environ.get("S10_FRONT_CAMERA_EXTRINSICS"))
         self._front_stream = config.get("camera_rtsp", {}).get("camera_front", FRONT_STREAM)
         self._active_config = None
         self._optical_frame = FRAME
@@ -311,13 +313,15 @@ class FrontDepthPlugin:
                 if not settings["cloud_frame_id"]:
                     raise DepthError("CALIBRATION_INVALID", "Calibration is missing cloud_frame_id")
                 return settings, FRAME, "maintenance-config"
-            if self._allow_bundled_extrinsics:
-                record, path = self._bundled_extrinsics()
-                source_prefix = "bundled:"
-            else:
+            if self._explicit_extrinsics_path:
                 raise DepthError("CALIBRATION_MISSING",
-                    f"Front-camera extrinsics are unavailable: {self.extrinsics_path}. "
-                    "The explicitly selected deployment calibration must be available.")
+                    f"The explicitly selected front-camera calibration is unavailable: {path}")
+            if not settings["allow_standard_extrinsics"]:
+                raise DepthError("CALIBRATION_MISSING",
+                    f"Install this robot's front-camera extrinsics at {path}, or explicitly "
+                    "enable allow_standard_extrinsics for a matching standard mount.")
+            record, path = self._bundled_extrinsics()
+            source_prefix = "bundled:"
         except (OSError, ValueError, UnicodeError) as exc:
             raise DepthError("CALIBRATION_INVALID",
                              f"Cannot read front-camera calibration {self.extrinsics_path}: {exc}") from exc
@@ -341,6 +345,14 @@ class FrontDepthPlugin:
         except (ValueError, KeyError, TypeError) as exc:
             raise DepthError("CALIBRATION_INVALID",
                              f"Invalid front-camera calibration {path}: {exc}") from exc
+        provenance = record.get("provenance")
+        if (source_prefix == "file:" and isinstance(provenance, dict)
+                and provenance.get("kind") == "shared-standard-model-mounting"):
+            if not settings["allow_standard_extrinsics"]:
+                raise DepthError("STANDARD_EXTRINSICS_DISABLED",
+                    f"{path} contains shared standard extrinsics. Install this robot's calibration "
+                    "or explicitly enable allow_standard_extrinsics.")
+            source_prefix = "standard-file:"
         return resolved, frame, source_prefix + str(path)
 
     def _camera_info(self):
@@ -366,6 +378,8 @@ class FrontDepthPlugin:
                 "cloud_topic": config["cloud_topic"], "cloud_frame_id": config["cloud_frame_id"],
                 "camera_optical_from_cloud": config["camera_optical_from_cloud"],
                 "extrinsics_source": extrinsics_source,
+                "calibration_warning": ("使用共享标准外参，本机相机与雷达的重投影未经验证，障碍物可能投影到错误像素。"
+                                        if extrinsics_source.startswith(("bundled:", "standard-file:")) else None),
                 "reprojection_verified": False,
                 "depth_unit": "mm", "depth_scale_m": .001, "invalid_depth_value": 0,
                 "depth_quantity": "optical_z", "sparse": False, "hole_filling": True,
@@ -393,6 +407,8 @@ class FrontDepthPlugin:
             "cloud_frame_id": {"type": "string", "title": "雷达消息的 frame_id"},
             "camera_optical_from_cloud": {"type": "string", "title": "雷达到前相机光学坐标的 4×4 外参",
                 "description": "Measured rigid transform as a JSON 4x4 array; translation in metres. No default."},
+            "allow_standard_extrinsics": {"type": "boolean", "title": "允许使用未验证的标准外参",
+                "description": "仅在已确认本机相机、镜头和安装位姿符合标准安装时启用。"},
             "min_depth_m": {"type": "number", "title": "最小深度（米）", "minimum": 0},
             "max_depth_m": {"type": "number", "title": "最大深度（米）", "maximum": 65.535},
             "rate_hz": {"type": "number", "title": "最大输出频率（Hz）", "exclusiveMinimum": 0, "maximum": 15},
@@ -406,7 +422,7 @@ class FrontDepthPlugin:
                     schema, topic_out=self._topic_outputs())
         card["camera_info"] = [self._camera_info()]
         config_properties = {key: copy.deepcopy(properties[key]) for key in
-                             ("min_depth_m", "max_depth_m", "rate_hz")}
+                             ("min_depth_m", "max_depth_m", "rate_hz", "allow_standard_extrinsics")}
         for key, prop in config_properties.items():
             prop.update(scope="instance", default=settings[key])
         card["configSchema"] = {"type": "object", "properties": config_properties}
@@ -682,6 +698,8 @@ class FrontDepthPlugin:
             with self._lock:
                 self._config = candidate
                 self._active_config = None
+                self._extrinsics_source = "unknown"
+                self._optical_frame = FRAME
                 self._last_error = None
                 self._error_code = None
 
@@ -717,6 +735,7 @@ class FrontDepthPlugin:
                 "last_valid_cloud_age_s": (None if self._last_cloud_at is None else
                                            max(0., time.monotonic() - self._last_cloud_at))}
         result["camera_info"] = [self._camera_info()]
+        result["calibration_warning"] = result["camera_info"][0]["vendor"]["calibration_warning"]
         return result
 
     def dispatch(self, action, args):

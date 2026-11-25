@@ -227,8 +227,9 @@ bundle startup only advertises the card.
 
 Front-camera rectification must remain enabled (the default); the RGB card
 does not need to be placed on the canvas.
-Start the card normally; calibration and transport fields
-are not exposed in canvas settings. The driver image includes actively loaded
+Install the per-unit front-camera extrinsics before starting the card. For a
+confirmed standard mount, the operator can instead enable **允许使用未验证的标准外参**
+in the card settings, save, and start the card. The driver image includes actively loaded
 model calibration files:
 
 - `resource/calibration/s10_pro_camera_intrinsics.json`: unchanged K/D and source
@@ -239,16 +240,18 @@ model calibration files:
 The user confirmed on2026-11-17 that target S10Pro robots have matching front
 cameras/lenses, horizontal front-facing upright mounting, and lidar_link
 coincident with the body origin and X-forward/Y-left/Z-up axes. Under these
-conditions the packaged values are the shared default; this is not a claim that
-every robot has been independently calibrated. No NOS machine-id lookup is
+conditions the packaged values are available by explicit opt-in. Their
+reprojection on an individual robot is unverified. No NOS machine-id lookup is
 needed to select it. An altered mounting or lens requires its own calibration.
 
 At each fresh start, the driver first reads
 `/opt/phanthy-motus/data/s10_pro/camera_front_extrinsics.json` (override with
 `S10_FRONT_CAMERA_EXTRINSICS`), a driver deployment interface. An existing
 per-unit record has precedence. If the default path is absent and no maintenance
-matrix is configured, it reads the packaged standard front record. No data-volume
-file is created. An explicit override never falls back if missing or invalid.
+matrix is configured, startup returns `CALIBRATION_MISSING` unless
+`allow_standard_extrinsics` is enabled. Opting in reads the packaged record
+and exposes `calibration_warning` in both the card status and camera metadata.
+A deployment file marked as the shared standard mount also requires opt-in. An explicit override never falls back if missing or invalid.
 The image's intrinsics are loaded from JSON as well; missing/corrupt resources
 produce a camera error and refuse enabled rectification, rather than guessing K
 or emitting unrectified video under rectified metadata.
@@ -305,7 +308,8 @@ or `ssh`, with relay state/count under `info.input.relay`. Failures are explicit
 `CLOUD_RELAY_FAILED`, `CLOUD_RELAY_STALE`, or `CLOUD_RELAY_DATA_TIMEOUT`.
 Missing/invalid extrinsics still fail before any relay starts.
 
-Canvas settings contain only `min_depth_m`, `max_depth_m`, and `rate_hz`.
+Canvas settings expose `min_depth_m`, `max_depth_m`, `rate_hz`, and
+`allow_standard_extrinsics`.
 The existing maintenance `config` API and saved settings remain compatible:
 
 | Setting | Meaning | Default |
@@ -314,6 +318,7 @@ The existing maintenance `config` API and saved settings remain compatible:
 | `cloud_frame_id` | The exact calibrated `header.frame_id` of that source | Obtained from deployment calibration |
 | `camera_optical_from_cloud` | Measured rigid 4x4 transform | Obtained from deployment calibration; no guessed default |
 | `min_depth_m` / `max_depth_m` | Accepted positive optical-Z range, in metres | `0.1` / `50.0` |
+| `allow_standard_extrinsics` | Allow the shared front mounting transform with unverified per-unit reprojection | `false` |
 | `rate_hz` | Maximum number of clouds submitted per second | `5.0`, configurable up to `15.0` |
 
 The transform uses column vectors:
