@@ -24,6 +24,7 @@ class Slot:
     started: float = 0
     enabled: bool = False
     rejected: str = ''
+    render_failures: int = 0
     seen: deque = field(default_factory=lambda:deque(maxlen=64))
 
 
@@ -174,7 +175,8 @@ class Playback:
         with self.lock:
             s=self.slot(key,side);self._advance(s)
             latest=s.last;active=s.active
-            return {'side':side,'enabled':s.enabled,'busy':bool(active or s.pending),'active_id':active['id'] if active else '',
+            return {'state': 'running' if s.enabled else 'idle',
+                    'side':side,'enabled':s.enabled,'busy':bool(active or s.pending),'active_id':active['id'] if active else '',
                     'action':(active or latest or {}).get('action',''),'last_id':latest['id'] if latest else '',
                     'count':len(latest['frames']) if latest else 0,'frame_ms':latest['frame_ms'] if latest else 50,
                     'pose':s.pose.copy(),'rejected':s.rejected,'topic_in':[{'topic':t,'format':FORMAT} for t in s.topics],
@@ -196,16 +198,21 @@ class Playback:
                 for key,s in self.slots.items():
                     if s.enabled:
                         self._advance(s)
-                        jobs.append((key,s.side,tuple(s.pose)))
-            for key,side,pose in jobs:
+                        jobs.append((key,s,tuple(s.pose)))
+            for key,slot,pose in jobs:
+                side = slot.side
                 try:
                     prev=cache.get(key)
                     if prev and prev[:2]==(side,pose) and time.monotonic()-prev[2]<1:continue
                     jpeg=prev[3] if prev and prev[:2]==(side,pose) else self.models[side].jpeg(pose)
                     self.bus.image(key,jpeg)
                     cache[key]=(side,pose,time.monotonic(),jpeg)
-                except Exception as e:
-                    print('[sim preview]',type(e).__name__,str(e)[:120],flush=True)
+                    slot.render_failures = 0
+                except Exception as exc:
+                    slot.render_failures += 1
+                    if slot.render_failures == 1 or slot.render_failures % 100 == 0:
+                        detail = ascii(f"{type(exc).__name__}: {str(exc)[:120]}")[1:-1][:180]
+                        print(f"[sim preview] {side} failures={slot.render_failures}: {detail}", flush=True)
 
     def shutdown(self):
         self.closed.set();self.thread.join(5)

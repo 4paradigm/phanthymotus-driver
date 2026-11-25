@@ -21,6 +21,7 @@ from common.vendor_runtime import DriverBundle
 from hand_device import build_plugins
 from mujoco_card.playback import Playback
 from mujoco_card.preview_cards import PreviewCards
+from mujoco_card.simulation import Simulation
 from mujoco_card.trajectories import VERSION
 
 
@@ -76,6 +77,50 @@ def test_playback_binding_busy_and_rejection():
         rt.start("second", "right", [topic])
     finally:
         rt.shutdown()
+
+
+def test_simulation_lifecycle_reports_bound_instance_state():
+    runtime = Playback({"right": Mock()}, SimpleNamespace(open={"right": [120] * 20}), Mock())
+    card = Simulation(runtime)
+    args = {"instance_id": "lifecycle-test", "input_topics": ["/sim/trajectory"]}
+    try:
+        for action, expected in (("info", "idle"), ("start", "running"), ("start", "running"),
+                                 ("info", "running"), ("stop", "idle"), ("stop", "idle"), ("info", "idle")):
+            result = card.dispatch(action, args)
+            assert result["state"] == expected
+            assert result["enabled"] == (expected == "running")
+            assert [topic["topic"] for topic in result["topic_in"]] == (args["input_topics"] if result["enabled"] else [])
+    finally:
+        runtime.shutdown()
+
+
+def test_preview_logs_first_and_hundredth_failure_and_resets_after_success(capsys):
+    bus = Mock()
+    planner = SimpleNamespace(open={"right": [120] * 20, "left": [120] * 20})
+    error = ValueError("bad\nframe\x1b[31m" + "x" * 400)
+    broken = Mock()
+    broken.jpeg.side_effect = [error] * 101 + [b"ok", error, error]
+    runtime = Playback({"left": Mock(), "right": broken}, planner, bus)
+    runtime.shutdown()  # Drive the real render loop synchronously, one scheduled frame at a time.
+    for side in ("right", "left"):
+        runtime.start(side, side, [])
+    ticks = 104
+    def tick(_interval):
+        nonlocal ticks
+        if not ticks:
+            return True
+        runtime.slots["right"].pose[0] = ticks
+        ticks -= 1
+        return False
+
+    with patch.object(runtime.closed, "wait", side_effect=tick):
+        runtime._stream()
+    lines = capsys.readouterr().out.splitlines()
+    assert [line.split(":", 1)[0] for line in lines] == [
+        "[sim preview] right failures=1", "[sim preview] right failures=100", "[sim preview] right failures=1"]
+    assert all(r"\n" in line and r"\x1b" in line and len(line) < 225 for line in lines)
+    assert broken.jpeg.call_count == 104
+
 
 @pytest.fixture
 def g20_fixture_archive(tmp_path):
