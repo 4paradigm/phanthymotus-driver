@@ -31,6 +31,9 @@ MOVE_COMPLETION_TIMEOUT_S = 20
 HARD_MAX_LINEAR_M_S = 0.5
 HARD_MAX_ANGULAR_DEG_S = 30.0
 WORKER_READY_TIMEOUT_S = 8.0
+# The vendor SDK has no synchronous getter for the exception level, only the
+# exception_state subscription; a move waits this long for its first report.
+EXCEPTION_STATE_TIMEOUT_S = 3.0
 WATCHDOG_MARGIN_S = 3.0
 
 
@@ -77,6 +80,8 @@ class SdkWorkerLink:
         self._ready = threading.Event()
         self._fatal = None
         self.exception_level = None
+        self.exception_supported = None  # worker reports whether the SDK has an exception device
+        self._exception_seen = threading.Event()
         self.exceptions = []  # last reported [{"module", "code"}] from the chassis
         self.exception_history = []  # recent (time, level, exceptions) for diagnosis
         self.odometry = None  # latest {"x","y","theta","vx","vy","w","age_s"} from the worker
@@ -114,6 +119,8 @@ class SdkWorkerLink:
             self._ready.clear()
             self._fatal = None
             self.exception_level = None
+            self.exception_supported = None
+            self._exception_seen.clear()
             self._proc = self._popen(
                 [python, "-m", "rokae.helios.chassis_sdk_worker", worker_config],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None,
@@ -134,6 +141,7 @@ class SdkWorkerLink:
                 continue
             kind = event.get("event")
             if kind == "ready":
+                self.exception_supported = bool(event.get("exception_state"))
                 self._ready.set()
             elif kind == "fatal":
                 self._fatal = event.get("message", "chassis SDK worker failed")
@@ -141,6 +149,7 @@ class SdkWorkerLink:
             elif kind == "exception":
                 self.exception_level = event.get("level")
                 self.exceptions = event.get("exceptions") or []
+                self._exception_seen.set()
                 self.exception_history = (self.exception_history + [{
                     "time": time.strftime("%H:%M:%S"), "level": self.exception_level,
                     "exceptions": self.exceptions}])[-10:]
@@ -152,6 +161,10 @@ class SdkWorkerLink:
                                    event.get("odometry"))
         # Worker exited: the chassis stops on missing speed commands.
         self._on_move_done(None, "error", self._fatal or "chassis SDK worker exited")
+
+    def wait_exception_state(self, timeout_s=EXCEPTION_STATE_TIMEOUT_S):
+        """True once the chassis has reported its exception level since the worker started."""
+        return self._exception_seen.wait(timeout_s)
 
     def send(self, message):
         with self._lock:
@@ -215,7 +228,9 @@ class HeliosChassisMove:
             raise ValueError(f"chassis_max_angular_deg_s must be in (0, {HARD_MAX_ANGULAR_DEG_S}]")
         self._allow_lateral = bool(config.get("chassis_allow_lateral", False))
         enabled = os.environ.get("HELIOS_CHASSIS_MOTION_ENABLED")
-        self._enabled = (enabled == "1") if enabled is not None else bool(config.get("chassis_motion_enabled", True))
+        # Off unless the deployment opts in: charging interlock, controller command timeout and
+        # obstacle-avoidance behaviour under SDK speed control are not yet verified.
+        self._enabled = (enabled == "1") if enabled is not None else bool(config.get("chassis_motion_enabled", False))
         self.link = link or SdkWorkerLink(config, self._on_move_done)
 
     # ── tool definition ──────────────────────────────────────────────────
@@ -327,8 +342,14 @@ class HeliosChassisMove:
             if self._active is not None:
                 return {"error": "a timed base move is already running; send stop first"}
         self.link.ensure_started()
+        # Fail closed: never drive a chassis whose exception level is unknown.
+        if not self.link.exception_supported:
+            raise RuntimeError("chassis SDK has no exception device; cannot confirm the chassis is "
+                               "safe to move, movement refused")
+        if not self.link.wait_exception_state():
+            raise RuntimeError("chassis exception state not received yet; movement refused, retry shortly")
         level = self.link.exception_level
-        if level not in (None, 0):
+        if level != 0:
             raise RuntimeError(f"chassis reports exception level {level} "
                                f"{getattr(self.link, 'exceptions', [])}; movement refused")
         action_id = f"helios_move_{uuid4().hex[:12]}"

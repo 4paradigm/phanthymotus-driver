@@ -118,7 +118,9 @@ def test_worker_blocks_on_chassis_exception_level():
 class FakeLink:
     def __init__(self):
         self.sent = []
-        self.exception_level = None
+        self.exception_level = 0
+        self.exception_supported = True
+        self.exception_seen = True
         self.started = 0
         self.killed = 0
         self.closed = 0
@@ -135,6 +137,9 @@ class FakeLink:
     def running(self):
         return self.started > 0
 
+    def wait_exception_state(self, timeout_s=None):
+        return self.exception_seen
+
     def send(self, message):
         self.sent.append(message)
 
@@ -145,7 +150,7 @@ class FakeLink:
         self.closed += 1
 
 
-CONFIG = {"chassis_max_linear_m_s": 0.2, "chassis_max_angular_deg_s": 15}
+CONFIG = {"chassis_max_linear_m_s": 0.2, "chassis_max_angular_deg_s": 15, "chassis_motion_enabled": True}
 
 
 def card(config=CONFIG, clock=time.monotonic):
@@ -233,6 +238,40 @@ def test_move_refused_when_disabled_sdk_missing_or_chassis_in_exception(monkeypa
     assert link.sent == []
 
 
+def test_motion_is_off_unless_the_deployment_opts_in(monkeypatch):
+    monkeypatch.delenv("HELIOS_CHASSIS_MOTION_ENABLED", raising=False)
+    move, link, _ = card({"chassis_max_linear_m_s": 0.2, "chassis_max_angular_deg_s": 15})
+    with pytest.raises(RuntimeError, match="disabled"):
+        move.dispatch("move", {"vx": 0.1, "duration_s": 1})
+    assert move.dispatch("info", {})["motion_enabled"] is False and link.sent == []
+    monkeypatch.setenv("HELIOS_CHASSIS_MOTION_ENABLED", "1")
+    move, link, _ = card({"chassis_max_linear_m_s": 0.2, "chassis_max_angular_deg_s": 15})
+    assert move.dispatch("move", {"vx": 0.1, "duration_s": 1})["state"] == "running"
+
+
+def test_move_fails_closed_while_exception_state_is_unknown():
+    move, link, _ = card()
+    link.exception_level, link.exception_seen = None, False
+    with pytest.raises(RuntimeError, match="not received"):
+        move.dispatch("move", {"vx": 0.1, "duration_s": 1})
+    link.exception_supported = False
+    with pytest.raises(RuntimeError, match="no exception device"):
+        move.dispatch("move", {"vx": 0.1, "duration_s": 1})
+    assert link.sent == []
+
+
+def test_worker_blocks_until_first_exception_report():
+    class Module:
+        def exception_state(self, cb):
+            self.cb = cb
+    module = Module()
+    worker = Worker(FakeNav(), lambda e: None, 50, exception_module=module)
+    assert worker._blocked() == "chassis exception state not received yet"
+    module.cb(type("Info", (), {"robot_exception": 0, "exceptions": []})())
+    assert worker._blocked() is None
+    assert Worker(FakeNav(), lambda e: None, 50)._blocked() is None  # no device: parent refuses instead
+
+
 def test_stop_cancels_active_move_and_worker_exit_finishes_it():
     move, link, notes = card()
     first = move.dispatch("move", {"vx": 0.1, "duration_s": 5})
@@ -289,6 +328,16 @@ FAKE_SDK = {
                     time.sleep(0.02)
             threading.Thread(target=run, daemon=True).start()
     """,
+    "exception.py": """
+        class _Info:
+            robot_exception = 0
+            exceptions = []
+        def has_exception_dev():
+            return True
+        def exception_state(cb):
+            import threading
+            threading.Timer(0.05, cb, args=(_Info(),)).start()
+    """,
     "nav.py": """
         import json, os
         LOG = os.environ["FAKE_NAV_LOG"]
@@ -332,7 +381,8 @@ def test_worker_process_moves_completes_and_stops_on_parent_exit(tmp_path, monke
                           "chassis_sdk_port": 9003, "chassis_sdk_python": sys.executable},
                          lambda *event: done.append(event))
     link.ensure_started()
-    assert link.running()
+    assert link.running() and link.exception_supported
+    assert link.wait_exception_state(2) and link.exception_level == 0
     link.send({"op": "move", "id": "m1", "vx": 0.1, "vy": 0.0, "wz": 0.1, "duration_s": 0.3})
     for _ in range(100):
         if done:

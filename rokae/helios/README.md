@@ -59,6 +59,8 @@
 
 厂家 SDK 只有 CPython 3.12 版，而 ROS Humble 是 3.10：镜像内置固定版本、校验 SHA256 的独立 Python 3.12（`/opt/sdk-python`，构建时先从 npmmirror 国内镜像、失败再从 GitHub 下载，均校验同一 SHA256），只给 SDK worker 使用，已在机器人只读实测可导入、连接并收到里程计。厂家 SDK 二进制不进 Git：参照 G1/Agibot A3/DJI 的做法，构建时由 Dockerfile 从项目 COS 下载并校验 SHA256（`VMR_SDK_URL` / `VMR_SDK_SHA256`），解压到镜像 `/opt/vmr-sdk`。未提供 URL 时镜像照常构建，卡片照常注册，`move` 明确报错。
 
+**默认关闭**：移动功能需部署时显式开启（`HELIOS_CHASSIS_MOTION_ENABLED=1`；bot 测试脚本用 `curl -fsSL https://motus.phanthy.com/run-pr-image.sh | sudo HELIOS_CHASSIS_MOTION_ENABLED=1 bash -s -- <镜像>`，网页控制台部署则写入 `/opt/phanthy-motus/.env`），未开启时 `move` 被拒绝。底盘异常状态未知（worker 启动后尚未收到首条异常上报，或 SDK 无异常设备）时同样拒绝移动。
+
 **前提**：底盘须在厂家界面建图、应用地图并重定位成功，且处于自动模式（非手动模式）。未定位时底盘刹车并报异常（311/4/2），`move` 会被拒绝并返回异常列表；手动模式下 SDK 速度被忽略。2026-11-24 已在现场看护下用本地预览镜像实测前进、后退、左右转、横移与 `stop_move`，详见接口文档。
 
 ## 画布与 Core 前端

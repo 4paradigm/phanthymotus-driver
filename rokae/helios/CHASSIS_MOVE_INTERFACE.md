@@ -14,7 +14,15 @@ Vendor VMR AMR SDK 2.1.51 (`VMR_AMR_SDK_arm_SDK-2.1.51_e22f4_py312`), module `na
 - Card contract follows `agilex/bunker-mini` `base_drive`: bounded `move`, `stop`, ACP completion, `x-resource: base`. `vyaw` is degrees/s on the card and converted to rad/s for the SDK.
 - The vendor Python extension is ABI-specific and is loaded only in `chassis_sdk_worker.py`, started on the first `move` (not at Driver start). The worker owns the 50 Hz loop and the per-move deadline, and on every exit path sends zero five times and releases speed control. stdin EOF stops it.
 - The Driver keeps one active move; a second `move` is refused until `stop`. A watchdog kills the worker if completion is not reported within duration + 3 s.
-- A move is refused when movement is disabled (`chassis_motion_enabled` / `HELIOS_CHASSIS_MOTION_ENABLED=0`), the SDK is not mounted, the worker cannot connect, or the last reported exception level is not normal. A non-normal level during a move stops it.
+- Movement is **off by default**. A deployment opts in with `HELIOS_CHASSIS_MOTION_ENABLED=1` (or `chassis_motion_enabled: true`); until then `move` is refused and `info` shows `motion_enabled: false`. With the bot's quick-test script the variable is passed through `sudo`, which `docker compose` interpolates into the service fragment:
+
+  ```bash
+  curl -fsSL https://motus.phanthy.com/run-pr-image.sh | sudo HELIOS_CHASSIS_MOTION_ENABLED=1 bash -s -- <image>
+  ```
+
+  For a web-console deployment, set `HELIOS_CHASSIS_MOTION_ENABLED=1` in the host's `/opt/phanthy-motus/.env`.
+- A move fails closed. It is refused when movement is disabled, the SDK is not mounted, the worker cannot connect, the SDK has no exception device, no exception report has arrived since the worker started (the SDK offers only the `exception_state` subscription, no synchronous getter; a move waits up to 3 s for the first report), or the reported level is not normal. The worker applies the same check on its side, and a non-normal level during a move stops it.
+- The worker installs `common.logsafe` before importing the vendor SDK, so its output follows the same line-atomic logging contract as the Driver (a separate interpreter does not inherit the Driver's wrapper).
 - Limits: configurable `chassis_max_linear_m_s` (default 0.2) and `chassis_max_angular_deg_s` (default 15), capped in code at 0.5 m/s and 30°/s. `chassis_allow_lateral` (default false) exposes `vy`.
 
 ## Distribution (same as other drivers' vendor SDKs)
@@ -25,7 +33,7 @@ Vendor VMR AMR SDK 2.1.51 (`VMR_AMR_SDK_arm_SDK-2.1.51_e22f4_py312`), module `na
 
 ## Python 3.12 for the SDK worker
 
-The vendor package 2.1.51 ships CPython 3.12 extension modules only; ROS Humble is CPython 3.10. The extensions need only glibc ≥ 2.17 and GLIBCXX ≥ 3.4.22 (Ubuntu 22.04 provides 2.35 / 3.4.30) and do not link libpython. The image therefore adds a pinned standalone CPython 3.12 (`python-build-standalone` 20261110, `cpython-3.12.16` aarch64 `install_only`, SHA256 `4792f817…3081`, PSF licence) at `/opt/sdk-python`, used only by `chassis_sdk_worker.py` (`chassis_sdk_python`). The worker's `PYTHONPATH` is limited to the SDK `lib/` and this repository so ROS's 3.10 packages never load into it. The archive is fetched by `build_fetch.py` from the npmmirror CDN first and the GitHub release second (`SDK_PYTHON_URL` / `SDK_PYTHON_FALLBACK_URL`), each with a socket timeout and progress output; the bot build host could not complete the GitHub download (killed after 10 min without output), and the pinned SHA256 is checked whichever source answers.
+The vendor package 2.1.51 ships CPython 3.12 extension modules only; ROS Humble is CPython 3.10. The extensions need only glibc ≥ 2.17 and GLIBCXX ≥ 3.4.22 (Ubuntu 22.04 provides 2.35 / 3.4.30) and do not link libpython. The image therefore adds a pinned standalone CPython 3.12 (`python-build-standalone` 20261110, `cpython-3.12.16` aarch64 `install_only_stripped`, SHA256 `b6a41def…5aab`, PSF licence; 29 MB download, 88 MB in the image — the unstripped build is 164 MB) at `/opt/sdk-python`, used only by `chassis_sdk_worker.py` (`chassis_sdk_python`). The worker's `PYTHONPATH` is limited to the SDK `lib/` and this repository so ROS's 3.10 packages never load into it. The archive is fetched by `build_fetch.py` from the npmmirror CDN first and the GitHub release second (`SDK_PYTHON_URL` / `SDK_PYTHON_FALLBACK_URL`), each with a socket timeout and progress output; the bot build host could not complete the GitHub download (killed after 10 min without output), and the pinned SHA256 is checked whichever source answers.
 
 Verified on the robot on 2026-11-23 (files in /tmp, removed afterwards; no speed control enabled): the cp312 modules import under that interpreter, `init_client` succeeds on 192.168.0.100 ports 9000 and 9003, `has_nav_dev`, `has_exception_dev`, `has_odom_dev`, `has_location_dev` and `has_audio_dev` are true, and `odom_state` delivered 80 samples in 2 s (~40 Hz). `close_client` prints repeated "Operation aborted" lines, which are harmless.
 
@@ -64,4 +72,4 @@ This was a locally built preview image, not the bot image; the bot-image test fo
 
 - The controller's own command timeout and whether obstacle avoidance applies during SDK speed control are not documented by the vendor.
 - Charging interlock: the card does not yet refuse moves while charging; a reliable charging signal still has to be identified.
-- Whether `exception_state` delivers the current level on subscription or only on change (an unknown level does not block a move).
+- Whether `exception_state` always delivers the current level on subscription. On the robot it arrived right after the worker started; if it ever does not, moves are refused until the next report.

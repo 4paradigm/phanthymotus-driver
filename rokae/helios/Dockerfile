@@ -8,13 +8,14 @@ COPY requirements.txt /driver/rokae/helios/requirements.txt
 # while ROS Humble uses 3.10. The SDK therefore runs in its own worker process under a
 # pinned standalone CPython 3.12 (python-build-standalone, PSF licence), used for nothing
 # else. Its binaries need glibc >= 2.17 / GLIBCXX >= 3.4.22, satisfied by Ubuntu 22.04.
+# The stripped build (no debug symbols) adds 88 MB to the image instead of 164 MB.
 # The build host reaches GitHub release downloads slowly or not at all, so the same
 # file is fetched from the npmmirror CDN first and GitHub second. Each attempt has a
 # socket timeout and prints progress (the bot kills builds that stay silent), and the
 # pinned SHA256 makes the source irrelevant to what ends up in the image.
-ARG SDK_PYTHON_URL=https://registry.npmmirror.com/-/binary/python-build-standalone/20261110/cpython-3.12.16%2B20261110-aarch64-unknown-linux-gnu-install_only.tar.gz
-ARG SDK_PYTHON_FALLBACK_URL=https://github.com/astral-sh/python-build-standalone/releases/download/20261110/cpython-3.12.16%2B20261110-aarch64-unknown-linux-gnu-install_only.tar.gz
-ARG SDK_PYTHON_SHA256=4792f81750282597fb2a3389fe18b945ed2ba6aad5e45ad406d122c58cb33081
+ARG SDK_PYTHON_URL=https://registry.npmmirror.com/-/binary/python-build-standalone/20261110/cpython-3.12.16%2B20261110-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz
+ARG SDK_PYTHON_FALLBACK_URL=https://github.com/astral-sh/python-build-standalone/releases/download/20261110/cpython-3.12.16%2B20261110-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz
+ARG SDK_PYTHON_SHA256=b6a41defec4975d94b4ff1950236e7383e5c02ba40ea48c9ec33c66087a35aab
 COPY build_fetch.py /tmp/build_fetch.py
 RUN python3 /tmp/build_fetch.py /tmp/sdk-python.tar.gz "${SDK_PYTHON_SHA256}" "${SDK_PYTHON_URL}" "${SDK_PYTHON_FALLBACK_URL}" && \
     mkdir -p /opt/sdk-python && tar xzf /tmp/sdk-python.tar.gz -C /opt/sdk-python --strip-components=1 && \

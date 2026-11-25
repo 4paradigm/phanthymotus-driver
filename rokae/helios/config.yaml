@@ -10,7 +10,7 @@ stale_timeout_s: 1.0
 connect_timeout_s: 3.0
 reconnect_delay_s: 1.0
 # Chassis movement (base_drive) via the vendor VMR AMR SDK (fetched at image build time).
-chassis_motion_enabled: true
+chassis_motion_enabled: false  # opt in per deployment: HELIOS_CHASSIS_MOTION_ENABLED=1
 chassis_sdk_dir: /opt/vmr-sdk
 chassis_sdk_lib_subdir: lib
 chassis_sdk_python: /opt/sdk-python/bin/python3

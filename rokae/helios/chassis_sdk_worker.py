@@ -160,6 +160,7 @@ class Worker:
         self._move = None  # (id, stop_event, thread)
         self._odom = odom
         self.exception_level = None
+        self._requires_exception_state = exception_module is not None
         if exception_module is not None:
             exception_module.exception_state(self._on_exception)
 
@@ -175,6 +176,8 @@ class Worker:
         self._emit({"event": "exception", "level": self.exception_level, "exceptions": active[:20]})
 
     def _blocked(self):
+        if self._requires_exception_state and self.exception_level is None:
+            return "chassis exception state not received yet"
         if self.exception_level not in (None, 0):
             return f"chassis exception level {self.exception_level}"
         return None
@@ -223,6 +226,13 @@ class Worker:
 
 
 def main(argv):
+    # A separate interpreter does not inherit the Driver's stdout wrapper; install it
+    # before the vendor SDK loads so its diagnostics are line-atomic as well.
+    try:
+        from common import logsafe
+        logsafe.install()
+    except Exception as exc:  # never block movement safety on the log wrapper
+        sys.stderr.write(f"logsafe unavailable: {exc}\n")
     config = json.loads(argv[1])
     out_lock = threading.Lock()
 
