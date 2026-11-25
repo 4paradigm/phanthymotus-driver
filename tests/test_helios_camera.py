@@ -300,3 +300,8 @@ def test_default_publish_rate_is_15_fps():
     assert config["camera_publish_fps"] == 15
     camera, _ = plugin()
     assert camera.dispatch("info", {"instance_id": "a"})["target_fps"] == 15
+
+
+def test_start_waits_at_most_2_5_s_for_the_first_frame():
+    from rokae.helios.camera_capture import STARTUP_TIMEOUT_S
+    assert STARTUP_TIMEOUT_S <= 2.5

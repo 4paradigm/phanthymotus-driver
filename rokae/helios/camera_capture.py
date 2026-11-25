@@ -50,6 +50,9 @@ CONVERT_THREADS = 4
 
 
 OUTPUT_WIDTH = 640
+# First verified frame arrives after ~0.76 s (G300) / ~0.26 s (SHW3H) on the robot; 2.5 s
+# keeps a card's start well inside the ~3 s MCP response budget with a 3x margin.
+STARTUP_TIMEOUT_S = 2.5
 
 
 def output_size(source):
@@ -156,7 +159,8 @@ class CameraCapture:
         self._sequence = 0
         self._dimensions = None
 
-    def start(self, timeout=7):
+    def start(self, timeout=None):
+        timeout = STARTUP_TIMEOUT_S if timeout is None else timeout
         with self._lock:
             if self._thread and self._thread.is_alive():
                 return
