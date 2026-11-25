@@ -40,7 +40,7 @@ def test_shipped_grasp_config_uses_adaptive_contact_settings():
     assert validate_position_vector(plugin.close_limit_pose) == plugin.close_limit_pose
     assert plugin.tactile_threshold == 15
     assert plugin.step_size == 5
-    assert set(plugin.get_tool()["inputSchema"]["x-completion"]["actions"]) == {"adaptive_grasp", "release"}
+    assert set(plugin.get_tool()["inputSchema"]["x-completion"]["actions"]) == {"adaptive_grasp", "prepare", "close_until_contact", "release"}
 
 
 def test_can_port_and_dds_settings_agree_across_deployment_files():

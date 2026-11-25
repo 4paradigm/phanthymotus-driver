@@ -1,0 +1,14 @@
+linkerhand-l20-mujoco:
+  image: __IMAGE__
+  container_name: motus-l20-mujoco
+  network_mode: host
+  read_only: true
+  tmpfs:
+    - /tmp:rw,nosuid,nodev,size=180m
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  volumes:
+    - /opt/phanthy-motus/data/l20-mujoco:/var/lib/l20-sim
+  restart: unless-stopped

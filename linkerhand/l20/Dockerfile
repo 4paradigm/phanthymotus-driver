@@ -15,6 +15,7 @@ COPY qemu_compat.py    /work/qemu_compat.py
 COPY hand_device.py    /work/hand_device.py
 COPY gesture_device.py /work/gesture_device.py
 COPY tactile_device.py /work/tactile_device.py
+COPY grasp_feedback.py /work/grasp_feedback.py
 COPY adaptive_grasp_device.py    /work/adaptive_grasp_device.py
 COPY joints_device.py  /work/joints_device.py
 COPY joints_model.py   /work/joints_model.py

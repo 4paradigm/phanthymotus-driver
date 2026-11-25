@@ -830,7 +830,7 @@ def build_plugins(config: dict, _namespace: str, _ros2) -> list:
     grasp_config = config.get("plugins", {}).get("hand_grasp", {})
     if grasp_config.get("enabled", True):
         from adaptive_grasp_device import AdaptiveGraspPlugin
-        plugins.append(AdaptiveGraspPlugin(hand_plugin, grasp_config, global_config=config))
+        plugins.append(AdaptiveGraspPlugin(hand_plugin, grasp_config, global_config=config, ros2=_ros2))
 
     tactile_config = config.get("plugins", {}).get("hand_tactile")
     if tactile_config and tactile_config.get("enabled", True):

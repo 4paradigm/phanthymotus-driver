@@ -340,7 +340,7 @@ def test_live_info_reports_sample_alongside_public_status_action(test_setup, mon
         assert sample['matrix_valid'] and sample['sample_timestamp'] > 0
         assert sample['peaks'] == dict.fromkeys(FINGER_JOINTS, 0)
         assert set(plugin.get_tool()['inputSchema']['x-action-params']) == {
-            'adaptive_grasp', 'release', 'get_state', 'config'}
+            'adaptive_grasp', 'preview_settings', 'prepare', 'close_until_contact', 'release', 'get_state', 'config'}
     finally:
         resume.set()
         assert done.wait(3)
@@ -819,7 +819,7 @@ def test_user_card_settings_and_actions_keep_threshold_separate_from_speed():
         'bound_side', 'speed_ratio', 'confirm_motion'}
     assert schema['x-action-params']['release']['params'] == ['bound_side', 'confirm_motion']
     assert schema['x-action-params']['get_state']['params'] == ['bound_side']
-    assert set(schema['x-completion']['actions']) == {'adaptive_grasp', 'release'}
+    assert set(schema['x-completion']['actions']) == {'adaptive_grasp', 'prepare', 'close_until_contact', 'release'}
     assert not set(settings).intersection(schema['properties'])
 
 
@@ -1009,8 +1009,8 @@ def test_adaptive_grasp_replaces_old_card():
     assert set(tools) == {"hand", "hand_gesture", "hand_grasp", "hand_tactile", "joints", "model"}
     assert next(plugin for plugin in plugins if plugin.PREFIX == "hand_grasp").__class__ is AdaptiveGraspPlugin
     schema = tools["hand_grasp"]["inputSchema"]
-    assert set(schema["x-action-params"]) == {"adaptive_grasp", "release", "get_state", "config"}
-    assert set(schema["x-completion"]["actions"]) == {"adaptive_grasp", "release"}
+    assert set(schema["x-action-params"]) == {"adaptive_grasp", "preview_settings", "prepare", "close_until_contact", "release", "get_state", "config"}
+    assert set(schema["x-completion"]["actions"]) == {"adaptive_grasp", "prepare", "close_until_contact", "release"}
 
 
 def test_adaptive_grasp_requires_explicit_motion_confirmation():
