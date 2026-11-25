@@ -458,6 +458,36 @@ ros2 topic hz /<robot_namespace>/motion/state
 docker logs -f embodied-noetix-bumi
 ```
 
+## `beat_performance` — 音乐节拍表演卡
+
+上传一段 WAV 或裸 PCM（16 kHz / 16-bit / 单声道；WAV 也接受立体声自动下混，最长
+120 秒），卡片解码后输出两路：
+
+1. `audio/pcm-16k`（`audio_msgs/msg/AudioChunk`，20 ms 一帧）连到现有 `speaker`
+   卡的 `input_topic`，由 speaker 播放；
+2. 在节拍点按 spec 触发 `semantic_action` 的挥手/欢呼/三种舞蹈之一，并叠加一个
+   有限帧的小幅 `publish_cmd` 转身脉冲。
+
+动作顺序与「第几拍做什么」全部由 `beat_performance_spec.py` 决定
+（`action_cycle` / `action_every_beats` / `turn_every_beats` / 冷却时间），设备侧
+只按调度发命令。节拍表来自 10 ms RMS 包络的上升沿检测；静音或没有明显瞬态的
+样片会退回 spec 指定的 `fallback_bpm` 均匀节拍，`info.beat_source` 会如实写
+`detected` 或 `fallback_bpm`。
+
+安全边界：
+
+- 动作命令和转身脉冲都经 `LocoPlugin` 的共享 `publish_cmd` 限速器发出，
+  相邻命令间隔 ≥2 ms；语义动作是 `COMMAND → 10 ms → DEFAULT` 的边沿，
+  非动作帧只发 `DEFAULT`，转身脉冲是有限帧速度串并以 `DEFAULT` 收尾。
+- 开始前用与 `semantic_action` 相同的路径准备行走模式；`workmode=26`
+  （保护模式）直接拒绝，`info.protection=true` 且 `info.state=error`。
+- `stop` 设置 generation 与可中断等待，取消后续所有节拍并补一个 `DEFAULT`。
+- 本卡**不**读写 `MediaController`、不改音量——speaker 卡的 500 ms
+  `set_*` 红线与本卡无关。
+
+`x-action-params.start` 的 `audio_file` 走 `POST /file/upload`（`format: file`,
+`uploadTo: mcp`），路径被限制在容器的 `/work/uploads` / `/work` 下。
+
 ## Read-only RGB-D visual odometry card (`rgbd_visual_odometry`)
 
 Single container: the estimator runs inside this bundle, not in a sidecar.
