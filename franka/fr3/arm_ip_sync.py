@@ -21,6 +21,16 @@ STATE = Path("/opt/phanthy-motus/franka-ip-sync")
 ACCESS = Path("/opt/phanthy-motus/franka-controller-access")
 
 
+def access_configured():
+    """Whether this host holds the PNP controller's pinned SSH host key.
+
+    Every controller login runs with StrictHostKeyChecking=yes against this file
+    and nothing in the driver creates it, so without it discovery can never
+    succeed — and nothing can confirm which address is the left arm.
+    """
+    return (ACCESS / "known_hosts").is_file()
+
+
 def read_state(name):
     try:
         value = json.loads((STATE / name).read_text())

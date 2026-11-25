@@ -73,3 +73,23 @@ class MotionArmIPTests(unittest.TestCase):
         self.assertEqual(joint._arm_ips, OLD)
         stopped = self.call(hand, 'stopmotion', arm='left')
         self.assertNotEqual(stopped.get('code'), 'CONTROLLER_CONFIGURATION_NOT_READY')
+
+
+class StandaloneHostTests(unittest.TestCase):
+    """A host without the controller's pinned key keeps working the old way."""
+
+    def test_without_controller_access_cards_take_a_robot_ip(self):
+        cards = joints.device.build_plugins(
+            {'motion_arm_ips': OLD}, 'franka', None, access_configured=lambda: False)
+        # The teleop card's stop talks to a PNP service this host does not run.
+        for card in cards[:4]:
+            self.addCleanup(card.stop)
+        tools = {tool['name']: tool for card in cards for tool in card.get_tools()}
+        self.assertNotIn('vision_pick_and_drop', tools)
+        self.assertNotIn('controller_configuration', tools)
+        for name in ('joint_control', 'gripper'):
+            properties = tools[name]['inputSchema']['properties']
+            self.assertIn('robot_ip', properties)
+            self.assertNotIn('arm', properties)
+        self.assertIn('robot_ip', tools['joint_states']['configSchema']['properties'])
+

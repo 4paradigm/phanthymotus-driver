@@ -972,10 +972,31 @@ class JointControlPlugin(FrankaPlugin):
             return {**self._info(instance_id, instance), "motion": motion}
 
 
-def build_plugins(config, namespace, ros2):
+def build_plugins(config, namespace, ros2, access_configured=None):
     from franka.fr3.arm_ip_sync import ControllerConfiguration
     from franka.fr3.camera import ExtCameraPlugin
     from franka.fr3.gripper import GripperPlugin
+    from franka.fr3.pnp_remote_teleop import PnpRemoteTeleopPlugin
+    if access_configured is None:
+        from franka.fr3.arm_ip_sync import access_configured
+    if not access_configured():
+        # Without a trusted PNP controller nothing can verify which address is
+        # which arm, and every motion card would refuse to move. Run the cards
+        # addressed by an explicit robot IP instead — the setup before the
+        # shared controller configuration — rather than trusting the left/right
+        # IPs in config.yaml, which describe one installation. Visual
+        # pick-and-place plans on the controller, so it is not offered.
+        print("[fr3] no PNP controller host key in "
+              "/opt/phanthy-motus/franka-controller-access; joint cards take a robot IP, "
+              "visual pick-and-place and controller configuration are unavailable", flush=True)
+        standalone = {key: value for key, value in config.items() if key != "motion_arm_ips"}
+        sensor = FrankaPlugin(standalone, namespace, ros2)
+        controller = JointControlPlugin(standalone, namespace, ros2,
+            manager=sensor._manager, discovery=sensor._discovery)
+        gripper = GripperPlugin(standalone, namespace, ros2, discovery=sensor._discovery)
+        return [sensor, controller, gripper,
+                ExtCameraPlugin(config.get("ext_camera", {}), namespace, ros2),
+                PnpRemoteTeleopPlugin()]
     from franka.fr3.pick_place import PickPlacePlugin
     controller_configuration = ControllerConfiguration(config.get("motion_arm_ips", {}))
     controller_configuration.start()
@@ -989,7 +1010,6 @@ def build_plugins(config, namespace, ros2):
     camera = ExtCameraPlugin(config.get("ext_camera", {}), namespace, ros2)
     pick = PickPlacePlugin(config, sensor._manager, camera, ros2, gripper_manager=gripper._manager,
                            controller_configuration=controller_configuration, acquire_gripper=gripper.acquire_for_vision)
-    from franka.fr3.pnp_remote_teleop import PnpRemoteTeleopPlugin
 
     return [controller_configuration, sensor, controller, gripper, camera, pick,
             PnpRemoteTeleopPlugin(controller_configuration=controller_configuration,
