@@ -266,26 +266,62 @@ def build_joint_commands(measured_rad, targets_deg, *, keep_kp, keep_kd,
 def step_with_accel(pos_deg: float, vel_deg_s: float, target_deg: float,
                     dt_s: float, max_vel_deg_s: float,
                     max_acc_deg_s2: float) -> tuple[float, float]:
-    """One trapezoidal step: clamp acceleration first, then velocity.
+    """One trapezoidal step with a real braking phase.
+
+    The brake speed is the velocity from which a full-deceleration stop fits
+    inside the remaining distance, minus one tick's worth of acceleration so the
+    discrete steps do not cross the target on the last tick. Velocity is then
+    approached under the acceleration bound and position advanced by the
+    average velocity over the tick. Nothing here snaps velocity to zero on
+    arrival: doing that is a single-tick deceleration of the whole speed and
+    breaks the 6 rad/s² contract the function advertises.
 
     Returning both position and velocity matters: a rate-only limiter can
     reverse direction instantly at the top of a swing, which is exactly the
-    jerk the 6 rad/s² bound is meant to remove.
+    jerk the bound is meant to remove.
     """
     if dt_s <= 0:
         raise ValueError("dt_s must be positive")
     if max_vel_deg_s <= 0 or max_acc_deg_s2 <= 0:
         raise ValueError("velocity and acceleration bounds must be positive")
-    remaining = float(target_deg) - float(pos_deg)
-    desired_vel = max(-max_vel_deg_s, min(max_vel_deg_s, remaining / dt_s))
-    delta_v = max(-max_acc_deg_s2 * dt_s,
-                  min(max_acc_deg_s2 * dt_s, desired_vel - float(vel_deg_s)))
-    velocity = max(-max_vel_deg_s, min(max_vel_deg_s, float(vel_deg_s) + delta_v))
-    step = velocity * dt_s
-    if (remaining >= 0 and step > remaining) or (remaining < 0 and step < remaining):
-        step = remaining
-        velocity = 0.0
-    return float(pos_deg) + step, velocity
+
+    pos = float(pos_deg)
+    velocity = float(vel_deg_s)
+    remaining = float(target_deg) - pos
+    distance = abs(remaining)
+    direction = 1.0 if remaining >= 0 else -1.0
+    accel_per_tick = max_acc_deg_s2 * dt_s
+
+    # Converged: both position and speed are within one tick of rest. Land
+    # exactly, and zeroing a speed this small is itself within the bound.
+    converge_distance = 0.5 * max_acc_deg_s2 * dt_s * dt_s
+    if distance <= converge_distance and abs(velocity) <= accel_per_tick:
+        return float(target_deg), 0.0
+
+    # v² = 2 a d is the continuous stop-from-here speed. Subtract one tick of
+    # deceleration so the discrete integration has room to brake: without it
+    # an axis at cruise speed crosses a near target on the final tick.
+    brake_speed = max(0.0,
+                      math.sqrt(2.0 * max_acc_deg_s2 * distance) - accel_per_tick)
+    desired_velocity = direction * min(max_vel_deg_s, brake_speed)
+
+    delta_v = max(-accel_per_tick,
+                  min(accel_per_tick, desired_velocity - velocity))
+    velocity = max(-max_vel_deg_s, min(max_vel_deg_s, velocity + delta_v))
+    step = 0.5 * (float(vel_deg_s) + velocity) * dt_s
+
+    if direction * step > distance:
+        # No discrete braking curve can land on an arbitrary target in exactly
+        # one tick. Prefer the velocity that reaches it if that still respects
+        # the acceleration bound; otherwise stop at the target for this tick
+        # without inventing a velocity the motor was never commanded to reach.
+        landing_velocity = 2.0 * remaining / dt_s - float(vel_deg_s)
+        if abs(landing_velocity - float(vel_deg_s)) <= accel_per_tick + 1e-9:
+            velocity = max(-max_vel_deg_s, min(max_vel_deg_s, landing_velocity))
+            step = remaining
+        else:
+            step = direction * distance
+    return pos + step, velocity
 
 
 def accel_limited_targets(current_deg: dict, velocity_deg_s: dict,

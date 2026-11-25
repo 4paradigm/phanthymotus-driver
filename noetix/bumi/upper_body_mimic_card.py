@@ -210,6 +210,8 @@ class UpperBodyMimicPlugin:
                 "跟踪丢失或置信度不足时按 2 rad/s、6 rad/s² 回到安全姿态，不保留上一帧人的命令。"
                 "限位取自机器人 URDF。默认关闭，且必须先在真机确认 LowController 与 HighController"
                 "不抢 DDS 控制权并把 dds_contention_verified 设为 true，才能 start。"
+                "这是一张危险动作卡：start 会真实接管全部电机，必须显式传入 confirm=true；"
+                "缺少或非布尔 true 一律拒绝，Agent Core 的危险动作确认门禁也依赖 x-is-dangerous 标记。"
             ),
             "inputSchema": {
                 "type": "object",
@@ -226,12 +228,20 @@ class UpperBodyMimicPlugin:
                             f"{self._default_angles_topic}；仅在手动接到别的源时需要指定"
                         ),
                     },
+                    "confirm": {
+                        "type": "boolean",
+                        "description": (
+                            "start 必填且必须为字面 true，确认授权真实驱动机器人；"
+                            "stop/info 不需要"
+                        ),
+                    },
                 },
                 "required": ["action"],
+                "x-is-dangerous": True,
                 "x-action-params": {
                     "start": {
-                        "params": ["angles_topic"],
-                        "description": "初始化低层控制器并开始按限速下发手臂指令；机器人会被真实驱动",
+                        "params": ["angles_topic", "confirm"],
+                        "description": "初始化低层控制器并开始按限速下发手臂指令；机器人会被真实驱动，需 confirm=true",
                     },
                     "stop": {
                         "params": [],
@@ -280,6 +290,15 @@ class UpperBodyMimicPlugin:
     # ── actions ──────────────────────────────────────────────────────────────
 
     def _start(self, args: dict) -> dict:
+        # This is a dangerous action: starting takes over all 21 motors, so a
+        # bare `start` from a user or an agent must never arm the loop. Mirror
+        # the driver contract's `confirm is true` rule used by other dangerous
+        # cards; `1`, `"true"` and truthy strings are not an explicit boolean.
+        if args.get("confirm") is not True:
+            return {"state": "error",
+                    "error": ("start requires confirm=true: this card takes "
+                              "over all 21 motors and really drives the robot")}
+
         if self._high_ctrl is None:
             return {"state": "error",
                     "error": "no robot controller: the SDK did not initialise"}

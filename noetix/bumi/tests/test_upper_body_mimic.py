@@ -207,7 +207,8 @@ def test_acceleration_is_limited_before_velocity():
         0.0, 0.0, 1000.0, dt, spec.MAX_VELOCITY_DEG_S,
         spec.MAX_ACCELERATION_DEG_S2)
     assert velocity == pytest.approx(spec.MAX_ACCELERATION_DEG_S2 * dt)
-    assert position == pytest.approx(velocity * dt)
+    # Trapezoidal integration: from rest, the tick's mean speed is v/2, not v.
+    assert position == pytest.approx(0.5 * velocity * dt)
 
 
 def test_velocity_never_exceeds_the_bound():
@@ -443,7 +444,7 @@ def test_the_tool_is_an_actuator_that_declares_the_motors_it_takes(monkeypatch):
 def test_start_refuses_outside_walking_mode(monkeypatch):
     """Only workmode=2 is permitted — protection and disabled are not 'close'."""
     _card, plugin, _high, low = _plugin(monkeypatch, mode=26)
-    result = plugin.dispatch("start", {})
+    result = plugin.dispatch("start", {"confirm": True})
     assert result["state"] == "error"
     assert "only workmode=2" in result["error"]
     assert low.calls == []
@@ -455,7 +456,7 @@ def test_start_refuses_without_the_dds_sign_off(monkeypatch):
     high = _FakeHighCtrl(mode=2, pose=[0.0] * 21)
     plugin = card.UpperBodyMimicPlugin(
         {}, "bumi", types.SimpleNamespace(add_node=lambda *_: None), high_ctrl=high)
-    result = plugin.dispatch("start", {})
+    result = plugin.dispatch("start", {"confirm": True})
     assert result["state"] == "error"
     assert "DDS contention not verified" in result["error"]
 
@@ -468,7 +469,7 @@ def test_start_refuses_when_the_urdf_limits_are_missing(monkeypatch):
     plugin = card.UpperBodyMimicPlugin(
         {"dds_contention_verified": True}, "bumi",
         types.SimpleNamespace(add_node=lambda *_: None), high_ctrl=high)
-    result = plugin.dispatch("start", {})
+    result = plugin.dispatch("start", {"confirm": True})
     assert result["state"] == "error"
     assert "URDF limits unavailable" in result["error"]
 
@@ -477,7 +478,7 @@ def test_start_refuses_without_a_controller(monkeypatch):
     card = _load_card_module(monkeypatch)
     plugin = card.UpperBodyMimicPlugin(
         {}, "bumi", types.SimpleNamespace(add_node=lambda *_: None), high_ctrl=None)
-    result = plugin.dispatch("start", {})
+    result = plugin.dispatch("start", {"confirm": True})
     assert result["state"] == "error"
     assert "controller" in result["error"]
 
@@ -500,7 +501,7 @@ def test_start_begins_from_the_current_pose_without_a_jump(monkeypatch):
     for index, value in inside_range.items():
         pose[index] = value
     _card, plugin, _high, low = _plugin(monkeypatch, pose=pose)
-    result = plugin.dispatch("start", {})
+    result = plugin.dispatch("start", {"confirm": True})
     try:
         assert result["state"] == "ready"
         import time
@@ -529,7 +530,7 @@ def test_a_lost_operator_drifts_back_toward_zero(monkeypatch):
 
     _card, plugin, _high, low = _plugin(
         monkeypatch, pose=[0.0] * 21, config={"lost_timeout_s": 0.2})
-    plugin.dispatch("start", {})
+    plugin.dispatch("start", {"confirm": True})
     try:
         payload = json.dumps({
             "tracked": True,
@@ -559,7 +560,7 @@ def test_a_card_started_with_nobody_in_frame_returns_to_the_safe_pose(monkeypatc
     pose[0] = math.radians(40.0)   # left shoulder held up by whatever came before
     _card, plugin, _high, low = _plugin(
         monkeypatch, pose=pose, config={"lost_timeout_s": 0.1})
-    plugin.dispatch("start", {})
+    plugin.dispatch("start", {"confirm": True})
     try:
         time.sleep(0.3)  # well past the lost timeout, nothing was ever tracked
         assert low.calls, "control loop never sent a command"
@@ -573,7 +574,7 @@ def test_a_card_started_with_nobody_in_frame_returns_to_the_safe_pose(monkeypatc
 
 def test_stop_releases_the_subscription_and_the_loop(monkeypatch):
     _card, plugin, _high, low = _plugin(monkeypatch)
-    plugin.dispatch("start", {})
+    plugin.dispatch("start", {"confirm": True})
     node = plugin._node
     assert len(node.subscriptions) == 1
     plugin.dispatch("stop", {})
@@ -588,7 +589,7 @@ def test_stop_releases_the_subscription_and_the_loop(monkeypatch):
 
 def test_a_malformed_angles_frame_does_not_kill_the_loop(monkeypatch):
     _card, plugin, _high, _low = _plugin(monkeypatch)
-    plugin.dispatch("start", {})
+    plugin.dispatch("start", {"confirm": True})
     try:
         plugin._on_angles(types.SimpleNamespace(data="not json"))
         plugin._on_angles(types.SimpleNamespace(data="[1,2,3]"))
@@ -599,7 +600,7 @@ def test_a_malformed_angles_frame_does_not_kill_the_loop(monkeypatch):
 
 def test_a_valid_frame_sets_the_targets(monkeypatch):
     _card, plugin, _high, _low = _plugin(monkeypatch)
-    plugin.dispatch("start", {})
+    plugin.dispatch("start", {"confirm": True})
     try:
         payload = (
             '{"tracked": true, "l_pitch_deg": 10.0, "l_roll_deg": 10.0,'
@@ -683,7 +684,7 @@ def test_leaving_walking_mode_during_a_run_stops_commanding(monkeypatch):
     import time
 
     _card, plugin, high, low = _plugin(monkeypatch, mode=2)
-    plugin.dispatch("start", {})
+    plugin.dispatch("start", {"confirm": True})
     try:
         time.sleep(0.08)
         assert low.calls, "control loop never sent a command"
@@ -704,7 +705,7 @@ def test_an_unreadable_workmode_stops_commanding(monkeypatch):
     import time
 
     _card, plugin, high, low = _plugin(monkeypatch, mode=2)
-    plugin.dispatch("start", {})
+    plugin.dispatch("start", {"confirm": True})
     try:
         time.sleep(0.08)
 
@@ -747,7 +748,7 @@ def test_repeated_start_stop_never_leaves_two_writers(monkeypatch):
     _card, plugin, _high, low = _plugin(monkeypatch)
     workers = []
     for _ in range(5):
-        plugin.dispatch("start", {})
+        plugin.dispatch("start", {"confirm": True})
         worker = plugin._worker
         assert worker is not None
         workers.append(worker)
@@ -767,7 +768,7 @@ def test_a_low_confidence_frame_drives_back_to_the_safe_pose(monkeypatch):
     import time
 
     _card, plugin, _high, low = _plugin(monkeypatch)
-    plugin.dispatch("start", {})
+    plugin.dispatch("start", {"confirm": True})
     try:
         person = json.dumps({
             "tracked": True,
@@ -801,3 +802,78 @@ def test_info_reports_the_safety_sign_off(monkeypatch):
     assert info["walking_mode_ok"] is True
     assert info["max_velocity_rad_s"] == pytest.approx(2.0)
     assert info["max_acceleration_rad_s2"] == pytest.approx(6.0)
+
+
+# ── dangerous-action gate (review High #1) ───────────────────────────────────
+
+def test_the_tool_is_declared_dangerous_with_a_confirm_parameter(monkeypatch):
+    """Agent Core only applies its confirmation gate to x-is-dangerous cards."""
+    card = _load_card_module(monkeypatch)
+    plugin = card.UpperBodyMimicPlugin(
+        {}, "bumi", types.SimpleNamespace(add_node=lambda *_: None))
+    schema = plugin.get_tool()["inputSchema"]
+    assert schema["x-is-dangerous"] is True
+    assert schema["properties"]["confirm"]["type"] == "boolean"
+    assert "confirm" in schema["x-action-params"]["start"]["params"]
+    assert "confirm" not in schema["x-action-params"]["stop"]["params"]
+
+
+@pytest.mark.parametrize("args", [
+    {},
+    {"confirm": False},
+    {"confirm": 1},
+    {"confirm": "true"},
+])
+def test_start_without_a_literal_confirm_true_refuses_to_arm(monkeypatch, args):
+    _card, plugin, _high, low = _plugin(monkeypatch)
+    result = plugin.dispatch("start", args)
+    assert result["state"] == "error"
+    assert "confirm=true" in result["error"]
+    assert low.calls == [], "an unconfirmed start must not touch the motors"
+    assert plugin._worker is None
+
+
+# ── trapezoidal braking (review High #2) ─────────────────────────────────────
+
+def test_per_tick_acceleration_stays_within_bound_through_a_short_target():
+    """A review found velocity was zeroed on arrival — one huge acceleration.
+
+    Cruise toward a target only 1 degree away and check *every* tick's speed
+    change. Snapping to rest on the final tick shows up here as a delta far
+    beyond max_acc * dt; a real braking phase never exceeds it.
+    """
+    dt = 0.02
+    limit = spec.MAX_ACCELERATION_DEG_S2
+    position, velocity = 0.0, spec.MAX_VELOCITY_DEG_S
+    ticks = 0
+    for _ in range(200):
+        next_position, next_velocity = spec.step_with_accel(
+            position, velocity, 1.0, dt,
+            spec.MAX_VELOCITY_DEG_S, limit)
+        delta_acc = abs(next_velocity - velocity) / dt
+        assert delta_acc <= limit + 1e-6, (
+            f"tick {ticks}: deceleration {delta_acc:.1f} exceeds {limit:.1f}")
+        assert abs(next_velocity) <= spec.MAX_VELOCITY_DEG_S + 1e-9
+        assert abs(next_position - 1.0) <= abs(position - 1.0) + 1e-9, \
+            "braking must not move away from the target"
+        position, velocity = next_position, next_velocity
+        ticks += 1
+        if abs(position - 1.0) < 1e-9 and abs(velocity) < 1e-9:
+            break
+    assert position == pytest.approx(1.0, abs=1e-6)
+    assert velocity == pytest.approx(0.0, abs=1e-6)
+
+
+def test_a_long_swing_also_obeys_the_acceleration_bound_to_arrival():
+    dt = 0.02
+    limit = spec.MAX_ACCELERATION_DEG_S2
+    position, velocity = 0.0, 0.0
+    for _ in range(600):
+        next_position, next_velocity = spec.step_with_accel(
+            position, velocity, 40.0, dt,
+            spec.MAX_VELOCITY_DEG_S, limit)
+        assert abs(next_velocity - velocity) / dt <= limit + 1e-6
+        position, velocity = next_position, next_velocity
+        if abs(position - 40.0) < 1e-9 and abs(velocity) < 1e-9:
+            break
+    assert position == pytest.approx(40.0, abs=1e-6)

@@ -40,6 +40,19 @@ dependencies. Those are comparatively small (tens of MiB in total) and are not
 enumerated byte-for-byte here; they are included in the whole-image measurement
 below.
 
+**On hash-locking the transitive dependencies:** the three dominant wheels are
+version-pinned, but pip still resolves their smaller transitives at build time,
+so two builds days apart can differ in those packages. That is acceptable for
+this optional card and is deliberately **not** turned into a `--require-hashes`
+lock file here: a correct hash lock is architecture- and index-specific, must be
+generated on ARM64 against the exact PyPI mirror the image uses (`PYPI_MIRROR`),
+and would go stale the moment the mirror re-syncs. Committing an x86-generated
+one would give a false sense of reproducibility and could break the pose build.
+If byte-identical pose images are later required, generate the lock on the ARM64
+builder with `pip-compile --generate-hashes` against that mirror and add
+`--require-hashes` to the Dockerfile install; until then this file records the
+residual as known.
+
 ### Is there a smaller alternative?
 
 - **ARM64 already uses the small torch wheel.** The same `torch==2.8.0` on

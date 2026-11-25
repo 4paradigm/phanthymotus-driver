@@ -596,6 +596,10 @@ What it does to stay inside that envelope:
   must first confirm on the real robot that `LowController` and
   `HighController` do not fight over DDS; software cannot prove this, so the
   switch is deliberately manual and defaults to false;
+- the card is marked `x-is-dangerous` and `start` requires an explicit
+  `confirm: true` — a missing, false or non-boolean value is refused before
+  any motor is touched, so neither a stray call nor an unattended agent can
+  arm the loop;
 - a missing controller and an SDK failure refuse to command rather than
   retrying into a robot that has said no.
 
