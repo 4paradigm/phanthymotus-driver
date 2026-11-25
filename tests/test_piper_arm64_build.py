@@ -30,6 +30,19 @@ test -f "$context/device.py" && test -f "$context/common/vendor_runtime.py"
                                     env=env, text=True, capture_output=True)
             return result, log.read_text() if log.exists() else ''
 
+    def test_waypoint_modules_ship_in_both_source_manifests(self):
+        import shlex
+        for filename in ('Dockerfile', 'Dockerfile.arm64-dev'):
+            source = (ROOT / 'agilex/piper' / filename).read_text()
+            copied = set()
+            for line in source.splitlines():
+                if not line.startswith('COPY '):
+                    continue
+                parts = shlex.split(line)
+                if parts and parts[0] == 'COPY' and parts[-1] == '/work/agilex/piper/':
+                    copied.update(parts[1:-1])
+            self.assertTrue({'waypoints.py', 'waypoint_control.py'} <= copied, filename)
+
     def test_native_jetson_uses_complete_context_without_buildx(self):
         result, commands = self.build('aarch64')
         self.assertEqual(result.returncode, 0, result.stderr)
