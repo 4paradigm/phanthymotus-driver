@@ -171,6 +171,8 @@ def grasp_points(box, payload, camera_matrix, setup, surface_offset):
 
 
 class TabletopPick:
+    PREFIX = CARD
+
     def __init__(self, config, device, *, vop=None, notify=_notify_completion, motion=None):
         self._config, self._device = config, device
         self._motion = motion if motion is not None else PickMotion(device, config)
@@ -186,7 +188,7 @@ class TabletopPick:
 
     def get_tool(self):
         actions = ["start", "info", "preview", "pick", "stop"]
-        return tool(CARD, "actuator",
+        return tool(self.PREFIX, "actuator",
                     "按现有 VOP 类别与可选颜色单次抓取桌面物体。preview 只计算抓取点；pick 抓起后保持夹爪闭合。",
                     {"type": "object", "properties": {
                         "action": {"type": "string", "enum": actions},

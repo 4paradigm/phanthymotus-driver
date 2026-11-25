@@ -330,6 +330,7 @@ for these concrete runtime paths:
 | `ros-humble-nav-msgs` | `nav_msgs/msg/Odometry` on `/odom` | Required for measured body velocity and pose |
 | `ros-humble-nav2-msgs` | `NavigateToPose` action for `controlled_spatial` | Panther navigation runtime dependency |
 | `ros-humble-lifecycle-msgs` | Check that the host Nav2 navigator is active | Explicit dependency already present in the tested driver image |
+| `ros-humble-moveit-msgs` | Import the typed `GetCartesianPath` service used by `tabletop_pick` | Adds the message package and any missing required dependencies. The MoveIt planner runs separately on the robot ROS domain. |
 | `ros-humble-std-srvs` | Vendor SLAM `Trigger` / `SetBool` services | Panther mapping/localization runtime dependency |
 | `ros-humble-tf2-ros` | Capture-time camera/IMU transforms and map-frame localization | Panther TF runtime dependency |
 | `ros-humble-rcl-interfaces` | Read `cmd_vel_timeout` before arming `base_servo` | Panther controller-timeout verification dependency |
@@ -339,10 +340,12 @@ for these concrete runtime paths:
 | `util-linux` | `nsenter` into the host namespaces for the lazy camera source | Required |
 | `systemd` | `systemctl`/`systemd-run` clients for the owned host transient unit | Required; the driver does not run systemd in the container |
 
-For a base-image update, measure package-layer changes with `docker history`
-instead of recording a size that becomes stale with the moving base image.
-These ROS packages can increase image size when absent from the base; no
-zero-growth claim is made. The follow-up review fix adds no packages or mounts.
+To measure the incremental size of `ros-humble-moveit-msgs`, build the Panther
+image twice on the same architecture with the same base image digest and apt
+snapshot. Omit that package from the apt install list in the baseline build.
+Compare the apt layer sizes with `docker history`. The compressed `.deb` size
+covers only the direct package, while the layer comparison captures installed
+files and any missing required dependencies.
 
 Physical capabilities are registered only when their plugin has
 `enabled: true`. Motion cards are declared as `type: actuator`, so Agent Core
