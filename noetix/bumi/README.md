@@ -272,6 +272,37 @@ Dockerfile installs FFmpeg and copies the recording module with the driver sourc
 The recorder uses host timestamps for software synchronization and exposes the
 file path only after encoding.
 
+## `emergency_response` card
+
+`emergency_response` is a Bumi-specific emergency handoff primitive, not an
+incident-management workflow. `engage` first calls the existing
+`loco.stop_move` path, then asks `vision_capture` for a fresh photo and publishes
+one handoff record. Camera failure is recorded and does not undo the chassis
+stop or hide the handoff.
+
+- `snapshot` adds a fresh photo result to the active handoff.
+- `release` requires the active `handoff_id` and `confirm=true`. It only clears
+  the handoff marker; it never starts or resumes motion.
+- `info` reports the active handoff and dependency availability; `history`
+  returns recent robot-local records.
+- Records are appended to
+  `/opt/phanthy-motus/data/emergency_response/handoffs.jsonl` and published as
+  `data/json` on `/<namespace>/emergency/handoff`.
+
+The card is not a safety-rated emergency stop and does not classify incidents,
+authenticate an operator, notify an external service, call security, mark a
+false alarm, or close a case. Those scene-specific operations belong to a Skill
+and an authenticated upstream service.
+
+Suggested robot acceptance sequence:
+
+1. Start a slow continuous `loco` move in a clear, supervised area.
+2. Call `engage` with a reason/source and keep the returned `handoff_id`.
+3. Verify that Bumi stops immediately and that the returned
+   photo exists under the configured `vision_capture` directory.
+4. Call `snapshot`, then inspect the handoff topic and JSONL journal.
+5. Call `release(confirm=true)` and verify that it does not resume motion.
+
 ## New cards
 
 ### `motion_state`
