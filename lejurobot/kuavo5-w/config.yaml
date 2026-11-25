@@ -1,0 +1,73 @@
+mcp_port: 15749
+name: "Leju Kuavo 5-W Driver"
+ros_namespace: ""
+# Optional operator-provided serial; not a robot_version or URDF selector.
+robot_serial: null
+# Set false to disable motion, resume and mode changes while preserving reads/stop.
+motion_enabled: true
+# Image-owned source is provisioned over SSH; no manually installed helper needed.
+host_runtime:
+  enabled: true
+  # Always wait for the boot owner to confirm initialization/BaseArm/pause.
+  controller_boot_required: true
+provisioning:
+  enabled: true
+  master: http://192.168.26.1:11311
+  # Fixed allowlist only, when existing vendor ROS/PulseAudio lacks a dependency.
+  install_missing_packages: true
+  auto_initialize_and_pause: true
+  # Shared addresses/users/ROS IPs and operator-requested default passwords
+  # are in connection_defaults.py. Private environment/0600 secret overrides win.
+  # Set use_default_credentials: false per role to require explicit keys/secrets.
+  # Upper host is local to the host-network container.
+  chassis: {volume: 50}
+# Start rosbridge_server on the ROS Noetic host and point this URL at it.
+rosbridge_url: "ws://127.0.0.1:9090"
+sensors:
+  # v63 sensor_time is a fixed-step cycle clock, not wall-clock capture time.
+  # Auto uses fresh post-read header.stamp + distinct cycle IDs for v63 only.
+  # Other versions retain strict sensor_time wall-clock validation.
+  joint_timebase: auto
+  imu_topic: /imu
+  auto_start: [joints, imu, loco_state, battery, laser_scan, camera_left, camera_right, camera_head, camera_depth]
+  # Only admit body-frame odometry; extend after verifying the robot's TF tree.
+  odom_body_frames: [base_link, base_footprint]
+  # SDK permits N*m or current. Set N*m only after verifying robot hardware output.
+  # Until then normalized tau is null; vendor.joint_torque preserves the raw values.
+  joint_torque_unit: null
+  # Vendor SDK uses the LIVE controller URDF for arm limits; intersect these
+  # with live kuavo_configuration limits. No local-model/default fallback.
+  # Set commissioned to require an operator record for arms as well as legs.
+  arm_limit_source: vendor_runtime
+  leg_limit_source: vendor_runtime
+  # An explicit record takes precedence; invalid records never fall back.
+  # Vendor runtime limits are not hardware certification.
+  joint_limits: null
+controlled_spatial:
+  # Deployment sets KUAVO_DATA_DIR=/opt/phanthy-motus/data.
+  # DB: <data>/kuavo5w/controlled_spatial.db; map snapshots: <data>/maps/kuavo5w/.
+  # Existing /config DB is migrated once without deleting/overwriting it.
+  # Only the factory ID-1 movement song; TTS and warning tracks are preserved.
+  motion_music_enabled: false
+  # Silence only factory ID-7 standby prompt; preserve alarms and speaker/TTS.
+  standby_voice_enabled: false
+plugins:
+  base_servo: {enabled: true}
+  base_drive: {enabled: true}
+  controlled_spatial: {enabled: true}
+  spatial_map: {enabled: true}
+  arm: {enabled: true}
+  leg: {enabled: true}
+  head: {enabled: true}
+  speaker: {enabled: true}
+  ext_mic: {enabled: true}
+  joints: {enabled: true}
+  imu: {enabled: true}
+  loco_state: {enabled: true}
+  model: {enabled: true}
+  battery: {enabled: true}
+  laser_scan: {enabled: true}
+  camera_left: {enabled: true}
+  camera_right: {enabled: true}
+  camera_head: {enabled: true}
+  camera_depth: {enabled: true}

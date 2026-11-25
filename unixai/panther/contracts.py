@@ -7,6 +7,21 @@ import time
 import xml.etree.ElementTree as ET
 from typing import Optional
 
+from common.odom import build_interface
+
+ODOM_RATE_HZ = 10.0
+ODOM_MAX_MEASUREMENT_DELAY_MS = 200
+
+
+def odom_interface(topic: str) -> dict:
+    interface = build_interface(
+        provides=["vx", "vy", "wz"], frame="body", rate_hz=ODOM_RATE_HZ,
+        pose_drift="unbounded", timing={"stamp_source": "robot",
+                                        "max_measurement_delay_ms": ODOM_MAX_MEASUREMENT_DELAY_MS},
+    )
+    return {**interface, "topic": topic,
+            "slam_pose": {"available": True, "profile": "motus_slam/1"}}
+
 
 LEFT_ARM_JOINTS = tuple(f"joint_la{i}" for i in range(8))
 RIGHT_ARM_JOINTS = tuple(f"joint_ra{i}" for i in range(8))

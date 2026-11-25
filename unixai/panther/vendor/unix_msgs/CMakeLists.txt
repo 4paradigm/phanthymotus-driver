@@ -7,6 +7,10 @@ find_package(sensor_msgs REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/GripperCommand.msg"
+  "srv/SaveMap.srv"
+  "srv/LoadMap.srv"
+  "srv/DeleteMap.srv"
+  "srv/GetMapList.srv"
   DEPENDENCIES sensor_msgs
 )
 

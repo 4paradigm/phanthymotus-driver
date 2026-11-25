@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from common.camera_info import build as build_camera_info
-from contracts import ARM_JOINT_FIELDS
+from contracts import ARM_JOINT_FIELDS, odom_interface
 from panther_media import ENCODE_TIMEOUT_S, MAX_DURATION_S
 
 
@@ -82,6 +82,40 @@ class JointsPlugin(SensorPlugin):
         return super().dispatch(action, args)
 
 
+class ImuPlugin(SensorPlugin):
+    """Keep body display; append the optional camera-motion computation port."""
+
+    def get_tool(self):
+        tool = super().get_tool()
+        if "camera_imu" in self.device.topics:
+            tool["topic_out"].append({**self.device.topics["camera_imu"], "name": "camera_imu"})
+            tool["imu_status"] = self.device.camera_imu("info")
+        return tool
+
+    def dispatch(self, action, args):
+        result = super().dispatch(action, args)
+        if "camera_imu" in self.device.topics:
+            result["imu_status"] = self.device.camera_imu(action)
+            result["topic_out"] = self.get_tool()["topic_out"]
+        return result
+
+    def stop(self):
+        if "camera_imu" in self.device.topics:
+            self.device.camera_imu("stop")
+
+
+class OdomPlugin(SensorPlugin):
+    def get_tool(self):
+        tool = super().get_tool()
+        tool["odom_interface"] = odom_interface(self.device.topics["odom"]["topic"])
+        return tool
+
+    def dispatch(self, action, args):
+        result = super().dispatch(action, args)
+        result["odom_interface"] = self.get_tool()["odom_interface"]
+        return result
+
+
 class ActuatorPlugin:
     def __init__(self, device, name, description, schema, method):
         self.device = device
@@ -124,7 +158,7 @@ class CameraPlugin:
     def get_tool(self):
         topic = self.device.topics[self.name]
         depth = self.kind == "depth"
-        return {
+        tool = {
             "name": self.name,
             "type": "sensor",
             "multiInstance": False,
@@ -143,6 +177,12 @@ class CameraPlugin:
                 vendor={"camera": "Orbbec Gemini 2 RGB-D", "transport": "ros2"},
             )],
         }
+        declaration = getattr(self.device, "camera_info", None)
+        if callable(declaration):
+            actual = declaration(self.kind)
+            if actual:
+                tool["camera_info"] = [actual]
+        return tool
 
     def start(self):
         # DriverBundle.start_all() runs at container startup. Camera hardware is
@@ -156,7 +196,46 @@ class CameraPlugin:
         del args
         result = self.device.camera(self.kind, {"action": action})
         result["topic_out"] = [self.device.topics[self.name]]
+        result["camera_info"] = self.get_tool()["camera_info"]
         return result
+
+
+class StereoCameraPlugin:
+    def __init__(self, device, eye):
+        self.runtime = device._stereo_camera
+        self.eye = eye
+        self.name = f"camera_{eye}"
+        self.topic = device.topics[self.name]
+
+    def get_tool(self):
+        return {
+            "name": self.name,
+            "type": "sensor",
+            "multiInstance": False,
+            "description": f"Panther {self.eye} eye image from the Pixe XYZ stereo camera",
+            "inputSchema": _sensor_schema(),
+            **self._outputs(),
+        }
+
+    def _outputs(self):
+        return {
+            "topic_out": [self.topic],
+            "camera_info": [self.runtime.declaration(self.eye, self.topic)],
+        }
+
+    def start(self):
+        # Canvas dispatch controls the subscription.
+        return None
+
+    def stop(self):
+        self.runtime.stop(self.eye)
+
+    def dispatch(self, action, args):
+        if action == "start":
+            self.runtime.start(self.eye)
+        elif action == "stop":
+            self.stop()
+        return {**self.runtime.info(self.eye), **self._outputs()}
 
 
 def _action_schema(actions, properties, required_by_action=None, resource=None,
@@ -200,11 +279,12 @@ def build_plugins(config, namespace, device):
         ("odom", "Panther wheel odometry"),
     ):
         if on(name):
-            plugins.append(SensorPlugin(device, name, description, [name]))
+            cls = ImuPlugin if name == "imu" else OdomPlugin if name == "odom" else SensorPlugin
+            plugins.append(cls(device, name, description, [name]))
     if on("laser_scan"):
         plugins.append(SensorPlugin(
-            device, "laser_scan", "Panther live planar lidar point cloud",
-            ["laser_cloud", "laser_scan"],
+            device, "laser_scan", "Panther planar XYZ point cloud projected from /scan",
+            ["laser_scan"],
         ))
     if on("camera_color"):
         plugins.append(CameraPlugin(
@@ -214,6 +294,9 @@ def build_plugins(config, namespace, device):
         plugins.append(CameraPlugin(
             device, "camera_depth", "depth", "Panther Gemini 2 depth stream (zlib 16UC1)"
         ))
+    for eye in ("left", "right"):
+        if on(f"camera_{eye}"):
+            plugins.append(StereoCameraPlugin(device, eye))
     if on("vision_capture"):
         schema = _action_schema(
             ["capture_photo", "record_video", "list", "delete", "start", "info", "stop"],
@@ -238,6 +321,22 @@ def build_plugins(config, namespace, device):
         for name in ("mic", "speaker"):
             if on(name):
                 plugins.append(AudioPlugin(name, namespace, enabled["audio"]))
+
+    if on("controlled_spatial"):
+        from controlled_spatial import ControlledSpatialPlugin
+        spatial = ControlledSpatialPlugin(enabled["controlled_spatial"], namespace, device._executor)
+        spatial.base_device = device
+        device._controlled_spatial = spatial
+        plugins.append(spatial)
+        if on("spatial_map"):
+            from spatial_map import SpatialMapPlugin
+            plugins.append(SpatialMapPlugin(spatial, namespace))
+
+    if on("base_servo"):
+        from base_servo import BaseServoPlugin
+        servo = BaseServoPlugin(device, enabled["base_servo"])
+        device._base_servo = servo
+        plugins.append(servo)
 
     if on("base_drive"):
         cfg = enabled["base_drive"]

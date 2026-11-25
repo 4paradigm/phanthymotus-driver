@@ -35,6 +35,12 @@ def capture(tmp_path, monkeypatch):
     runtime._active = set()
     runtime._closed = False
     runtime._config = {}
+    # Photos are rectified like the preview; an identity map keeps pixels unchanged.
+    import numpy as np
+    grid_y, grid_x = np.mgrid[0:16, 0:16].astype(np.float32)
+    runtime._geometry = {"frame_id": "rgb", "source_layout": {"rgb": (16, 16)},
+                         "color_x": grid_x, "color_y": grid_y}
+    runtime._geometry_error = ""
     runtime._frames = {"rgb": None}
     runtime._last_frame_at = {"rgb": 0.0}
     runtime._node = SimpleNamespace(count_publishers=lambda _: 0)

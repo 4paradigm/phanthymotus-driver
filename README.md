@@ -11,6 +11,7 @@ Each driver is a standalone [MCP](https://modelcontextprotocol.io) HTTP server t
 
 | Driver | Hardware | Port | Description |
 |--------|----------|------|-------------|
+| [`rokae/helios`](rokae/helios/README.md) | ROKAE Helios-2.1 | 15747 | Read-only 20-axis joints and dual-battery status with freshness information |
 | [`dobot/cra`](dobot/cra/README.md) | Dobot CRA V4 | 15746 | Official SDK; 30 Hz joint skeleton/angles and absolute joint motion |
 | `pico/4ultra` | PICO 4 Ultra | 15742 | Independent teleop_device; signed App, pairing, DDS controller input |
 | `unitree/g1` | Unitree G1 Humanoid | 15701 | Locomotion, arm control, mic, speaker, LED, state monitoring |
@@ -30,6 +31,7 @@ Each driver is a standalone [MCP](https://modelcontextprotocol.io) HTTP server t
 | [`limx/tron2`](limx/tron2/README.md) | LimX TRON2 dual-arm robot | 15791 | Head/wrist RGB cameras, joint skeleton with gripper outlines, arm MoveJ and verified saved-home reset |
 | `pnpbotics/adam` | PNPbotics Adam Humanoid | 15702 | State, locomotion (gRPC), upper body control, dexterous hands, 3D model |
 | `linkerhand/l20_lite` | LinkerHand L20 Lite | 15733 | USB-RS485/Modbus 115200, 10-joint position/speed/torque control and state reads |
+| [`phanthy/office`](phanthy/office/README.md) | Office scene: front-desk Windows PC + printer | 15750 | Over SSH: list today's visitors and print their badge from the visitor-management site |
 
 ## Quick Start
 

@@ -1,0 +1,54 @@
+"""Prepare a right-side runtime copy with consistent gripper units."""
+from pathlib import Path
+import sys
+
+
+def prepare(source):
+    replacements = {
+        '    abs_deltas = np.abs(start_pos - joints)':
+            '    # Startup guard compares only the seven arm joint angles.\n'
+            '    abs_deltas = np.abs(start_pos[:7] - joints[:7])',
+        '            start_pos[id_mask],\n            joints[id_mask],':
+            '            start_pos[:7][id_mask],\n            joints[:7][id_mask],',
+        '        current_joints = obs["joint_positions"]\n        delta = command_joints - current_joints':
+            '        current_joints = np.array(obs["joint_positions"], copy=True)\n'
+            '        current_joints[7] = np.clip(1.0 - current_joints[7], 0.0, 1.0)\n'
+            '        delta = command_joints - current_joints',
+        '    if (action - joints > 0.5).any():':
+            '    residual = np.abs(action[:7] - joints[:7])\n'
+            '    if (residual > 0.5).any():',
+        '        joint_index = np.where(action - joints > 0.8)':
+            '        joint_index = np.flatnonzero(residual > 0.5)',
+    }
+    for old, new in replacements.items():
+        if source.count(old) != 1:
+            raise ValueError(f"Vendor run_env source has changed at {old!r}")
+        source = source.replace(old, new)
+    boundary = "    save_path = None\n    start_time = time.time()"
+    if source.count(boundary) != 1:
+        raise ValueError("Vendor follow loop boundary has changed")
+    source = source.replace(boundary,
+        "    from vendor_alignment import wait_for_follow\n"
+        "    wait_for_follow(env, agent)\n"
+        "    obs = env.get_obs()\n" + boundary)
+    loop = "        obs = env.step(action)"
+    start = source.index("    wait_for_follow(env, agent)")
+    before, follow = source[:start], source[start:]
+    if follow.count(loop) != 1:
+        raise ValueError("Vendor recording loop boundary has changed")
+    follow = follow.replace("    save_path = None", """    from os import environ
+    from vendor_recordings import start_recording, record_frame
+    recording = start_recording(environ, args.data_dir)
+    save_path = None""", 1)
+    follow = follow.replace(loop, """        obs = env.step(action)
+        if recording:
+            observed_ns = time.monotonic_ns()
+            record_frame(recording, dt, obs, action.copy(), save_frame, observed_ns=observed_ns)""")
+    source = before + follow
+    compile(source, "right_run_env.py", "exec")
+    return source
+
+
+if __name__ == "__main__":
+    source, destination = map(Path, sys.argv[1:])
+    destination.write_text(prepare(source.read_text()))

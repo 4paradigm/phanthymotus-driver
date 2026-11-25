@@ -23,6 +23,7 @@ from test_linkerhand_l20 import (
     _SingleHandController,
     build_plugins,
 )
+from common.vendor_runtime import DriverBundle
 from can_client import PositionQueryTimeout, TactileQueryTimeout
 from adaptive_grasp_device import (
     DEFAULT_CLOSE_LIMIT_POSE,
@@ -1004,8 +1005,8 @@ def test_user_setting_boundaries_are_valid(value):
 def test_adaptive_grasp_replaces_old_card():
     config = yaml.safe_load((DRIVER / "config.yaml").read_text())
     plugins = build_plugins(config, "", None)
-    tools = {plugin.get_tool()["name"]: plugin.get_tool() for plugin in plugins}
-    assert set(tools) == {"hand", "hand_gesture", "hand_grasp", "hand_tactile"}
+    tools = {tool["name"]: tool for tool in DriverBundle(plugins).get_all_tools()}
+    assert set(tools) == {"hand", "hand_gesture", "hand_grasp", "hand_tactile", "joints", "model"}
     assert next(plugin for plugin in plugins if plugin.PREFIX == "hand_grasp").__class__ is AdaptiveGraspPlugin
     schema = tools["hand_grasp"]["inputSchema"]
     assert set(schema["x-action-params"]) == {"adaptive_grasp", "release", "get_state", "config"}

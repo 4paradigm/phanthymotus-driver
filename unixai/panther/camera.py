@@ -12,16 +12,22 @@ import shlex
 import threading
 import time
 import zlib
+from uuid import uuid4
+
+from common.camera_info import build as build_camera_info
+from spatial_inputs import CLOCK_ID, make_geometry, metric_depth, transform_matrix, imu_packet, stamp_ns, mount_offset_matrix
 
 
 class PantherCameraRuntime:
     COLOR_TOPIC = "/camera/color/image_raw"
     DEPTH_TOPIC = "/camera/depth/image_raw"
+    IMU_TOPIC = "/camera/gyro_accel/sample"
     HOST_UNIT = "panther_orbbec.service"
     _NSENTER = ("nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--")
 
     def __init__(self, node, bridge, config: dict, sensor_qos):
-        from sensor_msgs.msg import Image
+        from sensor_msgs.msg import Image, CameraInfo, Imu
+        from tf2_ros import Buffer, TransformListener
 
         self._node = node
         self._bridge = bridge
@@ -32,8 +38,8 @@ class PantherCameraRuntime:
         self._photo_waiting = False
         self._photo_frame = None
         self._source_lock = threading.Lock()
-        self._frames = {"rgb": None, "depth": None}
-        self._last_frame_at = {"rgb": 0.0, "depth": 0.0}
+        self._frames = {"rgb": None, "depth": None, "imu": None}
+        self._last_frame_at = {"rgb": 0.0, "depth": 0.0, "imu": 0.0}
         self._last_publish_at = {"rgb": 0.0, "depth": 0.0}
         self._frame_failures = {"rgb": 0, "depth": 0}
         self._armed_at = 0.0
@@ -41,10 +47,25 @@ class PantherCameraRuntime:
         self._managed_unit = None
         self._watchdog_restarts = 0
         self._closed = False
+        self._infos = {}
+        self._geometry = None
+        self._geometry_error = "waiting for source CameraInfo"
+        self._tf_buffer = Buffer()
+        self._tf_listener = TransformListener(self._tf_buffer, node)
+        self._epoch = uuid4().hex
+        self._imu_error = "waiting for camera IMU and capture-time TF"
+        self._imu_last_stamp = 0
+        self._mount_error = "waiting for capture-time body-camera TF"
+        self._mount_estimated = False
 
         self._subscriptions = (
             node.create_subscription(Image, self.COLOR_TOPIC, self._on_rgb, sensor_qos),
             node.create_subscription(Image, self.DEPTH_TOPIC, self._on_depth, sensor_qos),
+            node.create_subscription(CameraInfo, "/camera/color/camera_info",
+                                     lambda msg: self._on_info("color", msg), sensor_qos),
+            node.create_subscription(CameraInfo, "/camera/depth/camera_info",
+                                     lambda msg: self._on_info("depth", msg), sensor_qos),
+            node.create_subscription(Imu, self.IMU_TOPIC, self._on_camera_imu, sensor_qos),
         )
         self._rgb_thread = threading.Thread(target=self._rgb_loop, daemon=True, name="panther_rgb")
         self._depth_thread = threading.Thread(target=self._depth_loop, daemon=True, name="panther_depth")
@@ -56,7 +77,7 @@ class PantherCameraRuntime:
         self._watchdog_thread.start()
 
     def info(self, kind: str) -> dict:
-        source = self.COLOR_TOPIC if kind == "rgb" else self.DEPTH_TOPIC
+        source = {"rgb": self.COLOR_TOPIC, "depth": self.DEPTH_TOPIC, "imu": self.IMU_TOPIC}[kind]
         with self._lock:
             active = kind in self._active
             last = self._last_frame_at[kind]
@@ -67,8 +88,12 @@ class PantherCameraRuntime:
             and time.monotonic() - last < float(self._config.get("frame_stall_s", 15.0))
         )
         publishers = self._node.count_publishers(source)
+        imu_last = self._last_frame_at["imu"]
+        imu_ready = bool("imu" in self._active and imu_last and time.monotonic() - imu_last < .5
+                         and self._geometry is not None and not self._imu_error)
+        geometry_ready = self._geometry is not None
         return {
-            "state": "running" if active and frame_fresh else "unavailable" if active else "idle",
+            "state": "running" if active and frame_fresh and geometry_ready else "unavailable" if active else "idle",
             "available": publishers > 0 and last > 0,
             "fresh": frame_fresh,
             "source_topic": source,
@@ -76,12 +101,17 @@ class PantherCameraRuntime:
             "last_frame_age_ms": None if not last else int((time.monotonic() - last) * 1000),
             "host_service": source_unit,
             "host_service_managed": managed_unit is not None,
+            "geometry_ready": self._geometry is not None,
+            "geometry_error": self._geometry_error,
+            "imu_status": {"available": imu_ready,
+                           "reason": self._imu_error or ("" if imu_ready else "camera IMU idle or stale")},
+            "body_mount_status": {"available": not self._mount_error, "reason": self._mount_error},
         }
 
     def start(self, kind: str) -> dict:
-        if kind not in ("rgb", "depth"):
-            raise ValueError("camera kind must be rgb or depth")
-        required = self.COLOR_TOPIC if kind == "rgb" else self.DEPTH_TOPIC
+        if kind not in ("rgb", "depth", "imu"):
+            raise ValueError("camera kind must be rgb, depth or imu")
+        required = {"rgb": self.COLOR_TOPIC, "depth": self.DEPTH_TOPIC, "imu": self.IMU_TOPIC}[kind]
         with self._lock:
             last = self._last_frame_at[kind]
             already_ready = (
@@ -142,6 +172,7 @@ class PantherCameraRuntime:
             self._managed_unit = None
         for thread in (self._rgb_thread, self._depth_thread, self._watchdog_thread):
             thread.join(timeout=2.0)
+        self._tf_listener.unregister()
         if managed_unit:
             try:
                 self._run_host(["systemctl", "stop", "--no-block", managed_unit], timeout=15.0)
@@ -270,7 +301,149 @@ class PantherCameraRuntime:
             finally:
                 self._photo_waiting = False
                 self._photo_frame = None
-        return self._encode_rgb(message)
+        payload, _geometry = self._encode_rgb(message)
+        return payload
+
+    def _on_info(self, kind, msg):
+        key = (kind, msg.header.frame_id, int(msg.width), int(msg.height),
+               tuple(msg.k), tuple(msg.d), msg.distortion_model)
+        with self._lock:
+            if self._infos.get(kind, (None,))[0] == key:
+                return
+            self._infos[kind] = (key, msg)
+            self._geometry = None
+            self._geometry_error = "waiting for both source CameraInfo messages"
+            if set(self._infos) != {"color", "depth"}:
+                return
+            try:
+                color, depth = self._infos["color"][1], self._infos["depth"][1]
+                geometry = make_geometry(color, depth, registered=self._config.get("registered_depth", True))
+                geometry["source_layout"] = {
+                    "rgb": (color.width, color.height), "depth": (depth.width, depth.height)}
+                self._geometry = geometry
+                self._geometry_error = ""
+            except Exception as exc:
+                self._geometry_error = self._bounded_error(exc)
+
+    def declaration(self, kind, topic):
+        with self._lock:
+            geometry = self._geometry
+            error = self._geometry_error
+        vendor = {"camera": "Orbbec Gemini 2 RGB-D", "transport": "ros2",
+                  "clock_id": CLOCK_ID, "timestamp_semantics": "source_ros_header",
+                  "clock_mapping": {"verified": False, "method": "source_ros_header"},
+                  "registration": "registered_rectified" if geometry is not None else "unknown",
+                  "geometry_error": error,
+                  "body_mount": self.mount_declaration()}
+        if kind == "depth":
+            vendor.update(depth_unit="mm", depth_source="measured", depth_scale_m=0.001,
+                          invalid_value=0, depth_convention="axial_z",
+                          source_depth_unit_mm=self._config.get("source_depth_unit_mm", 1.0))
+        if geometry is not None:
+            vendor["frame_id"] = geometry["frame_id"]
+        return build_camera_info(
+            topic=topic["topic"], id="unixai/panther/camera/rectified", format=topic["format"],
+            width=640, height=480, K=geometry["K"].ravel().tolist() if geometry is not None else None,
+            D=[0.] * 5 if geometry is not None else None,
+            distortion_model="pinhole" if geometry is not None else "unknown",
+            source="derived-from-K" if geometry is not None else "unknown",
+            pipeline=["unixai/panther/registered-ray-rectification"], vendor=vendor)
+
+    def mount_declaration(self):
+        return dict(schema="motus.camera_mount/1",
+                    topic=f"/{self._bridge._namespace}/panther/camera/body_mount",
+                    parent_frame=self._config.get("body_frame", "base_link"),
+                    child_frame=self._geometry["frame_id"] if self._geometry is not None else None,
+                    source="configured_cad_estimate" if getattr(self, "_mount_estimated", False) else "tf",
+                    version="capture_tf_v1", epoch=self._epoch, mode="dynamic",
+                    length_unit="m", transform_direction="body_from_camera",
+                    accuracy_validated=False,
+                    provenance={"estimated_mount_config": self._config.get("estimated_body_mount", {}),
+                                "native_tf_preferred": True},
+                    status="unavailable" if self._mount_error else "available", reason=self._mount_error)
+
+    def _lookup_matrix(self, target, source, message):
+        from rclpy.time import Time
+        if stamp_ns(message) <= 0 or not target or not source:
+            raise ValueError("positive source capture time and frames required; no latest TF fallback")
+        result = self._tf_buffer.lookup_transform(target, source, Time.from_msg(message.header.stamp))
+        if result.header.frame_id != target or result.child_frame_id != source:
+            raise ValueError("TF frames differ from request")
+        return transform_matrix(result)
+
+    def _publish_mount(self, message):
+        packet = self.mount_declaration()
+        packet.pop("topic")
+        packet.update(stamp_ns=stamp_ns(message), stamp_source="measurement", clock_id=CLOCK_ID,
+                      child_frame=message.header.frame_id)
+        try:
+            try:
+                matrix = self._lookup_matrix(packet["parent_frame"], message.header.frame_id, message)
+                self._mount_estimated = False
+            except Exception:
+                estimate = self._config.get("estimated_body_mount", {})
+                if not estimate.get("enabled", False):
+                    raise
+                # Compose only in this driver. No competing TF authority or
+                # changes to the host's robot_description/static TF tree.
+                body_from_model = self._lookup_matrix(
+                    packet["parent_frame"], estimate["model_frame"], message)
+                source_from_optical = self._lookup_matrix(
+                    estimate["source_frame"], message.header.frame_id, message)
+                matrix = body_from_model @ mount_offset_matrix(estimate) @ source_from_optical
+                self._mount_estimated = True
+            packet["matrix"] = matrix.tolist()
+            packet["source"] = "configured_cad_estimate" if self._mount_estimated else "tf"
+            self._mount_error = ""
+        except Exception as exc:
+            self._mount_error = self._bounded_error(exc)
+        packet.update(status="unavailable" if self._mount_error else "available", reason=self._mount_error)
+        self._bridge.publish("body_mount", packet)
+
+    def _image_geometry(self, message, kind):
+        with self._lock:
+            geometry = self._geometry
+        if geometry is None:
+            raise ValueError(self._geometry_error)
+        if (message.header.frame_id != geometry["frame_id"] or
+                (message.width, message.height) != geometry["source_layout"][kind]):
+            raise ValueError("image frame/size differs from source calibration")
+        if stamp_ns(message) <= 0:
+            raise ValueError("image capture timestamp unavailable")
+        return geometry
+
+    def _on_camera_imu(self, message):
+        with self._lock:
+            if "imu" not in self._active or self._geometry is None:
+                return
+            frame = self._geometry["frame_id"]
+        try:
+            stamp = stamp_ns(message)
+            if stamp <= self._imu_last_stamp:
+                if stamp < self._imu_last_stamp:
+                    self._epoch = uuid4().hex
+                    self._imu_last_stamp = 0
+                raise ValueError("nonmonotonic IMU source time")
+            matrix = self._lookup_matrix(frame, message.header.frame_id, message)
+            packet = imu_packet(message, matrix, frame, self._epoch)
+            with self._lock:
+                if "imu" not in self._active or self._closed:
+                    return
+                self._bridge.publish("camera_imu", packet)
+                self._imu_last_stamp = stamp
+                self._imu_error = ""
+                self._last_frame_at["imu"] = time.monotonic()
+        except Exception as exc:
+            self._imu_error = self._bounded_error(exc)
+
+    def arm_imu(self):
+        # Optional camera motion must not prevent the existing body IMU display.
+        with self._source_lock:
+            self._ensure_source()
+        with self._lock:
+            self._active.add("imu")
+            self._armed_at = time.monotonic()
+        return self.info("imu")
 
     def _on_depth(self, msg) -> None:
         with self._lock:
@@ -307,7 +480,6 @@ class PantherCameraRuntime:
         import numpy as np
 
         quality = max(20, min(int(self._config.get("jpeg_quality", 70)), 95))
-        max_width = max(160, int(self._config.get("max_width", 640)))
         channels = {"rgb8": 3, "bgr8": 3, "rgba8": 4, "bgra8": 4, "mono8": 1}
         encoding = str(message.encoding).lower()
         count = channels.get(encoding)
@@ -325,13 +497,14 @@ class PantherCameraRuntime:
             image = cv2.cvtColor(image, cv2.COLOR_RGBA2BGR)
         elif encoding == "bgra8":
             image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
-        if width > max_width:
-            output_height = max(1, round(height * max_width / width))
-            image = cv2.resize(image, (max_width, output_height), interpolation=cv2.INTER_AREA)
+        # Same rectification as the preview, so a photo matches what the card shows.
+        geometry = self._image_geometry(message, "rgb")
+        image = cv2.remap(image, geometry["color_x"], geometry["color_y"], cv2.INTER_LINEAR)
         ok, encoded = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, quality])
         if not ok:
             raise ValueError("JPEG encoder rejected frame")
-        return {**self._header_payload(message), "message_format": "jpeg", "data": encoded.tobytes()}
+        payload = {**self._header_payload(message), "message_format": "jpeg", "data": encoded.tobytes()}
+        return payload, geometry
 
     def _rgb_loop(self) -> None:
         hz = max(1.0, min(float(self._config.get("rgb_hz", 10.0)), 20.0))
@@ -341,7 +514,11 @@ class PantherCameraRuntime:
                 time.sleep(0.01)
                 continue
             try:
-                self._bridge.publish("camera_color", self._encode_rgb(message))
+                payload, geometry = self._encode_rgb(message)
+                with self._lock:
+                    if "rgb" in self._active and geometry is self._geometry and not self._closed:
+                        self._publish_mount(message)
+                        self._bridge.publish("camera_color", payload)
             except Exception as exc:
                 self._log_frame_failure("rgb", "camera_color", exc)
 
@@ -356,34 +533,9 @@ class PantherCameraRuntime:
                 time.sleep(0.01)
                 continue
             try:
-                encoding = str(message.encoding)
-                if encoding not in ("16UC1", "mono16", "32FC1"):
-                    raise ValueError(f"unsupported depth encoding: {message.encoding}")
-                item_size = 4 if encoding == "32FC1" else 2
-                width, height, step = int(message.width), int(message.height), int(message.step)
-                if width <= 0 or height <= 0 or step < width * item_size:
-                    raise ValueError("invalid depth layout")
-                raw = np.frombuffer(message.data, dtype=np.uint8)
-                if raw.size < height * step:
-                    raise ValueError("truncated depth image")
-                depth = raw[: height * step].reshape(height, step)[:, : width * item_size]
-                byte_order = ">" if message.is_bigendian else "<"
-                if encoding == "32FC1":
-                    metres = depth.copy().view(byte_order + "f4").reshape(height, width).astype(np.float64)
-                    metres[~np.isfinite(metres) | (metres < 0)] = 0.0
-                    depth = np.clip(np.rint(metres * 1000.0), 0, 65535).astype("<u2")
-                else:
-                    depth = depth.copy().view(byte_order + "u2").reshape(height, width).astype("<u2")
-                if width * 3 > height * 4:
-                    crop_width = height * 4 // 3
-                    left = (width - crop_width) // 2
-                    depth = depth[:, left:left + crop_width]
-                elif width * 3 < height * 4:
-                    crop_height = width * 3 // 4
-                    top = (height - crop_height) // 2
-                    depth = depth[top:top + crop_height, :]
-                if depth.shape != (480, 640):
-                    depth = cv2.resize(depth, (640, 480), interpolation=cv2.INTER_NEAREST)
+                depth = metric_depth(message, self._config.get("source_depth_unit_mm", 1.0))
+                geometry = self._image_geometry(message, "depth")
+                depth = cv2.remap(depth, geometry["depth_x"], geometry["depth_y"], cv2.INTER_NEAREST)
                 payload = self._header_payload(message)
                 payload.update(
                     {
@@ -391,7 +543,10 @@ class PantherCameraRuntime:
                         "data": zlib.compress(depth.astype("<u2", copy=False).tobytes(), 1),
                     }
                 )
-                self._bridge.publish("camera_depth", payload)
+                with self._lock:
+                    if "depth" in self._active and geometry is self._geometry and not self._closed:
+                        self._publish_mount(message)
+                        self._bridge.publish("camera_depth", payload)
             except Exception as exc:
                 self._log_frame_failure("depth", "camera_depth", exc)
 
@@ -402,7 +557,8 @@ class PantherCameraRuntime:
         while not self._closed:
             time.sleep(1.0)
             with self._lock:
-                active = set(self._active)
+                # Optional motion/TF failure must never restart valid RGB-D.
+                active = set(self._active) & {"rgb", "depth"}
                 managed_unit = self._managed_unit
                 armed_at = self._armed_at
                 last = dict(self._last_frame_at)

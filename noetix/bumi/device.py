@@ -18,9 +18,8 @@ import json
 import math
 import os
 import struct
-import select
+import shutil
 import ssl
-import tempfile
 import urllib.request
 import subprocess
 import threading
@@ -1729,6 +1728,7 @@ def _mic_subprocess(namespace: str):
     import time as _time
     import struct as _struct
     import numpy as _np
+    import audioop as _audioop
 
     import rclpy as _rclpy
     from rclpy.node import Node as _Node
@@ -1751,6 +1751,10 @@ def _mic_subprocess(namespace: str):
     node = _Node("bumi_mic_sub")
     topic = f"/{namespace}/mic/audio"
     pub = node.create_publisher(_AudioChunk, topic, _QOS)
+    # The original topic retains SDK start stamps (possibly zero). Recording
+    # needs a shared host clock and chunk-END stamps, as used by G1's recorder.
+    # Publish the same PCM once more; do not open a second SDK capture client.
+    recording_pub = node.create_publisher(_AudioChunk, f"/{namespace}/mic/audio_recording", _QOS)
 
     print(f"[mic_subprocess] publishing to {topic}", flush=True)
 
@@ -1758,22 +1762,41 @@ def _mic_subprocess(namespace: str):
     t_start = _time.monotonic()
     buffer = _np.array([], dtype=_np.int16)
     buffer_start_us = 0
+    previous_rate = None
+    resample_state = None
     MIN_CHUNK_SAMPLES = 512  # 1024 bytes = 32ms @ 16kHz
 
     while True:
         try:
             audio = media_ctrl.get_audio_capture_data()
+            capture_end_ns = _time.time_ns()
             if audio.channels == 0 or len(audio.audio_data) == 0:
                 _time.sleep(0.005)
                 continue
 
             # Downmix 8ch → mono (channel 0) using numpy for speed
             samples = _np.array(audio.audio_data, dtype=_np.int16)
+            if len(samples) % audio.channels:
+                raise ValueError("SDK audio payload is not a whole number of channel frames")
+            source_rate = int(getattr(audio, "sample_rate", 0))
+            if not 8000 <= source_rate <= 192000:
+                raise ValueError(f"Invalid SDK microphone sample_rate: {source_rate}")
+            if source_rate != previous_rate:
+                buffer = _np.array([], dtype=_np.int16)
+                buffer_start_us = 0
+                resample_state = None
+                previous_rate = source_rate
             mono = samples[::audio.channels]
 
             # SDK returns low-amplitude signal (~8-bit dynamic range in 16-bit container)
             # Apply moderate gain to reach usable 16-bit level without clipping
             mono = _np.clip(mono.astype(_np.int32) * 50, -32768, 32767).astype(_np.int16)
+            if source_rate != 16000:
+                # Respect the SDK sample rate: labelling 48 kHz samples as
+                # 16 kHz makes counting sound slow and breaks A/V duration.
+                converted, resample_state = _audioop.ratecv(
+                    mono.tobytes(), 2, 1, source_rate, 16000, resample_state)
+                mono = _np.frombuffer(converted, dtype=_np.int16)
 
             # Accumulate until we have enough for a proper chunk
             if len(buffer) == 0:
@@ -1790,6 +1813,13 @@ def _mic_subprocess(namespace: str):
                     msg.header.stamp.sec = buffer_start_us // 1_000_000
                     msg.header.stamp.nanosec = (buffer_start_us % 1_000_000) * 1000
                 pub.publish(msg)
+                recording_msg = _AudioChunk()
+                recording_msg.format = "audio/pcm-16k"
+                recording_msg.data = msg.data
+                end_ns = capture_end_ns
+                recording_msg.header.stamp.sec = end_ns // 1_000_000_000
+                recording_msg.header.stamp.nanosec = end_ns % 1_000_000_000
+                recording_pub.publish(recording_msg)
                 buffer = _np.array([], dtype=_np.int16)
                 buffer_start_us = 0
 
@@ -3088,34 +3118,46 @@ def _acp_notify(action_id, status, result, tool):
 class VisionCapturePlugin:
     PREFIX = "vision_capture"
 
-    def __init__(self, plugin_config, camera_plugin):
+    def __init__(self, plugin_config, camera_plugin, namespace="bumi", executor=None, mic_enabled=True):
         self._worker = camera_plugin
+        self._executor = executor
+        self._video_topic = getattr(camera_plugin, "_color_topic", f"/{namespace}/camera/color")
+        self._audio_topic = f"/{namespace}/mic/audio_recording"
+        self._mic_enabled = mic_enabled
         self._output_dir = Path(str(plugin_config.get(
             "output_dir", "/opt/phanthy-motus/data/vision_capture"))).expanduser()
         self._fps = max(1, min(15, int(plugin_config.get("fps", 15))))
         self._max_duration_s = max(1, min(30, int(plugin_config.get("max_duration_s", 30))))
         self._recording_lock = threading.Lock()
         self._active_recording = None
+        self._last_recording = None
 
     def get_tool(self):
         return {
             "name": CARD, "type": "actuator", "multiInstance": False,
-            "description": "Capture a Bumi RGB photo or record a video (1–30 seconds) to persistent storage.",
+            "description": "Capture a Bumi RGB photo or record a real-time video (1–30 seconds), optionally with microphone AAC audio. Software A/V synchronization.",
             "inputSchema": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": ["start", "capture_photo", "record_video", "info", "stop"]},
-                "duration_s": {"type": "integer", "minimum": 1, "maximum": 30, "default": 5,
+                "duration_s": {"type": "integer", "minimum": 1, "maximum": self._max_duration_s,
+                               "default": min(5, self._max_duration_s),
                                "description": "默认值为5秒（可填写1–30秒）"},
+                "include_audio": {
+                    "type": "boolean", "default": True, "enum": [True, False],
+                    "oneOf": [{"const": True, "title": "true（有声，默认）"},
+                              {"const": False, "title": "false（无声）"}],
+                    "description": "true 为有声（默认），false 为无声。有声模式下麦克风不可用时返回错误。",
+                },
             }, "required": ["action"], "additionalProperties": False,
                 "x-action-params": {
-                    "start": {"params": [], "description": "检查相机 worker 是否就绪。"},
+                    "start": {"params": [], "description": "启用卡片；拍照与录像操作各自检查设备是否就绪。"},
                     "capture_photo": {"params": [], "description": "拍摄并保存一张当前 RGB 照片。"},
-                    "record_video": {"params": ["duration_s"], "description": "录制并保存 1–30 秒 RGB 视频，默认 5 秒。"},
+                    "record_video": {"params": ["duration_s", "include_audio"], "description": "录像默认 5 秒、带现场声音。include_audio=true 为有声，false 为无声。"},
                     "info": {"params": [], "description": "查看保存目录与相机状态。"},
-                    "stop": {"params": [], "description": "取消当前录像并删除未完成的视频。"},
+                    "stop": {"params": [], "description": "停用卡片并请求取消当前录像；立即返回 idle，清理终态由 ACP/info 报告。"},
                 },
                 "x-completion": {
                     "actions": ["record_video"],
-                    "timeout": self._max_duration_s + 15,
+                    "timeout": self._max_duration_s + 45,
                 }},
         }
 
@@ -3123,7 +3165,9 @@ class VisionCapturePlugin:
         return [self.get_tool()]
 
     def start(self):
-        return {"state": "ready" if self._camera_ready() else "error"}
+        # Actuator lifecycle marker. Device readiness belongs to business
+        # actions, not canvas activation (README_dev.md lifecycle contract).
+        return {"state": "ready"}
 
     def stop(self):
         # ``BumiDeviceBundle.stop_all`` calls this during SIGTERM/redeploy. Completing
@@ -3145,13 +3189,16 @@ class VisionCapturePlugin:
         age = round(max(0.0, time.time() - timestamp_ms / 1000), 2) if timestamp_ms else None
         with self._recording_lock:
             active = ({key: self._active_recording.get(key) for key in
-                       ("action_id", "state", "duration_s", "started_at", "path")}
+                       ("action_id", "state", "duration_s", "include_audio", "started_at")}
                       if self._active_recording else None)
+            last_recording = self._last_recording
         return {"ok": self._camera_ready(), "output_dir": str(self._output_dir),
                 "photos_dir": str(self._output_dir / "photos"),
                 "videos_dir": str(self._output_dir / "videos"), "fps": self._fps,
                 "max_duration_s": self._max_duration_s, "latest_frame_age_s": age,
-                "source": "bumi_camera", "active_recording": active}
+                "source": "bumi_camera", "active_recording": active,
+                "audio_topic": self._audio_topic, "mic_enabled": self._mic_enabled,
+                "last_recording": last_recording}
 
     def _frame(self, after_sequence=None, timeout_s=_FIRST_FRAME_TIMEOUT_S):
         if not self._camera_ready():
@@ -3193,154 +3240,64 @@ class VisionCapturePlugin:
         return {"ok": False, "code": "RECORD_CANCELLED",
                 "message": "Video recording was cancelled"}
 
-    def _set_recording_value(self, active, key, value):
-        if active is None:
-            return
-        with self._recording_lock:
-            if self._active_recording is active:
-                active[key] = value
-
     def _finish_recording(self, active, status, result):
         """Send one ACP terminal event and release the active-recording slot."""
         with self._recording_lock:
-            if active.get("finished"):
-                return False
-            active["finished"] = True
-            if self._active_recording is active:
-                self._active_recording = None
-            action_id = active["action_id"]
-        _acp_notify(action_id, status, result, CARD)
-        return True
-
-    @staticmethod
-    def _terminate_encoder(process):
-        if process is None:
-            return
-        try:
-            if process.stdin and not process.stdin.closed:
-                process.stdin.close()
-        except Exception:
-            pass
-        try:
-            if process.poll() is None:
-                process.terminate()
-                process.wait(timeout=2)
-        except Exception:
-            try:
-                if process.poll() is None:
-                    process.kill()
-                    process.wait(timeout=2)
-            except Exception:
-                pass
-
-    @staticmethod
-    def _write_video_frame(process, data, cancel_event):
-        # A stalled encoder must not block stop/shutdown indefinitely.
-        fd = process.stdin.fileno()
-        pending = memoryview(data)
-        deadline = time.monotonic() + 5.0
-        while pending:
-            if cancel_event.is_set():
-                return False
-            if process.poll() is not None:
-                raise RuntimeError("ffmpeg exited while encoding")
-            if time.monotonic() >= deadline:
-                raise RuntimeError("ffmpeg input timed out")
-            if not select.select([], [fd], [], 0.1)[1]:
-                continue
-            try:
-                written = os.write(fd, pending)
-                pending = pending[written:]
-            except BlockingIOError:
-                continue
-        return True
-
-    def _record_video(self, requested, cancel_event, active=None):
-        process = None
-        path = None
-        completed = False
-        try:
-            _, sequence = self._frame()
-            if cancel_event.is_set():
-                return self._cancelled_result()
-            directory = self._output_dir / "videos"
-            directory.mkdir(parents=True, exist_ok=True)
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            candidate = directory / f"video_{stamp}.mp4"
-            # Reserve this exact name; cleanup may only remove our own file.
-            with candidate.open("xb"):
-                pass
-            path = candidate
-            self._set_recording_value(active, "path", str(path))
-            # A file avoids the stderr pipe filling up and deadlocking ffmpeg.
-            with tempfile.TemporaryFile() as error_log:
-                process = subprocess.Popen([
-                    "ffmpeg", "-y", "-loglevel", "error", "-f", "mjpeg",
-                    "-r", str(self._fps), "-i", "-", "-an", "-c:v", "libx264",
-                    "-pix_fmt", "yuv420p", str(path),
-                ], stdin=subprocess.PIPE, stderr=error_log, bufsize=0)
-                self._set_recording_value(active, "process", process)
-                os.set_blocking(process.stdin.fileno(), False)
-                frames, deadline = 0, time.monotonic() + requested
-                while time.monotonic() < deadline and not cancel_event.is_set():
-                    tick = time.monotonic()
-                    frame, sequence = self._frame(
-                        after_sequence=sequence,
-                        timeout_s=max(0.25, 2.0 / self._fps),
-                    )
-                    if not self._write_video_frame(process, frame["data"], cancel_event):
-                        break
-                    frames += 1
-                    cancel_event.wait(min(
-                        max(0.0, 1.0 / self._fps - (time.monotonic() - tick)),
-                        max(0.0, deadline - time.monotonic())))
-                if cancel_event.is_set():
-                    return self._cancelled_result()
-                process.stdin.close()
-                if process.wait(timeout=10) != 0 or not frames or not path.stat().st_size:
-                    error_log.seek(0)
-                    message = error_log.read(4096).decode("utf-8", "replace")
-                    raise RuntimeError(message.strip() or "ffmpeg failed to create MP4")
-                if cancel_event.is_set():
-                    return self._cancelled_result()
-                completed = True
-                return {"ok": True, "media_type": "video", "file_path": str(path),
-                        "recorded_duration_s": requested, "frames": frames,
-                        "captured_at": datetime.now().isoformat(timespec="seconds")}
-        except Exception as exc:
-            if cancel_event.is_set():
-                return self._cancelled_result()
-            return {"ok": False, "code": "RECORD_FAILED", "message": str(exc)}
-        finally:
-            self._terminate_encoder(process)
-            self._set_recording_value(active, "process", None)
-            if not completed and path is not None:
+            if self._active_recording is not active:
+                return
+            # A stop can race the worker after encoding but before terminal
+            # notification. Whichever takes this lock first decides the result.
+            if result.get("ok") and active["cancel_event"].is_set():
                 try:
-                    path.unlink(missing_ok=True)
+                    Path(result["file_path"]).unlink(missing_ok=True)
+                    result, status = self._cancelled_result(), "cancelled"
                 except OSError as exc:
-                    print(f"[vision_capture] could not remove partial video {path}: {exc}", flush=True)
+                    result = {"ok": False, "code": "CLEANUP_FAILED", "message": str(exc)}
+                    status = "error"
+            self._last_recording = {**result, "status": status, "action_id": active["action_id"]}
+            self._active_recording = None
+        _acp_notify(active["action_id"], status, result, CARD)
 
-    def _record_video_async(self, active, requested):
-        result = self._record_video(requested, active["cancel_event"], active)
-        if result.get("ok"):
-            status = "completed"
-        elif result.get("code") == "RECORD_CANCELLED":
-            status = "cancelled"
+    def _record_video_async(self, active):
+        def on_encoding():
+            with self._recording_lock:
+                if not active["cancel_event"].is_set():
+                    active["state"] = "encoding"
+
+        try:
+            from bumi_av_recording import record
+
+            result = record(
+                executor=self._executor, video_topic=self._video_topic,
+                audio_topic=self._audio_topic if active["include_audio"] else None,
+                directory=self._output_dir / "videos", duration_s=active["duration_s"],
+                fps=self._fps, cancel=active["cancel_event"], on_encoding=on_encoding,
+            )
+        except Exception as exc:
+            code = getattr(exc, "code", "AV_RECORD_FAILED")
+            status = "cancelled" if code == "RECORD_CANCELLED" else "error"
+            result = {"ok": False, "code": code, "message": str(exc)}
         else:
-            status = "error"
+            status = "completed"
         self._finish_recording(active, status, result)
 
     def _start_video_recording(self, args):
-        try:
-            requested = args.get("duration_s", 5)
-            if isinstance(requested, bool) or not isinstance(requested, int):
-                raise ValueError("duration_s must be an integer")
-        except (TypeError, ValueError):
+        requested = args.get("duration_s", min(5, self._max_duration_s))
+        if type(requested) is not int:
             return {"ok": False, "code": "INVALID_DURATION", "message": "duration_s must be an integer"}
         if not 1 <= requested <= self._max_duration_s:
             return {"ok": False, "code": "INVALID_DURATION", "message": f"duration_s must be between 1 and {self._max_duration_s}"}
+        include_audio = args.get("include_audio", True)
+        if type(include_audio) is not bool:
+            return {"ok": False, "code": "INVALID_AUDIO_OPTION", "message": "include_audio must be a boolean"}
         if not self._camera_ready():
             return {"ok": False, "code": "RECORD_FAILED", "message": "Bumi camera worker is unavailable"}
+        if self._executor is None:
+            return {"ok": False, "code": "RECORD_UNAVAILABLE", "message": "Recording requires the bundle ROS executor"}
+        if include_audio and not self._mic_enabled:
+            return {"ok": False, "code": "AUDIO_UNAVAILABLE", "message": "Enable the Bumi mic card to record audio"}
+        if not shutil.which("ffmpeg"):
+            return {"ok": False, "code": "ENCODER_UNAVAILABLE", "message": "ffmpeg is not installed"}
         with self._recording_lock:
             if self._active_recording:
                 return {"ok": False, "code": "RECORD_IN_PROGRESS", "message": "A video recording is already in progress",
@@ -3348,27 +3305,37 @@ class VisionCapturePlugin:
             action_id = f"vision_capture_record_video_{time.time_ns()}"
             cancel_event = threading.Event()
             active = {"action_id": action_id, "state": "recording", "duration_s": requested,
+                      "include_audio": include_audio,
                       "started_at": datetime.now().isoformat(timespec="seconds"),
-                      "cancel_event": cancel_event, "process": None, "path": None,
-                      "finished": False}
+                      "cancel_event": cancel_event}
             thread = threading.Thread(target=self._record_video_async,
-                                      args=(active, requested), daemon=True,
+                                      args=(active,), daemon=True,
                                       name="bumi_vision_capture_record_video")
             active["thread"] = thread
             self._active_recording = active
-            thread.start()
+            try:
+                thread.start()
+            except Exception as exc:
+                self._active_recording = None
+                return {"ok": False, "code": "RECORD_START_FAILED", "message": str(exc)}
         return {"ok": True, "state": "queued", "action_id": action_id, "media_type": "video",
+                "include_audio": include_audio,
                 "requested_duration_s": requested, "message": "Video recording started; completion will be reported asynchronously."}
 
-    def _stop_recording(self):
+    def _stop_recording(self, *, wait=True):
         with self._recording_lock:
             active = self._active_recording
             if not active:
-                return {"state": "idle", "message": "No video recording is in progress"}
+                return {"state": "idle", "cancellation_pending": False,
+                        "message": "No video recording is in progress"}
             active["state"] = "stopping"
             active["cancel_event"].set()
-            process = active.get("process")
-        self._terminate_encoder(process)
+        if not wait:
+            # Canvas stop is an immediate lifecycle marker. The worker still
+            # owns the slot until cleanup and the actual ACP terminal result.
+            return {"ok": True, "state": "idle", "recording_state": "stopping",
+                    "cancellation_pending": True, "action_id": active["action_id"],
+                    "message": "Cancellation requested; cleanup completion is reported by ACP/info"}
         # Keep the slot until the worker has removed its partial output. A new
         # recording must not race cleanup of a cancelled recording.
         active["thread"].join(timeout=6)
@@ -3379,8 +3346,7 @@ class VisionCapturePlugin:
 
     def dispatch(self, action, args):
         if action == "start":
-            return {"state": "ready" if self._camera_ready() else "error",
-                    "message": "" if self._camera_ready() else "Bumi camera worker is unavailable"}
+            return self.start()
         if action == "info":
             return self._info()
         if action == "capture_photo":
@@ -3388,5 +3354,5 @@ class VisionCapturePlugin:
         if action == "record_video":
             return self._start_video_recording(args)
         if action == "stop":
-            return self._stop_recording()
+            return self._stop_recording(wait=False)
         return None

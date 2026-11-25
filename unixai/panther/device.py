@@ -12,9 +12,11 @@ import json
 import math
 import os
 import ssl
+import struct
 import threading
 import time
 import urllib.request
+from array import array
 from pathlib import Path
 from uuid import uuid4
 
@@ -23,6 +25,8 @@ from contracts import (
     ARM_MIRROR_SIGNS,
     HEAD_JOINTS,
     LEFT_ARM_JOINTS,
+    ODOM_MAX_MEASUREMENT_DELAY_MS,
+    ODOM_RATE_HZ,
     RIGHT_ARM_JOINTS,
     age_ms,
     byte_value,
@@ -32,17 +36,18 @@ from contracts import (
     head_target_from_degrees,
     intersect_joint_limits,
     json_float,
+    odom_interface,
     parse_joint_indices,
     parse_joint_limits,
     populate_switch_request,
     validate_drive,
     validate_joint_target,
 )
-from common.odom import build_interface, build_sample, mean_twist, resolve_stamp_ms
-from core_bridge import BridgeWorker, output_topics
+from common.odom import build_sample, mean_twist, resolve_stamp_ms
+from core_bridge import BridgeWorker, XYZ_POINT_STEP, output_topics
 from joint_display import dedicated_row, display_gripper_row, joint_row, render_model
-from laser_cloud import current_points, point_packet
 from panther_media import VisionCapture
+from spatial_inputs import odom_pose, stamp_ns
 
 
 MODEL_PATH = Path(__file__).with_name("resource") / "panther.urdf"
@@ -103,6 +108,19 @@ def _message_dict(value):
     return str(value)
 
 
+def project_laser_scan(msg) -> bytes:
+    """Pack valid lidar returns as XYZ float32 in the scan frame."""
+    if not all(math.isfinite(v) for v in (msg.angle_min, msg.angle_increment)):
+        raise ValueError("LaserScan angles must be finite")
+    points = bytearray()
+    for i, distance in enumerate(msg.ranges):
+        if not math.isfinite(distance) or not msg.range_min <= distance <= msg.range_max:
+            continue
+        angle = msg.angle_min + i * msg.angle_increment
+        points.extend(struct.pack("<fff", distance * math.cos(angle), distance * math.sin(angle), 0.0))
+    return bytes(points)
+
+
 class PantherDevice:
     def __init__(self, config: dict, namespace: str, executor):
         import rclpy
@@ -112,7 +130,7 @@ class PantherDevice:
         from rclpy.action import ActionClient
         from rclpy.node import Node
         from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
-        from sensor_msgs.msg import BatteryState, Imu, JointState, LaserScan
+        from sensor_msgs.msg import BatteryState, Imu, JointState, LaserScan, PointCloud2, PointField
         from std_msgs.msg import Float64MultiArray, String
         from control_msgs.action import FollowJointTrajectory
         from controller_manager_msgs.srv import ListControllers, SwitchController
@@ -123,19 +141,19 @@ class PantherDevice:
         self._cfg = config
         self.namespace = namespace
         self._lock = threading.RLock()
+        self._base_gate = threading.RLock()
+        self._base_servo = None
+        self._controlled_spatial = None
         self._cache: dict[str, tuple[object, float]] = {}
         self._last_card_publish: dict[str, float] = {}
         self._callback_errors: dict[str, dict] = {}
         self._laser_lock = threading.Lock()
         laser = config.get("plugins", {}).get("laser_scan", {})
+        # Prefer the merged scan; fall back to the front lidar on units where
+        # the merger publishes nothing.
         self._laser_topics = tuple(laser.get("topics", ("/scan", "/lidar_front/scan")))
-        self._laser_max_points = int(laser.get("max_points", 20000))
-        self._laser_max_range_m = float(laser.get("max_range_m", 12.0))
-        if not (1 <= self._laser_max_points <= 40000 and 0 < self._laser_max_range_m <= 100):
-            raise ValueError("invalid laser_scan cloud limits")
         self._laser_source = None
         self._laser_seen = {}
-        self._laser_cloud_info = {}
         self._model_urdf = MODEL_PATH.read_text(encoding="utf-8")
         self._model_joint_limits = parse_joint_limits(self._model_urdf)
         self._urdf = ""
@@ -149,6 +167,9 @@ class PantherDevice:
         self._odom_window: list[list] = []
         self._odom_vendor_ms = None
         self._odom_vendor_meta: dict = {}
+        self._odom_segment = uuid4().hex
+        self._odom_last_stamp = 0
+        self._odom_frames = None
         self._drive_lock = threading.Lock()
         self._drive_generation = 0
         self._drive_action_id = None
@@ -204,7 +225,7 @@ class PantherDevice:
             sensor_qos,
         )
         self._node.create_subscription(Odometry, "/odom", guarded("odom", self._on_odom), sensor_qos)
-        self._node.create_timer(0.1, guarded("odom", self._publish_odom_window))
+        self._node.create_timer(1.0 / ODOM_RATE_HZ, guarded("odom", self._publish_odom_window))
         self._node.create_subscription(
             DiagnosticArray, "/diagnostics", guarded("robot_state", self._on_diagnostics), sensor_qos
         )
@@ -231,13 +252,17 @@ class PantherDevice:
         self._node.create_subscription(
             String, "/robot_description", guarded("model", self._on_robot_description), latched_qos
         )
-        if laser.get("enabled", False):
-            for topic in self._laser_topics:
-                self._node.create_subscription(
-                    LaserScan, topic,
-                    guarded("laser_scan", lambda msg, topic=topic: self._on_laser(msg, topic)),
-                    sensor_qos,
-                )
+        self._laser_cloud_type = PointCloud2
+        self._laser_cloud_fields = [
+            PointField(name=axis, offset=index * 4, datatype=PointField.FLOAT32, count=1)
+            for index, axis in enumerate(("x", "y", "z"))
+        ]
+        self._laser_cloud_pub = self._node.create_publisher(
+            PointCloud2, f"/{namespace}/panther/laser_scan/points", sensor_qos
+        )
+        self._node.create_subscription(
+            LaserScan, "/scan", guarded("laser_scan", self._on_laser), sensor_qos,
+        )
 
         self._twist_type = Twist
         self._drive_qos = reliable_qos
@@ -279,6 +304,13 @@ class PantherDevice:
         )
         self._vision = VisionCapture(self._camera, config.get("plugins", {}).get("vision_capture", {}),
                                      _notify_completion)
+        plugins = config.get("plugins", {})
+        self._stereo_camera = None
+        if any(plugins.get(card, {}).get("enabled") for card in ("camera_left", "camera_right")):
+            from stereo_camera import StereoCameraRuntime
+            self._stereo_camera = StereoCameraRuntime(
+                self._node, self._bridge, plugins.get("stereo_camera", {}), sensor_qos
+            )
 
     @property
     def topics(self):
@@ -297,6 +329,8 @@ class PantherDevice:
     def close(self) -> None:
         if self._closed:
             return
+        if self._base_servo is not None:
+            self._base_servo.stop()
         base_cfg = self._cfg.get("plugins", {}).get("base_drive", {})
         stop_wait = (float(base_cfg.get("stop_match_timeout_s", 3.0))
                      + float(base_cfg.get("stop_publish_duration_s", 1.0)))
@@ -305,6 +339,8 @@ class PantherDevice:
         self._stop_arm("driver_shutdown", wait_s=20.0)
         self._stop_head("driver_shutdown", wait_s=5.0)
         self._vision.close()
+        if self._stereo_camera is not None:
+            self._stereo_camera.close()
         self._camera.close()
         self._bridge.stop()
         pending_stop = self._wait_for_pending_drive_stop(0.0)
@@ -367,8 +403,7 @@ class PantherDevice:
 
     def _store_and_publish(self, card: str, msg, builder) -> None:
         received = self._put(card, msg)
-        rates = {"imu": 10.0, "laser_scan": 5.0}
-        self._publish_limited(card, builder(msg, received), rates.get(card, 10.0))
+        self._publish_limited(card, builder(msg, received), 10.0)
 
     def _publish_limited(self, card: str, payload: dict, rate_hz: float, force: bool = False) -> bool:
         now = time.monotonic()
@@ -441,40 +476,64 @@ class PantherDevice:
             self._publish_limited("joints", self._joints_payload(msg, received), 10.0)
 
     def _on_odom(self, msg) -> None:
+        received_ms = time.time_ns() // 1_000_000
         self._put("odom", msg)
         twist = msg.twist.twist
         header = msg.header.stamp
         vendor_ms = int(header.sec) * 1000 + int(header.nanosec) // 1_000_000
         with self._lock:
+            source_stamp = stamp_ns(msg)
+            frames = (msg.header.frame_id, msg.child_frame_id)
+            if source_stamp < self._odom_last_stamp or frames != self._odom_frames:
+                self._odom_segment = uuid4().hex
+            self._odom_last_stamp = source_stamp
+            self._odom_frames = frames
+            pose, quality = odom_pose(msg, self._odom_segment)
             self._odom_window.append([
                 json_float(twist.linear.x), json_float(twist.linear.y), None,
                 None, None, json_float(twist.angular.z),
             ])
             self._odom_vendor_ms = vendor_ms
             self._odom_vendor_meta = {
+                "received_ms": received_ms,
                 "frame_id": msg.header.frame_id,
                 "child_frame_id": msg.child_frame_id,
+                "pose": pose, "motus_slam": quality,
             }
 
-    def _on_laser(self, msg, topic) -> None:
+    def _on_laser_topic(self, msg, topic) -> None:
+        """Use the first fresh topic in preference order, then publish its scan."""
         with self._laser_lock:
             now = time.monotonic()
             self._laser_seen[topic] = now
-            preferred = next(t for t in self._laser_topics if now - self._laser_seen.get(t, -math.inf) < 1.0)
+            preferred = next(t for t in self._laser_topics
+                             if now - self._laser_seen.get(t, -math.inf) < 1.0)
             if topic != preferred:
                 return
-            changed_source = topic != self._laser_source
             self._laser_source = topic
-            received = self._put("laser_scan", msg)
-            self._publish_limited("laser_scan", self._laser_payload(msg, received, topic), 5.0,
-                                  force=changed_source)
-            if not changed_source and now - self._last_card_publish.get("laser_cloud", -math.inf) < 1 / 15:
+        self._on_laser(msg)
+
+    def _on_laser(self, msg) -> None:
+        self._put("laser_scan", msg)
+        now = time.monotonic()
+        with self._lock:
+            if now - self._last_card_publish.get("laser_scan", -math.inf) < 0.2:
                 return
-            points = current_points(msg, self._laser_max_range_m, self._laser_max_points)
-            self._laser_cloud_info = {
-                "cloud_frame": msg.header.frame_id, "cloud_points": len(points),
-            }
-            self._publish_limited("laser_cloud", point_packet(points), 15.0, force=True)
+            self._last_card_publish["laser_scan"] = now
+
+        points = project_laser_scan(msg)
+        cloud = self._laser_cloud_type()
+        cloud.header = msg.header
+        cloud.height = 1
+        cloud.width = len(points) // XYZ_POINT_STEP
+        cloud.fields = self._laser_cloud_fields
+        cloud.is_bigendian = False
+        cloud.point_step = XYZ_POINT_STEP
+        cloud.row_step = len(points)
+        cloud.data = array("B", points)
+        cloud.is_dense = True
+        self._laser_cloud_pub.publish(cloud)
+        self._bridge.publish("laser_scan", points)
 
     def _publish_odom_window(self) -> None:
         with self._lock:
@@ -484,12 +543,16 @@ class PantherDevice:
             vendor = dict(self._odom_vendor_meta)
         if not readings:
             return
-        received_ms = int(time.time() * 1000)
+        received_ms = vendor.pop("received_ms")
         stamp, stamp_meta = resolve_stamp_ms(vendor_ms=vendor_ms, received_ms=received_ms)
+        now_ms = time.time_ns() // 1_000_000
+        if now_ms - min(stamp, received_ms) > ODOM_MAX_MEASUREMENT_DELAY_MS:
+            return
         sample = build_sample(
             stamp_ms=stamp,
             twist=mean_twist(readings),
             frame="body",
+            pose=vendor.pop("pose", None),
             vendor={**vendor, **stamp_meta, "source_topic": "/odom"},
         )
         self._put("odom_sample", sample)
@@ -698,20 +761,18 @@ class PantherDevice:
                 "fresh": fresh(received),
                 "age_ms": age_ms(received),
                 "data": sample,
-                "odom_interface": build_interface(
-                    provides=["vx", "vy", "wz"], frame="body", rate_hz=10.0,
-                    pose_drift="none",
-                ),
+                "odom_interface": odom_interface(self._topics["odom"]["topic"]),
+                "slam_pose": {"available": True, "profile": "motus_slam/1",
+                              "clock_mapping_verified": False},
                 **self._callback_health("odom"),
             }
         if card == "laser_scan":
-            with self._laser_lock:
-                msg, received = self._get(card)
-                data = self._laser_payload(msg, received, self._laser_source) if msg is not None else {
-                    "available": False, "fresh": False,
-                }
-                return {"available": msg is not None, **data, **self._laser_cloud_info,
+            msg, received = self._get(card)
+            if msg is None:
+                return {"available": False, "fresh": False, "source": card,
                         **self._callback_health(card)}
+            return {"available": True, **self._laser_payload(msg, received, self._laser_source or "/scan"),
+                    **self._callback_health(card)}
         msg, received = self._get(card)
         if msg is None:
             return {"available": False, "fresh": False, "source": card,
@@ -997,7 +1058,70 @@ class PantherDevice:
                 _notify_completion(action_id, status, completion, "base_drive")
             return
 
+    def base_check_available(self, owner):
+        """Called under _base_gate: a resource label alone is not a motor lock."""
+        if self._closed:
+            raise RuntimeError("Panther device is closing")
+        if owner != "base_servo" and self._base_servo is not None and self._base_servo._reserved:
+            raise RuntimeError("base_servo owns the chassis; confirm its stop first")
+        if owner != "controlled_spatial" and self._controlled_spatial is not None and self._controlled_spatial.nav:
+            raise RuntimeError("Nav2 owns the chassis; stop navigation and await its terminal result")
+        if self._drive_stop_request is not None or (owner != "base_drive" and self._drive_action_id is not None):
+            raise RuntimeError("base_drive motion or its zero-output stop is still active")
+
+    def servo_prepare(self, dry_run=False):
+        if not dry_run:
+            self._ensure_motion_ready()
+            self._require_controller("movebase3_drive_controller")
+            from rcl_interfaces.srv import GetParameters
+            client = self._node.create_client(GetParameters, "/movebase3_drive_controller/get_parameters")
+            try:
+                if not client.wait_for_service(timeout_sec=2):
+                    raise RuntimeError("cannot verify the base controller command timeout")
+                request = GetParameters.Request()
+                request.names = ["cmd_vel_timeout"]
+                result = self._wait_future(client.call_async(request), 3.)
+                value = result.values[0]
+                timeout = value.double_value if value.type == 3 else value.integer_value if value.type == 2 else None
+                if timeout is None or not math.isfinite(timeout) or not 0 < timeout <= .5:
+                    raise RuntimeError("base_servo requires controller cmd_vel_timeout in (0, 0.5] seconds")
+            finally:
+                self._node.destroy_client(client)
+            self._select_drive_topic()
+
+    def servo_publish(self, values):
+        """All stream output stays on the robot domain and uses the existing route."""
+        moving = any(values)
+        if moving:
+            self._ensure_motion_ready()
+            states, received = self._get("controllers")
+            if not fresh(received, 3.) or not states or states.get("movebase3_drive_controller") != "active":
+                raise RuntimeError("base controller state is stale or inactive")
+        with self._drive_lock:
+            matched = self._drive_publisher_matched(self._drive_pub)
+            if moving and (not matched or self._closed):
+                raise RuntimeError("base command subscriber disappeared or device is closing")
+            if self._drive_pub is not None:
+                msg = self._twist_type()
+                msg.linear.x, msg.linear.y, msg.angular.z = values[0], values[1], values[5]
+                self._drive_pub.publish(msg)
+            return matched
+
     def drive(self, args: dict) -> dict:
+        if args.get("action", "move") == "move":
+            self._ensure_motion_ready()
+        with self._base_gate:
+            action = args.get("action", "move")
+            if action in ("move", "stop", "cancel"):
+                if self._base_servo is not None:
+                    self._base_servo.pause_for_explicit_command()
+                if action in ("stop", "cancel") and self._controlled_spatial is not None and self._controlled_spatial.nav:
+                    return self._controlled_spatial.stop_nav()
+                if action == "move":
+                    self.base_check_available("base_drive")
+            return self._drive_impl(args)
+
+    def _drive_impl(self, args: dict) -> dict:
         action = args.get("action", "move")
         if action in ("cancel", "stop"):
             return self.cancel_drive("cancelled_by_request", force=True)
@@ -1578,6 +1702,20 @@ class PantherDevice:
             thread.join(timeout=wait_s)
         return {"state": "idle" if not thread or not thread.is_alive() else "stopping",
                 "stopped": True, "reason": reason, "action_id": action_id}
+
+    def camera_info(self, kind):
+        card = "camera_color" if kind == "rgb" else "camera_depth"
+        return self._camera.declaration(kind, self.topics[card])
+
+    def camera_imu(self, action):
+        if action == "start":
+            try:
+                return self._camera.arm_imu()
+            except Exception as exc:
+                return {"state": "unavailable", "reason": str(exc)[:200]}
+        if action == "stop":
+            return self._camera.stop("imu")
+        return self._camera.info("imu")
 
     def camera(self, kind: str, args: dict) -> dict:
         action = args.get("action", "info")
