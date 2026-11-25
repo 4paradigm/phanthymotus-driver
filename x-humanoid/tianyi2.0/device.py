@@ -5398,11 +5398,7 @@ class TtsPlugin:
             force = args.get("force", False)
             if not text:
                 return {"error": "text is required"}
-            # 驱动内部调用（例如 weigh 卡的语音提示）经 bundle 传入 _on_done(status)：
-            # 播完时只回调它，不向 Agent Core 发 ACP（那里没有登记这条 action_id，
-            # 调用方自己的 ACP 覆盖整个动作）。MCP 传不了可调用对象，外部调用不受影响。
-            on_done = args.get("_on_done")
-            return self._speak(text, force, on_done if callable(on_done) else None)
+            return self._speak(text, force)
         elif action == "interrupt":
             # 打断 = 停当前 + 丢弃队列里还没播的。这是唯一会停 lyre 的入口；
             # 普通 speak 一律排队，不再互相覆盖。
@@ -5487,7 +5483,7 @@ class TtsPlugin:
                 print(f"[TtsPlugin] job {job['action_id']} 异常: {e}", flush=True)
             finally:
                 self._current_job = None
-                self._finish_job(job, status)
+                self._acp_callback(job, status)
 
     def _flush_queue(self, reason: str) -> list:
         """清空待播队列，每条回一次 cancelled 回执。返回被清掉的 job。
@@ -5509,7 +5505,7 @@ class TtsPlugin:
             # 回执是一次阻塞 HTTP（5s 超时）。interrupt 挂在 on_interrupt_speak 上，
             # 要尽快返回，所以别在调用线程里串行发 N 次。
             threading.Thread(
-                target=lambda: [self._finish_job(j, "cancelled") for j in drained],
+                target=lambda: [self._acp_callback(j, "cancelled") for j in drained],
                 daemon=True, name="tianyi2-tts-flush-acp").start()
         return drained
 
@@ -5535,7 +5531,7 @@ class TtsPlugin:
         else:
             print(f"[TtsPlugin] stop lyre（{why}）", flush=True)
 
-    def _speak(self, text: str, force: bool, on_done=None) -> dict:
+    def _speak(self, text: str, force: bool) -> dict:
         if not self._play_client:
             return {"error": "service client not initialized"}
         import queue as _queue
@@ -5546,7 +5542,7 @@ class TtsPlugin:
             # 分段：超过 280 字按标点切分，避免超长文本 PlayEvent 丢失
             segments = self._split_text(text, max_chars=280)
             job = {"action_id": action_id, "segments": segments, "force": force,
-                   "text": text, "cancel": threading.Event(), "on_done": on_done}
+                   "text": text, "cancel": threading.Event()}
 
             # force 的既有语义就是"打断当前播放"，保留；不带 force 的一律排队。
             if force:
@@ -5821,18 +5817,6 @@ class TtsPlugin:
             self._pending_play_progress_at.pop(seg_sid, None)
             self._pending_play_position.pop(seg_sid, None)
             self._play_event_buffer.pop(seg_sid, None)
-
-    def _finish_job(self, job: dict, overall_status: str) -> None:
-        """每个 job 恰好一次的回执：内部调用回调 on_done，其余回 ACP。"""
-        on_done = job.get("on_done")
-        if on_done is None:
-            self._acp_callback(job, overall_status)
-            return
-        try:
-            on_done(overall_status)
-        except Exception as e:
-            print(f"[TtsPlugin] on_done callback failed for {job['action_id']}: {e}", flush=True)
-        print(f"[TtsPlugin] internal {overall_status}: {job['action_id']} (no ACP)", flush=True)
 
     def _acp_callback(self, job: dict, overall_status: str) -> None:
         """回一次 /api/acp/complete。每个 job 恰好一次。"""

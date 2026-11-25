@@ -154,8 +154,9 @@ plugins:
   robot_faults:
     enabled: true
   weigh:
-    # 手掌托举称重（实验性）。卡片只有 weigh / reset：weigh 自动抬臂、去皮、语音提示放物品、测量并播报；
-    # reset 张开手指、放下手臂。经 arm、hand、tts 卡执行（需这几张卡启用）。
+    # 手掌托举称重（实验性）。卡片只有 weigh / reset：weigh 自动抬臂、去皮、等人放物品、测量；
+    # reset 张开手指、放下手臂。经 arm、hand 卡执行（需这两张卡启用）。卡片自己不出声：
+    # 要让用户知道的话（to_user）发到 weigh_state，由 decision_core 决定怎么转告。
     # 默认开启：不调用时只订阅、不动；只有显式调用 weigh / reset 才会移动手臂和手指。
     enabled: true
     sides: [left, right]    # 卡片上可选的手（默认 right；两只手都启用时还可选 both）
@@ -164,20 +165,19 @@ plugins:
     current_ratio_max: 0.6  # 所称那只手臂任一关节电流超过额定 60% → valid=false（掌心约 2 kg，未实测）
     joint_dev_deg: 1.5      # 关节相对去皮时偏差超过 1.5° → valid=false
     default_hand: cup       # 托举手型：四指立起 65 围住掌心
-    place_window_s: 5       # 提示「请放物品。5秒内放到右手掌心」播完后等待放物品的时间
-    place_window_both_s: 8  # side=both 时两只手都要放，等待时间
+    place_window_s: 30      # 发出"可以放了"之后等人放物品的时间（转告可能晚几秒，给宽一些）
+    place_window_both_s: 30 # side=both 时两只手都要放，等待时间
     detect_kg: 0.05         # 掌上读数超过此值算放上了物品
-    announce: true          # 语音提示和播报结果（经 tts 卡）
+    reset_confirm_window_s: 60  # reset 请用户确认掌心是空的之后，这么多秒内再 reset 一次才动
     # 轻物体偏高的修正：[[原始读数 kg, 修正系数], ...]，mass = raw / (scale × f)，表内线性插值，
     # 最后一个点之后 f=1。2026-11-25 电子秤实测（102–813 g），400 g 以上直接用比例系数。
     low_load_correction:
       right: [[0.1213, 1.115], [0.2296, 1.0845], [0.5397, 1.0]]
       left: [[0.1308, 1.1695], [0.2291, 1.0758], [0.3381, 1.0242], [0.4310, 1.0]]
   weigh_state:
-    # 发布 weigh 卡最近一次结果到 /{ns}/state/weigh（data/json）。weigh 的 ACP 完成通知被
-    # agent-core 裁掉了重量，skill 要用数值就读这里。
+    # weigh 卡每有一句要让用户知道的话（to_user），就往 /{ns}/state/weigh（data/json）发一条，
+    # 带上最近一次结果；平时不发。连到 decision_core 时每条都会唤醒它一次。
     enabled: true
-    rate_hz: 2
   laser_scan:
     enabled: true
   chassis_raw:

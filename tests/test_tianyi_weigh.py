@@ -56,12 +56,10 @@ class Rig:
         self.arm_reply = None
         self.hand_calls = []
         self.hand_reply = None
-        self.order = []              # ("arm"|"hand"|"tts", action 或播报文本) 调用顺序
-        self.tts_texts = []          # 假 tts 卡：收到的播报文本
-        self.tts_delay = 2.0         # 每句话播多久（假时钟）
-        self.tts_status = "completed"
-        self.tts_reply = None
-        self.on_say = None           # 收到一句播报时调用（用来在提示之后安排放物品）
+        self.order = []              # ("arm"|"hand"|"tell", action 或给用户的话) 调用顺序
+        self.messages = []           # 给用户的话（完整消息）
+        self.told = []               # 给用户的话（只有文字）
+        self.on_tell = None          # 收到一句给用户的话时调用（用来在"可以放了"之后安排放物品）
         self.current_ratio = 0.1
         self.error = 0
         self.force_on = True
@@ -73,21 +71,15 @@ class Rig:
         self.logs = []
         self.engine = weigh.WeighEngine(cfg, clock=lambda: self.t, wall=lambda: self.wall,
                                         sleep=self.advance, log=self.logs.append,
-                                        arm_call=self.fake_arm, hand_call=self.fake_hand,
-                                        tts_call=self.fake_tts)
+                                        arm_call=self.fake_arm, hand_call=self.fake_hand)
+        self.engine.add_listener(self.on_message)
 
-    def fake_tts(self, args):
-        text = args["text"]
-        self.tts_texts.append(text)
-        self.order.append(("tts", text))
-        if self.on_say:
-            self.on_say(text)
-        if self.tts_reply is not None:
-            return self.tts_reply
-        cb = args.get("_on_done")
-        if cb is not None:
-            self.events.append((self.t + self.tts_delay, lambda: cb(self.tts_status)))
-        return {"state": "speaking", "action_id": f"tts-{len(self.tts_texts)}"}
+    def on_message(self, msg):
+        self.messages.append(msg)
+        self.told.append(msg["text"])
+        self.order.append(("tell", msg["text"]))
+        if self.on_tell:
+            self.on_tell(msg)
 
     def fake_hand(self, args):
         self.hand_calls.append(dict(args))
@@ -446,8 +438,10 @@ def test_tool_schema(tmp_path):
     assert 60 < schema["x-completion"]["timeout"] <= 300
     # 完成通知只解锁资源、不唤醒大模型（否则 Agent Core 的主代理每称一次就醒一次）
     assert schema["x-completion"]["silent_completion"] is True
-    assert schema["x-resource"] == ["arm_l", "arm_r", "hand_l", "hand_r", "mouth"]
-    assert "weigh_state" in tool["description"]
+    # 卡片不出声，不占用"嘴"
+    assert schema["x-resource"] == ["arm_l", "arm_r", "hand_l", "hand_r"]
+    assert "weigh_state" in tool["description"] and "to_user" in tool["description"]
+    assert "播报" not in tool["description"] and "语音提示" not in tool["description"]
     only_left = weigh.WeighPlugin({"state_file": str(tmp_path / "w.json"), "sides": ["left"]},
                                   "ns", _FakeRos2()).get_tool()["inputSchema"]
     assert only_left["properties"]["side"]["enum"] == ["left"]
@@ -462,11 +456,12 @@ def test_plugin_lifecycle_and_unknown_action(tmp_path):
 
 
 def test_plugin_never_publishes_commands():
-    """手臂、手指和语音都经对应的卡；本模块唯一的发布者是 weigh_state 的 JSON 状态。"""
+    """手臂和手指都经对应的卡，不调 tts 卡；本模块唯一的发布者是 weigh_state 的 JSON 状态。"""
     src = (BUNDLE / "weigh.py").read_text(encoding="utf-8")
     assert "cmd_pos" not in src and "CmdSetMotorPosition" not in src
     assert src.count("create_publisher") == 1
     assert "create_publisher(String, self._topic" in src
+    assert not re.search(r"\btts\b", src, re.I)
 
 
 def test_plugin_uses_its_own_executor():
@@ -488,7 +483,7 @@ def test_rated_currents_match_device():
 def test_bundle_registers_weigh_enabled_by_default():
     main = (BUNDLE / "main.py").read_text(encoding="utf-8")
     assert "from weigh import WeighPlugin" in main and "from weigh import WeighStatePlugin" in main
-    assert 'tts_call=lambda args: self._dispatch("tts", dict(args))' in main
+    assert "tts_call" not in main and 'self._dispatch("tts"' not in main
     cfg = (BUNDLE / "config.yaml").read_text(encoding="utf-8")
     for name in ("weigh", "weigh_state"):
         block = re.search(rf"^  {name}:\n((?:    .*\n|\s*\n)+)", cfg, re.M).group(1)
@@ -865,7 +860,7 @@ def test_side_defaults_to_right_and_rejects_others(rig, tmp_path):
     for bad in ("up", "Both"):
         r = p.dispatch("weigh", {"side": bad})
         assert r["state"] == "error" and r["code"] == "bad_side", r
-    assert rig.arm_calls == [] and rig.hand_calls == [] and rig.tts_texts == []
+    assert rig.arm_calls == [] and rig.hand_calls == [] and rig.told == []
     seen = []
     rig.engine.auto_weigh = lambda args: seen.append(("weigh", dict(args))) or {"state": "weighed"}
     rig.engine.reset = lambda args: seen.append(("reset", dict(args))) or {"state": "reset"}
@@ -941,7 +936,11 @@ def test_long_action_returns_action_id_then_completes(hanging, tmp_path, monkeyp
     try:
         res = p.dispatch("weigh", {"side": "right"})
         assert res["state"] == "weighing" and res["action_id"].startswith("weigh_weigh_"), res
-        assert "weigh_state" in res["message"]
+        # 说清楚现在在做什么、接下来会收到什么、这段时间不要做什么
+        msg = res["message"]
+        assert "正在抬起右臂、摆手势、去皮，约 20 秒" in msg and "最多等 30 秒" in msg, msg
+        assert "to_user" in msg and "weigh_state" in msg and "sides.right.last.mass_g" in msg
+        assert "不要再调用 weigh" in msg
     finally:
         gate.set()
     assert fired.wait(30)
@@ -1113,11 +1112,11 @@ def test_stop_cancels_pending_weigh_and_sends_nothing_more(hanging, tmp_path):
     res = p.dispatch("weigh", {"side": "right"})
     assert "action_id" in res
     assert entered.wait(10)
-    n_arm, n_hand, n_tts = len(hanging.arm_calls), len(hanging.hand_calls), len(hanging.tts_texts)
+    n_arm, n_hand, n_told = len(hanging.arm_calls), len(hanging.hand_calls), len(hanging.told)
     assert p.dispatch("stop", {}) == {"state": "idle"}
     assert not p._worker.is_alive()                  # stop 等到动作退出
     assert len(hanging.arm_calls) == n_arm and len(hanging.hand_calls) == n_hand
-    assert len(hanging.tts_texts) == n_tts           # 也不再播报
+    assert len(hanging.told) == n_told               # 也不再发给用户的话
     assert fired.wait(10)
     assert calls[0][1] == "cancelled" and calls[0][2]["code"] == "cancelled"
     assert hanging.engine._tare["right"] is None
@@ -1285,33 +1284,40 @@ def test_servo_resumed_during_a_stage_stops_waiting_without_commands(hanging):
 
 # ── 一键称重：卡片的 weigh / reset ─────────────────────────────────────────────
 
+PREPARING = "我在准备称重，等我说“可以放了”，再把东西放到右手掌心。在这之前先别碰我的手。"
+READY = "可以放了，请把东西放到右手掌心。放好后手拿开，几秒就能称好。"
+
+
 def place_after_prompt(rig, mass, delay=1.0, side="right"):
-    """「请放物品。…秒内放到…掌心」那句话播完之后 delay 秒（假时钟），把物品放到掌心。"""
+    """发出"可以放了"之后 delay 秒（假时钟），把物品放到掌心。"""
     attr = "mass" if side == "right" else "mass_left"
 
-    def on_say(text):
-        if "秒内" in text:
-            rig.events.append((rig.t + rig.tts_delay + delay, lambda: setattr(rig, attr, mass)))
-    rig.on_say = on_say
+    def on_tell(msg):
+        if msg["kind"] == "ready":
+            rig.events.append((rig.t + delay, lambda: setattr(rig, attr, mass)))
+    rig.on_tell = on_tell
 
 
-def _spoken(mass_g):
-    return f"称好了，物品大约{weigh.WeighEngine._speak_mass(mass_g)}"
+def _result(mass_g, both=False):
+    total = "两边一共" if both else ""
+    return f"称好了，{total}大约{weigh.WeighEngine._speak_mass(mass_g)}。东西可以拿走了。"
 
 
-def test_weigh_from_hanging_poses_prompts_measures_and_announces(hanging):
+def test_weigh_from_hanging_poses_prompts_measures_and_tells_the_result(hanging):
     place_after_prompt(hanging, 0.59)
     res = hanging.engine.auto_weigh({})
     assert res["state"] == "weighed" and res["valid"], res
     assert res["mass_kg"] == pytest.approx(0.59, abs=0.005)
-    assert res["stage"] == "measure" and res["seq"] == 1 and "announce_problems" not in res
-    texts = hanging.tts_texts
-    assert texts == ["开始称重。我先抬起右手、摆好手势，大约20秒。这段时间请不要碰我的手，听到请放物品再放",
-                     "请放物品。5秒内放到右手掌心",
-                     _spoken(res["mass_g"])]
-    # 抬臂、手型、去皮都在提示之前做完；称完手臂保持举起
-    prompt = hanging.order.index(("tts", texts[1]))
-    assert max(i for i, o in enumerate(hanging.order) if o[0] in ("arm", "hand")) < prompt
+    assert res["stage"] == "measure" and res["seq"] == 1
+    assert hanging.told == [PREPARING, READY, _result(res["mass_g"])]
+    assert res["to_user"] == hanging.told[-1]
+    assert [m["kind"] for m in hanging.messages] == ["preparing", "ready", "result"]
+    assert [m["id"] for m in hanging.messages] == [1, 2, 3]
+    assert all(m["seq"] == 1 and m["side"] == "right" for m in hanging.messages)
+    # "可以放了"在抬臂、手型、去皮都做完之后才发；称完手臂保持举起
+    ready = hanging.order.index(("tell", READY))
+    assert max(i for i, o in enumerate(hanging.order) if o[0] in ("arm", "hand")) < ready
+    assert hanging.order.index(("tell", PREPARING)) < hanging.order.index(("arm", "move_pos"))
     assert [m["right_positions"] for m in hanging.moves()] == [MID, list(POSE_DEG)]
     assert max(abs(a - b) for a, b in zip(hanging.pose, POSE_DEG)) < 0.01
     snap = hanging.engine.snapshot()
@@ -1320,6 +1326,17 @@ def test_weigh_from_hanging_poses_prompts_measures_and_announces(hanging):
     assert right["last"]["seq"] == 1 and right["last"]["valid"]
     assert right["last"]["mass_g"] == res["mass_g"] and right["last"]["measured_at_ms"] > 0
     assert snap["last_attempt"]["state"] == "weighed" and snap["last_attempt"]["seq"] == 1
+    assert snap["to_user"]["text"] == hanging.told[-1] and snap["to_user"]["kind"] == "result"
+
+
+def test_messages_never_announce_an_upcoming_motion(hanging):
+    """转告可能晚几秒到：不能说"我要抬手"这类马上要做的动作，也不报倒计时秒数。"""
+    place_after_prompt(hanging, 0.59)
+    hanging.engine.auto_weigh({"side": "both"})
+    hanging.engine.reset({"side": "both"})
+    texts = hanging.told + list(weigh._FAIL_TO_USER.values())
+    for t in texts:
+        assert not re.search(r"(我先|我要|马上|即将|抬起|秒内)", t), t
 
 
 def test_second_weigh_reuses_pose_and_tare(hanging):
@@ -1328,18 +1345,17 @@ def test_second_weigh_reuses_pose_and_tare(hanging):
     hanging.mass = 0.0                                  # 取走第一件
     hanging.warm(1)
     tare = hanging.engine._tare["right"]
-    n_arm, n_hand, n_tts = len(hanging.arm_calls), len(hanging.hand_calls), len(hanging.tts_texts)
+    n_arm, n_hand, n_told = len(hanging.arm_calls), len(hanging.hand_calls), len(hanging.told)
     place_after_prompt(hanging, 0.3)
     res = hanging.engine.auto_weigh({})
     assert res["valid"] and res["mass_kg"] == pytest.approx(0.3, abs=0.005) and res["seq"] == 2
     assert len(hanging.arm_calls) == n_arm and len(hanging.hand_calls) == n_hand
     assert hanging.engine._tare["right"] is tare        # 没有重新去皮
-    assert hanging.tts_texts[n_tts:] == ["请放物品。5秒内放到右手掌心", _spoken(res["mass_g"])]
+    assert hanging.told[n_told:] == [READY, _result(res["mass_g"])]
 
 
-def test_place_window_starts_after_the_prompt_finishes(hanging):
-    hanging.tts_delay = 3.0
-    place_after_prompt(hanging, 0.5, delay=4.0)       # 说话 3 s + 4 s：从调用 speak 算已超过 5 s
+def test_place_window_is_generous_because_relaying_takes_time(hanging):
+    place_after_prompt(hanging, 0.5, delay=25.0)       # 转告慢、人也慢：25 s 后才放
     res = hanging.engine.auto_weigh({})
     assert res["state"] == "weighed" and res["valid"], res
 
@@ -1347,7 +1363,8 @@ def test_place_window_starts_after_the_prompt_finishes(hanging):
 def test_no_object_ends_and_keeps_the_arm_up(hanging):
     res = hanging.engine.auto_weigh({})
     assert res["state"] == "error" and res["code"] == "no_object" and res["stage"] == "place", res
-    assert hanging.tts_texts[-1] == "没有检测到物品，本次称重结束"
+    assert hanging.told[-1] == "这次没等到东西，称重先结束了。想称的话再叫我。"
+    assert hanging.messages[-1]["kind"] == "failed" and res["to_user"] == hanging.told[-1]
     n = len(hanging.moves())
     assert n == 2 and max(abs(a - b) for a, b in zip(hanging.pose, POSE_DEG)) < 0.01
     snap = hanging.engine.snapshot()
@@ -1361,11 +1378,11 @@ def test_no_object_ends_and_keeps_the_arm_up(hanging):
 def test_object_already_on_palm_is_measured_without_prompt(hanging):
     place_after_prompt(hanging, 0.59)
     assert hanging.engine.auto_weigh({})["valid"]
-    n_tts = len(hanging.tts_texts)
-    hanging.on_say = None
+    n_told = len(hanging.told)
+    hanging.on_tell = None
     res = hanging.engine.auto_weigh({})                 # 第一件还在掌心
     assert res["valid"] and res["mass_kg"] == pytest.approx(0.59, abs=0.005)
-    assert hanging.tts_texts[n_tts:] == [_spoken(res["mass_g"])]
+    assert hanging.told[n_told:] == [_result(res["mass_g"])]
 
 
 def _hanging_rig(tmp_path, **cfg):
@@ -1379,14 +1396,14 @@ def test_stale_tare_with_object_on_palm_is_not_retared(tmp_path):
     r = _hanging_rig(tmp_path, tare_ttl_s=20)
     place_after_prompt(r, 0.59)
     assert r.engine.auto_weigh({})["valid"]
-    r.on_say = None
+    r.on_tell = None
     r.warm(25)                                          # 去皮过期，物品还在掌心
     n_arm, n_hand = len(r.arm_calls), len(r.hand_calls)
     res = r.engine.auto_weigh({})
     assert res["code"] == "object_on_hand" and res["stage"] == "prepare", res
     assert res["load_kg"] == pytest.approx(0.59, abs=0.01)
     assert len(r.arm_calls) == n_arm and len(r.hand_calls) == n_hand
-    assert r.tts_texts[-1] == "手上还有东西，请先拿走，再重新称重"
+    assert r.told[-1] == "我右手掌心好像有东西，称重前要先空着。请拿走后再称一次。"
     r.mass = 0.0                                        # 取走后：原地重新去皮，不再抬臂
     r.warm(1)
     n_moves = len(r.moves())
@@ -1396,50 +1413,51 @@ def test_stale_tare_with_object_on_palm_is_not_retared(tmp_path):
     assert len(r.moves()) == n_moves
 
 
-def test_failed_result_announcement_is_reported_as_error_with_mass(hanging):
-    place_after_prompt(hanging, 0.59)
-    hanging.engine.pose({})
-    hanging.tts_reply = {"error": "TTS 队列已满"}
-    res = hanging.engine.auto_weigh({})
-    assert res["state"] == "error" and res["code"] == "announce_failed", res
-    assert res["valid"] and res["mass_kg"] == pytest.approx(0.59, abs=0.005)
-    assert res["announce_problems"] == ["tts_rejected", "tts_rejected"]
-    last = hanging.engine.snapshot()["sides"]["right"]["last"]
-    assert last["valid"] and last["mass_g"] == res["mass_g"]
-
-
-def test_announce_can_be_disabled(tmp_path):
-    r = _hanging_rig(tmp_path, announce=False)
+def test_weighs_normally_with_nobody_listening(tmp_path):
+    """没连 decision_core（没有任何 listener）：照常称，消息只留在 snapshot 里。"""
+    r = _hanging_rig(tmp_path)
+    r.engine._listeners.clear()
     assert r.engine.pose({})["state"] == "posed"
     r.events.append((r.t + 2.0, lambda: setattr(r, "mass", 0.4)))
     res = r.engine.auto_weigh({})
     assert res["state"] == "weighed" and res["valid"], res
-    assert r.tts_texts == []
+    assert r.told == [] and r.engine.snapshot()["to_user"]["kind"] == "result"
 
 
-def test_tts_card_missing_still_weighs_but_reports_it(tmp_path):
+def test_a_failing_listener_does_not_break_weighing(tmp_path):
     r = _hanging_rig(tmp_path)
-    r.engine._tts_call = lambda args: None             # bundle 里没有 tts 卡
-    assert r.engine.pose({})["state"] == "posed"
-    r.events.append((r.t + 2.0, lambda: setattr(r, "mass", 0.4)))
+    r.engine.add_listener(lambda msg: 1 / 0)
+    place_after_prompt(r, 0.4)
     res = r.engine.auto_weigh({})
-    assert res["code"] == "announce_failed" and res["mass_kg"] == pytest.approx(0.4, abs=0.005)
+    assert res["state"] == "weighed" and res["valid"], res
+    assert any("to_user listener failed" in line for line in r.logs)
 
 
-def test_unknown_start_pose_is_announced_and_nothing_moves(hanging):
+def test_unknown_start_pose_is_told_and_nothing_moves(hanging):
     hanging.pose = [30.0, 5.0, 0.0, -40.0, 0.0, 0.0, 0.0]
     hanging.warm(1)
     res = hanging.engine.auto_weigh({})
     assert res["code"] == "unknown_start_pose" and res["stage"] == "prepare", res
-    assert hanging.moves() == [] and hanging.tts_texts[-1] == "手臂不在初始位置，请先复位"
+    assert hanging.moves() == []
+    assert hanging.told[-1] == "我的手臂不在起始位置，没法开始称重，需要先复位。"
 
 
-def test_weigh_cancelled_while_waiting_for_the_prompt(hanging):
+def test_weigh_cancelled_while_waiting_for_the_object(hanging):
     hanging.engine.pose({})
-    hanging.tts_delay = 20.0
     hanging.events.append((hanging.t + 1.0, hanging.engine.cancel))
     with pytest.raises(weigh.Cancelled):
         hanging.engine.auto_weigh({})
+    assert hanging.told == [READY]                      # 取消之后不再发消息
+
+
+def test_result_text_for_invalid_results():
+    e = weigh.WeighEngine({"state_file": "/nonexistent/w.json"})
+    assert e._result_text({"state": "weighed", "valid": False, "reasons": ["right:current_high"]}) \
+        == "东西可能太重了，这次没称准，请换轻一点的。"
+    assert e._result_text({"state": "weighed", "valid": False, "reasons": ["x"]}) == "这次没称准，请再称一次。"
+    assert e._result_text({"state": "weighed", "valid": True, "mass_g": 10, "warnings": ["below_resolution"]}) \
+        == "读数太小，没称出来。请把东西放在掌心中间，再称一次。"
+    assert e._result_text({"state": "error", "code": "whatever"}) == "称重没有完成。"
 
 
 def test_reset_opens_hand_lowers_arm_and_clears_tare(hanging):
@@ -1456,17 +1474,21 @@ def test_reset_opens_hand_lowers_arm_and_clears_tare(hanging):
     snap = hanging.engine.snapshot()["sides"]["right"]
     assert not snap["in_pose"] and not snap["tare_valid"]
     assert snap["last"]["mass_g"] == w["mass_g"]         # 结果保留给 skill 读
+    # 动完才说"放下来了"
+    assert hanging.order[-1] == ("tell", "好了，手已经放下来了。")
+    assert hanging.messages[-1]["kind"] == "reset_done" and res["to_user"] == "好了，手已经放下来了。"
 
 
-def test_reset_with_object_refuses_and_says_so(hanging):
+def test_reset_with_object_refuses_and_asks_to_confirm(hanging):
     place_after_prompt(hanging, 0.59)
     hanging.engine.auto_weigh({})
     n_arm, n_hand = len(hanging.arm_calls), len(hanging.hand_calls)
     res = hanging.engine.reset({})
     assert res["code"] == "object_on_hand", res
     assert len(hanging.arm_calls) == n_arm and len(hanging.hand_calls) == n_hand
-    assert hanging.tts_texts[-1] == "手上还有东西，请先拿走。确认手上是空的话，请在10秒内再点一次复位"
-    assert res["confirm_within_s"] == 10
+    assert hanging.told[-1] == "我手上好像还有东西，请先拿走。确认是空的话，再复位一次就行。"
+    assert hanging.messages[-1]["kind"] == "reset_confirm"
+    assert res["confirm_within_s"] == 60 and res["to_user"] == hanging.told[-1]
 
 
 def test_reset_long_after_weighing_still_checks_the_palm(tmp_path):
@@ -1476,8 +1498,8 @@ def test_reset_long_after_weighing_still_checks_the_palm(tmp_path):
     r.warm(r.engine.cfg["tare_ttl_s"] + 60)             # 去皮过期了，但旧零点仍可判断有没有东西
     assert r.engine.reset({})["code"] == "object_on_hand"
     r.mass = 0.0
-    r.warm(1)
-    assert r.engine.reset({})["state"] == "reset"        # 不需要 confirm_empty
+    r.warm(61)                                          # 过了确认时间：靠读数判断已经空了
+    assert r.engine.reset({})["state"] == "reset"
 
 
 def test_reset_when_arm_already_down_clears_state(hanging):
@@ -1489,15 +1511,47 @@ def test_reset_when_arm_already_down_clears_state(hanging):
 
 # ── weigh_state 传感器 ──────────────────────────────────────────────────────
 
-def test_weigh_state_sensor_publishes_the_latest_result(hanging, tmp_path):
+class _FakePub:
+    def __init__(self):
+        self.sent = []
+
+    def publish(self, msg):
+        self.sent.append(json.loads(msg.data))
+
+
+class _FakeString:
+    data = ""
+
+
+def _running_sensor(p):
+    sensor = weigh.WeighStatePlugin({}, "ns", _FakeRos2(), p)
+    pub = _FakePub()
+    sensor._pub = (pub, _FakeString)
+    sensor._running = True
+    sensor._thread = threading.Thread(target=sensor._loop, daemon=True)
+    sensor._thread.start()
+    return sensor, pub
+
+
+def _wait_for(cond, timeout=10.0):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if cond():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def test_weigh_state_sensor_reads_the_latest_result(hanging, tmp_path):
     p, calls, fired = _async_plugin(hanging, tmp_path, grace=600)
-    sensor = weigh.WeighStatePlugin({"rate_hz": 2}, "ns", _FakeRos2(), p)
+    sensor = weigh.WeighStatePlugin({}, "ns", _FakeRos2(), p)
     tool = sensor.get_tool()
     assert tool["name"] == "weigh_state" and tool["type"] == "sensor"
     assert tool["topic_out"] == [{"topic": "/ns/state/weigh", "format": "data/json"}]
+    assert "to_user" in tool["description"] and "由你决定" in tool["description"]
     assert sensor.dispatch("info", {})["state"] == "idle"
     before = sensor.dispatch("read", {})
-    assert before["seq"] == 0 and before["sides"]["right"]["last"] is None
+    assert before["seq"] == 0 and before["sides"]["right"]["last"] is None and before["to_user"] is None
     place_after_prompt(hanging, 0.59)
     res = p.dispatch("weigh", {})
     assert res["state"] == "weighed"
@@ -1505,26 +1559,49 @@ def test_weigh_state_sensor_publishes_the_latest_result(hanging, tmp_path):
     last = after["sides"]["right"]["last"]
     assert after["seq"] == 1 and last["seq"] == 1 and last["mass_g"] == res["mass_g"] and last["valid"]
     assert after["sides"]["left"]["last"] is None and after["timestamp_ms"] > 0
+    assert list(after)[0] == "to_user" and after["to_user"]["kind"] == "result"
     json.dumps(after)                                   # 能直接发成 data/json
     assert sensor.dispatch("bogus", {})["state"] == "error"
 
 
-def test_result_speech():
-    e = weigh.WeighEngine
-    assert e._speak_mass(589.6) == "590克" and e._speak_mass(1234.0) == "1.23千克"
-    assert e._speak_mass(1500.0) == "1.5千克" and e._speak_mass(2000.0) == "2千克"
+def test_weigh_state_publishes_one_message_per_thing_to_tell_and_nothing_else(hanging, tmp_path):
+    p, calls, fired = _async_plugin(hanging, tmp_path, grace=600)
+    sensor, pub = _running_sensor(p)
+    try:
+        time.sleep(1.5)
+        assert pub.sent == []                           # 没有话要说时不发（不会反复唤醒 decision_core）
+        place_after_prompt(hanging, 0.59)
+        res = p.dispatch("weigh", {})
+        assert _wait_for(lambda: len(pub.sent) == 3), pub.sent
+        assert [m["to_user"]["kind"] for m in pub.sent] == ["preparing", "ready", "result"]
+        assert [m["to_user"]["text"] for m in pub.sent] == hanging.told
+        # 结果那一条里已经带着这次的重量
+        assert pub.sent[-1]["sides"]["right"]["last"]["mass_g"] == res["mass_g"]
+        time.sleep(1.5)
+        assert len(pub.sent) == 3
+    finally:
+        sensor.stop()
+
+
+def test_weigh_state_not_started_publishes_nothing(hanging, tmp_path):
+    p, calls, fired = _async_plugin(hanging, tmp_path, grace=600)
+    sensor = weigh.WeighStatePlugin({}, "ns", _FakeRos2(), p)
+    place_after_prompt(hanging, 0.59)
+    p.dispatch("weigh", {})
+    assert list(sensor._queue) == []
+    assert sensor.dispatch("read", {})["to_user"]["kind"] == "result"
 
 
 # ── side=both：两只手各放一件，重量相加 ───────────────────────────────────────
 
 def _place_both(rig, right, left, left_delay=3.0):
-    """提示播完后先往右手放，left_delay 秒后再往左手放。"""
-    def on_say(text):
-        if "秒内" in text:
-            t = rig.t + rig.tts_delay
+    """"可以放了"之后先往右手放，left_delay 秒后再往左手放。"""
+    def on_tell(msg):
+        if msg["kind"] == "ready":
+            t = rig.t
             rig.events.append((t + 1.0, lambda: setattr(rig, "mass", right)))
             rig.events.append((t + 1.0 + left_delay, lambda: setattr(rig, "mass_left", left)))
-    rig.on_say = on_say
+    rig.on_tell = on_tell
 
 
 def test_weigh_both_waits_for_both_hands_and_adds_them_up(hanging):
@@ -1533,10 +1610,10 @@ def test_weigh_both_waits_for_both_hands_and_adds_them_up(hanging):
     assert res["state"] == "weighed" and res["valid"] and res["side"] == "both", res
     # 右手先放、左手 4 s 后才放：不能只称到右手那一件
     assert res["mass_kg"] == pytest.approx(0.70, abs=0.01)
-    texts = hanging.tts_texts
-    assert texts[0] == "开始称重。我先抬起双手、摆好手势，大约20秒。这段时间请不要碰我的手，听到请放物品再放"
-    assert texts[1] == "请放物品。8秒内放到双手掌心"
-    assert texts[-1] == _spoken(res["mass_g"])
+    texts = hanging.told
+    assert texts[0] == "我在准备称重，等我说“可以放了”，再把东西放到两只手掌心。在这之前先别碰我的手。"
+    assert texts[1] == "可以放了，请在两只手掌心各放一件。放好后手拿开，几秒就能称好。"
+    assert texts[-1] == _result(res["mass_g"], both=True)
     snap = hanging.engine.snapshot()
     assert snap["both_last"]["mass_g"] == res["mass_g"] and snap["both_last"]["side"] == "both"
     assert snap["sides"]["right"]["in_pose"] and snap["sides"]["left"]["in_pose"]
@@ -1564,9 +1641,10 @@ def test_reset_both_lowers_both_arms(hanging):
     assert res["state"] == "reset", res
     assert hanging.engine._tare == {"right": None, "left": None}
     assert hanging.engine._hand == {"right": "open", "left": "open"}
+    assert hanging.told[-1] == "好了，两只手都放下来了。"
 
 
-# ── reset：判断不了掌上有没有东西时，提示后 10 秒内再点一次 ─────────────────────
+# ── reset：判断不了掌上有没有东西时，请用户确认，60 秒内再调用一次 ───────────────
 
 def _posed_without_tare(tmp_path):
     r = _hanging_rig(tmp_path)
@@ -1580,10 +1658,10 @@ def test_reset_without_zero_asks_and_a_second_press_confirms(tmp_path):
     r = _posed_without_tare(tmp_path)
     n_moves = len(r.moves())
     res = r.engine.reset({})
-    assert res["code"] == "load_unknown" and res["confirm_within_s"] == 10, res
-    assert r.tts_texts[-1] == "无法确认手上有没有东西。确认手上是空的话，请在10秒内再点一次复位"
+    assert res["code"] == "load_unknown" and res["confirm_within_s"] == 60, res
+    assert r.told[-1] == "我没法确认手上有没有东西。确认是空的话，再复位一次就行。"
     assert len(r.moves()) == n_moves
-    r.warm(5)
+    r.warm(40)                                          # 转告、人去看一眼，都要时间
     res = r.engine.reset({})
     assert res["state"] == "reset" and res["confirmed_empty"], res
     assert [m["right_positions"] for m in r.moves()[n_moves:]] == [MID, REST]
@@ -1593,20 +1671,10 @@ def test_reset_confirmation_expires(tmp_path):
     r = _posed_without_tare(tmp_path)
     n_moves = len(r.moves())
     assert r.engine.reset({})["code"] == "load_unknown"
-    r.warm(11)
-    assert r.engine.reset({})["code"] == "load_unknown"   # 过了 10 秒：重新提示，不动
+    r.warm(61)
+    assert r.engine.reset({})["code"] == "load_unknown"   # 过了 60 秒：重新请用户确认，不动
     assert len(r.moves()) == n_moves
-    assert r.engine.reset({})["state"] == "reset"          # 紧接着再点一次才动
-
-
-def test_reset_confirmation_window_starts_after_the_prompt_is_spoken(tmp_path):
-    r = _posed_without_tare(tmp_path)
-    r.tts_delay = 6.0
-    t0 = r.t
-    assert r.engine.reset({})["code"] == "load_unknown"
-    assert r.t - t0 >= 6.0                                  # 等提示说完才返回
-    r.warm(8)                                               # 说完后 8 s：仍在 10 s 内
-    assert r.engine.reset({})["state"] == "reset"
+    assert r.engine.reset({})["state"] == "reset"          # 紧接着再调用一次才动
 
 
 def test_reset_confirmation_is_per_side(tmp_path):
@@ -1621,7 +1689,7 @@ def test_reset_confirmation_is_per_side(tmp_path):
 
 
 def test_reset_with_object_reading_can_be_confirmed_by_a_second_press(hanging):
-    """读数说有东西、人确认是空的（例如去皮时手上已经有东西）：10 秒内再点一次就复位。"""
+    """读数说有东西、人确认是空的（例如去皮时手上已经有东西）：再调用一次就复位。"""
     place_after_prompt(hanging, 0.59)
     hanging.engine.auto_weigh({})
     n_moves = len(hanging.moves())
@@ -1653,34 +1721,40 @@ def test_reset_object_confirmation_expires(hanging):
     hanging.engine.auto_weigh({})
     n_moves = len(hanging.moves())
     assert hanging.engine.reset({})["code"] == "object_on_hand"
-    hanging.warm(11)
+    hanging.warm(61)
     assert hanging.engine.reset({})["code"] == "object_on_hand"
     assert len(hanging.moves()) == n_moves
 
 
-# ── 播报：先说在做什么、要等多久，等"请放物品"再放 ─────────────────────────────
+# ── 返回给调用方的说明 ─────────────────────────────────────────────────────────
 
-def test_prepare_speech_when_arm_is_already_up_says_the_short_version(tmp_path):
+def test_start_message_depends_on_where_the_arm_is(tmp_path):
+    r = _hanging_rig(tmp_path, tare_ttl_s=20)
+    e = r.engine
+    assert "正在抬起右臂、摆手势、去皮，约 20 秒" in e.start_message("weigh", "right")
+    assert "正在抬起双臂" in e.start_message("weigh", "both")
+    assert "both_last.mass_g" in e.start_message("weigh", "both")
+    place_after_prompt(r, 0.59)
+    assert e.auto_weigh({})["valid"]
+    r.mass = 0.0
+    r.warm(1)
+    assert "手臂已在托举姿态、零点可用，直接等人放物品" in e.start_message("weigh", "right")
+    r.warm(25)                                          # 去皮过期，手臂还举着
+    assert "手臂已举着，正在重新摆手势、去皮，约 10 秒" in e.start_message("weigh", "right")
+    msg = e.start_message("reset", "right")
+    assert "放下右臂" in msg and "60 秒内再调用一次 reset" in msg and "to_user" in msg
+
+
+def test_prepare_message_is_sent_again_when_only_the_tare_expired(tmp_path):
     r = _hanging_rig(tmp_path, tare_ttl_s=20)
     place_after_prompt(r, 0.59)
     assert r.engine.auto_weigh({})["valid"]
     r.mass = 0.0
     r.warm(25)                                          # 去皮过期，手臂还举着、掌上是空的
-    n = len(r.tts_texts)
+    n = len(r.told)
     place_after_prompt(r, 0.59)
     assert r.engine.auto_weigh({})["valid"]
-    assert r.tts_texts[n] == "开始称重。我先摆好手势、校准一下，大约10秒。这段时间请不要碰我的手，听到请放物品再放"
-    assert r.tts_texts[n + 1] == "请放物品。5秒内放到右手掌心"
-
-
-def test_prepare_speech_is_not_waited_for(hanging):
-    """开场那句边说边动：手臂在这句话播完之前就开始动。"""
-    hanging.tts_delay = 8.0
-    place_after_prompt(hanging, 0.59)
-    hanging.engine.auto_weigh({})
-    first_move = hanging.order.index(("arm", "move_pos"))
-    assert hanging.order[first_move - 1][0] == "tts" or hanging.order.index(
-        ("tts", hanging.tts_texts[0])) < first_move
+    assert r.told[n:n + 2] == [PREPARING, READY]
 
 
 # ── 轻物体修正表 ──────────────────────────────────────────────────────────────

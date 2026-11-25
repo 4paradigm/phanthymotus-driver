@@ -476,23 +476,23 @@ class TianyiDeviceBundle:
             # It must never take the rest of the driver down with it.
             try:
                 from weigh import WeighPlugin
-                # weigh/reset move the arm and fingers through the arm/hand cards and
-                # speak through the tts card, via the same routing as tools/call (lazy
-                # start, preflight, feedback). tts_call passes an _on_done callback, so
-                # the tts card reports back to weigh instead of posting its own ACP.
+                # weigh/reset move the arm and fingers through the arm/hand cards, via
+                # the same routing as tools/call (lazy start, preflight, feedback). The
+                # card does not speak: what the user should hear is published on
+                # weigh_state as to_user, for decision_core to relay however it likes.
                 weigh_plugin = WeighPlugin(
                     plugins_cfg["weigh"], namespace, ros2,
                     arm_call=lambda args: self._dispatch("arm", dict(args)),
                     hand_call=lambda args: self._dispatch("hand", dict(args)),
                     # The servo card streams arm/hand targets too; weigh/reset
                     # pause it before moving (explicit action wins over the stream).
-                    servo_call=lambda args: self._dispatch("servo", dict(args)),
-                    tts_call=lambda args: self._dispatch("tts", dict(args)))
+                    servo_call=lambda args: self._dispatch("servo", dict(args)))
                 self._plugins.append(weigh_plugin)
                 print("[bundle] WeighPlugin loaded (weigh)")
                 if plugins_cfg.get("weigh_state", {}).get("enabled", False):
-                    # Publishes the latest weighing result for skills: weigh's ACP
-                    # completion is slimmed by agent-core and does not carry the mass.
+                    # Publishes one message per thing the user should be told (to_user),
+                    # with the latest result: weigh's ACP completion is silent and slimmed
+                    # by agent-core, so it carries neither the mass nor the wording.
                     from weigh import WeighStatePlugin
                     self._plugins.append(WeighStatePlugin(
                         plugins_cfg["weigh_state"], namespace, ros2, weigh_plugin))
