@@ -141,7 +141,7 @@ ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 COPY resource/ /work/resource/
 COPY common/ /work/common/
 COPY main.py   /work/main.py
-COPY device.py /work/device.py
+COPY device.py bumi_av_recording.py /work/
 # Runtime sources for the walking-mode backend imported by main.py.
 COPY walking_mode.py walking_mode_client.py /work/
 # Navi support modules are independent from device.py for ROS-free tests.

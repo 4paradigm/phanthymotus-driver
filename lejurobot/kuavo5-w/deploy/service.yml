@@ -1,0 +1,39 @@
+lejurobot-kuavo5-w:
+  image: __IMAGE__
+  container_name: embodied-lejurobot-kuavo5-w
+  network_mode: host
+  ipc: host
+  pid: host
+  volumes:
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+    - /opt/phanthy-motus/data:/opt/phanthy-motus/data
+    # Docker may create this directory on a fresh robot. The driver exclusively
+    # seeds config.yaml, and persists SSH trust/optional mode-0600 operator secrets.
+    - type: bind
+      source: /opt/phanthy-motus/drivers/lejurobot-kuavo5-w
+      target: /config
+      bind:
+        create_host_path: true
+  environment:
+    - ROS_DOMAIN_ID=42
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+    - PYTHONUNBUFFERED=1
+    - CONFIG_PATH=/config/config.yaml
+    - KUAVO_STATE_DIR=/config
+    - KUAVO_DATA_DIR=/opt/phanthy-motus/data
+    - KUAVO_CONFIG_SEED=1
+    - KUAVO_HOST_SSH_PASSWORD=${KUAVO_HOST_SSH_PASSWORD:-}
+    - KUAVO_CONTROLLER_SSH_PASSWORD=${KUAVO_CONTROLLER_SSH_PASSWORD:-}
+    - KUAVO_CHASSIS_SSH_PASSWORD=${KUAVO_CHASSIS_SSH_PASSWORD:-}
+    - KUAVO_HOST_SUDO_PASSWORD=${KUAVO_HOST_SUDO_PASSWORD:-}
+    - KUAVO_CONTROLLER_SUDO_PASSWORD=${KUAVO_CONTROLLER_SUDO_PASSWORD:-}
+    - KUAVO_CHASSIS_SUDO_PASSWORD=${KUAVO_CHASSIS_SUDO_PASSWORD:-}
+    - ROSBRIDGE_URL=${KUAVO_ROSBRIDGE_URL:-}
+    - AGENT_CORE_URL=https://localhost:15678
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: always

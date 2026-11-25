@@ -1,0 +1,6 @@
+# Optional override for an existing bridge-networked Core.
+# Merge AFTER the bot-generated Compose file, whose service is rokae-helios.
+# Both the MCP loopback and the DDS loopback must be in Core's namespace.
+services:
+  rokae-helios:
+    network_mode: "container:${HELIOS_CORE_CONTAINER:?Set HELIOS_CORE_CONTAINER to the running Core container name}"

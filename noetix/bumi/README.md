@@ -221,19 +221,28 @@ the new card. State scopes, JSON snapshots, labels and interval logging are no
 longer supported. Historical files under `/opt/phanthy-motus/data/bumi/state-records`
 are left untouched.
 
-- `start`: check whether the camera process is ready (does not take a photo).
+- `start`: immediately return the actuator lifecycle marker `ready`. Camera
+  readiness is checked by the photo/video actions, not canvas activation.
 - `capture_photo`: save one current RGB JPEG.
-- `record_video`: asynchronously save an RGB MP4/H.264 video; `duration_s` is
-  an integer from 1 to 30, default 5 seconds.
+- `record_video`: asynchronously save an MP4/H.264 video; `duration_s` is
+  an integer from 1 to 30, default 5 seconds. `include_audio: true` (default)
+  includes microphone AAC audio. Set `include_audio: false` for video only.
 - `info`: return storage directories, camera/frame freshness and active recording.
-- `stop`: cancel recording and remove the incomplete video. This is not
-  “finish early and save”. It does not stop the existing camera sensor card.
+- `stop`: immediately return lifecycle `idle` and request cancellation. If a
+  recording exists, `cancellation_pending=true` means cleanup is still running;
+  ACP/`info.last_recording` reports the terminal result. This does not stop the
+  camera/mic or “finish early and save”. Bundle shutdown separately waits for cleanup.
 
 Bumi reuses its existing 640x480 JPEG topic `/<namespace>/camera/color`.
 A recent cached frame is used for a photo; if none is available or it is older
 than 3 seconds, capture waits for a fresh frame (up to 5 seconds per wait).
-Recording requests a strictly later frame sequence for each encoded frame.
-No second RealSense pipeline, depth capture, audio or state JSON is added.
+Recording subscribes to the existing timestamped JPEG producer. It maps source
+timestamps onto the output frame clock, repeating missing frames instead of
+accelerating playback. A camera gap over one second fails the recording.
+Optional audio uses `/<namespace>/mic/audio_recording`, published by the existing
+mic process with host chunk-end stamps. No second SDK capture client is opened.
+The original mic topic keeps its SDK timestamp contract; SDK audio at a different
+sample rate is resampled to the declared 16 kHz instead of changing playback speed.
 
 Default persistent output:
 
@@ -254,13 +263,14 @@ Photo failure returns `CAPTURE_FAILED` without creating a JSON sidecar.
 Video requests return `state=queued` and an `action_id`; completion/failure/
 cancellation is sent to `AGENT_CORE_URL/api/acp/complete` (default Agent Core
 URL: `https://localhost:15678`), matching Q5's ACP contract. Only one video
-recording may run at a time. A callback delivery failure is logged; it does not
-delete a successfully saved video.
+recording may run at a time. `info.last_recording` retains its terminal result.
+A callback delivery failure is logged; it does not delete a successfully saved video.
 
 Configuration is under `plugins.vision_capture`: `output_dir`, `fps`
-(default/max 15), and `max_duration_s` (default/max 30). Rebuild the driver
-image to install the new FFmpeg dependency. All runtime implementation remains
-in `device.py`; no extra runtime Python file is required.
+(output fps, default/max 15), and `max_duration_s` (default/max 30). The existing
+Dockerfile installs FFmpeg and copies the recording module with the driver source.
+The recorder uses host timestamps for software synchronization and exposes the
+file path only after encoding.
 
 ## New cards
 

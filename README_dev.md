@@ -204,6 +204,33 @@ reachable at `{origin}/…` with no work on the agent-core side.
 
 ---
 
+#### Choices only the driver can find (`x-options-action`)
+
+Some choices exist only where the driver can see them — the printers on a PC it
+reaches over SSH, the pages open in a browser there. Give such a field a `oneOf`
+built from what the driver last found, and name the action that finds them:
+
+```python
+"page_url": {"type": "string", "title": "访客列表网页", "oneOf": [...],
+             "description": "<what the last check found, or what to do first>",
+             "x-options-action": "detect"},
+```
+
+The config dialog puts a 检测 button beside the field. Clicking it saves the form
+(so the action sees the connection just typed), calls the action, and applies its
+reply in place — the dialog stays open:
+
+```python
+return {"options": {"page_url": [{"const": ..., "title": ...}], "printer": [...]},   # new choices
+        "help":    {"page_url": "已连接，找到 3 台打印机…"}}                          # new help text
+```
+
+Keys may name any field of the form, not just the one with the button. A pick that is
+no longer offered is cleared rather than kept. Agent Core refuses every action of a
+card whose `config` answers `adapter_ok: false`, so report `adapter_ok` from what the
+action needs (the connection), not from the field it fills — or the button can never
+run. Example: `phanthy/office`.
+
 ## x-action-params Specification
 
 ### Problem
