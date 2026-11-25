@@ -136,6 +136,7 @@ class _SingleHandController:
         channel: str,
         motion_lock: threading.RLock,
         can_id: Optional[int] = None,
+        request_metadata: bool = True,
     ):
         self.config = config
         self.side = side
@@ -145,6 +146,7 @@ class _SingleHandController:
 
         self._client: L20CanClient | None = None
         self._client_lock = threading.Lock()
+        self._request_metadata = request_metadata
         self._stop_evt = threading.Event()
 
         self.motion_timeout_s = float(config.get("motion_timeout_s", 8.0))
@@ -172,6 +174,7 @@ class _SingleHandController:
                     self.channel, self.side,
                     baudrate=self.config.get("baudrate", 1_000_000),
                     can_id=self.can_id,
+                    request_metadata=self._request_metadata,
                 )
             return self._client
 
@@ -354,6 +357,7 @@ def get_shared_controller(
     channel: str = "can0",
     can_id: Optional[int] = None,
     bus_lock: Optional[threading.RLock] = None,
+    request_metadata: bool = True,
 ) -> _SingleHandController:
     key = (side, channel)
     lock = bus_lock or GLOBAL_BUS_LOCK
@@ -366,7 +370,8 @@ def get_shared_controller(
                 can_id = right_id if side == "right" else left_id
             # Registry synchronization is separate from per-hand motor ownership:
             # a long motion on the other hand must not block pressure monitoring.
-            ctrl = _SingleHandController(config, side, channel, threading.RLock(), can_id=can_id)
+            ctrl = _SingleHandController(config, side, channel, threading.RLock(), can_id=can_id,
+                                         request_metadata=request_metadata)
             GLOBAL_CONTROLLERS[key] = ctrl
         return ctrl
 
@@ -831,5 +836,10 @@ def build_plugins(config: dict, _namespace: str, _ros2) -> list:
     if tactile_config and tactile_config.get("enabled", True):
         from tactile_device import TactilePlugin
         plugins.append(TactilePlugin(hand_plugin, tactile_config, global_config=config, ros2=_ros2, namespace=_namespace))
+
+    joints_config = config.get("plugins", {}).get("joints")
+    if joints_config and joints_config.get("enabled", True):
+        from joints_device import JointsPlugin
+        plugins.append(JointsPlugin(hand_plugin, joints_config, global_config=config, ros2=_ros2, namespace=_namespace))
 
     return plugins

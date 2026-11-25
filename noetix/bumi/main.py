@@ -202,7 +202,9 @@ class BumiDeviceBundle:
         if plugins_cfg.get("vision_capture", {}).get("enabled", False):
             from device import VisionCapturePlugin
             vision_capture_plugin = VisionCapturePlugin(
-                plugins_cfg["vision_capture"], camera_plugin)
+                plugins_cfg["vision_capture"], camera_plugin, namespace=namespace,
+                executor=executor, mic_enabled=bool(plugins_cfg.get("mic", {}).get("enabled", False)
+                                                    and media_ctrl is not None))
             self._plugins.append(vision_capture_plugin)
             print("[bundle] VisionCapturePlugin loaded")
 

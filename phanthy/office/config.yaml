@@ -1,0 +1,16 @@
+mcp_port: 15750
+name: "Phanthy Office"
+
+plugins:
+  visitor_badge:
+    # Connection settings come from the card's config dialog; values here are
+    # only a fallback for running the driver by hand.
+    host: ""
+    user: ""
+    password: ""
+    port: 22
+    page_url: ""
+    printer: ""
+    list_timeout_s: 45      # under Agent Core's 60 s limit for an actuator call
+    print_timeout_s: 150
+    known_hosts: /opt/phanthy-motus/data/visitor_badge/known_hosts

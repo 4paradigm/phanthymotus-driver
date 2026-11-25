@@ -13,12 +13,14 @@
 | [`dobot/cra`](dobot/cra/README.md) | 越疆 Dobot CRA V4 | 15746 | 官方 SDK；30 Hz 六轴骨架、关节角度与绝对关节运动 |
 | `unitree/g1` | Unitree G1 人形机器人 | 15701 | 运动控制、机械臂、麦克风、扬声器、LED、状态监控 |
 | `engineai/t800` | 众擎 T800 开发版 | 15708 | ROS2/Native SDK、全身状态、舞蹈/手势序列、虚拟手柄、运动与高低层控制 |
+| [`unixai/panther`](unixai/panther/README.md) | UniX AI Panther | 15792 | CycloneDDS/domain 0 真机链路、进程隔离的 Agent Core 桥接、状态感知与安全门控的移动操作能力 |
 | `deep_robotics/lynx_m20` | 云深处山猫 M20 | 15716 | 官方 ROS 2/Fast DDS 接口与 basic_server TCP/UDP 原生控制，隔离标准版和 Pro 能力 |
 | `deep_robotics/s10_pro` | 云深处山猫 S10 Pro | 15745 | 明文 TCP 原生协议、状态/故障上报、运动、设备和导航控制 |
 | `chasing/qianjiao_p200_pro` | 潜行科技潜鲛 P200 Pro ROV | 15739 | MAVLink v1/UDP 6DOF 运动控制、锁定/解锁、心跳和连接状态 |
 | [`limx/tron2`](limx/tron2/README.md) | 逐际动力 TRON2 双臂机器人 | 15791 | 头部/左右腕RGB摄像头、关节骨架与夹爪示意、双臂 MoveJ及自动验证复位 |
  | `brainco/revo2` | BrainCo Revo 2 灵巧手 | 15706 | 手指位置/预设手势/LED 控制、状态遥测，触觉版附带指尖触觉遥测 |
 | `linkerhand/l20_lite` | 灵心巧手 L20 Lite | 15733 | USB-RS485/Modbus 115200、10 关节控制与状态读取 |
+| [`phanthy/office`](phanthy/office/README.md) | 办公室场景：前台 Windows 电脑 + 打印机 | 15750 | 经 SSH 查询当天访客并在访客系统网页上打印访客贴 |
 | [`linkerhand/l20`](linkerhand/l20/README.md) | 灵心巧手 L20-10 | 15734 | USB-CAN、16 主动关节控制、数字手势、自适应接触停止抓握与独立触觉感知，共四张卡片 |
 | `phanthy/remote_control` | 远程控制桥接 | 15710 | 远程控制中继 |
 

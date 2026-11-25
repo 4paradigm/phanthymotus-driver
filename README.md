@@ -11,6 +11,7 @@ Each driver is a standalone [MCP](https://modelcontextprotocol.io) HTTP server t
 
 | Driver | Hardware | Port | Description |
 |--------|----------|------|-------------|
+| [`rokae/helios`](rokae/helios/README.md) | ROKAE Helios-2.1 | 15747 | Read-only 20-axis joints and dual-battery status with freshness information |
 | [`dobot/cra`](dobot/cra/README.md) | Dobot CRA V4 | 15746 | Official SDK; 30 Hz joint skeleton/angles and absolute joint motion |
 | `pico/4ultra` | PICO 4 Ultra | 15742 | Independent teleop_device; signed App, pairing, DDS controller input |
 | `unitree/g1` | Unitree G1 Humanoid | 15701 | Locomotion, arm control, mic, speaker, LED, state monitoring |
@@ -23,12 +24,14 @@ Each driver is a standalone [MCP](https://modelcontextprotocol.io) HTTP server t
 | `engineai/t800` | EngineAI T800 Development Edition | 15708 | ROS2/Native SDK, full state, dance/gesture sequences, virtual gamepad, locomotion and low-level joint control |
 | `noetix/bumi` | Noetix Bumi-EDU Humanoid | 15704 | Mic, speaker, locomotion, RealSense camera, state monitoring |
 | `x-humanoid/tianyi2.0` | X-humanoid Tianyi 2.0 Pro Bundle | 15707 | 35DOF (wheeled chassis + dual arms + dexterous hands + head + navigation) |
+| [`unixai/panther`](unixai/panther/README.md) | UniX AI Panther | 15792 | CycloneDDS/domain 0 robot link, process-isolated Agent Core bridge, state sensing and safety-gated mobile manipulation |
 | `deep_robotics/lynx_m20` | DEEPRobotics Lynx M20 | 15716 | Official ROS 2/Fast DDS interfaces and basic_server TCP/UDP native control, with Standard/Pro capability isolation |
 | `deep_robotics/s10_pro` | DEEPRobotics S10 Pro | 15745 | Plain TCP native protocol, state/fault reporting, locomotion, device and navigation controls |
 | `chasing/qianjiao_p200_pro` | Chasing Qianjiao P200 Pro ROV | 15739 | MAVLink v1/UDP 6DOF motion control, lock/unlock, heartbeat and link status |
 | [`limx/tron2`](limx/tron2/README.md) | LimX TRON2 dual-arm robot | 15791 | Head/wrist RGB cameras, joint skeleton with gripper outlines, arm MoveJ and verified saved-home reset |
 | `pnpbotics/adam` | PNPbotics Adam Humanoid | 15702 | State, locomotion (gRPC), upper body control, dexterous hands, 3D model |
 | `linkerhand/l20_lite` | LinkerHand L20 Lite | 15733 | USB-RS485/Modbus 115200, 10-joint position/speed/torque control and state reads |
+| [`phanthy/office`](phanthy/office/README.md) | Office scene: front-desk Windows PC + printer | 15750 | Over SSH: list today's visitors and print their badge from the visitor-management site |
 
 ## Quick Start
 
