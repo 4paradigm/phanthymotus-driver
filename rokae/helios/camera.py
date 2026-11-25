@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import threading
 
@@ -9,6 +10,10 @@ from common.camera_info import build
 from common.vendor_runtime import action_schema, tool
 from .camera_capture import SOURCES, CameraCapture, output_size
 
+
+# Letters first, then letters/digits; "-" only between them, never doubled: maps
+# one-to-one onto a valid ROS 2 token (no "__", no leading digit) by "-" -> "_".
+READABLE_INSTANCE = re.compile(r"[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)*")
 
 class RosCameraStream:
     def __init__(self, ros2, namespace, source_id, source, fps):
@@ -123,17 +128,17 @@ class HeliosCamera:
         return source_id
 
     def _topic(self, instance):
-        # One readable topic per card, named after the card id like go1/go2 cameras
-        # (card-mwvl5yh15sat -> card_mwvl5yh15sat). ROS names allow only ASCII letters,
-        # digits and "_", and a token must not start with a digit. The topic does not
-        # change when the card switches camera, so Core's subscription stays valid.
+        # One topic per card, stable when the card switches camera, so Core's
+        # subscription stays valid. Core card ids (card-mwvl5yh15sat) only use ASCII
+        # letters, digits and "-": those map one-to-one to a readable name, the same
+        # convention as the G1/Go2 external cameras (card_mwvl5yh15sat). Any other id is
+        # hashed under a separate "id/" level, so the two forms can never collide.
         if not instance:
             return f"/{self._namespace}/camera/preview/rgb"
-        safe = "".join(ch if ch.isascii() and (ch.isalnum() or ch == "_") else "_" for ch in instance)
-        safe = re.sub("_+", "_", safe).strip("_") or "card"  # ROS 2 forbids "__"
-        if safe[0].isdigit():
-            safe = "card_" + safe
-        return f"/{self._namespace}/camera/{safe}/rgb"
+        if READABLE_INSTANCE.fullmatch(instance):
+            return f"/{self._namespace}/camera/{instance.replace('-', '_')}/rgb"
+        digest = hashlib.sha256(instance.encode()).hexdigest()[:24]
+        return f"/{self._namespace}/camera/id/h{digest}/rgb"
 
     def _release(self, instance):
         previous = self._active.pop(instance, None)

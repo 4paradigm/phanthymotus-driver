@@ -309,10 +309,23 @@ def test_start_waits_at_most_2_5_s_for_the_first_frame():
 
 @pytest.mark.parametrize("instance, topic", [
     ("card-mwvl5yh15sat", "/rokae_helios/camera/card_mwvl5yh15sat/rgb"),
-    ("9abc", "/rokae_helios/camera/card_9abc/rgb"),
-    ("卡片-1", "/rokae_helios/camera/card_1/rgb"),
-    ("a--b", "/rokae_helios/camera/a_b/rgb"),
+    ("cam2", "/rokae_helios/camera/cam2/rgb"),
 ])
-def test_topic_is_readable_and_a_valid_ros_name(instance, topic):
+def test_core_card_ids_get_readable_topics(instance, topic):
     camera, _ = plugin()
     assert camera.dispatch("info", {"instance_id": instance})["topic_out"][0]["topic"] == topic
+
+
+def test_topic_names_never_collide_and_are_valid_ros_names():
+    import re
+    camera, created = plugin()
+    ids = ["a-b", "a_b", "a--b", "9abc", "卡片-1", "id", "h0", "card-x", "card_x", "A-b"]
+    topics = [camera.dispatch("info", {"instance_id": i})["topic_out"][0]["topic"] for i in ids]
+    assert len(set(topics)) == len(ids)
+    for t in topics:
+        assert "__" not in t and all(re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", tok) for tok in t.strip("/").split("/"))
+    # Two colliding-looking cards on different cameras publish on distinct topics.
+    camera.dispatch("start", {"instance_id": "a-b", "camera": "chest_rgb"})
+    camera.dispatch("start", {"instance_id": "a_b", "camera": "head_rgb"})
+    chest, head = camera._streams["chest_rgb"], camera._streams["head_rgb"]
+    assert set(chest.attached.values()).isdisjoint(head.attached.values())
