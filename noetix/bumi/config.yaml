@@ -10,9 +10,9 @@ plugins:
   # Requires loco for chassis arbitration. Startup only prepares the backend.
   walking_mode:
     enabled: true
-    # Empty: passively discover perception_ip from this SDK motion board.
-    # An explicit app_host can be set when UDP discovery is unavailable.
-    app_host: ""
+    # Connect to the SDK motion board directly; App use can pause UDP discovery.
+    # Set empty only when passive discovery of perception_ip is required.
+    app_host: "192.168.55.102"
     discovery_source_ip: "192.168.55.102"
     discovery_timeout_s: 3.0
     query_timeout_s: 1.0
