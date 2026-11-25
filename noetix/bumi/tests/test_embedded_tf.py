@@ -68,7 +68,12 @@ class FakeExecutor:
         self.nodes = []
 
     def add_node(self, node):
-        self.nodes.append(node)
+        if node not in self.nodes:
+            self.nodes.append(node)
+
+    def remove_node(self, node):
+        if node in self.nodes:
+            self.nodes.remove(node)
 
 
 @pytest.fixture
@@ -223,6 +228,27 @@ def test_stop_pauses_and_close_destroys_the_tree(ros, fake_tf):
     tf_node = node.tf_node
     node.close()
     assert tf_node.destroyed is True
+
+
+def test_reset_reuses_the_same_node_without_leaking_executor_entries(ros, fake_tf, monkeypatch):
+    """P1 regression: stop/start cycles must not add same-named nodes."""
+    # start() would bind camera topics; only the tf lifecycle is under test.
+    monkeypatch.setattr(vo.VisualOdometryNode, "bind_inputs", lambda self, ns: None)
+    node = _node({"tf": {"enabled": True}}, ros)
+    node.start_tf()
+    first = node.tf_node
+    assert len(ros.nodes) == 1
+
+    for _ in range(3):
+        node.stop()
+        node.start()          # start() calls start_tf() -> reuse
+        assert node.tf_node is first
+        assert first.running is True
+        assert len(ros.nodes) == 1        # no leak
+
+    node.stop_tf(destroy=True)
+    assert first.destroyed is True
+    assert ros.nodes == []                # removed from executor on destroy
 
 
 def test_info_exposes_embedded_tf_health(ros, fake_tf, monkeypatch):

@@ -445,12 +445,20 @@ def test_no_output_contains_a_non_finite_number():
         assert "NaN" not in text and "Infinity" not in text
 
 
-# ── Dockerfile COPY guard: a missing COPY means import fails in the image ───
+# ── Dockerfile COPY guard ───────────────────────────────────────────────────
 
-def test_the_spec_and_card_modules_reach_the_image():
+def test_only_the_embedded_tf_modules_reach_the_image():
+    """The retired vision_tf card is not copied into the runtime image.
+
+    Its logic is archived as a dependency-free library in the repository, but
+    the embedded-tf path only imports tf_tree_card / tf_tree_spec, so the image
+    carries just those two (minimal-change infrastructure).
+    """
     dockerfile = (BUMI / "Dockerfile").read_text(encoding="utf-8")
-    assert "COPY vision_tf_spec.py /work/vision_tf_spec.py" in dockerfile
-    assert "COPY vision_tf_card.py /work/vision_tf_card.py" in dockerfile
+    assert "COPY tf_tree_card.py /work/tf_tree_card.py" in dockerfile
+    assert "COPY tf_tree_spec.py /work/tf_tree_spec.py" in dockerfile
+    assert "COPY vision_tf_card.py" not in dockerfile
+    assert "COPY vision_tf_spec.py" not in dockerfile
 
 
 def test_vision_tf_is_not_exposed_as_a_standalone_card():

@@ -377,8 +377,21 @@ class VisualOdometryNode:
     # the odometry card so a stopped card leaves no fresh tf behind.
 
     def start_tf(self):
-        """Create and start the internal tf-tree node (idempotent)."""
-        if not self.tf_enabled or self.tf_node is not None:
+        """Start the internal tf-tree node, reusing a paused one (idempotent).
+
+        A canvas stop/reset pauses the node rather than discarding it, so a
+        later start reuses the SAME node instead of adding a second, same-named
+        node to the executor. Only close() destroys it. This is what keeps the
+        executor node count stable across repeated stop/start cycles.
+        """
+        if not self.tf_enabled:
+            return
+        node = self.tf_node
+        if node is not None:
+            if not node.running:
+                node.start('')  # reset of a previously paused node
+            self.tf_states = dict(enabled=True, state='running',
+                                  parse_error=node.parse_error)
             return
         from tf_tree_card import _TfTreeNode
         cfg = self.tf_config
@@ -390,30 +403,40 @@ class VisualOdometryNode:
         if not 0.1 <= max_joint_age_s <= 5.0:
             raise ValueError('tf.max_joint_age_s must be in [0.1, 5.0]')
         status_topic = f'/{self.namespace}'+TF_STATUS_TOPIC
-        self.tf_node = _TfTreeNode(
+        node = _TfTreeNode(
             self.namespace, urdf_path, publish_rate_hz, max_joint_age_s,
             500,  # no external vision topic; camera pose is pushed directly
             node_name='bumi_visual_odometry_tf', status_topic=status_topic)
         if self.executor is not None:
-            self.executor.add_node(self.tf_node)
-        self.tf_node.start('')
+            self.executor.add_node(node)
+        self.tf_node = node
+        node.start('')
         self.tf_states = dict(enabled=True, state='running',
-                              parse_error=self.tf_node.parse_error)
+                              parse_error=node.parse_error)
 
     def stop_tf(self, destroy=False):
-        """Stop the internal tf tree (idempotent).
+        """Pause the internal tf tree; only close() destroys it.
 
-        ``reset`` stops and restarts the odometry within one node, so the tf
-        node is reused there; only ``close`` destroys it.
+        Keeping the reference across a stop/reset lets start_tf() reuse the
+        node. ``destroy=True`` (close) additionally removes it from the
+        executor and destroys it, so no stopped node leaks for the driver's
+        lifetime.
         """
         node = self.tf_node
-        self.tf_node = None
-        self.tf_states = dict(enabled=self.tf_enabled, state='idle')
         if node is None:
+            self.tf_states = dict(enabled=self.tf_enabled, state='idle')
             return
         node.stop()
-        if destroy:
-            node.destroy_node()
+        self.tf_states = dict(enabled=self.tf_enabled, state='idle')
+        if not destroy:
+            return  # keep the reference for reset() to reuse
+        self.tf_node = None
+        if self.executor is not None and hasattr(self.executor, 'remove_node'):
+            try:
+                self.executor.remove_node(node)
+            except Exception:
+                pass  # node already deregistered during teardown
+        node.destroy_node()
 
     def publish_tf_pose(self, data):
         """Publish the camera's own odom pose as a dynamic tf edge.
