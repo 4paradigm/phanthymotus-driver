@@ -45,6 +45,12 @@ The worker subscribes to `odometry.odom_state` (x/y m, theta rad, vx/vy m/s, w r
 
 The FH-6-140-X-DP base has steerable wheels. When the direction changes (for example forward after a lateral move) it first turns the wheels and only then drives; on the robot a 1 s forward move right after lateral moves only straightened the wheels, and the next one moved about 5 cm. `duration_s` therefore counts from the moment odometry shows the base has actually covered 1 cm along the commanded direction (or turned 1.5°), waiting at most 5 s for that. The first move after the base has been idle also has to wake and enable the motors (it rests with exception `2/7`); on the robot that first move, with a 2 s wait, moved only 1 mm. Speed is not used for this: while the wheels turn, odometry reports short speed spikes (0.016–0.037 m/s for a 0.05 m/s command, recorded on the robot) with only 2–5 mm of real displacement; with no fresh odometry it counts from the first command. The move result reports the wait as `start_delay_s`, and the watchdog allows for it.
 
+## Waking a resting base
+
+After the base has been idle it rests with motors disabled (`2/7`). Waking it, the motor module reports `2/7` → `2/1` (motors not enabled) → `2/2` (brake), and the brake briefly raises the vehicle exception level to 1 before everything clears (recorded on the robot; names from the chassis warning table). Only before the base has started moving, and only when the active exceptions are these motor states (plus the scheduler heartbeat `116/1`), that level 1 is tolerated for at most 2 s. Any other code, level 2, a longer brake, or any non-zero level once moving still stops the move.
+
+Each move result includes `diagnostics` (`acquire_s`, `start_reason`: `distance` / `rotation` / `stale_odometry` / `grace` / `no_odometry`, `commands_sent`, `streamed_s`), and `info.last_move` repeats the latest result. `chassis_exception_history` records only changes, so a short-lived level is not pushed out by repeated identical reports.
+
 ## Chassis prerequisites
 
 The vendor controller accepts SDK speed only in **auto mode on a loaded map with the robot localised**. Observed on the robot (2026-11-23/24):

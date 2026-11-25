@@ -157,9 +157,13 @@ class SdkWorkerLink:
                 self.exception_level = event.get("level")
                 self.exceptions = event.get("exceptions") or []
                 self._exception_seen.set()
-                self.exception_history = (self.exception_history + [{
-                    "time": time.strftime("%H:%M:%S"), "level": self.exception_level,
-                    "exceptions": self.exceptions}])[-10:]
+                last = self.exception_history[-1] if self.exception_history else None
+                if last is None or (last["level"], last["exceptions"]) != (self.exception_level, self.exceptions):
+                    # Only changes: the chassis repeats identical reports, which used to push a
+                    # short-lived level-1 entry out of the history before it could be read.
+                    self.exception_history = (self.exception_history + [{
+                        "time": time.strftime("%H:%M:%S"), "level": self.exception_level,
+                        "exceptions": self.exceptions}])[-10:]
             elif kind == "odom":
                 self.odometry = {k: event[k] for k in ("x", "y", "theta", "vx", "vy", "w") if k in event}
                 self.odometry["received_monotonic"] = time.monotonic()
@@ -167,7 +171,7 @@ class SdkWorkerLink:
                 self._on_move_acquired(event.get("id"))
             elif kind == "move_done":
                 self._on_move_done(event.get("id"), event.get("status", "error"), event.get("message", ""),
-                                   event.get("odometry"), event.get("start_delay_s"))
+                                   event.get("odometry"), event.get("start_delay_s"), event.get("stats"))
         # Worker exited: the chassis stops on missing speed commands.
         self._on_move_done(None, "error", self._fatal or "chassis SDK worker exited")
 
@@ -227,6 +231,7 @@ class HeliosChassisMove:
         self._clock = clock
         self._lock = threading.Lock()
         self._active = None  # {"id", "deadline"}
+        self._last_move = None  # result of the most recent move, for info/diagnosis
         self._watchdog_stop = threading.Event()
         self._watchdog = None
         self._max_linear = float(config.get("chassis_max_linear_m_s", 0.2))
@@ -327,6 +332,7 @@ class HeliosChassisMove:
             "limits": {"max_linear_m_s": self._max_linear, "max_angular_deg_s": self._max_angular_deg,
                        "max_duration_s": MOVE_MAX_DURATION_S, "lateral_enabled": self._allow_lateral},
             "active_move": active["id"] if active else None,
+            "last_move": self._last_move,
         }
 
     def _validate(self, args):
@@ -386,6 +392,8 @@ class HeliosChassisMove:
             if active is None or (action_id is not None and active["id"] != action_id):
                 return
             self._active = None
+            self._last_move = {"action_id": active["id"], "status": status,
+                               "finished": time.strftime("%H:%M:%S"), **result}
         self._notify(active["id"], status, result)
 
     def _odometry(self):
@@ -404,12 +412,14 @@ class HeliosChassisMove:
             if active is not None and active["id"] == action_id:
                 active["deadline"] = self._clock() + START_GRACE_S + active["duration"] + WATCHDOG_MARGIN_S
 
-    def _on_move_done(self, action_id, status, message, odometry=None, start_delay_s=None):
+    def _on_move_done(self, action_id, status, message, odometry=None, start_delay_s=None, stats=None):
         result = {"message": message} if message else {}
         if odometry:
             result["odometry"] = odometry
-        if start_delay_s:  # time spent turning the wheels before the move's duration started
+        if start_delay_s:  # time spent waking/turning before the move's duration started
             result["start_delay_s"] = start_delay_s
+        if stats:
+            result["diagnostics"] = stats
         if status == "error" and message:
             result["error"] = message
         self._finish(action_id, status, result)

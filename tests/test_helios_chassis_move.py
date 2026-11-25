@@ -603,3 +603,62 @@ def test_lateral_field_is_listed_right_after_vx():
     schema = move.get_tools()[0]["inputSchema"]
     assert list(schema["properties"])[:5] == ["action", "vx", "vy", "vyaw", "duration_s"]
     assert schema["x-action-params"]["move"]["params"] == ["vx", "vy", "vyaw", "duration_s"]
+
+
+def test_move_diagnostics_reach_the_result_and_info():
+    nav = FakeNav()
+    speed, clock = session(nav)
+    speed.run(0.05, 0, 0, 1.0, threading.Event(), moving=lambda: clock.now >= 0.4)
+    assert speed.stats["start_reason"] == "moving" and speed.stats["acquire_s"] == 0
+    assert speed.stats["commands_sent"] >= 70 and 1.3 <= speed.stats["streamed_s"] <= 1.45
+    speed, clock = session(FakeNav())
+    speed.run(0.05, 0, 0, 1.0, threading.Event(), moving=lambda: False)
+    assert speed.stats["start_reason"] == "grace"
+
+    move, link, notes = card()
+    result = move.dispatch("move", {"vx": 0.1, "duration_s": 1})
+    move._on_move_done(result["action_id"], "completed", "", {"forward_m": 0.06}, 0.8,
+                       {"start_reason": "distance", "commands_sent": 90})
+    last = move.dispatch("info", {})["last_move"]
+    assert last["status"] == "completed" and last["start_delay_s"] == 0.8
+    assert last["diagnostics"]["start_reason"] == "distance" and last["odometry"]["forward_m"] == 0.06
+
+
+def test_exception_history_keeps_only_changes():
+    import io
+    lines = [json.dumps({"event": "exception", "level": lvl, "exceptions": exc}) + "\n" for lvl, exc in
+             [(0, [{"module": 2, "code": 7}]), (1, [{"module": 9, "code": 9}])] + [(0, [{"module": 116, "code": 1}])] * 20]
+    link = SdkWorkerLink({}, lambda *a: None)
+    link._read_events(type("P", (), {"stdout": io.StringIO("".join(lines))})())
+    assert [h["level"] for h in link.exception_history] == [0, 1, 0]
+
+
+def _info(level, codes):
+    items = [type("E", (), {"exception_moudle": m, "exception_code": c})() for m, c in codes]
+    return type("Info", (), {"robot_exception": level, "exceptions": items})()
+
+
+def test_wake_brake_is_tolerated_only_before_motion_and_only_briefly():
+    class Module:
+        def exception_state(self, cb):
+            self.cb = cb
+    clock = FakeClock()
+    module = Module()
+    worker = Worker(FakeNav(), lambda e: None, 50, exception_module=module, clock=clock)
+    worker._session.stats = {"start_reason": None}  # still waiting for the base to move
+    module.cb(_info(1, [(116, 1), (2, 2)]))  # brake while the motors wake (recorded on the robot)
+    assert worker._blocked() is None
+    clock.now = 1.9
+    assert worker._blocked() is None
+    clock.now = 2.1
+    assert worker._blocked() == "chassis exception level 1"  # brake held too long
+    module.cb(_info(0, [(116, 1)]))
+    assert worker._blocked() is None
+
+    module.cb(_info(1, [(116, 1), (311, 1)]))  # localisation timeout: never tolerated
+    assert worker._blocked() == "chassis exception level 1"
+    module.cb(_info(2, [(2, 2)]))  # emergency stop level: never tolerated
+    assert worker._blocked() == "chassis exception level 2"
+    worker._session.stats = {"start_reason": "distance"}  # already moving: any level stops
+    module.cb(_info(1, [(116, 1), (2, 2)]))
+    assert worker._blocked() == "chassis exception level 1"

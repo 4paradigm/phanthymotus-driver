@@ -40,6 +40,13 @@ START_GRACE_S = 5.0
 # with only 2-5 mm of real displacement.
 START_DISTANCE_M = 0.01
 START_YAW_DEG = 1.5
+# Waking a resting base, the motor module reports 2/7 (resting) -> 2/1 (motors not enabled)
+# -> 2/2 (brake), and the brake briefly raises the vehicle exception level to 1 before all
+# clear (recorded on the robot; names from the chassis warning table). Only before the base
+# has started moving, and only for these codes, such a level 1 is tolerated for this long.
+WAKE_EXCEPTIONS = frozenset({(2, 1), (2, 2), (2, 7), (116, 1)})  # 116/1: scheduler heartbeat, always present
+WAKE_MOTOR_CODES = frozenset({(2, 1), (2, 2)})
+WAKE_TOLERANCE_S = 2.0
 
 
 def _twist(nav, vx, vy, wz):
@@ -87,6 +94,10 @@ class SpeedSession:
         after START_GRACE_S at most; `self.start_delay_s` records the wait.
         """
         self.start_delay_s = 0.0
+        # Diagnostics for the move result: how long acquisition took, why the duration
+        # started (distance / rotation / stale_odometry / grace / no_odometry), what was sent.
+        self.stats = {"acquire_s": None, "start_reason": None, "commands_sent": 0, "streamed_s": 0.0}
+        t_request = self._clock()
         for value in (vx, vy, wz, duration_s):
             if not math.isfinite(value):
                 return "error", "non-finite command"
@@ -100,12 +111,15 @@ class SpeedSession:
                 return "cancelled", ""
             return "error", (f"could not acquire SDK speed control after {ACQUIRE_ATTEMPTS} attempts "
                              f"({reason}); the chassis may still be waking its motors, retry shortly")
+        self.stats["acquire_s"] = round(self._clock() - t_request, 2)
         on_acquired()
         status, message = "completed", ""
         try:
             twist = _twist(self._nav, vx, vy, wz)
             first = self._clock()
             deadline = None if moving is not None else first + duration_s
+            if moving is None:
+                self.stats["start_reason"] = "no_odometry"
             failures = 0
             while True:
                 if stop_event.is_set():
@@ -116,11 +130,18 @@ class SpeedSession:
                     status, message = "error", reason
                     break
                 now = self._clock()
-                if deadline is None and (now - first >= START_GRACE_S or moving()):
-                    deadline = now + duration_s
-                    self.start_delay_s = round(now - first, 2)
+                if deadline is None:
+                    if now - first >= START_GRACE_S:
+                        self.stats["start_reason"] = "grace"
+                    elif moving():
+                        self.stats["start_reason"] = getattr(moving, "reason", "moving")
+                    if self.stats["start_reason"]:
+                        deadline = now + duration_s
+                        self.start_delay_s = round(now - first, 2)
                 if deadline is not None and now >= deadline:
                     break
+                self.stats["commands_sent"] += 1
+                self.stats["streamed_s"] = round(self._clock() - first, 2)
                 if self._nav.send_third_expected_speed(twist):
                     failures = 0
                 else:
@@ -204,8 +225,11 @@ class OdomTracker:
 
 
 class Worker:
-    def __init__(self, nav, emit, rate_hz, exception_module=None, odom=None):
+    def __init__(self, nav, emit, rate_hz, exception_module=None, odom=None, clock=time.monotonic):
         self._session = SpeedSession(nav, rate_hz)
+        self._clock = clock
+        self._active_exceptions = frozenset()
+        self._wake_since = None
         self._emit = emit
         self._lock = threading.Lock()
         self._move = None  # (id, stop_event, thread)
@@ -224,14 +248,25 @@ class Worker:
             code = getattr(item, "exception_code", None)
             if isinstance(module, int) and isinstance(code, int):
                 active.append({"module": module, "code": code})
+        self._active_exceptions = frozenset((e["module"], e["code"]) for e in active)
         self._emit({"event": "exception", "level": self.exception_level, "exceptions": active[:20]})
 
     def _blocked(self):
         if self._requires_exception_state and self.exception_level is None:
             return "chassis exception state not received yet"
-        if self.exception_level not in (None, 0):
-            return f"chassis exception level {self.exception_level}"
-        return None
+        if self.exception_level in (None, 0):
+            self._wake_since = None
+            return None
+        stats = getattr(self._session, "stats", None) or {}
+        starting = stats.get("start_reason") is None
+        if (self.exception_level == 1 and starting and self._active_exceptions <= WAKE_EXCEPTIONS
+                and self._active_exceptions & WAKE_MOTOR_CODES):
+            now = self._clock()
+            if self._wake_since is None:
+                self._wake_since = now
+            if now - self._wake_since <= WAKE_TOLERANCE_S:
+                return None  # motors waking / brake releasing before the first motion
+        return f"chassis exception level {self.exception_level}"
 
     def handle(self, message):
         op = message.get("op")
@@ -270,7 +305,8 @@ class Worker:
         end = self._odom.snapshot() if self._odom else None
         self._emit({"event": "move_done", "id": move_id, "status": status, "message": text,
                     "odometry": OdomTracker.displacement(start, end),
-                    "start_delay_s": getattr(self._session, "start_delay_s", 0.0)})
+                    "start_delay_s": getattr(self._session, "start_delay_s", 0.0),
+                    "stats": getattr(self._session, "stats", None)})
 
     def _moving_check(self, vx, vy, wz):
         """True once odometry shows the base has covered START_DISTANCE_M along the command
@@ -281,6 +317,7 @@ class Worker:
         def moving():
             sample = self._odom.snapshot(max_age_s=0.5)
             if sample is None:
+                moving.reason = "stale_odometry"
                 return True
             if not origin:
                 origin.append(sample)
@@ -289,8 +326,12 @@ class Worker:
             if linear > 0:
                 along = (moved["forward_m"] * vx + moved["left_m"] * vy) / linear
                 if along >= START_DISTANCE_M:
+                    moving.reason = "distance"
                     return True
-            return wz != 0 and math.copysign(1.0, wz) * moved["yaw_deg"] >= START_YAW_DEG
+            if wz != 0 and math.copysign(1.0, wz) * moved["yaw_deg"] >= START_YAW_DEG:
+                moving.reason = "rotation"
+                return True
+            return False
         return moving
 
     def stop(self, timeout_s=3.0):
