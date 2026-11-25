@@ -166,8 +166,8 @@ def test_servo_watchdog_fires_at_1000_ms_without_admitting_stale_commands(servo,
     assert servo.native.calls[-1] == servo.native.calls[-2]
     assert p._sink.stats()['watchdog_strikes'] == 1
     rate = started['control_interface']['rate']
-    assert rate['max_feedback_gap_ms'] == 300
-    assert started['control_interface']['navigation'] == {'use_obstacle_history': False}
+    assert 'max_feedback_gap_ms' not in rate
+    assert 'navigation' not in started['control_interface']
     assert rate['watchdog_ms'] == 1000
     assert rate['max_command_ttl_ms'] == 1000
     assert rate['max_obs_age_ms'] == 1000
