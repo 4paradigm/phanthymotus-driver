@@ -853,6 +853,45 @@ class TestDriverContracts(unittest.TestCase):
         self.assertEqual(["mic", "vision_capture"], created)
         self.assertEqual(2, len(ready.plugins))
 
+    def test_bundle_registers_enabled_obstacle_monitor_only_when_dds_is_ready(self):
+        class FakeObstacleMonitor:
+            def __init__(self, config, namespace, executor):
+                self.namespace = namespace
+
+            def get_tool(self):
+                return {"name": "obstacle_monitor", "type": "sensor"}
+
+            def dispatch(self, action, args):
+                return {"action": action, "namespace": self.namespace}
+
+        device = types.ModuleType("device")
+        device.StatePlugin = device.LocoPlugin = device.SpecialMotionPlugin = object
+        device.LedPlugin = object
+        multimedia = types.ModuleType("multimedia")
+        multimedia.CameraPlugin = multimedia.SpeakerPlugin = multimedia.MicPlugin = object
+        lidar = types.ModuleType("lidar")
+        lidar.LidarPlugin = object
+        spatial = types.ModuleType("controlled_spatial")
+        spatial.ControlledSpatialPlugin = object
+        mapping = types.ModuleType("slam_mapping")
+        mapping.SlamMappingPlugin = object
+        obstacle = types.ModuleType("obstacle_monitor")
+        obstacle.ObstacleMonitorPlugin = FakeObstacleMonitor
+        disabled = ("state", "loco", "special_motion", "mic", "speaker", "led",
+                    "camera", "vision_capture", "lidar", "controlled_spatial", "slam_mapping")
+        config = {"plugins": {name: {"enabled": False} for name in disabled}}
+        config["plugins"]["obstacle_monitor"] = {"enabled": True}
+        modules = {"device": device, "multimedia": multimedia, "lidar": lidar,
+                   "controlled_spatial": spatial, "slam_mapping": mapping,
+                   "obstacle_monitor": obstacle}
+        with patch.dict(sys.modules, modules):
+            ready = self.main.Bundle(config, "dog", object(), object(), "eth0", dds_ready=True)
+            degraded = self.main.Bundle(config, "dog", object(), object(), None, dds_ready=False)
+        self.assertEqual(["model", "obstacle_monitor"], [tool["name"] for tool in ready.tools()])
+        self.assertEqual({"action": "read", "namespace": "dog"},
+                         ready.call("obstacle_monitor", {"action": "read"}))
+        self.assertEqual(["model"], [tool["name"] for tool in degraded.tools()])
+
     def test_camera_start_returns_running_with_async_readiness(self):
         plugin = self.multimedia.CameraPlugin.__new__(self.multimedia.CameraPlugin)
         plugin._topic = "/test/camera/front"

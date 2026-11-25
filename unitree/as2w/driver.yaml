@@ -28,3 +28,4 @@ cards:
   - { name: loco_state, type: sensor }
   - { name: remote_controller, type: sensor }
   - { name: lidar_cloud, type: sensor }
+  - { name: obstacle_monitor, type: sensor }

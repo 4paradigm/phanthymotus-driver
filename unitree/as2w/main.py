@@ -156,6 +156,10 @@ class Bundle:
             self.plugins.append(VisionCapturePlugin(
                 p.get("vision_capture", {}), namespace, executor))
         if dds_ready and p.get("lidar", {}).get("enabled", True): self.plugins.append(LidarPlugin(p.get("lidar", {}), namespace, executor, interface))
+        if dds_ready and p.get("obstacle_monitor", {}).get("enabled", False):
+            from obstacle_monitor import ObstacleMonitorPlugin
+            self.plugins.append(ObstacleMonitorPlugin(
+                p.get("obstacle_monitor", {}), namespace, executor))
         if dds_ready and p.get("controlled_spatial", {}).get("enabled", True):
             controlled_spatial = ControlledSpatialPlugin(
                 p.get("controlled_spatial", {}), namespace, executor, interface)
