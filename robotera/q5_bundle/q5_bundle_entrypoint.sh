@@ -30,6 +30,25 @@ driver_uri="${Q5_CYCLONEDDS_URI:-${CYCLONEDDS_URI:-}}"
 ) &
 driver_pid=$!
 
+# AprilTag 检测器运行在 Q5 本体 ROS domain，输出带图像时间戳的检测结果和 TF。
+# 它没有运动命令发布接口；测量卡片只读取这些结果。
+(
+  export ROS_DOMAIN_ID="${Q5_ROS_DOMAIN_ID:-211}"
+  export RMW_IMPLEMENTATION="rmw_cyclonedds_cpp"
+  export ROS_LOCALHOST_ONLY="${ROS_LOCALHOST_ONLY:-0}"
+  if [[ -n "${driver_uri}" ]]; then
+    export CYCLONEDDS_URI="${driver_uri}"
+  else
+    unset CYCLONEDDS_URI
+  fi
+  exec ros2 run apriltag_ros apriltag_node --ros-args \
+    -r image_rect:=/camera/camera/color/image_raw \
+    -r camera_info:=/camera/camera/color/camera_info \
+    -r detections:=/q5/apriltag/detections \
+    --params-file /work/apriltag_q5.yaml
+) &
+detector_pid=$!
+
 (
   export ROS_DOMAIN_ID="${AGENT_CORE_ROS_DOMAIN_ID:-42}"
   export RMW_IMPLEMENTATION="rmw_fastrtps_cpp"
@@ -43,9 +62,10 @@ bridge_pid=$!
 
 shutdown() {
   trap - TERM INT EXIT
-  kill -TERM "$bridge_pid" "$driver_pid" 2>/dev/null || true
+  kill -TERM "$bridge_pid" "$driver_pid" "$detector_pid" 2>/dev/null || true
   wait "$bridge_pid" 2>/dev/null || true
   wait "$driver_pid" 2>/dev/null || true
+  wait "$detector_pid" 2>/dev/null || true
 }
 
 trap shutdown TERM INT EXIT
