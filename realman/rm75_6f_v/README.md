@@ -27,6 +27,12 @@ Available tools are:
 - `model`: simplified RM75-6F-V URDF for live skeleton display. Its seven
   movable joint names exactly match the `joint_states` skeleton stream.
 - `joint_control`: bounded joint-space motion and controlled stop.
+- `servo`: continuous 8-dimension control from a `motus.control/1` stream, and
+  the `state/joint` proprioception a VLA binds as its observation input. See
+  "Continuous control" below.
+- `gripper`: two-finger gripper position, one call-shaped motion at a time.
+  Mutually exclusive with `servo`, which streams the same gripper as dimension
+  8 of its action space.
 - `abs_move`: `move` reads the current TCP as A and moves to
   the requested base-frame B using
   joint-space planning by default, with an explicit TCP-linear mode available.
@@ -34,6 +40,140 @@ Available tools are:
 - `ext_camera`: multi-instance upper-computer USB camera card. A RealSense
   instance can publish RGB, depth, or left infrared without going through the
   RealMan controller.
+
+## Continuous control (`servo`)
+
+`joint_control` is the call-shaped path: one absolute target per `tools/call`,
+an ACP completion, a `confirm_motion` per request. That is right for an LLM
+deciding to move the arm somewhere, and wrong for an execution model, which
+produces tens of commands per second and is not asking a question each time.
+
+`servo` is the stream-shaped path. It subscribes to a `control/joint` topic,
+runs every message through the shared `common/control.ControlSink`, and passes
+what survives to the RealMan passthrough API (`rm_movej_canfd`). Freshness,
+arbitration between sources, step clamping, hard limits, the watchdog and its
+escalation all live in the sink and are tested without an arm.
+
+Both paths reserve the same physical arm through one shared motion gate, so
+while `servo` is streaming, `joint_control`, `gripper`, `abs_move` and
+`pick_place` are all refused with `another arm operation is active`. Every
+movement still requires `RM_MOTION_ENABLED=1`; a card that streams does not
+earn an exemption because its commands are frequent — it is checked once at
+`start`, which is where a human is present.
+
+### The action space is 8 dimensions
+
+| index | meaning | unit | limits |
+| --- | --- | --- | --- |
+| 0-6 | joint 1-7 | rad | the same vendor limits `joint_control` enforces |
+| 7 | gripper | normalized closure | 0.0-1.0 |
+
+**The gripper is dimension 8, not a side channel.** An execution model emits
+"move the hand here *and* close the gripper" in one timestep; the call-shaped
+`gripper` card cannot take that, and a model whose gripper dimension went
+nowhere would negotiate successfully, report every command as applied, and
+never pick anything up.
+
+Setting `servo.gripper: false` makes this a genuinely **7-dimension** card, not
+an 8-dimension one that ignores the last value — so a model with a gripper
+fails negotiation instead of being half-executed. Which one it is gets decided
+by asking the robot at `start` (`rm_get_gripper_state` must report
+`status: 1` **and** `enable_state: 1`); a config claiming a gripper the arm does
+not have is refused rather than silently downgraded.
+
+**Gripper polarity: 0 is open, 1 is closed — and this is not yet verified on
+hardware.** The SDK takes an *aperture* of 1-1000 in the opposite direction, so
+closure 0 maps to 1000 and closure 1 maps to 1. Whether a given model's gripper
+dimension means closure or aperture is **not** something negotiation can check:
+`motus.vla/1` passes the gripper through unchanged, deliberately, because
+normalizing it needs the travel of this particular gripper, which is the
+robot's knowledge and not the model's. Getting it backwards turns "open" into
+"clench" around an object — the dangerous direction. **Before trusting a policy
+with this arm, command closure 0 and 1 by hand once and watch the gripper.**
+
+The gripper is a serial device behind the controller, not a 30 Hz joint, so its
+commands are rate-capped (`servo.gripper_max_hz`, default 10) and deadbanded
+(`servo.gripper_deadband`, default 0.02). The arm itself keeps running at
+`expected_hz`. Both values are reported in `info()` — a cap nobody can see reads
+as "every command reached the gripper" when it did not.
+
+On a watchdog or an abort the arm slow-stops and the gripper is **held**, not
+released: releasing drops whatever is being carried onto whatever is underneath,
+and this driver cannot know which is worse. Set
+`servo.release_gripper_on_watchdog: true` to open it instead.
+
+### Proprioception comes out of this card
+
+`servo` publishes `state/joint` on `/{namespace}/servo/state`, which is what a
+VLA card binds as its observation input. Wire it back to the policy on the
+canvas: `vla → servo →(state)→ vla`.
+
+```json
+{"schema": "motus.control/1", "kind": "joint_state", "dof": 8,
+ "joint_names": ["joint_1", ..., "gripper"],
+ "values": [7 joint angles in rad, gripper closure],
+ "eef": [x, y, z, qx, qy, qz, qw, gripper closure],
+ "stamp_ms": 1760000000000}
+```
+
+`values` is in the same order and the same units as the commands this card
+accepts, because both come out of one `build_descriptor()` — the two cannot be
+changed independently. `eef` is the current end-effector pose, in metres and a
+unit quaternion (**xyzw**), and exists so an incremental model (OpenVLA emits an
+end-effector delta) has the base pose its delta is relative to — only the robot
+knows where "here" is.
+
+Two things to be aware of:
+
+- **`stamp_ms` is when the sample was taken**, not when it was published. A
+  policy uses it to compute observation age, and reporting the publish time
+  would claim the channel is fresher than it is.
+- **`eef` is in the controller's currently active tool frame.** This driver does
+  not own that setting — see the `cartesian.tool_length_mm` comment in
+  `config.yaml`, which is only 222.5 mm when the controller has been set to the
+  gripper TCP. The assumption is reported in `info()` under
+  `state_out.eef_frame` rather than compensated for here: silently adding an
+  offset for a setting we cannot confirm is worse than not adding one.
+
+If any channel is unreadable, **nothing is published** rather than padded with
+zeros: zero radians is "arm straight out" and zero closure is "gripper open",
+both plausible-looking readings a policy has no way to tell apart from the truth.
+The reason lands in `info()` under `state_out.error`.
+
+### Six-axis force aborts the stream
+
+RM75-6F-V has an integrated six-axis force/torque sensor, so step 7 of the sink
+chain is real on this arm. Over any per-axis threshold, the sink **aborts and
+latches**: the next command after hitting something is precisely the one that
+must not run. The only way out is the `servo` card's `reset` action — `resume`
+does not clear a latch.
+
+**It reads `zero_force_data` (external force, with the tool's weight
+compensated), never `force_data`.** The raw vector includes the gripper's own
+weight, so a threshold on it trips on gravity in some poses and never trips in
+others, and both look like "the threshold needs tuning".
+
+Two preconditions, and the driver refuses to present a protection it cannot
+trust:
+
+- **The sensor must be zeroed with the arm hanging free, and the payload
+  configured.** The driver deliberately does **not** call
+  `rm_clear_force_data` at start: zeroing while the arm is already touching
+  something bakes that contact in as zero, after which a real collision reads as
+  nothing.
+- If `zero_force_data` comes back as exactly zero on all six axes, that cannot
+  be told apart from an unwired or unpopulated sensor, so the protection is
+  **not enabled** and `info()` says why under `force_torque.note`.
+
+**The default thresholds (50 N per force axis, 5 Nm per torque axis) are a
+guess and have not been checked against this hardware.** The vendor rates the
+sensor at 200 N / 8 Nm. They are deliberately loose: too tight makes the arm
+abort constantly, which is how a protection gets switched off for good. To set
+them properly, with the arm zeroed and hanging free, run the motion you intend
+at reduced speed, read `info()["force_torque"]["last_reading"]` throughout to
+see the quiescent envelope, and set each axis above that envelope and below the
+force you are willing to let the arm apply. `servo.force_torque: false` turns
+it off entirely, and a 6-list `[Fx, Fy, Fz, Mx, My, Mz]` sets each axis.
 
 ## Upper-computer RealSense camera
 
