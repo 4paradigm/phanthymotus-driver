@@ -7,6 +7,7 @@
 | `joints` | sensor | 关节骨架和逐轴状态，默认 10 Hz |
 | `battery` | sensor | 两块电池状态，默认 1 Hz |
 | `model` | resource | 运行时读取本机 iNex 的 URDF，骨架渲染器自动调用 |
+| `base_drive` | actuator | 底盘限时低速移动（前进/后退/旋转）与立即停车，见 [CHASSIS_MOVE_INTERFACE.md](CHASSIS_MOVE_INTERFACE.md) |
 
 ## 数据与单位
 
@@ -50,6 +51,16 @@
 
 关节默认 1 秒、电池默认 3 秒无有效报文即过期。断线、无效、过期或停止时清空相应数据；无关报文不刷新有效期。关节流的 `received_at_ms` 是 Driver 接收时间；`timestamp_ms` 是发布时刻。没有厂家采样时间，无法仅凭接收计数排除控制器内部数据冻结。
 
+## 底盘移动 `base_drive`
+
+与 AgileX Bunker 的 `base_drive` 同一契约：`move(vx, vy, vyaw, duration_s)` 必须给时长，到时自动停车；`stop_move` 立即停车（画布可见；Core 会隐藏系统动作 `stop`，`stop` 仍保留供项目停止时调用）；`info` 返回限速、SDK 连接与底盘异常等级。`x-completion` 经 Agent Core ACP 回报 completed / cancelled / error，`x-resource: base`。默认上限 0.2 m/s、15°/s、10 s（代码硬上限 0.5 m/s、30°/s，配置不能超过）；横移 `vy` 默认关闭。
+
+速度经厂家 VMR AMR SDK 的第三方控速下发（`set_third_speed_ctrl` → 50 Hz `send_third_expected_speed` → 零速 → `close_third_speed_ctrl`），在独立 worker 进程内运行：每次移动自带截止时间，Driver 退出或 worker 被杀时底盘因收不到速度指令自动停车（厂家示例说明）。`info` 与每次移动结果附带里程计实测位移（前进/左移/转角）。
+
+厂家 SDK 只有 CPython 3.12 版，而 ROS Humble 是 3.10：镜像内置固定版本、校验 SHA256 的独立 Python 3.12（`/opt/sdk-python`），只给 SDK worker 使用，已在机器人只读实测可导入、连接并收到里程计。厂家 SDK 二进制不进 Git：参照 G1/Agibot A3/DJI 的做法，构建时由 Dockerfile 从项目 COS 下载并校验 SHA256（`VMR_SDK_URL` / `VMR_SDK_SHA256`），解压到镜像 `/opt/vmr-sdk`。未提供 URL 时镜像照常构建，卡片照常注册，`move` 明确报错。
+
+**前提**：底盘须在厂家界面建图、应用地图并重定位成功，且处于自动模式（非手动模式）。未定位时底盘刹车并报异常（311/4/2），`move` 会被拒绝并返回异常列表；手动模式下 SDK 速度被忽略。2026-11-24 已在现场看护下用本地预览镜像实测前进、后退、左右转、横移与 `stop_move`，详见接口文档。
+
 ## 画布与 Core 前端
 
 在卡片共享配置中保存状态地址，再将 `joints` 和 `battery` 加入画布并启动。`model` 无需单独运行；首次请求时读取同一 iNex 地址的 `/api/robot_3d_model` 及其同源 `urdf_url`，核对 20 轴名称后在进程内缓存。没有把厂家模型打入镜像。模型服务暂不可用时明确返回错误，不影响关节和电池订阅启动。监控页从 `joints` 自动生成骨架。
@@ -73,7 +84,7 @@
 仓库根目录安装本 Driver 的 requirements 及 pytest 后执行：
 
 ```bash
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=. python -m pytest -q tests/test_helios_joints.py tests/test_helios_battery.py tests/test_helios_torque.py tests/test_helios_model.py
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=. python -m pytest -q tests/test_helios_joints.py tests/test_helios_battery.py tests/test_helios_torque.py tests/test_helios_model.py tests/test_helios_chassis_move.py
 python scripts/check_service_yml.py rokae/helios
 ```
 

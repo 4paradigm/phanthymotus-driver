@@ -9,3 +9,14 @@ publish_hz: 10
 stale_timeout_s: 1.0
 connect_timeout_s: 3.0
 reconnect_delay_s: 1.0
+# Chassis movement (base_drive) via the vendor VMR AMR SDK (fetched at image build time).
+chassis_motion_enabled: true
+chassis_sdk_dir: /opt/vmr-sdk
+chassis_sdk_lib_subdir: lib
+chassis_sdk_python: /opt/sdk-python/bin/python3
+chassis_sdk_host: 192.168.0.100
+chassis_sdk_port: 9003
+chassis_command_hz: 50
+chassis_max_linear_m_s: 0.2
+chassis_max_angular_deg_s: 15
+chassis_allow_lateral: false
