@@ -662,3 +662,19 @@ def test_wake_brake_is_tolerated_only_before_motion_and_only_briefly():
     worker._session.stats = {"start_reason": "distance"}  # already moving: any level stops
     module.cb(_info(1, [(116, 1), (2, 2)]))
     assert worker._blocked() == "chassis exception level 1"
+
+
+def test_sdk_python_runtime_is_installed_only_with_the_sdk():
+    from pathlib import Path
+    text = (Path(__file__).parents[1] / "rokae/helios/Dockerfile").read_text()
+    branch = text[text.index('RUN if [ -n "${VMR_SDK_URL}" ]; then'):text.index("fi && rm -f /tmp/build_fetch.py")]
+    assert text.count("/tmp/sdk-python.tar.gz") == branch.count("/tmp/sdk-python.tar.gz") > 0  # only inside the SDK branch
+
+
+def test_acp_failure_log_names_the_action(monkeypatch, capsys):
+    import urllib.request as ur
+    from rokae.helios import chassis_move
+    monkeypatch.setattr(ur, "urlopen", lambda *a, **k: (_ for _ in ()).throw(OSError("refused")))
+    chassis_move.acp_notify("helios_move_abc123", "completed", {})
+    out = capsys.readouterr().out
+    assert "action_id=helios_move_abc123" in out and "status=completed" in out and "/api/acp/complete" in out

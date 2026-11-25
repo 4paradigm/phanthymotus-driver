@@ -58,7 +58,10 @@ def acp_notify(action_id, status, result):
         with urllib.request.urlopen(request, timeout=5, context=context):
             pass
     except Exception as exc:
-        print(f"[helios-move] ACP completion callback failed ({type(exc).__name__})", flush=True)
+        # Agent Core keeps the action pending until its timeout: name it so the log line can be
+        # matched to the stuck action.
+        print(f"[helios-move] ACP completion callback failed for action_id={action_id} "
+              f"status={status} url={url}/api/acp/complete ({type(exc).__name__}: {exc})", flush=True)
 
 
 def _number(args, name, default=0.0):
