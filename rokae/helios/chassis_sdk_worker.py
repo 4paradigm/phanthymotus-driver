@@ -31,10 +31,10 @@ MAX_SEND_FAILURES = 3
 # Each attempt is bounded by the RPC call timeout (3 s), so acquisition takes at most ~10 s.
 ACQUIRE_ATTEMPTS = 3
 ACQUIRE_RETRY_DELAY_S = 0.5
-# The Helios base has steerable wheels: when the direction changes (e.g. forward after a
-# lateral move) it first turns the wheels and only then drives. duration_s counts from
-# the moment odometry shows the base moving, waiting at most STEER_GRACE_S for that.
-STEER_GRACE_S = 2.0
+# Before the base actually drives it may first wake and enable idle motors (it rests after
+# a while: exception 2/7) and turn its steerable wheels to the new direction. duration_s
+# counts from the moment odometry shows the base moving, waiting at most START_GRACE_S.
+START_GRACE_S = 5.0
 # Motion is judged by distance actually covered, not by speed: while the wheels turn,
 # odometry shows short speed spikes (measured 0.016-0.037 m/s for a 0.05 m/s command)
 # with only 2-5 mm of real displacement.
@@ -84,7 +84,7 @@ class SpeedSession:
 
         `moving()` reports whether odometry shows the base following the command (None:
         no odometry, time from the first command). The duration starts once it does, or
-        after STEER_GRACE_S at most; `self.start_delay_s` records the wait.
+        after START_GRACE_S at most; `self.start_delay_s` records the wait.
         """
         self.start_delay_s = 0.0
         for value in (vx, vy, wz, duration_s):
@@ -116,7 +116,7 @@ class SpeedSession:
                     status, message = "error", reason
                     break
                 now = self._clock()
-                if deadline is None and (now - first >= STEER_GRACE_S or moving()):
+                if deadline is None and (now - first >= START_GRACE_S or moving()):
                     deadline = now + duration_s
                     self.start_delay_s = round(now - first, 2)
                 if deadline is not None and now >= deadline:

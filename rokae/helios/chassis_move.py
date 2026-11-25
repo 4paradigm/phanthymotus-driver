@@ -38,9 +38,9 @@ WATCHDOG_MARGIN_S = 3.0
 # Before the worker reports move_acquired it may still be retrying set_third_speed_ctrl
 # while the chassis wakes its motors (3 attempts x 3 s RPC timeout, see the worker).
 ACQUIRE_BUDGET_S = 10.0
-# After acquisition the worker may wait up to this long for steerable wheels to turn
-# before the move's duration starts (worker STEER_GRACE_S).
-STEER_GRACE_S = 2.0
+# After acquisition the worker may wait up to this long for idle motors to wake and the
+# steerable wheels to turn before the move's duration starts (worker START_GRACE_S).
+START_GRACE_S = 5.0
 
 
 def acp_notify(action_id, status, result):
@@ -367,7 +367,7 @@ class HeliosChassisMove:
                 return {"error": "a timed base move is already running; send stop first"}
             # Until the worker holds speed control, allow for the chassis waking its motors.
             self._active = {"id": action_id, "duration": duration,
-                            "deadline": self._clock() + ACQUIRE_BUDGET_S + STEER_GRACE_S + duration
+                            "deadline": self._clock() + ACQUIRE_BUDGET_S + START_GRACE_S + duration
                             + WATCHDOG_MARGIN_S}
         try:
             self.link.send({"op": "move", "id": action_id, "vx": vx, "vy": vy,
@@ -402,7 +402,7 @@ class HeliosChassisMove:
         with self._lock:
             active = self._active
             if active is not None and active["id"] == action_id:
-                active["deadline"] = self._clock() + STEER_GRACE_S + active["duration"] + WATCHDOG_MARGIN_S
+                active["deadline"] = self._clock() + START_GRACE_S + active["duration"] + WATCHDOG_MARGIN_S
 
     def _on_move_done(self, action_id, status, message, odometry=None, start_delay_s=None):
         result = {"message": message} if message else {}

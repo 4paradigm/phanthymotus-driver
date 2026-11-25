@@ -95,7 +95,7 @@ def test_steering_wait_is_capped():
     nav = FakeNav()
     speed, clock = session(nav)
     speed.run(0.05, 0, 0, 1.0, threading.Event(), moving=lambda: False)
-    assert speed.start_delay_s == 2.0 and clock.now < 3.5  # never waits longer than STEER_GRACE_S
+    assert 5.0 <= speed.start_delay_s <= 5.05 and clock.now < 6.5  # never waits longer than START_GRACE_S
 
 
 def test_stop_during_steering_wait_cancels():
@@ -386,11 +386,11 @@ def test_watchdog_allows_motor_wake_up_until_speed_control_is_acquired():
     clock.now = 11.0  # still acquiring (chassis waking): not cut off
     time.sleep(0.5)
     assert link.killed == 0 and not notes
-    move._on_move_acquired(result["action_id"])  # acquired at t=11: 2 s steering + 1 s move + 3 s margin
-    clock.now = 16.5
+    move._on_move_acquired(result["action_id"])  # acquired at t=11: 5 s start + 1 s move + 3 s margin
+    clock.now = 19.5
     time.sleep(0.5)
     assert link.killed == 0 and not notes
-    clock.now = 17.5
+    clock.now = 20.5
     for _ in range(50):
         if notes:
             break
@@ -402,7 +402,7 @@ def test_watchdog_kills_worker_when_completion_never_arrives():
     clock = FakeClock()
     move, link, notes = card(clock=clock)
     result = move.dispatch("move", {"vx": 0.1, "duration_s": 1})
-    clock.now = 20.0
+    clock.now = 30.0
     for _ in range(50):
         if notes:
             break
