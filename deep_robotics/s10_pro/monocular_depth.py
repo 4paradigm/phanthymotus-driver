@@ -74,6 +74,9 @@ class MonocularDepth:
         self._input_dtype = np.float16 if descriptor.type == 'tensor(float16)' else np.float32
 
     def predict(self, jpeg):
+        return zlib.compress(self.predict_mm(jpeg), level=1)
+
+    def predict_mm(self, jpeg):
         from PIL import Image
 
         if not 0 < len(jpeg) <= 2 * 1024 * 1024:
@@ -91,11 +94,12 @@ class MonocularDepth:
         depth = np.squeeze(np.asarray(outputs[0], dtype=np.float32))
         if depth.shape != (self._input_h, self._input_w):
             raise ValueError('unexpected monocular depth output geometry')
-        depth = np.asarray(Image.fromarray(depth[y:y + height, x:x + width]).resize(
-            (640, 480), Image.Resampling.NEAREST))
+        # Nearest-neighbour resize copies samples. Quantize each model sample
+        # once before expanding it onto the 640x480 output grid.
+        depth = depth[y:y + height, x:x + width]
         valid = np.isfinite(depth) & (depth >= .001) & (depth <= 65.535)
         packet = np.rint(np.where(valid, depth * 1000, 0)).astype('<u2')
-        return zlib.compress(packet.tobytes(), level=1)
+        return Image.fromarray(packet).resize((640, 480), Image.Resampling.NEAREST).tobytes()
 
 
 if __name__ == '__main__':

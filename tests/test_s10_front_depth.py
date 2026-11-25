@@ -810,7 +810,9 @@ def test_start_is_lazy_and_idempotent_keeps_receipt_stamp_and_metric_payload(rig
     values = struct.unpack("<307200H", raw)
     assert values.count(2000) == 1 and values.count(0) == 307199
     assert rig.plugin.dispatch("info", {})["stats"]["published"] == 1
-    assert rig.plugin.dispatch("info", {})["stats"]["last_source_stamp"] == [10, 123]
+    stats = rig.plugin.dispatch("info", {})["stats"]
+    assert stats["last_source_stamp"] == [10, 123]
+    assert stats["receive_to_enqueue_ms"] >= 0
 
 
 @pytest.mark.parametrize("bad", [cloud(frame="map"), cloud(sec=0, nanosec=0),
@@ -954,9 +956,9 @@ def _worker_with_constant_monocular_model(jobs, results):
     # neural model is an oracle; no engine download or GPU belongs in IPC tests.
     depth = module()
     class ConstantModel:
-        def predict(self, jpeg):
+        def predict_mm(self, jpeg):
             assert jpeg == b'front-jpeg'
-            return zlib.compress(struct.pack('<H', 2000) * (640 * 480))
+            return struct.pack('<H', 2000) * (640 * 480)
     depth.MonocularDepth = ConstantModel
     depth._project_worker(jobs, results)
 
@@ -1005,6 +1007,7 @@ def test_real_worker_reports_bad_layout_then_completes_depth_and_closes(monkeypa
         assert struct.unpack_from("<H", raw, (240 * 640 + 320) * 2)[0] == 2000
         assert struct.unpack_from("<H", raw, (240 * 640 + 322) * 2)[0] == 2000
         assert struct.unpack_from("<H", raw, (240 * 640 + 325) * 2)[0] == 2000
+        assert stats["worker_wait_ms"] >= 0
         assert stats["source_points"] == len(points)
         assert stats["sample_points"] == stats["valid_pixels"] == len(points)
         assert stats["filled_pixels"] == 0 and stats["fill_conflicts"] == 0

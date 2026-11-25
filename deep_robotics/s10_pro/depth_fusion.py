@@ -9,10 +9,12 @@ from deep_robotics.s10_pro import cpu_kernels
 
 _NEAR_COMPLETION_MM = 500
 _NEAR_RELATIVE_ERROR = .10
+# Fixed-grid terms shared by every frame of the S10 depth stream.
+_HOLDOUT = (13 * np.arange(640) + 7 * np.arange(480)[:, None]) % 5 == 0
+_LOG_METRES = np.log(np.maximum(np.arange(65536, dtype=np.float64) / 1000, .001))
 
 
-def _decode(packet):
-    raw = zlib.decompress(packet)
+def _depth_grid(raw):
     if len(raw) != 640 * 480 * 2:
         raise ValueError('depth packet is not 640x480 uint16')
     return np.frombuffer(raw, dtype='<u2').reshape(480, 640)
@@ -29,7 +31,12 @@ def _window_sum(values):
 
 
 def fuse_depth(raw_packet, local_packet, mono_packet, *, min_depth_m=.1, max_depth_m=50.0):
-    """Return one completed packet, with calibration diagnostics.
+    return fuse_depth_mm(zlib.decompress(raw_packet), zlib.decompress(local_packet),
+                         zlib.decompress(mono_packet), min_depth_m=min_depth_m, max_depth_m=max_depth_m)
+
+
+def fuse_depth_mm(raw_mm, local_mm, monocular_mm, *, min_depth_m=.1, max_depth_m=50.0):
+    """Fuse uncompressed uint16 grids and encode the final transport packet.
 
     Fit a robust log-affine correction against ORIGINAL returns, then correct
     local log residuals near those returns. A deterministic fifth of reference
@@ -40,23 +47,22 @@ def fuse_depth(raw_packet, local_packet, mono_packet, *, min_depth_m=.1, max_dep
     if (not math.isfinite(min_depth_m) or not math.isfinite(max_depth_m)
             or not 0 <= min_depth_m < max_depth_m <= 65.535):
         raise ValueError('invalid fusion depth range')
-    raw, local, mono_mm = map(_decode, (raw_packet, local_packet, mono_packet))
+    raw, local, mono_mm = map(_depth_grid, (raw_mm, local_mm, monocular_mm))
     observed = raw != 0
     if not np.array_equal(raw[observed], local[observed]):
         raise ValueError('local depth does not preserve original observations')
-    mono = mono_mm.astype(np.float64) / 1000
     measured = raw.astype(np.float64) / 1000
     # Keep the configured valid range; distance alone cannot identify a false
     # near return. Only original observations, never interpolated pixels, fit.
     reference = (measured >= max(.001, min_depth_m)) & (measured <= max_depth_m) & (mono_mm != 0)
-    y, x = np.indices(raw.shape)
-    train = reference & ((13 * x + 7 * y) % 5 != 0)
-    holdout = reference & ~train
-    cells = np.unique((y[train] // 80) * 8 + x[train] // 80)
+    train = reference & ~_HOLDOUT
+    holdout = reference & _HOLDOUT
+    rows, columns = np.nonzero(train)
+    cells = np.unique((rows // 80) * 8 + columns // 80)
     if train.sum() < 64 or holdout.sum() < 16 or len(cells) < 6:
         raise ValueError('insufficient distributed LiDAR reference points for depth calibration')
 
-    log_mono = np.log(np.maximum(mono, .001))
+    log_mono = _LOG_METRES[mono_mm]
     indices = np.flatnonzero(train)
     if len(indices) > 4096:
         indices = indices[np.linspace(0, len(indices) - 1, 4096, dtype=int)]

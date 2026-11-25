@@ -147,7 +147,14 @@ def validate_cloud_layout(cloud):
 
 def project_depth(cloud, K, camera_optical_from_cloud, *, min_depth_m=0.1,
                   max_depth_m=50.0, max_points=200000):
-    """Project a bounded uniformly sampled cloud; return zlib bytes and counts.
+    raw, stats = project_depth_mm(cloud, K, camera_optical_from_cloud, min_depth_m=min_depth_m,
+                                  max_depth_m=max_depth_m, max_points=max_points)
+    return zlib.compress(raw, level=1), stats
+
+
+def project_depth_mm(cloud, K, camera_optical_from_cloud, *, min_depth_m=0.1,
+                     max_depth_m=50.0, max_points=200000):
+    """Project a bounded uniformly sampled cloud; return uint16 LE bytes and counts.
 
     Source indices include both endpoints when sampling two or more points.
     Z-buffer comparisons use unquantized optical Z, not radial distance.
@@ -191,7 +198,7 @@ def project_depth(cloud, K, camera_optical_from_cloud, *, min_depth_m=0.1,
     valid_pixels = int(np.count_nonzero(observed))
     output = np.where(observed, np.clip(np.floor(np.minimum(zbuffer, 65.535) * 1000 + .5),
                                        1, 65535), 0).astype('<u2')
-    return zlib.compress(output.tobytes(), level=1), {
+    return output.tobytes(), {
         'source_points': total, 'sample_points': sampled, 'valid_pixels': valid_pixels,
     }
 
@@ -202,6 +209,11 @@ HOLE_FILL_RELATIVE_JUMP = 0.06
 
 
 def fill_depth_holes(packet):
+    filled, stats = fill_depth_holes_mm(zlib.decompress(packet))
+    return zlib.compress(filled, level=1), stats
+
+
+def fill_depth_holes_mm(raw):
     """Fill bounded 2-D patches; preserve originals and reject depth boundaries.
 
     Two fixed paths (rows then columns, columns then rows) interpolate between
@@ -211,13 +223,11 @@ def fill_depth_holes(packet):
     """
     import numpy as np
 
-    raw = zlib.decompress(packet)
     if len(raw) != WIDTH * HEIGHT * 2:
         raise ValueError("depth packet is not 640x480 uint16")
     if cpu_kernels.AVAILABLE:
-        result, stats = cpu_kernels.fill_holes(raw, HOLE_FILL_MAX_GAP_PX,
-                                              HOLE_FILL_MAX_JUMP_MM, HOLE_FILL_RELATIVE_JUMP)
-        return zlib.compress(result, level=1), stats
+        return cpu_kernels.fill_holes(raw, HOLE_FILL_MAX_GAP_PX,
+                                      HOLE_FILL_MAX_JUMP_MM, HOLE_FILL_RELATIVE_JUMP)
     source = np.frombuffer(raw, dtype='<u2').reshape(HEIGHT, WIDTH).astype(np.int32)
 
     def bridge(state, axis):
@@ -265,7 +275,7 @@ def fill_depth_holes(packet):
     filled = np.where(both, (a + b + 1) // 2, np.maximum(a, b))
     filled[conflict] = 0
     filled[source != 0] = source[source != 0]
-    return zlib.compress(filled.astype('<u2').tobytes(), level=1), {
+    return filled.astype('<u2').tobytes(), {
         'filled_pixels': int(np.count_nonzero((source == 0) & (filled != 0))),
         'fill_conflicts': int(np.count_nonzero(conflict)),
     }

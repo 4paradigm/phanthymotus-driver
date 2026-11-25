@@ -56,3 +56,23 @@ def test_inference_rejects_a_different_rgb_geometry():
     Image.new('RGB', (320, 240)).save(data, format='PNG')
     with pytest.raises(ValueError, match='640x360'):
         model.predict(data.getvalue())
+
+
+def test_metric_quantization_matches_expanded_grid_at_range_and_rounding_edges():
+    Image = pytest.importorskip('PIL.Image')
+    from types import SimpleNamespace
+
+    model = object.__new__(MonocularDepth)
+    model._input_h, model._input_w = 192, 320
+    model._input_name, model._input_dtype = 'images', np.float32
+    samples = np.array([np.nan, np.inf, -.5, .0009, .001, 1.0005, 3.0005,
+                        65.535, 65.536], dtype=np.float32)
+    depth = np.resize(samples, (192, 320))
+    model._session = SimpleNamespace(run=lambda *_: [depth])
+    jpeg = io.BytesIO()
+    Image.new('RGB', (640, 360)).save(jpeg, format='JPEG')
+
+    expanded = np.asarray(Image.fromarray(depth[6:186]).resize((640, 480), Image.Resampling.NEAREST))
+    valid = np.isfinite(expanded) & (expanded >= .001) & (expanded <= 65.535)
+    expected = np.rint(np.where(valid, expanded * 1000, 0)).astype('<u2')
+    assert model.predict_mm(jpeg.getvalue()) == expected.tobytes()

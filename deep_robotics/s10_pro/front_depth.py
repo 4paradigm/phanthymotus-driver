@@ -21,11 +21,11 @@ import time
 from common.camera_info import build as build_camera_info
 from common.vendor_runtime import action_schema, tool
 from deep_robotics.s10_pro.depth_projection import (
-    depth_intrinsics, fill_depth_holes, project_depth, validate_cloud_layout, validate_transform,
+    depth_intrinsics, fill_depth_holes_mm, project_depth_mm, validate_cloud_layout, validate_transform,
 )
 from deep_robotics.s10_pro.undistortion import CameraUndistortion, half_fov
 from deep_robotics.s10_pro.cloud_relay import CloudRelay
-from deep_robotics.s10_pro.depth_fusion import fuse_depth
+from deep_robotics.s10_pro.depth_fusion import fuse_depth_mm
 from deep_robotics.s10_pro.monocular_depth import MonocularDepth
 from deep_robotics.s10_pro import cpu_kernels
 
@@ -118,25 +118,26 @@ def _project_worker(jobs, results):
                    ("generation", "camera_generation", "stamp", "source_stamp", "received_monotonic")}
         try:
             started = time.monotonic()
-            packet, stats = project_depth(
+            raw, stats = project_depth_mm(
                 job["cloud"], job["K"], job["transform"],
                 min_depth_m=job["min_depth_m"], max_depth_m=job["max_depth_m"])
             stats['projection_ms'] = round((time.monotonic() - started) * 1000, 1)
             fill_started = time.monotonic()
-            filled_packet, fill_stats = fill_depth_holes(packet)
+            filled, fill_stats = fill_depth_holes_mm(raw)
             stats.update(fill_stats)
             stats['hole_fill_ms'] = round((time.monotonic() - fill_started) * 1000, 1)
             if model is None:
                 model = MonocularDepth()
             inference_started = time.monotonic()
-            mono_packet = model.predict(job['jpeg'])
+            mono = model.predict_mm(job['jpeg'])
             stats['monocular_inference_ms'] = round((time.monotonic() - inference_started) * 1000, 1)
             fusion_started = time.monotonic()
-            fused_packet, fusion_stats = fuse_depth(packet, filled_packet, mono_packet,
+            fused_packet, fusion_stats = fuse_depth_mm(raw, filled, mono,
                                                   min_depth_m=job['min_depth_m'],
                                                   max_depth_m=job['max_depth_m'])
             stats.update(fusion_stats)
             stats['fusion_ms'] = round((time.monotonic() - fusion_started) * 1000, 1)
+            stats["worker_wait_ms"] = round((started - context["received_monotonic"]) * 1000, 1)
             stats['processing_ms'] = round((time.monotonic() - started) * 1000, 1)
             stats['cpu_kernel_backend'] = 'native' if cpu_kernels.AVAILABLE else 'numpy'
             stats["measured_coverage"] = round(stats["valid_pixels"] / (640 * 480), 4)
@@ -559,6 +560,7 @@ class FrontDepthPlugin:
 
     def _receive_cloud(self, generation, message, transport="ros"):
         receipt_stamp = divmod(time.time_ns(), 10**9)
+        received_monotonic = time.monotonic()
         with self._lock:
             if not self._running or generation != self._generation or transport != self._input_transport:
                 return
@@ -604,7 +606,7 @@ class FrontDepthPlugin:
                 source["data"] = bytes(view)
                 job = {
                     "generation": generation, "camera_generation": camera_generation,
-                    "stamp": receipt_stamp, "source_stamp": (sec, nsec), "received_monotonic": now,
+                    "stamp": receipt_stamp, "source_stamp": (sec, nsec), "received_monotonic": received_monotonic,
                     "jpeg": frame[2], "rgb_received_monotonic": frame[1],
                     "cloud": source,
                     "K": depth_intrinsics(calibration), "transform": config["camera_optical_from_cloud"],
@@ -645,6 +647,8 @@ class FrontDepthPlugin:
                 output.format, output.data = ROS_FORMAT, packet
                 self._publisher.publish(output)
                 self._stats.update(stats)
+                self._stats["receive_to_enqueue_ms"] = round(
+                    (time.monotonic() - context["received_monotonic"]) * 1000, 1)
                 self._stats["published"] += 1
                 self._stats["last_source_stamp"] = list(context["source_stamp"])
                 self._last_error = None

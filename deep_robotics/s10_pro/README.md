@@ -381,7 +381,11 @@ regions, not the accuracy of wholly unobserved areas or camera/LiDAR occlusion.
 `info.stats` separates measured coverage, local filled coverage and final
 `output_coverage`, and reports `monocular_pixels`, inference time, calibration
 coefficients, reference/holdout counts and held-out error percentiles. Raw
-projection and monocular prediction remain internal to the worker.
+projection and monocular prediction remain internal to the worker. Only
+the final depth grid is zlib-compressed.
+`worker_wait_ms` measures time from local cloud receipt
+until the worker starts the job. `receive_to_enqueue_ms` measures from that
+same instant through handoff to the core-domain publisher, before DDS delivery.
 
 The model is downloaded and checked at image build time, not on card start:
 `https://github.com/ultralytics/assets/releases/download/v8.4.0/yolo26n-depth.onnx`,
