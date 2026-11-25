@@ -49,9 +49,17 @@ def resolve_device(source, sysfs=Path("/sys/class/video4linux"), dev=Path("/dev"
 CONVERT_THREADS = 4
 
 
+OUTPUT_WIDTH = 640
+
+
+def output_size(source):
+    """Published JPEG size: fixed width, native aspect ratio (known before any frame)."""
+    return OUTPUT_WIDTH, OUTPUT_WIDTH * source["height"] // source["width"]
+
+
 def capture_command(source, device, fps):
     """Drop frames before scaling/conversion; preserve the native aspect ratio."""
-    height = 640 * source["height"] // source["width"]
+    width, height = output_size(source)
     return [
         "gst-launch-1.0", "-q", "v4l2src", f"device={device}", "io-mode=mmap", "!",
         f"video/x-raw,format={source['format']},width={source['width']},"
@@ -60,7 +68,7 @@ def capture_command(source, device, fps):
         "videorate", "drop-only=true", "!", f"video/x-raw,framerate={fps}/1", "!",
         # Single-threaded scaling of the 1920x1536 fisheye frames topped out near 9 fps on
         # the Orin; GStreamer 1.20's n-threads reaches the 15 fps target (measured on site).
-        "videoscale", f"n-threads={CONVERT_THREADS}", "!", f"video/x-raw,width=640,height={height}", "!",
+        "videoscale", f"n-threads={CONVERT_THREADS}", "!", f"video/x-raw,width={width},height={height}", "!",
         "videoconvert", f"n-threads={CONVERT_THREADS}", "!", "jpegenc", "quality=80", "!",
         "fdsink", "fd=1", "sync=false",
     ]

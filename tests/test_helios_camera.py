@@ -216,7 +216,11 @@ def test_camera_contract_five_upper_body_slots_and_unknown_optics():
     info = camera.dispatch("info", {})
     assert info["state"] == "idle" and not created
     optics = parse(info["camera_info"][0])
-    assert not optics.known and optics.width is None and optics.source == "unknown"
+    # Output size is declared before streaming (fixed by the pipeline); optics stay unknown.
+    assert (optics.width, optics.height) == (640, 400) and optics.source == "unknown"
+    assert optics.half_fov_rad is None
+    fisheye = camera.dispatch("info", {"instance_id": "x", "camera": "head_front_fisheye"})
+    assert (fisheye["camera_info"][0]["width"], fisheye["camera_info"][0]["height"]) == (640, 512)
     assert info["position_mapping_confirmed"]
 
 

@@ -8,7 +8,7 @@ import threading
 
 from common.camera_info import build
 from common.vendor_runtime import action_schema, tool
-from .camera_capture import SOURCES, CameraCapture
+from .camera_capture import SOURCES, CameraCapture, output_size
 
 
 class RosCameraStream:
@@ -170,13 +170,15 @@ class HeliosCamera:
         stream = self._streams.get(source_id)
         snapshot = (stream.snapshot() if instance in self._active and stream else
                     {"state": "idle", "available": False})
+        width, height = output_size(source)
         return {**snapshot, "camera": source_id, "label": source["label"],
                 "position_mapping_confirmed": True, "target_fps": self._fps,
                 "timestamp_source": "driver_receive_time",
                 "topic_out": [{"topic": topic, "format": "image/jpeg"}],
                 "camera_info": [build(id=f"rokae/helios/{source_id}", topic=topic,
-                                      format="image/jpeg", width=snapshot.get("width"),
-                                      height=snapshot.get("height"), source="unknown",
+                                      # The port's output size is fixed by the pipeline, so it is
+                                      # declared even before the first frame; optics stay unknown.
+                                      format="image/jpeg", width=width, height=height, source="unknown",
                                       pipeline=["v4l2", "videorate", "videoscale", "jpegenc"])],
                 "sources": [{"id": key, "label": value["label"], "rgb_backend": "v4l2"}
                             for key, value in SOURCES.items()]}
