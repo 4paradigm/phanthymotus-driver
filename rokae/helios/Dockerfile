@@ -8,10 +8,15 @@ COPY requirements.txt /driver/rokae/helios/requirements.txt
 # while ROS Humble uses 3.10. The SDK therefore runs in its own worker process under a
 # pinned standalone CPython 3.12 (python-build-standalone, PSF licence), used for nothing
 # else. Its binaries need glibc >= 2.17 / GLIBCXX >= 3.4.22, satisfied by Ubuntu 22.04.
-ARG SDK_PYTHON_URL=https://github.com/astral-sh/python-build-standalone/releases/download/20261110/cpython-3.12.16%2B20261110-aarch64-unknown-linux-gnu-install_only.tar.gz
+# The build host reaches GitHub release downloads slowly or not at all, so the same
+# file is fetched from the npmmirror CDN first and GitHub second. Each attempt has a
+# socket timeout and prints progress (the bot kills builds that stay silent), and the
+# pinned SHA256 makes the source irrelevant to what ends up in the image.
+ARG SDK_PYTHON_URL=https://registry.npmmirror.com/-/binary/python-build-standalone/20261110/cpython-3.12.16%2B20261110-aarch64-unknown-linux-gnu-install_only.tar.gz
+ARG SDK_PYTHON_FALLBACK_URL=https://github.com/astral-sh/python-build-standalone/releases/download/20261110/cpython-3.12.16%2B20261110-aarch64-unknown-linux-gnu-install_only.tar.gz
 ARG SDK_PYTHON_SHA256=4792f81750282597fb2a3389fe18b945ed2ba6aad5e45ad406d122c58cb33081
-RUN python3 -c "import urllib.request; urllib.request.urlretrieve('${SDK_PYTHON_URL}', '/tmp/sdk-python.tar.gz')" && \
-    echo "${SDK_PYTHON_SHA256}  /tmp/sdk-python.tar.gz" | sha256sum -c - && \
+COPY build_fetch.py /tmp/build_fetch.py
+RUN python3 /tmp/build_fetch.py /tmp/sdk-python.tar.gz "${SDK_PYTHON_SHA256}" "${SDK_PYTHON_URL}" "${SDK_PYTHON_FALLBACK_URL}" && \
     mkdir -p /opt/sdk-python && tar xzf /tmp/sdk-python.tar.gz -C /opt/sdk-python --strip-components=1 && \
     rm -f /tmp/sdk-python.tar.gz && /opt/sdk-python/bin/python3 -c "import sys; assert sys.version_info[:2] == (3, 12)"
 # Vendor chassis SDK (closed binaries): fetched from the project COS at build time and
@@ -23,12 +28,11 @@ ARG VMR_SDK_URL=
 ARG VMR_SDK_SHA256=
 RUN if [ -n "${VMR_SDK_URL}" ]; then \
       test -n "${VMR_SDK_SHA256}" && \
-      python3 -c "import urllib.request; urllib.request.urlretrieve('${VMR_SDK_URL}', '/tmp/vmr-sdk.tar.gz')" && \
-      echo "${VMR_SDK_SHA256}  /tmp/vmr-sdk.tar.gz" | sha256sum -c - && \
+      python3 /tmp/build_fetch.py /tmp/vmr-sdk.tar.gz "${VMR_SDK_SHA256}" "${VMR_SDK_URL}" && \
       mkdir -p /opt/vmr-sdk && tar xzf /tmp/vmr-sdk.tar.gz -C /opt/vmr-sdk && \
       rm -f /tmp/vmr-sdk.tar.gz && \
       PYTHONPATH=/opt/vmr-sdk/lib LD_LIBRARY_PATH=/opt/vmr-sdk/lib /opt/sdk-python/bin/python3 -c "import nav, py_client_common, odometry"; \
-    fi
+    fi && rm -f /tmp/build_fetch.py
 ARG PYPI_MIRROR=https://pypi.tuna.tsinghua.edu.cn/simple
 RUN python3 -m pip install --no-cache-dir -i ${PYPI_MIRROR} -r /driver/rokae/helios/requirements.txt
 COPY common/__init__.py common/vendor_runtime.py common/logsafe.py /driver/common/

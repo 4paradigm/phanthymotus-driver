@@ -57,7 +57,7 @@
 
 速度经厂家 VMR AMR SDK 的第三方控速下发（`set_third_speed_ctrl` → 50 Hz `send_third_expected_speed` → 零速 → `close_third_speed_ctrl`），在独立 worker 进程内运行：每次移动自带截止时间，Driver 退出或 worker 被杀时底盘因收不到速度指令自动停车（厂家示例说明）。`info` 与每次移动结果附带里程计实测位移（前进/左移/转角）。
 
-厂家 SDK 只有 CPython 3.12 版，而 ROS Humble 是 3.10：镜像内置固定版本、校验 SHA256 的独立 Python 3.12（`/opt/sdk-python`），只给 SDK worker 使用，已在机器人只读实测可导入、连接并收到里程计。厂家 SDK 二进制不进 Git：参照 G1/Agibot A3/DJI 的做法，构建时由 Dockerfile 从项目 COS 下载并校验 SHA256（`VMR_SDK_URL` / `VMR_SDK_SHA256`），解压到镜像 `/opt/vmr-sdk`。未提供 URL 时镜像照常构建，卡片照常注册，`move` 明确报错。
+厂家 SDK 只有 CPython 3.12 版，而 ROS Humble 是 3.10：镜像内置固定版本、校验 SHA256 的独立 Python 3.12（`/opt/sdk-python`，构建时先从 npmmirror 国内镜像、失败再从 GitHub 下载，均校验同一 SHA256），只给 SDK worker 使用，已在机器人只读实测可导入、连接并收到里程计。厂家 SDK 二进制不进 Git：参照 G1/Agibot A3/DJI 的做法，构建时由 Dockerfile 从项目 COS 下载并校验 SHA256（`VMR_SDK_URL` / `VMR_SDK_SHA256`），解压到镜像 `/opt/vmr-sdk`。未提供 URL 时镜像照常构建，卡片照常注册，`move` 明确报错。
 
 **前提**：底盘须在厂家界面建图、应用地图并重定位成功，且处于自动模式（非手动模式）。未定位时底盘刹车并报异常（311/4/2），`move` 会被拒绝并返回异常列表；手动模式下 SDK 速度被忽略。2026-11-24 已在现场看护下用本地预览镜像实测前进、后退、左右转、横移与 `stop_move`，详见接口文档。
 
