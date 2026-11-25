@@ -26,9 +26,13 @@ other card shares.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import tempfile
 import threading
 import time
+import urllib.request
 import zlib
 
 import cv2
@@ -136,6 +140,97 @@ class _DepthCache:
         return frame.reshape((height, width)), width, height
 
 
+# `YOLO("yolo11n-pose.pt")` silently downloads from GitHub on first use and
+# hands the bytes straight to torch — no integrity check. Pin the official
+# v8.3.0 asset and verify it ourselves *before* YOLO sees the path.
+# Digest computed from the release asset bytes (6,255,593) via the GitHub API.
+_YOLO_WEIGHT_NAME = "yolo11n-pose.pt"
+_YOLO_WEIGHT_URL = (
+    "https://github.com/ultralytics/assets/releases/download/"
+    "v8.3.0/yolo11n-pose.pt"
+)
+_YOLO_WEIGHT_SHA256 = "869e83fcdffdc7371fa4e34cd8e51c838cc729571d1635e5141e3075e9319dc0"
+# Guard against a hostile/looping response filling the disk; the real asset is
+# ~6 MiB, so 64 MiB leaves room for a future official repack.
+_YOLO_WEIGHT_MAX_BYTES = 64 * 1024 * 1024
+
+
+def _sha256_file(path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _verified_weight_path(model_path, expected_sha256):
+    """Return a local weight path whose bytes match `expected_sha256`.
+
+    A local file (the offline-robot case) is checked in place. The bare
+    official filename is downloaded by us into a cache directory so the digest
+    can be checked *before* YOLO constructs the model; ultralytics' own
+    auto-download has no such check. An empty `expected_sha256` is an explicit
+    opt-out for operators supplying their own model.
+    """
+    if not expected_sha256:
+        return model_path
+    expected = str(expected_sha256).strip().lower()
+    path = os.fspath(model_path)
+    if os.path.dirname(path):
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"model_path does not exist: {path}")
+        actual = _sha256_file(path).lower()
+        if actual != expected:
+            raise ValueError(
+                f"model_path digest mismatch: {path}: "
+                f"expected {expected}, got {actual}"
+            )
+        return path
+
+    if path != _YOLO_WEIGHT_NAME:
+        raise FileNotFoundError(
+            f"no local file at {path!r}; pass an absolute path to your own "
+            "weight, or set model_sha256: '' to use ultralytics' resolution"
+        )
+    cache_dir = os.path.join(
+        os.path.expanduser("~"), ".cache", "bumi-upper-body-track")
+    cached = os.path.join(cache_dir, _YOLO_WEIGHT_NAME)
+    if os.path.isfile(cached) and _sha256_file(cached).lower() == expected:
+        return cached
+
+    os.makedirs(cache_dir, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(prefix=".weights-", dir=cache_dir)
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        with os.fdopen(handle, "wb") as out:
+            with urllib.request.urlopen(_YOLO_WEIGHT_URL, timeout=60) as response:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > _YOLO_WEIGHT_MAX_BYTES:
+                        raise ValueError(
+                            "YOLO weight download exceeded "
+                            f"{_YOLO_WEIGHT_MAX_BYTES} bytes")
+                    out.write(chunk)
+                    digest.update(chunk)
+        actual = digest.hexdigest()
+        if actual != expected:
+            raise ValueError(
+                f"downloaded YOLO weight digest mismatch: expected "
+                f"{expected}, got {actual}")
+        os.replace(temporary, cached)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    return cached
+
+
 class _PoseEngine:
     """YOLO11-pose wrapper.
 
@@ -143,11 +238,14 @@ class _PoseEngine:
     module can be byte-compiled on a machine that has neither — the same lazy
     discipline the rest of the bundle uses for ROS. Official weights, no
     training: the file is downloaded once and cached, or `model_path` points at
-    a pre-downloaded copy on an offline robot.
+    a pre-downloaded copy on an offline robot. Either way the pinned SHA-256 is
+    checked before YOLO opens the file.
     """
 
-    def __init__(self, model_path="yolo11n-pose.pt", device="cpu", conf=0.5, imgsz=640):
+    def __init__(self, model_path=_YOLO_WEIGHT_NAME, device="cpu", conf=0.5,
+                 imgsz=640, model_sha256=_YOLO_WEIGHT_SHA256):
         self.model_path = model_path
+        self.model_sha256 = model_sha256
         self.device = device
         self.conf = conf
         self.imgsz = imgsz
@@ -167,7 +265,8 @@ class _PoseEngine:
             return
         try:
             from ultralytics import YOLO
-            self._model = YOLO(self.model_path)
+            model_path = _verified_weight_path(self.model_path, self.model_sha256)
+            self._model = YOLO(model_path)
         except Exception as exc:
             # `info` exposes model.error so an operator can tell "runtime not
             # installed / weights unreadable" from "no person in frame"; leave
@@ -241,6 +340,8 @@ class UpperBodyTrackPlugin:
             device=str(cfg.get("device", "cpu")),
             conf=float(cfg.get("conf", 0.5)),
             imgsz=int(cfg.get("imgsz", 640)),
+            # Empty string disables the check for a privately supplied model.
+            model_sha256=str(cfg.get("model_sha256", _YOLO_WEIGHT_SHA256)),
         )
         self._min_kp_conf = float(cfg.get("min_keypoint_conf", 0.4))
         self._depth_cache = _DepthCache()

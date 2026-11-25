@@ -544,11 +544,22 @@ card falls back to a flat-plane assumption and says so in `degraded`. The sign
 of each axis can be corrected per robot in `config.yaml` or overridden at
 `start` without rebuilding.
 
+The official `yolo11n-pose.pt` weight is pinned to SHA-256
+`869e83fcdffdc7371fa4e34cd8e51c838cc729571d1635e5141e3075e9319dc0` in
+`config.yaml`. The card verifies that digest **before** YOLO opens the file —
+both for the auto-downloaded copy and for a pre-downloaded absolute path — so a
+tampered cache or an intercepted download cannot reach torch. An offline robot
+with its own weight should set `model_sha256` to that file's digest, or set it
+to `''` to deliberately disable the check.
+
 The [pose-dependency size record](review-evidence/image-size-upper-body-track.md)
 documents the pinned ARM64 wheels behind the enabled image's growth (about
 101 MiB across torch, torchvision and ultralytics; the default image is
 unchanged), why the ARM64 torch wheel is already the smallest official build,
-and the commands to measure the full-image delta on an ARM64 builder.
+and the commands to measure the full-image delta on an ARM64 builder. **That
+whole-image delta has not been measured yet: do not publish a
+`INSTALL_POSE_DEPS=1` image until the ARM64 `docker inspect` numbers are
+recorded in that file.** Publishing the default image is unaffected.
 
 ### `upper_body_mirror` — driving the arms
 

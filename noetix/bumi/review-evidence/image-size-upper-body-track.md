@@ -54,7 +54,12 @@ below.
   unchanged, which is the property that matters for the fleet.
 - **Model weights are not baked into the image.** `yolo11n-pose.pt` is fetched
   on first use and cached, or supplied via `model_path`, so no weight bytes are
-  added at build time.
+  added at build time. The download is pinned to the official Ultralytics
+  `v8.3.0` release asset (6,255,593 bytes) with SHA-256
+  `869e83fcdffdc7371fa4e34cd8e51c838cc729571d1635e5141e3075e9319dc0`; the
+  card checks that digest before YOLO opens either a downloaded or a
+  pre-downloaded file. The digest was computed from the asset bytes retrieved
+  through the GitHub releases API (the asset itself has no published digest).
 
 ## Reproduction (on an ARM64 builder or the Bumi host)
 
@@ -75,3 +80,12 @@ Record both `Size` values and the sum of image-history layer `Size` entries, as
 `review-evidence/image-size-2026-10-14.md` does for the earlier overlay. Until
 that is run, the 101.0 MiB of pinned ARM64 wheels above is the defensible lower
 bound for the growth, not a measured whole-image delta.
+
+## Release gate
+
+This PR does **not** publish a pose-enabled image: the default build does not
+install the runtime and is the only image produced by the review build. Before
+anyone publishes an `INSTALL_POSE_DEPS=1` image, run the two builds and the
+`docker inspect` comparison above on an ARM64 builder, append the two byte
+counts and the layer-sum delta to this file, and only then release. The default
+image has no such gate beyond the usual review build.

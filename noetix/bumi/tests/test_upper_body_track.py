@@ -777,3 +777,141 @@ def test_stale_frame_is_skipped_before_processing(monkeypatch):
 
     assert processed == [], "stale frame must not reach _process"
     assert warnings and "stale frame" in warnings[0]
+
+
+# ── weight integrity: the download must be checked before YOLO loads it ──────
+
+def _engine_with_fake_yolo(monkeypatch):
+    """Load the card with a recording YOLO stand-in (no torch, no network)."""
+    import sys
+    import types
+
+    card = _load_card_module(monkeypatch)
+    calls = []
+
+    def fake_yolo(path):
+        calls.append(path)
+        return object()
+
+    monkeypatch.setitem(sys.modules, "ultralytics",
+                        types.SimpleNamespace(YOLO=fake_yolo))
+    return card, calls
+
+
+def test_a_tampered_local_weight_never_reaches_yolo(monkeypatch, tmp_path):
+    card, calls = _engine_with_fake_yolo(monkeypatch)
+    weight = tmp_path / "tampered.pt"
+    weight.write_bytes(b"not the official weight")
+
+    engine = card._PoseEngine(model_path=str(weight))
+    with pytest.raises(ValueError, match="digest mismatch"):
+        engine.load()
+
+    assert calls == [], "YOLO must not open a file that failed verification"
+
+
+def test_a_verified_local_weight_is_passed_through(monkeypatch, tmp_path):
+    """Offline robots can still use a pre-downloaded absolute path."""
+    import hashlib
+
+    card, calls = _engine_with_fake_yolo(monkeypatch)
+    data = b"weight bytes supplied by the operator"
+    weight = tmp_path / "offline.pt"
+    weight.write_bytes(data)
+
+    engine = card._PoseEngine(
+        model_path=str(weight),
+        model_sha256=hashlib.sha256(data).hexdigest())
+    engine.load()
+
+    assert calls == [str(weight)]
+    assert engine.loaded
+
+
+def test_auto_download_is_hash_checked_before_yolo(monkeypatch, tmp_path):
+    """The default bare filename must not go through ultralytics' unchecked path."""
+    import hashlib
+
+    card, calls = _engine_with_fake_yolo(monkeypatch)
+    data = b"official weight bytes" * 100
+    digest = hashlib.sha256(data).hexdigest()
+    seen = {"url": None, "position": 0}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size):
+            start = seen["position"]
+            seen["position"] += min(1000, len(data) - start)
+            return data[start:seen["position"]]
+
+    def fake_urlopen(url, **_kwargs):
+        seen["url"] = url
+        return _Response()
+
+    monkeypatch.setattr(card.os.path, "expanduser", lambda _p: str(tmp_path))
+    monkeypatch.setattr(card.urllib.request, "urlopen", fake_urlopen)
+
+    engine = card._PoseEngine(model_sha256=digest)
+    engine.load()
+
+    cached = tmp_path / ".cache" / "bumi-upper-body-track" / "yolo11n-pose.pt"
+    assert calls == [str(cached)]
+    assert cached.read_bytes() == data
+    assert seen["url"].endswith("/v8.3.0/yolo11n-pose.pt")
+    # A second load reuses the verified cache instead of downloading again.
+    seen["url"] = None
+    engine._model = None
+    engine.load()
+    assert seen["url"] is None
+
+
+def test_a_bad_download_is_rejected_and_leaves_no_cache(monkeypatch, tmp_path):
+    import hashlib
+
+    card, calls = _engine_with_fake_yolo(monkeypatch)
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size):
+            if getattr(self, "_done", False):
+                return b""
+            self._done = True
+            return b"evil"
+
+    monkeypatch.setattr(card.os.path, "expanduser", lambda _p: str(tmp_path))
+    monkeypatch.setattr(card.urllib.request, "urlopen", lambda *_a, **_k: _Response())
+
+    engine = card._PoseEngine(
+        model_sha256=hashlib.sha256(b"the real bytes").hexdigest())
+    with pytest.raises(ValueError, match="digest mismatch"):
+        engine.load()
+
+    assert calls == []
+    cache_dir = tmp_path / ".cache" / "bumi-upper-body-track"
+    assert not (cache_dir / "yolo11n-pose.pt").exists()
+    assert list(cache_dir.glob(".weights-*")) == []
+
+
+def test_an_explicit_opt_out_keeps_custom_weight_resolution(monkeypatch):
+    """Operators with a private model can disable the pinned-digest check."""
+    card, calls = _engine_with_fake_yolo(monkeypatch)
+    engine = card._PoseEngine(model_path="my-private-model.pt", model_sha256="")
+    engine.load()
+    assert calls == ["my-private-model.pt"]
+
+
+def test_the_default_config_pins_the_official_digest():
+    root = Path(__file__).resolve().parent.parent
+    config = (root / "config.yaml").read_text(encoding="utf-8")
+    assert ("model_sha256: "
+            "869e83fcdffdc7371fa4e34cd8e51c838cc729571d1635e5141e3075e9319dc0") in config

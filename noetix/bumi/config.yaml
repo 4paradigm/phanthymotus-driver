@@ -97,8 +97,11 @@ plugins:
   # 6 个手臂关节角。不下发任何关节命令，不驱动手臂。
   upper_body_track:
     enabled: false   # 默认关闭：需先用 --build-arg INSTALL_POSE_DEPS=1 构建含 ultralytics/torch 的镜像，并持续占 CPU
-    # YOLO11-pose 权重。n=nano 最快；首次运行自动下载，离线机器人请预下载后填绝对路径。
+    # YOLO11-pose 权重。n=nano 最快；首次运行从固定的官方 v8.3.0 地址下载，
+    # 校验 SHA-256 通过后才交给 YOLO。离线机器人请预下载后填绝对路径，
+    # 并把 model_sha256 改成该文件的摘要；自训模型可显式填空字符串关闭校验。
     model_path: yolo11n-pose.pt
+    model_sha256: 869e83fcdffdc7371fa4e34cd8e51c838cc729571d1635e5141e3075e9319dc0
     device: cpu
     conf: 0.5                 # 人体检测置信度
     imgsz: 640
