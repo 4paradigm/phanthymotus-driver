@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Read-only MCP/HTTP readiness check; does not open a robot command socket."""
 import json
+import math
 import time
 import urllib.error
 import urllib.request
 
+
 BASE = 'http://127.0.0.1:15791'
+from common.control import parse_descriptor
 from device import VERSION
 CARDS = {'joints'}
 from camera import CAMERA_SOURCES
@@ -106,9 +109,44 @@ def run_check(timeout=20, camera=False):
                 schema.get('x-resource')!=['arm_l','arm_r','head']:
             raise ValueError('Pose schema or shared physical resources differ')
     names = {tool['name'] for tool in tools}
-    expected = {**dict.fromkeys(CARDS | {'battery'} | set(CAMERA_SOURCES), 'sensor'), 'loco_servo_arm':'actuator', 'loco_leg':'actuator', 'arm_control': 'actuator', 'pose': 'actuator', 'move_head': 'actuator', 'gripper': 'actuator', 'model': 'resource', 'head_visual_follow':'actuator'}
-    if not CARDS <= names or names - set(expected) or any(tool['type'] != expected[tool['name']] for tool in tools):
-        raise ValueError('Expected skeleton sensor, optional camera/arm_control and model resource')
+    expected = {**dict.fromkeys(CARDS | {'battery', 'eef_state'} | set(CAMERA_SOURCES), 'sensor'), 'servo_eef':'actuator', 'loco_servo_arm':'actuator', 'loco_leg':'actuator', 'arm_control': 'actuator', 'pose': 'actuator', 'move_head': 'actuator', 'gripper': 'actuator', 'model': 'resource', 'head_visual_follow':'actuator'}
+    eef_ports = {
+        'eef_state': ('topic_out', 'state/eef', '/limx_tron2/state/eef'),
+        'servo_eef': ('topic_in', 'control/eef', '/limx_tron2/control/eef'),
+    }
+    eef_only = bool(names) and names <= set(eef_ports)
+    if (not eef_only and not CARDS <= names) or names - set(expected) or any(tool['type'] != expected[tool['name']] for tool in tools):
+        raise ValueError('Expected configured TRON2 tools and their declared types')
+    for tool in tools:
+        if tool['name'] in eef_ports:
+            field, fmt, topic = eef_ports[tool['name']]
+            if not any(port.get('format') == fmt and port.get('topic') == topic for port in tool.get(field, [])):
+                raise ValueError('Wrong EEF port for ' + tool['name'])
+            reply = rpc('tools/call', {'name': tool['name'], 'arguments': {'action': 'info'}})
+            if reply.get('isError'):
+                raise ValueError('Cannot read EEF card information for ' + tool['name'])
+            data = json.loads(reply['content'][0]['text'])
+            if tool['name'] == 'eef_state':
+                if type(data.get('available')) is not bool:
+                    raise ValueError('Missing EEF state availability')
+                if data['available']:
+                    sample = data['sample']
+                    eef = sample.get('eef')
+                    if (set(sample) != {'schema', 'frame', 'stamp_ms', 'eef'}
+                            or sample['schema'] != 'motus.eef/1' or sample['frame'] != 'base_Link'
+                            or type(sample['stamp_ms']) is not int or not isinstance(eef, list)
+                            or len(eef) != 16 or not all(type(v) in (int, float) and math.isfinite(v) for v in eef)):
+                        raise ValueError('Expected a complete numeric EEF state')
+            else:
+                interface = parse_descriptor(data['control_interface'])
+                if (interface.mode != 'eef_pose' or interface.dof != 16 or interface.frame != 'base_Link'
+                        or interface.eef_quat_offsets != (3, 11)):
+                    raise ValueError('Expected the TRON2 dual TCP and gripper control layout')
+    if eef_only:
+        if camera:
+            raise ValueError('Camera card is not enabled')
+        print('PASS: EEF card discovery, Core registration and read-only info')
+        return
     camera_tools = {tool['name']: tool for tool in tools if tool['name'] in CAMERA_SOURCES}
     for name, camera_tool in camera_tools.items():
         if camera_tool['topic_out'] != [{'topic': CAMERA_SOURCES[name][0], 'format': 'image/jpeg'}] \

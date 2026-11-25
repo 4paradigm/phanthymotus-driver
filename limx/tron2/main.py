@@ -63,7 +63,7 @@ def load_settings():
     if settings['stale_after_seconds'] < settings['poll_interval_seconds']:
         raise ValueError('Stale threshold must cover the poll interval')
     plugins = config.get('plugins', {})
-    allowed = {'loco_servo_arm', 'loco_leg', 'battery','joints','joint_state', 'arm_control', 'move_head', 'pose', 'gripper', 'gripper_left', 'gripper_right','head_visual_follow'} | set(CAMERA_SOURCES)
+    allowed = {'loco_servo_arm', 'eef_state', 'servo_eef', 'loco_leg', 'battery','joints','joint_state', 'arm_control', 'move_head', 'pose', 'gripper', 'gripper_left', 'gripper_right','head_visual_follow'} | set(CAMERA_SOURCES)
     if not isinstance(plugins, dict) or set(plugins) - allowed:
         raise ValueError('Only TRON2 sensor, arm_control and gripper plugins may be configured')
     enabled = []
@@ -72,7 +72,7 @@ def load_settings():
             raise ValueError('Expected boolean enabled for ' + name)
         if value['enabled']:
             enabled.append(name)
-    if not set(enabled) & ({'joints','battery','joint_state'} | set(CAMERA_SOURCES)):
+    if not set(enabled) & ({'joints','battery','joint_state','eef_state','servo_eef'} | set(CAMERA_SOURCES)):
         raise ValueError('Enable at least one read-only sensor')
     if 'head_visual_follow' in enabled and (not {'camera','move_head'} <= set(enabled) or not {'joint_state','joints'} & set(enabled)):
         raise ValueError('头部跟随需要joint_state、camera和move_head')
@@ -106,7 +106,11 @@ async def run():
     from ros2 import JsonPublisher
     from camera import CAMERA_SOURCES
     settings = load_settings()
-    publisher = JsonPublisher([SENSOR_TOPICS[name] for name in settings['enabled_cards'] if name in SENSOR_TOPICS],
+    json_topics = [SENSOR_TOPICS[name] for name in settings['enabled_cards'] if name in SENSOR_TOPICS]
+    if 'eef_state' in settings['enabled_cards']:
+        from eef_state import STATE_TOPIC
+        json_topics.append(STATE_TOPIC)
+    publisher = JsonPublisher(json_topics,
         image_topics=[source[0] for name, source in CAMERA_SOURCES.items() if name in settings['enabled_cards']])
     tasks = []
     runner = None
@@ -120,6 +124,8 @@ async def run():
                 timeout=aiohttp.ClientTimeout(total=8)) as session:
             adapter = Adapter(publisher.publish, settings, session=session)
             adapter.arm_servo.publisher = publisher
+            if adapter.servo_eef is not None:
+                adapter.servo_eef.publisher = publisher
             if 'head_visual_follow' in adapter.enabled:
                 from head_follow.runtime import Runtime
                 adapter.follow_runtime = Runtime(adapter, publisher)
@@ -138,8 +144,10 @@ async def run():
             tasks = [asyncio.create_task(adapter.reader.run(session)),
                      asyncio.create_task(adapter.publish_loop()),
                      asyncio.create_task(adapter.register_loop(session)),
-                     asyncio.create_task(stopping.wait()),
-                     asyncio.create_task(identify_configuration(adapter.reader))]
+                     asyncio.create_task(stopping.wait())]
+            if adapter.eef_state is not None:
+                tasks.append(asyncio.create_task(adapter.eef_state.run()))
+            tasks.append(asyncio.create_task(identify_configuration(adapter.reader)))
             try:
                 # One-shot identification finishing must not stop the services.
                 done, _ = await asyncio.wait(tasks[:-1], return_when=asyncio.FIRST_COMPLETED)
@@ -147,6 +155,8 @@ async def run():
                     task.result()
             finally:
                 await adapter.close_lower(shutting_down=True)
+                if adapter.servo_eef is not None:
+                    await adapter.servo_eef.close()
                 await adapter.arm_servo.close()
                 if adapter.follow_runtime is not None:
                     await adapter.follow_runtime.close()
@@ -163,6 +173,8 @@ async def run():
             await adapter.follow_runtime.close()
         if adapter is not None:
             await adapter.close_lower(shutting_down=True)
+            if adapter.servo_eef is not None:
+                await adapter.servo_eef.close()
             await adapter.arm_servo.close()
         if runner:
             await runner.cleanup()

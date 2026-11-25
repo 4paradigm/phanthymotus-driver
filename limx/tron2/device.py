@@ -22,7 +22,7 @@ from camera import CameraStream, CAMERA_SOURCES
 from gripper import Gripper, tool as gripper_tool, command as gripper_command, MOTION_ACTIONS, recovery_arguments, normalize_arguments, GRIPPER_SIDES, combined_tool, combined_arguments
 
 LOG = logging.getLogger('tron2')
-VERSION = '0.25.0'
+VERSION = '0.25.14'
 PORT = 15791
 SERVER_NAME = 'LimX TRON2 Sensors and Arm Control'
 TOPICS = {name: '/limx_tron2/' + name for name in
@@ -55,7 +55,7 @@ class Adapter:
         self.publish = publish
         self.settings = settings
         self.enabled = settings['enabled_cards']
-        if set(self.enabled) - (set(SENSOR_TOPICS) | set(CAMERA_SOURCES) | ({'loco_servo_arm', 'loco_leg', 'arm_control', 'move_head', 'gripper', 'pose', 'head_visual_follow'} | set(GRIPPER_SIDES))):
+        if set(self.enabled) - (set(SENSOR_TOPICS) | set(CAMERA_SOURCES) | ({'eef_state', 'servo_eef', 'loco_servo_arm', 'loco_leg', 'arm_control', 'move_head', 'gripper', 'pose', 'head_visual_follow'} | set(GRIPPER_SIDES))):
             raise ValueError('Unknown TRON2 card in configuration')
         if 'head_visual_follow' in self.enabled and (not {'camera','move_head'} <= set(self.enabled) or not {'joint_state','joints'} & set(self.enabled)):
             raise ValueError('头部跟随需要joint_state、camera和move_head')
@@ -91,6 +91,14 @@ class Adapter:
         self.camera = self.cameras['camera']
         from arm_servo import ArmServoPlugin
         self.arm_servo = ArmServoPlugin(self, settings.get('loco_servo_arm', {}))
+        self.eef_state = self.servo_eef = None
+        if {'servo_eef', 'eef_state'} & set(self.enabled):
+            from eef_state import EefState
+            self.eef_state = EefState(self)
+        if 'servo_eef' in self.enabled:
+            from servo_eef import EefServo
+            self.servo_eef = EefServo(self, self.eef_state)
+            self._servo_lifecycle = asyncio.Lock()
 
     async def _report_lower_completion(self, tool, action_id, status, result):
         # Core associates each instance with the unique action_id returned to it.
@@ -188,6 +196,10 @@ class Adapter:
 
     def tools(self):
         tools = []
+        if 'eef_state' in self.enabled:
+            tools.append(self.eef_state.tool())
+        if 'servo_eef' in self.enabled:
+            tools.append(self.servo_eef.tool())
         if 'loco_servo_arm' in self.enabled:
             tools.append(self.arm_servo.get_tool())
         if 'loco_leg' in self.enabled:
@@ -214,7 +226,7 @@ class Adapter:
                                    **metadata_properties()}},
                 'topic_out': [{'topic': CAMERA_SOURCES[name][0], 'format': 'image/jpeg'}]})
         for name in self.enabled:
-            if name in ({'loco_servo_arm', 'loco_leg', 'arm_control', 'move_head', 'gripper', 'pose', 'head_visual_follow'} | set(GRIPPER_SIDES)) or name in CAMERA_SOURCES:
+            if name in ({'eef_state', 'servo_eef', 'loco_servo_arm', 'loco_leg', 'arm_control', 'move_head', 'gripper', 'pose', 'head_visual_follow'} | set(GRIPPER_SIDES)) or name in CAMERA_SOURCES:
                 continue
             tools.append({'name': name, 'type': 'sensor', 'multiInstance': False,
                 'description': DESCRIPTIONS[name],
@@ -282,6 +294,8 @@ class Adapter:
         allowed = {'action', 'instance_id', '_trace_id'}
         if name == 'loco_servo_arm':
             allowed |= {'input_topic', 'input_topics', 'dry_run'}
+        if name == 'servo_eef':
+            allowed |= {'input_topic', 'input_topics'}
         if name == 'head_visual_follow':
             allowed |= {'input_topic','input_topics','non_follow_action','speed'}
         if name == 'loco_leg':allowed |= {'vx','vy','vyaw','duration'}
@@ -304,6 +318,12 @@ class Adapter:
             if not isinstance(value, str) or len(value) > 128 or any(
                     ord(c) < 32 or ord(c) == 127 for c in value):
                 raise ValueError('Invalid Core metadata: ' + key)
+        if name == 'eef_state' and name in self.enabled:
+            return self.eef_state.call(args.get('action', 'info'))
+        if name == 'servo_eef' and name in self.enabled:
+            if args.get('action', 'info') not in ('info', 'start', 'stop', 'pause', 'resume'):
+                raise ValueError('Unsupported servo_eef action')
+            return {'status': 'validated', 'motion_sent': False}
         if name == 'loco_servo_arm' and name in self.enabled:
             if args.get('action', 'info') not in ('info', 'start', 'stop', 'pause', 'resume', 'config'):
                 raise ValueError('Unsupported loco_servo_arm action')
@@ -522,6 +542,12 @@ class Adapter:
                 return await self.close_lower()
             if self._lower_stopping and args.get('action') != 'info':
                 raise ValueError('下肢任务正在停止，暂不接受新动作')
+        if name in ('loco_servo_arm', 'servo_eef') and name in self.enabled and self.servo_eef is not None:
+            selected, other = (self.servo_eef, self.arm_servo) if name == 'servo_eef' else (self.arm_servo, self.servo_eef)
+            async with self._servo_lifecycle:
+                if args.get('action') in ('start', 'resume') and other.running and not other.paused:
+                    raise ValueError('Pause the other arm servo before starting this control stream')
+                return await selected.call(args)
         if name == 'loco_servo_arm' and name in self.enabled:
             return await self.arm_servo.call(args)
         # Explicit commands outrank the stream. Await its in-flight send and
@@ -534,6 +560,8 @@ class Adapter:
                 name == 'head_visual_follow' and (args.get('action', 'follow') == 'follow' or
                     args.get('action') == 'not_follow' and args.get('non_follow_action') == 'reset')):
             await self.arm_servo.preempt()
+            if self.servo_eef is not None:
+                await self.servo_eef.preempt()
         if name=='loco_leg':
             action=args.get('action','info')
             if action=='stand_down':action='sit_down'
@@ -609,7 +637,7 @@ class Adapter:
                     error = False
                 except (ValueError, TypeError) as exc:
                     data, error = {'error': str(exc)[:240],
-                        'read_only': params.get('name') not in self.enabled or params.get('name') not in ({'loco_servo_arm', 'loco_leg', 'arm_control', 'move_head', 'gripper', 'pose', 'head_visual_follow'} | set(GRIPPER_SIDES)) or
+                        'read_only': params.get('name') not in self.enabled or params.get('name') not in ({'servo_eef', 'loco_servo_arm', 'loco_leg', 'arm_control', 'move_head', 'gripper', 'pose', 'head_visual_follow'} | set(GRIPPER_SIDES)) or
                             params.get('name') in GRIPPER_SIDES and params.get('arguments', {}).get('action') not in MOTION_ACTIONS,
                         'motion_sent': getattr(exc, 'motion_sent', False)}, True
                     if params.get('name') == 'gripper' and 'gripper' in self.enabled:
@@ -638,11 +666,13 @@ class Adapter:
         samples = self.snapshot()
         # An optional battery field must not regress existing joint readiness.
         required = {k: v for k, v in samples.items() if k in ('joint_state', 'joints')} or samples
+        if not required and self.eef_state is not None:
+            required = {'joint_state': self.reader.sample('joint_state')}
         ready = self.reader.connected and bool(required) and all(s['available'] for s in required.values())
         cameras = {name: stream.info() for name, stream in self.cameras.items() if name in self.enabled}
         if not samples and cameras:
             ready = all(info['available'] for info in cameras.values())
-        return {'walk':self.walk.info(), 'sit_down':self.sit_down.info(), 'stand': self.stand.info(), 'version': VERSION, 'read_only': not set(self.enabled) & ({'loco_servo_arm', 'loco_leg', 'arm_control', 'move_head', 'gripper', 'pose'} | set(GRIPPER_SIDES)), 'ready': ready,
+        return {'walk':self.walk.info(), 'sit_down':self.sit_down.info(), 'stand': self.stand.info(), 'version': VERSION, 'read_only': not set(self.enabled) & ({'servo_eef', 'loco_servo_arm', 'loco_leg', 'arm_control', 'move_head', 'gripper', 'pose'} | set(GRIPPER_SIDES)), 'ready': ready,
             'loco_servo_arm': self.arm_servo.info(),
             'arm_motion': self.motion.summary(),
             'head_motion': self.head.summary(),
