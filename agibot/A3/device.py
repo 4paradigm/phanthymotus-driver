@@ -928,12 +928,10 @@ class A3Nodes:
         self._audio_publishers = {}
         self.speaker_subscription = None
         if AudioCapture is not None and AudioPlayback is not None and AudioChunk is not None:
-            # This A3 firmware has no writer on /agent/process_audio_output;
-            # its live capture endpoint is /audiohal/audio/capture.  Keep the
-            # external card on its own route rather than duplicating internal
-            # microphone audio into it.
-            for key, topic in (("mic", "/audiohal/audio/capture"),
-                               ("ext_mic", "/agent/audio/data/external")):
+            # Map raw capture sources to cards here; each card keeps its own
+            # output topic and audio processing pipeline.
+            for key, topic in (("mic", "/agent/audio/data/external"),
+                               ("ext_mic", "/audiohal/audio/capture")):
                 core_topic = _core_topic(namespace, f"{key}/audio")
                 pub = self.core.create_publisher(AudioChunk, core_topic, 5)
                 self._audio_publishers[key] = pub

@@ -39,6 +39,7 @@ start)
   nsenter -t 1 -r -u -n -p -- /usr/bin/bash --noprofile --norc -c \
     'set -e
      cd /tmp
+     export ROS_DISCOVERY_SERVER="10.42.10.10:11811;10.42.10.12:11811"
      # The launcher inherits the Humble process environment.  Jazzy setup
      # rejects a preselected ROS_DISTRO and its setup files use optional
      # variables that are not compatible with bash -u.
