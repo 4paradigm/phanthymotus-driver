@@ -22,7 +22,7 @@ from datetime import date
 from pathlib import Path
 
 from visitor_site import (ADMITTED, LEFT, NOT_ADMITTED, SiteError, Visit, VisitorSite,
-                          close_profile_edge, login_window_open, open_for_login)
+                          close_profile_edge, login_window_open, open_for_login, timings)
 
 
 BASE = Path(__file__).resolve().parent
@@ -66,6 +66,19 @@ class Worker:
             self._site = None
 
     def run(self, job: dict) -> dict:
+        try:
+            return self._run(job)
+        except SiteError as exc:
+            if exc.code == "login_required" and job.get("action") in ("list", "print"):
+                # Open the login window in this same job. Leaving it to a second
+                # job from the robot cost another SSH round trip, scheduled-task
+                # start and process scan before the window appeared.
+                self.close()
+                open_for_login(PROFILE, str(job.get("page_url") or ""))
+                exc.login_window = True
+            raise
+
+    def _run(self, job: dict) -> dict:
         action = job.get("action")
         page_url = str(job.get("page_url") or "")
         today = date.today().isoformat()
@@ -116,17 +129,22 @@ def main() -> int:
             request = pending[0]
             job_id = request.name.removesuffix(".request.json")
             job: dict = {}
+            started = time.monotonic()
+            timings.reset()
             try:
                 job = json.loads(request.read_text(encoding="utf-8-sig"))
                 result = worker.run(job)
             except SiteError as exc:
                 result = {"ok": False, "code": exc.code, "error": str(exc)}
+                if getattr(exc, "login_window", False):
+                    result["login_window"] = True
             except Exception as exc:
                 traceback.print_exc()
                 result = {"ok": False, "code": "automation_error", "error": str(exc)[:300]}
             finally:
                 request.unlink(missing_ok=True)
-            print(f"{time.strftime('%F %T')} {job_id[:8]} {job.get('action')} ok={result['ok']} {result.get('code', '')}")
+            print(f"{time.strftime('%F %T')} {job_id[:8]} {job.get('action')} ok={result['ok']} "
+                  f"{result.get('code', '')} {time.monotonic() - started:.1f}s {timings.report()}")
             out = JOBS / f"{job_id}.result.json"
             tmp = out.with_suffix(".tmp")
             tmp.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")

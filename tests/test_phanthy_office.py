@@ -68,8 +68,12 @@ def test_card_contract():
     assert definition["name"] == "visitor_badge" and definition["type"] == "actuator"
     schema = definition["inputSchema"]
     assert schema["x-completion"]["actions"] == ["print"]
-    assert set(schema["x-action-params"]) >= {"list", "print", "detect"}
-    assert {o["const"]: o["title"] for o in schema["properties"]["action"]["oneOf"]}["detect"] == "检测前台电脑"
+    assert set(schema["x-action-params"]) >= {"list", "print"}
+    # Detect is the settings dialog's 检测 button, not a card action: listed, it
+    # showed in the action dropdown and was offered to the agent.
+    assert "detect" not in schema["properties"]["action"]["enum"]
+    assert "detect" not in schema["x-action-params"]
+    assert "detect" not in {o["const"] for o in schema["properties"]["action"]["oneOf"]}
     assert "setup" not in schema["x-action-params"]   # installing is the driver's business
     config = definition["configSchema"]
     assert config["properties"]["password"]["x-sensitive"] is True
@@ -188,7 +192,11 @@ def test_open_tabs_come_first_and_survive_a_history_that_lost_them(tmp_path):
     import http.server
     import json as _json
 
+    # The same page in three tabs: Edge restores the old tabs each time it is
+    # reopened and opens the page once more, and each 检测 listed it again.
     targets = [{"type": "page", "url": "https://visit.example/#/visitor/list", "title": "访客列表"},
+               {"type": "page", "url": "https://visit.example/#/visitor/list", "title": "访客列表"},
+               {"type": "page", "url": "https://visit.example/#/visitor/list", "title": "访客列表"},
                {"type": "page", "url": "https://visit.example/#/login", "title": "登录"},
                {"type": "service_worker", "url": "https://visit.example/sw.js"},
                {"type": "page", "url": "edge://newtab/", "title": ""}]
@@ -295,6 +303,16 @@ def test_login_required_opens_the_login_window_and_says_so(plugin):
     assert [c["action"] for c in plugin.calls] == ["list", "login"]
 
 
+def test_no_second_job_when_the_worker_already_opened_the_login_window(plugin):
+    """Each job is an SSH round trip plus a scheduled-task start; the logged-out
+    answer was slow partly because it took two."""
+    plugin.reply = lambda job: {"ok": False, "code": "login_required", "error": "访客系统需要登录",
+                                "login_window": True}
+    result = plugin.dispatch("list", {})
+    assert result["code"] == "login_required"
+    assert [c["action"] for c in plugin.calls] == ["list"]
+
+
 def _visit(name, status, host="李四", tail="1234"):
     return visitor_site.Visit(visit_id=name + status, name=name, host=host, status=status, phone_tail=tail)
 
@@ -386,3 +404,164 @@ def test_worker_stays_while_the_login_window_is_open(monkeypatch, tmp_path):
         sys.stdout.close()
         sys.stdout, sys.stderr = stdout, stderr
     assert next(checks, "done") == "done"
+
+
+# ── Windows side: which Edge a job opens ─────────────────────────────────────
+
+class _FakePage:
+    def __init__(self, url="about:blank"):
+        self.url, self.closed = url, False
+
+    def is_closed(self):
+        return self.closed
+
+    def on(self, *_):
+        pass
+
+    remove_listener = on
+
+    def goto(self, url, **_):
+        return None   # the url stays wherever the fake was told it lands
+
+    def reload(self, **_):
+        return None
+
+
+class _FakeContext:
+    def __init__(self, headless, landing):
+        self.headless, self.pages, self.closed = headless, [_FakePage(landing)], False
+
+    def add_init_script(self, **_):
+        pass
+
+    def new_page(self):
+        self.pages.append(_FakePage())
+        return self.pages[-1]
+
+    def close(self):
+        self.closed = True
+
+
+@pytest.fixture
+def edge(monkeypatch):
+    """A fake Playwright that records every Edge launched on the profile."""
+    import types
+    launched = []
+    state = {"landing": "https://visit.example/list"}
+
+    def launch(profile, headless, **_):
+        launched.append(_FakeContext(headless, state["landing"]))
+        return launched[-1]
+
+    pw = types.SimpleNamespace(chromium=types.SimpleNamespace(launch_persistent_context=launch),
+                               stop=lambda: None)
+    api = types.ModuleType("playwright.sync_api")
+    api.sync_playwright = lambda: types.SimpleNamespace(start=lambda: pw)
+    api.TimeoutError = TimeoutError
+    monkeypatch.setitem(sys.modules, "playwright", types.ModuleType("playwright"))
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", api)
+    monkeypatch.setattr(visitor_site, "close_profile_edge", lambda _profile: None)
+    return launched, state
+
+
+def test_reading_visits_never_shows_a_window(edge, tmp_path):
+    """Not logged in: the check must not open the login page in a visible
+    window — the login job then closed it for the plain login window, so the
+    front desk saw the login page open, vanish and open again."""
+    launched, state = edge
+    state["landing"] = "https://visit.example/login?redirect=list"
+    site = visitor_site.VisitorSite(CONFIG["page_url"], tmp_path)
+    with pytest.raises(visitor_site.SiteError) as exc:
+        site.visits("2026-11-25")
+    assert exc.value.code == "login_required"
+    assert [c.headless for c in launched] == [True]
+
+
+def test_only_printing_opens_edge_on_the_desktop(edge, tmp_path):
+    launched, _ = edge
+    site = visitor_site.VisitorSite(CONFIG["page_url"], tmp_path)
+    site._browser()
+    site._browser()
+    assert [c.headless for c in launched] == [True], "a second read reuses the headless Edge"
+    site._browser(headless=False)
+    assert [c.headless for c in launched] == [True, False]
+    assert launched[0].closed, "the profile is freed before the visible Edge takes it"
+    site._browser(headless=False)
+    assert len(launched) == 2
+
+
+def test_install_makes_edge_print_to_the_windows_default_printer():
+    """The printer setting works by switching the Windows default; Edge only
+    follows it with this policy, otherwise it reuses the last printer."""
+    script = (DRIVER / "windows" / "install.ps1").read_text(encoding="ascii")   # PS 5.1: ASCII only
+    assert "SOFTWARE\\Policies\\Microsoft\\Edge" in script
+    assert "'PrintPreviewUseSystemDefaultPrinter' -PropertyType DWord -Value 1" in script
+
+
+def test_a_print_reads_headless_first_and_only_then_opens_a_window(monkeypatch):
+    """worker.run's order is what keeps a logged-out print from flashing the
+    login page: `visits()` (headless) has to come before `print_badge()`."""
+    events = []
+    monkeypatch.setattr(worker, "open_for_login", lambda profile, url: events.append("login_window"))
+
+    class FakeSite:
+        list_url = CONFIG["page_url"]
+
+        def visits(self, day):
+            events.append("visits")
+            raise visitor_site.SiteError("login_required", "访客系统需要登录")
+
+        def print_badge(self, *_):
+            events.append("print_badge")
+
+        def close(self):
+            pass
+
+    w = worker.Worker()
+    w._site = FakeSite()
+    with pytest.raises(visitor_site.SiteError) as exc:
+        w.run({"action": "print", "page_url": CONFIG["page_url"], "name": "张三"})
+    assert exc.value.code == "login_required"
+    assert events == ["visits", "login_window"], "a logged-out print must stop before the visible Edge opens"
+
+
+def test_a_logged_out_job_opens_the_login_window_itself(monkeypatch):
+    opened = []
+    monkeypatch.setattr(worker, "open_for_login", lambda profile, url: opened.append(url))
+
+    class LoggedOut:
+        list_url = CONFIG["page_url"]
+
+        def visits(self, day):
+            raise visitor_site.SiteError("login_required", "访客系统需要登录")
+
+        def close(self):
+            pass
+
+    w = worker.Worker()
+    w._site = LoggedOut()
+    with pytest.raises(visitor_site.SiteError) as exc:
+        w.run({"action": "list", "page_url": CONFIG["page_url"]})
+    assert exc.value.code == "login_required" and exc.value.login_window
+    assert opened == [CONFIG["page_url"]]
+    assert w._site is None, "the headless Edge must let go of the profile first"
+
+
+def test_a_late_redirect_to_login_is_noticed_without_the_search_button_wait(edge, tmp_path, monkeypatch):
+    """A single-page app: DOMContentLoaded fires on the list URL, and its router
+    moves to the login page a moment later. The old check looked once, missed
+    it, then waited out the search-button click (3-5 s)."""
+    launched, _ = edge
+    redirect_after = {"n": 3}
+
+    def wait_for_timeout(self, ms):
+        redirect_after["n"] -= 1
+        if redirect_after["n"] == 0:
+            self.url = "https://visit.example/#/login"
+
+    monkeypatch.setattr(_FakePage, "wait_for_timeout", wait_for_timeout, raising=False)
+    site = visitor_site.VisitorSite(CONFIG["page_url"], tmp_path)
+    with pytest.raises(visitor_site.SiteError) as exc:
+        site.visits("2026-11-25")   # _FakePage has no get_by_role: reaching the button wait would fail differently
+    assert exc.value.code == "login_required"
+    assert redirect_after["n"] == 0

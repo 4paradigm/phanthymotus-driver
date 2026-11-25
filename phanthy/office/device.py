@@ -29,7 +29,7 @@ PACKAGE_VERSION = hashlib.sha256(b"".join(
     p.read_bytes() for p in sorted(WINDOWS_PACKAGE.iterdir()) if p.is_file())).hexdigest()[:12]
 _CONFIG_KEYS = ("host", "user", "password", "port", "page_url", "printer")
 _CONNECTION_KEYS = ("host", "user", "password", "port")
-_ACTION_TITLES = {"list": "列出访客", "print": "打印访客贴", "detect": "检测前台电脑"}
+_ACTION_TITLES = {"list": "列出访客", "print": "打印访客贴"}
 _NOT_DETECTED = "还没检测：填好前台电脑 IP、用户名和密码后，点右边的「检测」"
 # Said instead of the error where the next step differs for detect.
 _DETECT_MESSAGES = {"preparing": "正在安装或升级前台电脑上的程序（约 2–3 分钟），装好后再执行一次检测"}
@@ -65,9 +65,10 @@ class VisitorBadgePlugin:
             "list": ([], "列出今天还没入场的访客（姓名、被访人、时间、手机尾号）"),
             "print": (["name", "host"], "给今天一位未入场访客打印访客贴；同名时用 host（被访人）区分。"
                                         "结果异步返回，失败时把 error 原样告诉用户，不要自行重试"),
-            "detect": ([], "（管理员）检测前台电脑：连接、首次安装、打印机和访客网页，"
-                           "结果供卡片设置里的下拉框选择"),
         }
+        # `detect` is dispatched but not listed: only the settings dialog's 检测
+        # button runs it (x-options-action, which calls the tool directly). Listed,
+        # it shows in the card's action dropdown and is offered to the agent.
         schema = action_schema(actions, {
             "name": {"type": "string", "description": "访客姓名"},
             "host": {"type": "string", "description": "被访人姓名，可选"},
@@ -171,12 +172,13 @@ class VisitorBadgePlugin:
             self._install(cfg, deadline - time.monotonic() - 20)
             result = desk.job(job, PACKAGE_VERSION, remaining())
         if result.get("code") == "login_required":
-            # Put the login window in front of the operator; it is left alone
-            # if already open, so a retry does not interrupt a login.
-            try:
-                desk.job({"action": "login", "page_url": cfg["page_url"]}, PACKAGE_VERSION, 20)
-            except FrontDeskError:
-                pass
+            # The worker opens the login window itself in the same job
+            # (`login_window`); a second job only as a fallback.
+            if not result.get("login_window"):
+                try:
+                    desk.job({"action": "login", "page_url": cfg["page_url"]}, PACKAGE_VERSION, 20)
+                except FrontDeskError:
+                    pass
             raise FrontDeskError("login_required", "访客系统需要登录：已在前台电脑打开 Edge，请前台登录后再试")
         if not result.get("ok"):
             raise FrontDeskError(str(result.get("code") or "failed"), str(result.get("error") or "前台电脑执行失败"))
