@@ -453,8 +453,16 @@ def test_the_spec_and_card_modules_reach_the_image():
     assert "COPY vision_tf_card.py /work/vision_tf_card.py" in dockerfile
 
 
-def test_driver_yaml_declares_the_card_with_the_matching_type():
+def test_vision_tf_is_not_exposed_as_a_standalone_card():
+    """tf is now an implicit capability of the odometry card, not a canvas card.
+
+    The spec/card modules stay in the image (the spec is the library the
+    odometry card builds on), but the driver no longer lists either tf card as
+    an independently placeable processor.
+    """
     import yaml
     driver = yaml.safe_load((BUMI / "driver.yaml").read_text(encoding="utf-8"))
-    cards = {c["name"]: c["type"] for c in driver["cards"]}
-    assert cards.get("vision_tf") == "processor"
+    cards = {c["name"] for c in driver["cards"]}
+    assert "vision_tf" not in cards
+    assert "tf_tree" not in cards
+    assert "rgbd_visual_odometry" in cards

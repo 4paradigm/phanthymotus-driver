@@ -14,6 +14,23 @@ config to disable it. When enabled, `main.py` exports
 pyrealsense2 capture process publishes the raw RGB-D branch `visual_inputs.py`
 uses. Disabled means no raw branch, no estimator child, no extra DDS traffic.
 
+## Embedded tf tree (optional, off by default)
+
+Full-localisation tf is an **implicit capability of this card**, not a pair of
+canvas cards. The former `vision_tf` / `tf_tree` processor cards are retired.
+Set `plugins.visual_odometry.tf.enabled: true` to make this card publish:
+
+- URDF `fixed` joints (the camera mount chain included) on latched `/tf_static`;
+- the 21 revolute joints on `/tf` from `/{ns}/state/joints`;
+- the camera's own odom pose `<segment>_odom → <segment>_base` on `/tf`, using
+  the estimator's own `stamp_ns` for every accepted tracking sample.
+
+With the switch off (the default), enabling this card publishes **no** `/tf`.
+The `data/json` / `state/odom` outputs are unchanged either way. Health is
+reported under `info()['tf']` and at `/{ns}/bumi_visual_odometry/tf_status`;
+the tree comes up and tears down with the card. Configuration keys are
+`plugins.visual_odometry.tf.{urdf_path, publish_rate_hz, max_joint_age_s}`.
+
 ## Card
 
 | Field | Value |

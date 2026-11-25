@@ -73,11 +73,16 @@ class _TfTreeNode(Node):
     topic. Purely mechanical; the decisions live in `tf_tree_spec`."""
 
     def __init__(self, namespace: str, urdf_path: str, publish_rate_hz: float,
-                 max_joint_age_s: float, vision_ttl_ms: int):
-        super().__init__("bumi_tf_tree")
+                 max_joint_age_s: float, vision_ttl_ms: int,
+                 node_name: str = "bumi_tf_tree",
+                 status_topic: str | None = None):
+        # node_name/status_topic are overridable so a functional card can host
+        # this node as an *implicit* capability (visual odometry does) without
+        # impersonating the retired standalone `tf_tree` card.
+        super().__init__(node_name)
         self._namespace = namespace
         self._joints_topic = f"/{namespace}/state/joints"
-        self._status_topic = f"/{namespace}/tf_tree/status"
+        self._status_topic = status_topic or f"/{namespace}/tf_tree/status"
         self._urdf_path = urdf_path
         self._publish_rate_hz = publish_rate_hz
         self._max_joint_age_s = max_joint_age_s
@@ -491,6 +496,50 @@ class _TfTreeNode(Node):
         if stamped:
             self._dynamic_bc.sendTransform(stamped)
         self._publish_count += 1
+
+    def publish_pose(self, parent: str, child: str, position, quaternion,
+                     stamp_ns: int) -> bool:
+        """Publish one caller-supplied pose edge on ``/tf``.
+
+        This is the seam used by a card that *embeds* the tree (currently
+        visual odometry): it adds its own measured pose — e.g.
+        ``<segment>_odom -> <segment>_base`` — through this node's single
+        broadcaster, so every dynamic edge shares one publisher and stamp
+        policy. The caller owns the frame semantics; this method only guards
+        the numbers, because a NaN/Inf pose would poison every downstream
+        ``lookup_transform``.
+
+        Returns False (publishing nothing) when not running, when the tree
+        failed to parse, or on a non-finite/zero-length pose or a missing
+        stamp. The caller's stamp is used verbatim, never publish time.
+        """
+        if not self._running or self._tree is None:
+            return False
+        if not parent or not child or parent == child:
+            return False
+        try:
+            values = [float(v) for v in list(position) + list(quaternion)]
+            stamp = int(stamp_ns)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if len(values) != 7 or not all(math.isfinite(v) for v in values):
+            return False
+        if math.sqrt(sum(v * v for v in values[3:])) <= 1e-12:
+            return False
+        if stamp <= 0:
+            return False
+        from geometry_msgs.msg import TransformStamped
+        from rclpy.time import Time
+        t = TransformStamped()
+        t.header.stamp = Time(nanoseconds=stamp).to_msg()
+        t.header.frame_id = parent
+        t.child_frame_id = child
+        (t.transform.translation.x, t.transform.translation.y,
+         t.transform.translation.z) = values[0:3]
+        (t.transform.rotation.x, t.transform.rotation.y,
+         t.transform.rotation.z, t.transform.rotation.w) = values[3:7]
+        self._dynamic_bc.sendTransform([t])
+        return True
 
     # ── the loop ────────────────────────────────────────────────────────────
 

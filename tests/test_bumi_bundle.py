@@ -194,32 +194,35 @@ def test_existing_bumi_plugin_loading_is_unchanged(bundle_module):
         "loco", "loco_servo", "speaker"]
 
 
-def test_enabled_vision_tf_registers_even_without_any_controller(bundle_module):
-    # vision_tf is a pure data card: no high_ctrl, no media_ctrl, yet it must
-    # still load — gating it on a controller would make it silently disappear.
-    config = _config()
-    config["plugins"]["vision_tf"] = {"enabled": True, "source_name": "ar"}
+def test_tf_cards_are_no_longer_registered_as_standalone_plugins(bundle_module):
+    """tf is an implicit capability of the odometry card, not canvas cards.
+
+    Even if an old deployment still carries `plugins.vision_tf` / `tf_tree`
+    keys, the bundle must not expose them: their logic now lives in the
+    vision-odometry card's embedded tree.
+    """
+    config = _config(loco=False, loco_servo=False)
+    config["plugins"]["vision_tf"] = {"enabled": True}
+    config["plugins"]["tf_tree"] = {"enabled": True}
 
     bundle = bundle_module.BumiDeviceBundle(
         config, "bumi_test", object(), high_ctrl=None, media_ctrl=None)
 
-    tools = bundle.get_all_tools()
-    # With high_ctrl=None the controller-gated loco/loco_servo cards do NOT
-    # register — but vision_tf must still load because it is a pure data card.
-    assert [t["name"] for t in tools] == ["vision_tf"]
-    vision_tf = bundle._plugins[-1]
-    assert vision_tf.plugin_config["source_name"] == "ar"
-    assert vision_tf.namespace == "bumi_test"
+    assert bundle.get_all_tools() == []
 
 
-def test_vision_tf_is_skipped_when_disabled(bundle_module):
-    config = _config()
-    config["plugins"]["vision_tf"] = {"enabled": False}
+def test_embedded_tf_config_is_default_off(bundle_module):
+    """The odometry card's tf switch is absent/false by default in config.yaml.
 
-    bundle = bundle_module.BumiDeviceBundle(
-        config, "bumi_test", object(), high_ctrl=None, media_ctrl=None)
+    Enabling the odometry card must never silently start publishing /tf: the
+    operator has to opt in with plugins.visual_odometry.tf.enabled.
+    """
+    import yaml
+    config = yaml.safe_load((BUMI / "config.yaml").read_text(encoding="utf-8"))
+    tf_cfg = config["plugins"]["visual_odometry"].get("tf")
+    assert isinstance(tf_cfg, dict)
+    assert tf_cfg.get("enabled", False) is False
 
-    assert "vision_tf" not in [t["name"] for t in bundle.get_all_tools()]
 
 
 class FakeTfTreePlugin:
@@ -241,35 +244,17 @@ class FakeTfTreePlugin:
         return {"state": action}
 
 
-def test_tf_tree_registers_without_controller_or_camera(bundle_module, monkeypatch):
-    """tf is structural: it must come up even on a build with every other card off.
+def test_bundle_source_has_no_standalone_tf_registration(bundle_module):
+    """Guard the source itself: main.py must not mount either tf card.
 
-    Gating it on a controller or on the camera plugin would silently drop the
-    only /tf publisher in the bundle, with no error beyond a missing card.
+    A config-level test alone would miss a reintroduced import/append, so pin
+    the source text. The tf-tree *node* class is still imported by
+    visual_odometry.py (as an embedded capability); only the two card plugins
+    are retired.
     """
-    fake = types.ModuleType("tf_tree_card")
-    fake.TfTreePlugin = FakeTfTreePlugin
-    monkeypatch.setitem(sys.modules, "tf_tree_card", fake)
+    import inspect
+    source = inspect.getsource(bundle_module.BumiDeviceBundle.__init__)
+    assert "VisionTfPlugin" not in source
+    assert "TfTreePlugin" not in source
+    assert "vision_tf_card" not in source
 
-    config = _config(loco=False, loco_servo=False)
-    config["plugins"]["tf_tree"] = {"enabled": True}
-
-    bundle = bundle_module.BumiDeviceBundle(
-        config, "bumi_test", object(), high_ctrl=None, media_ctrl=None)
-
-    assert [tool["name"] for tool in bundle.get_all_tools()] == ["tf_tree"]
-    assert bundle._plugins[0].namespace == "bumi_test"
-
-
-def test_tf_tree_skipped_when_disabled(bundle_module, monkeypatch):
-    fake = types.ModuleType("tf_tree_card")
-    fake.TfTreePlugin = FakeTfTreePlugin
-    monkeypatch.setitem(sys.modules, "tf_tree_card", fake)
-
-    config = _config(loco=False, loco_servo=False)
-    config["plugins"]["tf_tree"] = {"enabled": False}
-
-    bundle = bundle_module.BumiDeviceBundle(
-        config, "bumi_test", object(), high_ctrl=None, media_ctrl=None)
-
-    assert bundle.get_all_tools() == []

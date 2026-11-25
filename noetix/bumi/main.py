@@ -204,25 +204,10 @@ class BumiDeviceBundle:
                 plugins_cfg["vision_capture"], camera_plugin))
             print("[bundle] VisionCapturePlugin loaded")
 
-        # vision_tf is a pure data adapter: it turns vision-localisation JSON
-        # into tf-shaped transforms for a downstream tf-tree card.  It touches
-        # no hardware, so it is deliberately NOT gated on high_ctrl/media_ctrl —
-        # those may both be None (e.g. a data-only deployment) and the card must
-        # still come up.
-        if plugins_cfg.get("vision_tf", {}).get("enabled", False):
-            from vision_tf_card import VisionTfPlugin
-            self._plugins.append(VisionTfPlugin(
-                plugins_cfg["vision_tf"], namespace, executor))
-            print("[bundle] VisionTfPlugin loaded")
-
-        if plugins_cfg.get("tf_tree", {}).get("enabled", False):
-            # Not gated on a controller or on the camera: tf is structural —
-            # it needs only the URDF and the joint-state topic, both of which
-            # exist regardless of which other cards are enabled.
-            from tf_tree_card import TfTreePlugin
-            self._plugins.append(TfTreePlugin(
-                plugins_cfg["tf_tree"], namespace, executor))
-            print("[bundle] TfTreePlugin loaded")
+        # tf publishing is embedded in the visual-odometry card (see
+        # plugins.visual_odometry.tf). vision_tf / tf_tree are no longer
+        # standalone cards: their logic stays in vision_tf_spec / tf_tree_spec
+        # and is hosted by rgbd_visual_odometry when its tf switch is enabled.
 
     def start_all(self) -> None:
         failed = 0

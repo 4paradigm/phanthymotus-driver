@@ -575,8 +575,9 @@ machine-specific or per-start prefixes, so they can never be hard-coded:
 
 These two pairs are the **same physical frames under different names**, not two
 separate cameras. The URDF tree (`base_link → waist_yaw_link → head_center_link → camera_link →
-camera_optical_frame`) is published on `/tf_static` by the `tf_tree` card below,
-so a `lookup(base_link → camera_optical_frame)` now resolves. The odometry tree
+camera_optical_frame`) is published on `/tf_static` by the embedded tf tree
+below (when enabled), so a `lookup(base_link → camera_optical_frame)` resolves.
+The odometry tree
 (`bumi_visual_<uuid>_base → <hostname>_rgb_optical`) is still estimator-private
 and broadcast separately by `visual_odometry.py`; the two trees remain
 **disconnected** — a `lookup(base_link → <hostname>_rgb_optical)` reports
@@ -585,19 +586,52 @@ a `camera_link → bumi_visual_*_base` identity link) rather than assume the
 same-physical name pairs coincide automatically, and must not hard-code a parent
 frame in place of the `frame_id` already carried by the input image header.
 
-## `vision_tf` card — turn a vision localisation into a tf transform
+## Full-localisation tf is embedded, not a card
 
-`vision_tf` is a processor card that sits between a vision-localisation card
-(AR marker, stamped pose, pixel+depth, object list) and a tf-tree card:
+Per CTO direction, tf localisation is an **implicit capability of the functional
+card** that produces the pose — here `rgbd_visual_odometry` — rather than a
+chain of scattered canvas cards. The former `vision_tf` and `tf_tree`
+**processor cards are retired**: they are no longer listed in `driver.yaml`,
+no longer registered by `main.py`, and never appear on the canvas. Their pure
+logic stays in `vision_tf_spec.py` / `tf_tree_spec.py` as the libraries the
+embedded tree is built from.
 
-```
-vision card ──data/json──> vision_tf ──data/json──> tf-tree card
-   (left link)                                      (right link)
-```
+The embedded tree is **OFF by default**. Set
+`plugins.visual_odometry.tf.enabled: true` in `config.yaml` to turn it on;
+enabling the odometry card alone never publishes `/tf`. When on, the odometry
+card hosts a `tf_tree` node on its own executor that publishes:
 
-It consumes one `data/json` topic (`input_topic` supplied by the canvas at
-`start`) and publishes one `data/json` topic containing a list of tf-shaped
-edges:
+- the URDF `fixed` joints (including the camera mount chain) on latched
+  `/tf_static`;
+- the 21 revolute joints on `/tf`, driven by `/{ns}/state/joints`;
+- **the camera's own odom pose** — `bumi_visual_<uuid>_odom →
+  bumi_visual_<uuid>_base`, stamped with the estimator's own `stamp_ns` — as a
+  dynamic `/tf` edge, for every accepted tracking sample.
+
+The card's `data/json` and `state/odom` outputs are unchanged by tf being on or
+off. Its `info()` returns a `tf` health snapshot (state, frame counts, parse
+error) and the status lives at `/{ns}/bumi_visual_odometry/tf_status`; there is
+no standalone card to wire up.
+
+### Camera frame and rotation still come from the URDF
+
+The camera's position on the robot is **not invented**. It comes from the
+`camera_link` / `camera_optical_frame` fixed frames in
+`resource/bumi_model.urdf`: `camera_mount_joint` carries the measured offset
+**+5 cm forward (x), +3.5 cm left (y), +0.5 cm up (z)** from `head_center_link`
+(the centre of the head), and `camera_optical_joint` carries the optical→body
+rotation (`rpy = (-π/2, 0, -π/2)`, quaternion `[-0.5, 0.5, -0.5, 0.5]` xyzw).
+The same rotation is the library constant
+`vision_tf_spec.ROTATION_ORDER` / `OPTICAL_TO_BODY_QUAT`, so there is a single
+source of truth.
+
+### The archived vision-localisation adapter (library, not a card)
+
+`vision_tf_spec.py` still offers the pure conversion from "where a vision
+algorithm says an object is" into tf-shaped edges, in case a deployment needs
+to attach external targets (AR marker, stamped pose, pixel+depth, object list)
+to the tree. It is a dependency-free library, not a card: no canvas tool, no
+`start`/`stop`, no left/right link. Its edge shape is:
 
 ```json
 {
@@ -622,99 +656,32 @@ edges:
 }
 ```
 
-Every located object becomes one `parent → child` edge, with the parent a camera
-frame and the child `vision_<source>_<id>`. The card is disabled by default
-(`plugins.vision_tf.enabled: false` in `config.yaml`) because only deployments
-that attach vision targets to the body tf tree need it.
+Every located object becomes one `parent → child` edge, with a camera frame as
+parent and `vision_<source>_<id>` as child. Quaternions are **xyzw** everywhere.
+The library's adapters are `pose`, `pose_tf_like`, `ar_marker`, `pixel_depth`;
+missing fields are rejected, never zero-filled. It applies no rotation by
+default (`input_frame: optical` leaves numbers untouched so the URDF rotation
+is applied once by the tree); `output_frame: body` opts into converting to
+machine axes via `camera_to_body_point` / `camera_to_body_quaternion`.
 
-### Where the camera frame and the rotation come from
+### Freshness: consumers must check it themselves
 
-The camera's position on the robot is **not invented by this card**. It comes
-from the `camera_link` / `camera_optical_frame` fixed frames in
-`resource/bumi_model.urdf` (added alongside this work). `camera_optical_frame`
-already carries the optical→body rotation as a fixed joint
-(`rpy = (-π/2, 0, -π/2)`, quaternion `[-0.5, 0.5, -0.5, 0.5]` xyzw), which is
-why the visual convention (x right / y down / z depth) and the robot's spatial
-convention (x forward / y left / z up) line up when a tf tree reads that URDF.
+ROS `/tf` has no retract message: once an edge is published, a `tf2_ros` buffer
+keeps it for the consumer's cache duration even after the source stopped
+republishing. A consumer doing `lookup_transform(target, source, Time())`
+(latest available) can therefore get a stale pose with no error. Correct usage
+is to look up at a specific time and validate the returned header stamp with
+the dependency-free
+`tf_tree_spec.transform_is_fresh(header_stamp_ms, now_ms, max_age_ms)` helper.
+Treat a failed check as "not currently localised", never as a live pose.
 
-Consequently the card **does not rotate by default**: `input_frame: optical`
-passes the numbers through unchanged and uses `camera_optical_frame` as parent,
-letting the tree apply the URDF rotation once. If a caller wants machine-axis
-numbers directly, set `output_frame: body` — the card then applies the same
-rotation in `vision_tf_spec.camera_to_body_point` / `camera_to_body_quaternion`
-and uses `camera_link` as parent. Either way the rotation has a single source of
-truth; pick one, not both.
+The embedded tree drives nothing and is not a pose source. Its status topic
+`/{ns}/bumi_visual_odometry/tf_status` is a *health* report (frame counts,
+publish rate, joint-sample age, `degraded` reason); reading it as a transform
+is a bug. It does not join trees that other cards broadcast separately — a
+consumer needing that must publish its own explicit transform rather than
+assume two same-physical frame names coincide.
 
-### Adapters (the "various vision JSON" shapes)
-
-`adapter` selects how a target is parsed. Missing fields are rejected with a
-reason in `last_error` — never zero-filled.
-
-| adapter | expected shape |
-|---|---|
-| `pose` | `{position:[x,y,z], orientation:[x,y,z,w]}` (also accepts `{x,y,z}` objects) |
-| `pose_tf_like` | `{translation:[x,y,z], rotation:[x,y,z,w]}` |
-| `ar_marker` | `{marker_id, tvec:[x,y,z], rvec:[rx,ry,rz]}` or `quaternion` instead of rvec (both → rejected as ambiguous) |
-| `pixel_depth` | `{u, v, depth_m}` + pinhole intrinsics (defaults to image centre + configured `focal_px`) |
-
-### Parent frame, direction, time
-
-- `input_frame`: `optical` → `camera_optical_frame`, `body` → `camera_link`,
-  `base` → `base_link`. `output_frame: body` overrides to `camera_link`.
-- `pose_direction`: `object_in_camera` (default) uses the pose verbatim;
-  `camera_in_object` inverts it (`t' = -Rᵀt`, `q' = q⁻¹`).
-- Quaternions are **xyzw** everywhere (the renderer-only `imu_quat` wxzy order
-  in `device.py` is not used here).
-- A target's `stamp_ms` (or `header.stamp`) is kept verbatim as `stamp_source:
-  "input"`; with no stamp the receive time is used (`"receive"`). A target not
-  refreshed within `ttl_ms` (default 500) moves to `dropped`.
-
-### What it does not do
-
-No rotation by default, no tf-tree construction, no `/tf` or `/tf_static`
-publishing (that is the tf-tree card's job), no distortion correction (pixels
-must be ideal pinhole), and no hardware. It is deliberately not gated on the
-high/media controllers, so it loads in a data-only deployment.
-
-`start` requires `input_topic`; without it the card honestly reports
-`{"state":"idle","degraded":"no_input_topic"}` instead of claiming `running`.
-
-## `tf_tree` card
-
-Publishes the kinematic tree parsed from `resource/bumi_model.urdf` as ROS 2
-transforms: the 21 revolute joints on `/tf`, driven by the 10 Hz
-`/{ns}/state/joints` sample, and any `fixed` joints on the latched `/tf_static`.
-It computes forward kinematics itself — there is no `robot_state_publisher`
-subprocess and no extra image dependency (`tf2_ros` and `geometry_msgs` are
-already installed for the odometry card). The `fixed` joints declared in the
-URDF — including `camera_mount_joint` and `camera_optical_joint` from the camera
-mount section above — are published on `/tf_static`, which is what connects
-vision targets to the body tree.
-
-Optionally attaches a vision card's `data/json` transform batch (the
-`input_topic` arg of `start`) as additional child frames. Transforms carry the
-sample's own timestamp and expire after `vision_ttl_ms`.
-
-> **Consumers must check freshness themselves.** ROS `/tf` has no retract
-> message: once a vision edge is published, a `tf2_ros` buffer keeps it for the
-> consumer's cache duration even after `vision_ttl_ms` has elapsed and this card
-> stopped republishing it. `vision_ttl_ms` governs **this card's publishing**,
-> not what a downstream cache still holds. A consumer doing
-> `lookup_transform(target, source, Time())` (latest available) can therefore
-> get a stale object pose with no error. Correct usage is to look up at a
-> specific time and validate the returned header stamp with the dependency-free
-> `tf_tree_spec.transform_is_fresh(header_stamp_ms, now_ms, vision_ttl_ms)`
-> helper (also exposed in `info` as `vision_ttl_ms`). Treat a failed check as
-> "target not currently localised", never as a live pose.
-
-**It drives nothing and is not a pose source.** Its only output topic,
-`/{ns}/tf_tree/status`, is a *health* report (frame counts, publish rate,
-joint-sample age, `degraded` reason). Downstream code that wants "pose of A
-relative to C" must use `tf2_ros` `lookup_transform` on `/tf`; reading `status`
-as a transform is a bug. The card claims no `odom → base_link` edge, so it does
-not conflict with `rgbd_visual_odometry`. It also does not join any trees that
-other cards broadcast separately — a consumer needing that must publish its own
-explicit transform rather than assume two same-physical frame names coincide.
-
-Configuration is under `plugins.tf_tree`: `urdf_path`, `publish_rate_hz`,
-`max_joint_age_s`, `vision_ttl_ms`.
+Configuration for the embedded tree is under
+`plugins.visual_odometry.tf`: `enabled` (false), `urdf_path`,
+`publish_rate_hz`, `max_joint_age_s`.
