@@ -103,6 +103,35 @@ def test_engage_stops_motion_captures_and_publishes(module, tmp_path):
     assert plugin._node.publisher.messages == [result["record"]]
 
 
+def test_engage_journal_failure_does_not_leave_active_handoff(
+        module, tmp_path, monkeypatch):
+    loco, capture = FakeLoco(), FakeCapture()
+    plugin = make_plugin(module, tmp_path, loco=loco, capture=capture)
+    append = plugin._journal.append
+    attempts = 0
+
+    def fail_once(record):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("persistent mount is read-only")
+        return append(record)
+
+    monkeypatch.setattr(plugin._journal, "append", fail_once)
+    failed = plugin.dispatch("engage", {
+        "reason": "mount failure", "source": "system"})
+
+    assert failed["state"] == "error"
+    assert failed["error"] == "invalid_or_unavailable"
+    assert plugin.dispatch("info", {})["state"] == "ready"
+    assert len(loco.calls) == 1 and len(capture.calls) == 1
+
+    retried = plugin.dispatch("engage", {
+        "reason": "retry after mount recovery", "source": "system"})
+    assert retried["state"] == "engaged"
+    assert len(loco.calls) == 2 and len(capture.calls) == 2
+
+
 def test_canvas_dispatch_lifecycle(module, tmp_path):
     plugin = make_plugin(module, tmp_path)
     assert plugin.dispatch("start", {}) == {"state": "ready"}

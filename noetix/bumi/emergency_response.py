@@ -211,9 +211,9 @@ class EmergencyResponsePlugin:
                               "state": "engaged", "reason": reason, "source": source,
                               "location": location or None, "engaged_at": _now(),
                               "latest_photo": photo.get("file_path") if photo.get("ok") else None}
-                    self._active = active
                     record = self._record("engage", active, {
                         "motion_stop": motion, "photo": photo})
+                    self._active = active
                 return {"state": "engaged", "handoff": deepcopy(active),
                         "motion_stop": motion, "photo": photo, "record": record}
 
