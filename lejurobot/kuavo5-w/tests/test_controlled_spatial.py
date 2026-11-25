@@ -30,7 +30,7 @@ class Tracker:
         self._active, self.events = {}, []
         self.counter = 0
 
-    def begin(self, channel, tool):
+    def begin(self, channel, tool, notify=True):
         self.counter += 1
         aid, event = str(self.counter), threading.Event()
         self._active[channel] = aid, tool, event
@@ -69,12 +69,20 @@ class Bundle:
         self.tracker = Tracker()
         self._stop_epoch, self._transition = 0, None
         self.state = types.SimpleNamespace(motion_blocked=False, require_motion=lambda modes: None,
+                                           snapshot=lambda: {'controller_boot': None},
+                                           motion_send_uncertain=False,
                                            require_motion_enabled=lambda: None,
                                            read=lambda key: (False if key == 'upper_velocity_enabled'
                                                              else 'nav_mpc_path_track', time.monotonic()))
         self.ros1 = types.SimpleNamespace(connection=(True, 1))
-        self.base_servo = types.SimpleNamespace(preempt=lambda: None)
+        self.base_servo = types.SimpleNamespace(preempt=lambda: None, mark_paused=lambda: None)
         self.pauses = []
+
+    def _resume_unresolved(self):
+        return False
+
+    def _mode_unresolved(self):
+        return False
 
     def _begin_control(self, action):
         with self.tracker.lock:
@@ -158,7 +166,7 @@ class Client:
             self.feedback['agvState']['softwareEstop'] = False
             return {'success': True, 'stationary': True, 'software_estop': False,
                     'old_task_cancelled': True, 'released': released}
-        if operation == 'soft_stop':
+        if operation in ('soft_stop', 'manual_hold'):
             self.feedback['agvState']['softwareEstop'] = True
             return {'success': True, 'stationary': True, 'software_estop': True}
         if operation == 'stationary':
@@ -310,7 +318,8 @@ class SpatialTests(unittest.TestCase):
         schema = self.plugin.get_tool()['inputSchema']
         self.assertEqual(schema['x-resource'], 'base')
         self.assertEqual(schema['x-hooks']['on_interrupt_motion'], {'action': 'stop_nav'})
-        self.assertEqual(set(schema['properties']['action']['enum']), set(schema['x-action-params']))
+        self.assertEqual(set(schema['properties']['action']['enum']),
+                         set(schema['x-action-params']) | (set(schema['x-workbench']['actions']) - {'info', 'stop'}))
         self.assertIn('load_map', schema['x-completion']['actions'])
         self.assertEqual(self.call('start')['state'], 'running')
         self.assertEqual(self.call('stop')['state'], 'idle')
@@ -445,6 +454,24 @@ class SpatialTests(unittest.TestCase):
         self.assertEqual(status, 'error')
         self.assertIn('chassis_selected_nav_mpc_move_base', result['reason'])
         wait(lambda: ('cancel', {}) in self.client.calls)
+
+    def test_failure_after_native_acceptance_still_cancels_the_goal(self):
+        self.client.navigate = {'success': False, 'stage': 'resume_new_tracker',
+                                'goal_submitted': True, 'delivery_uncertain': False}
+        self.assertEqual(self.navigate()['state'], 'executing')
+        status, result = self.completed()
+        self.assertEqual(status, 'error')
+        self.assertIn('failed_at_resume_new_tracker', result['reason'])
+        wait(lambda: ('cancel', {}) in self.client.calls)
+        wait(lambda: not self.plugin.unresolved())
+
+    def test_uncertain_native_handoff_is_not_cleared_as_a_rejected_goal(self):
+        self.client.navigate = {'success': False, 'stage': 'goal_submit',
+                                'goal_submitted': True, 'delivery_uncertain': True}
+        self.assertEqual(self.navigate()['state'], 'executing')
+        self.assertEqual(self.completed()[0], 'error')
+        wait(lambda: ('cancel', {}) in self.client.calls)
+        self.assertTrue(self.plugin.unresolved())
 
     def test_pending_task_is_not_completed_by_close_pose(self):
         self.client.check = {'success': True, 'status': 0, 'arrived': False}
@@ -590,9 +617,9 @@ class SpatialTests(unittest.TestCase):
         self.assertEqual(self.completed()[0], 'completed')
         self.assertEqual(self.plugin.store.state('mapping')['phase'], 'mapping')
         self.assertEqual(self.client.commands, [
-            ('ChangeMode', {'mode': 'MANUAL'}), ('StartCartoMapping', {}),
-            ('ChangeMode', {'mode': 'AUTO'})])
-        self.assertEqual(self.client.feedback['agvState']['runningMode'], 'AUTO')
+            ('ChangeMode', {'mode': 'MANUAL'}), ('StartCartoMapping', {})])
+        self.assertEqual(self.client.feedback['agvState']['runningMode'], 'MANUAL')
+        self.assertTrue(self.client.feedback['agvState']['softwareEstop'])
         self.assertEqual(self.navigate()['state'], 'error')
         self.call('tag_place', name='entry')
         self.bundle.tracker.events.clear()
@@ -606,11 +633,11 @@ class SpatialTests(unittest.TestCase):
         self.assertEqual(self.client.commands[-1], ('ChangeMode', {'mode': 'AUTO'}))
         self.assertFalse(self.plugin.unresolved())
 
-    def test_mapping_requires_both_active_slam_and_upper_remote_route(self):
+    def test_mapping_requires_both_active_slam_and_manual_web_route(self):
         original = self.client.command
         def command(method, params, timeout):
             original(method, params, timeout)
-            if method == 'ChangeMode' and params['mode'] == 'AUTO':
+            if method == 'StartCartoMapping':
                 self.client.feedback['agvState']['isMapping'] = False
         self.client.command = command
         def confirm(predicate, *args, **kwargs):
@@ -626,8 +653,8 @@ class SpatialTests(unittest.TestCase):
         original = self.client.command
         def command(method, params, timeout):
             original(method, params, timeout)
-            if method == 'ChangeMode' and params['mode'] == 'AUTO':
-                raise TimeoutError('lost_auto_ack')
+            if method == 'ChangeMode' and params['mode'] == 'MANUAL':
+                raise TimeoutError('lost_manual_ack')
         self.client.command = command
         self.call('start_mapping', map_name='new')
         self.assertEqual(self.completed()[0], 'error')
@@ -1191,8 +1218,19 @@ class NativePreparationTests(unittest.TestCase):
         self.env_patch = patch.dict(self.module.os.environ)
         self.env_patch.start(); self.addCleanup(self.env_patch.stop)
         self.stationary_patch = patch.object(self.module, 'confirm_stationary',
-                                              side_effect=lambda *a: self.events.append('stationary'))
+                                              side_effect=lambda *a, **kw: self.events.append('stationary'))
         self.stationary_patch.start(); self.addCleanup(self.stationary_patch.stop)
+        self.tracker_patch = patch.object(self.module, 'tracker_command',
+                                          side_effect=lambda ros, op, request: self.events.append(('tracker', op)))
+        self.tracker_patch.start(); self.addCleanup(self.tracker_patch.stop)
+        self.mux_patch = patch.object(self.module, 'select_navigation_source',
+                                      side_effect=lambda ros: self.events.append('mux'))
+        self.mux_patch.start(); self.addCleanup(self.mux_patch.stop)
+        self.stop_feedback_patch = patch.object(self.module, 'confirm_software_stop')
+        self.stop_feedback_patch.start(); self.addCleanup(self.stop_feedback_patch.stop)
+        self.path_feedback_patch = patch.object(self.module, 'confirm_tracker_target',
+                                                side_effect=lambda *a: self.events.append('new_path'))
+        self.path_feedback_patch.start(); self.addCleanup(self.path_feedback_patch.stop)
 
     def call(self, operation='prepare'):
         return self.module.main({'master': 'http://test:11311', 'ros_ip': '127.0.0.1', 'operation': operation})
@@ -1202,13 +1240,15 @@ class NativePreparationTests(unittest.TestCase):
                    'args': {'x': 1., 'y': 2., 'yaw': .3, 'speed': .5}}
         self.reject = 4
         self.assertEqual(self.module.main(request), {'success': False, 'stage': 'dispatch_handoff'})
-        self.assertEqual(self.events, [4])
+        self.assertEqual(self.events, [0, 2, ('tracker', 3), 'stationary', 4])
 
         self.reject = None
         self.events.clear()
         self.assertEqual(self.module.main(request), {'success': True, 'task_id': 'task-1'})
-        handoff, (goal, kwargs) = self.events
-        self.assertEqual((handoff, goal), (4, 'goal'))
+        self.assertEqual(self.events[:6], [0, 2, ('tracker', 3), 'stationary', 4, 'mux'])
+        goal, kwargs = self.events[6]
+        self.assertEqual(goal, 'goal')
+        self.assertEqual(self.events[7:], ['new_path', ('tracker', 4), 'mux', 1])
         self.assertEqual(kwargs['options'].linear_velocity, .5)
         self.assertTrue(kwargs['options'].avoid_enabled)
 
@@ -1233,14 +1273,14 @@ class NativePreparationTests(unittest.TestCase):
 
     def test_cancel_and_stationary_before_release_then_stationary_again(self):
         result = self.call()
-        self.assertEqual(self.events, [2, 'stationary', 1, 'stationary'])
+        self.assertEqual(self.events, [0, 2, ('tracker', 3), 'stationary', 1, 'stationary'])
         self.assertTrue(result['old_task_cancelled'])
         self.assertFalse(result['software_estop'])
 
-    def test_clear_state_never_sends_redundant_release(self):
+    def test_clear_state_is_held_while_stale_tracker_is_paused(self):
         self.state.soft_estop = False
-        self.assertFalse(self.call()['released'])
-        self.assertEqual(self.events, [2, 'stationary', 'stationary'])
+        self.assertTrue(self.call()['released'])
+        self.assertEqual(self.events, [0, 2, ('tracker', 3), 'stationary', 1, 'stationary'])
 
     def test_hardware_fault_is_not_bypassed(self):
         for flag in ('estop', 'bumper', 'driver_error'):
@@ -1252,24 +1292,67 @@ class NativePreparationTests(unittest.TestCase):
     def test_rejected_cancel_never_releases(self):
         self.reject = 2
         with self.assertRaises(RuntimeError): self.call()
-        self.assertEqual(self.events, [2])
+        self.assertEqual(self.events, [0, 2])
 
     def test_missing_stationary_samples_never_releases(self):
         with patch.object(self.module, 'confirm_stationary', side_effect=TimeoutError()):
             with self.assertRaises(TimeoutError): self.call()
-        self.assertEqual(self.events, [2])
+        self.assertEqual(self.events, [0, 2, ('tracker', 3)])
 
     def test_feedback_loss_after_release_reasserts_stop(self):
         self.fail_after_release = True
         with self.assertRaises(TimeoutError): self.call()
-        self.assertEqual(self.events, [2, 'stationary', 1, 0])
+        self.assertEqual(self.events, [0, 2, ('tracker', 3), 'stationary', 1, 0])
         self.assertTrue(self.state.soft_estop)
 
     def test_interrupt_stop_asserts_stop_and_cancels_before_confirmation(self):
         self.state.soft_estop = False
         result = self.call('soft_stop')
-        self.assertEqual(self.events, [0, 2, 'stationary'])
+        self.assertEqual(self.events, [0, 2, ('tracker', 3), 'stationary'])
         self.assertTrue(result['software_estop'])
+
+    def test_tracker_pause_failure_never_selects_mux_or_releases_stop(self):
+        with patch.object(self.module, 'tracker_command', side_effect=RuntimeError('pause_unconfirmed')):
+            for operation in ('prepare', 'navigate'):
+                self.events.clear()
+                request = {'master': 'http://test:11311', 'ros_ip': '127.0.0.1', 'operation': operation,
+                           'args': {'x': 1., 'y': 2., 'yaw': .3, 'speed': .1}}
+                with self.assertRaisesRegex(RuntimeError, 'pause_unconfirmed'):
+                    self.module.main(request)
+                self.assertNotIn(1, self.events)
+                self.assertNotIn('mux', self.events)
+                self.assertTrue(self.state.soft_estop)
+
+    def test_mux_failure_never_submits_goal_and_retains_stop(self):
+        with patch.object(self.module, 'select_navigation_source', side_effect=TimeoutError('mux')):
+            with self.assertRaises(TimeoutError):
+                self.module.main({'master': 'http://test:11311', 'ros_ip': '127.0.0.1',
+                                  'operation': 'navigate',
+                                  'args': {'x': 1., 'y': 2., 'yaw': .3, 'speed': .1}})
+        self.assertEqual(self.events, [0, 2, ('tracker', 3), 'stationary', 4, 0])
+        self.assertTrue(self.state.soft_estop)
+
+    def test_unconfirmed_software_stop_never_switches_source(self):
+        with patch.object(self.module, 'confirm_software_stop', side_effect=TimeoutError('stop')):
+            with self.assertRaises(TimeoutError):
+                self.module.main({'master': 'http://test:11311', 'ros_ip': '127.0.0.1',
+                                  'operation': 'navigate',
+                                  'args': {'x': 1., 'y': 2., 'yaw': .3, 'speed': .1}})
+        self.assertEqual(self.events, [0, 0])
+        self.assertTrue(self.state.soft_estop)
+
+    def test_resume_failure_after_accepted_goal_reasserts_stop(self):
+        def tracker(ros, op, request):
+            if op == 4:
+                raise RuntimeError('resume_unconfirmed')
+        with patch.object(self.module, 'tracker_command', side_effect=tracker):
+            with self.assertRaisesRegex(RuntimeError, 'resume_unconfirmed'):
+                self.module.main({'master': 'http://test:11311', 'ros_ip': '127.0.0.1',
+                                  'operation': 'navigate',
+                                  'args': {'x': 1., 'y': 2., 'yaw': .3, 'speed': .1}})
+        self.assertNotIn(1, self.events)
+        self.assertEqual(self.events[-1], 0)
+        self.assertTrue(self.state.soft_estop)
 
 
 class DispatchAbiTests(unittest.TestCase):
@@ -1344,7 +1427,8 @@ class NativeIdentityTests(unittest.TestCase):
             'nav_msgs': types.ModuleType('nav_msgs'),
             'nav_msgs.msg': types.SimpleNamespace(Odometry=object)}
         request = {'master': 'http://test:11311', 'ros_ip': '127.0.0.1', 'operation': 'cancel'}
-        with patch.dict(sys.modules, modules), patch.dict(module.os.environ):
+        with patch.dict(sys.modules, modules), patch.dict(module.os.environ), \
+             patch.object(module, 'tracker_command'), patch.object(module, 'confirm_software_stop'):
             for stamps, accepted in (([9.9] * 4, False), ([10.1] * 4, False),
                                      ([10.1, 10.2, 10.41], True)):
                 ros.wait_for_message = unittest.mock.Mock(side_effect=[odom(t) for t in stamps])

@@ -406,14 +406,14 @@ class DriverContractTests(unittest.TestCase):
         self.assertFalse(self.bundle._mode_unresolved())
         self.assertIs(self.bundle.state.read('control_enabled')[0], False)
 
-    def test_mapping_restores_remote_velocity_without_resuming_motors(self):
-        self.ros.emit('/enable_vel_control_state', False)
+    def test_mapping_disables_upper_velocity_without_resuming_motors(self):
+        self.ros.emit('/enable_vel_control_state', True)
         self.ros.emit('/enable_control_state', False)
         self.bundle.prepare_mapping_velocity(self.bundle._stop_epoch)
-        self.assertIs(self.bundle.state.read('upper_velocity_enabled')[0], True)
+        self.assertIs(self.bundle.state.read('upper_velocity_enabled')[0], False)
         self.assertIs(self.bundle.state.read('control_enabled')[0], False)
         self.assertEqual(self.ros.sent_services,
-                         [('/enable_vel_control', 'std_srvs/SetBool', {'data': True})])
+                         [('/enable_vel_control', 'std_srvs/SetBool', {'data': False})])
 
     def test_metadata_and_schema_actions_agree(self):
         import yaml
@@ -425,8 +425,10 @@ class DriverContractTests(unittest.TestCase):
             if tool['type'] != 'actuator':
                 continue
             schema = tool["inputSchema"]
-            self.assertEqual(set(schema["properties"]["action"]["enum"]) - ({"start", "stop", "info"} if name == "base_servo" else set()),
-                             set(schema["x-action-params"]))
+            lifecycle = {"start", "stop", "info"}
+            advertised = set(schema['x-action-params']) | set(schema.get('x-workbench', {}).get('actions', []))
+            self.assertEqual(set(schema["properties"]["action"]["enum"]) - lifecycle,
+                             advertised - lifecycle)
             self.assertTrue(all(set(a["params"]) <= set(schema["properties"])
                                 for a in schema["x-action-params"].values()))
             if not tool.get('topic_in'):

@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><style>
+body{margin:0;padding:24px;background:#f6f8fa;color:#18232d;font:15px system-ui,sans-serif}
+h1{font-size:22px;margin:0 0 12px}p{line-height:1.6}.muted{color:#516171}
+button{font:inherit;padding:12px 18px;border:1px solid #b5c4d1;border-radius:8px;background:white;cursor:pointer}
+button:disabled{opacity:.5;cursor:default}button:focus-visible{outline:3px solid #2478c2}
+#enable{background:#15639d;color:white}#stop{background:#a22626;color:white}
+.keys{display:grid;grid-template-columns:repeat(3,110px);gap:10px;margin:24px 0}
+.keys button{height:72px;touch-action:none}.pressed{background:#c5e2fa}
+#state{padding:14px;background:white;border-left:4px solid #15639d;min-height:48px;white-space:pre-wrap}
+</style></head><body tabindex="0">
+<h1>Mapping keyboard control</h1>
+<p><strong>Limits: 0.15 m/s forward/reverse · 0.3 rad/s turning · 300 ms heartbeat timeout.</strong></p>
+<p class="muted">Start mapping first. This panel uses the factory MANUAL RobotMotion route.
+Other base controllers remain paused or blocked. Opening this panel does not enable motion.</p>
+<p><button id="enable" disabled>Enable keyboard</button> <button id="release" disabled>Release keyboard</button>
+<button id="stop">Stop all motion</button></p>
+<div class="keys" aria-label="Hold a button to drive">
+<span></span><button data-code="KeyW" disabled>Forward<br>Alt+W / I</button><span></span>
+<button data-code="KeyA" disabled>Turn left<br>Alt+A / J</button><button data-code="KeyS" disabled>Reverse<br>Alt+S / K</button><button data-code="KeyD" disabled>Turn right<br>Alt+D / L</button>
+</div>
+<p>Keep this panel focused. Hold Alt and a direction, or hold a direction button.
+Release the key/button to stop. Switching tabs or leaving this panel releases control.
+After preparation completes, release all keys and press again.</p>
+<p id="state" role="status">Waiting for the canvas connection…</p>
+<p class="muted">Release keyboard and wait for confirmed stop before saving or loading a map.
+A hardware emergency stop remains independent of this panel.</p>
+<script>
+let port=null,serial=0,session=null,seq=0,ready=false,inflight=false,opening=false,releasing=false;
+const pending=new Map(),pressed=new Set(),state=document.getElementById('state');
+const enable=document.getElementById('enable'),release=document.getElementById('release');
+const aliases={KeyI:'KeyW',KeyK:'KeyS',KeyJ:'KeyA',KeyL:'KeyD',KeyW:'KeyW',KeyS:'KeyS',KeyA:'KeyA',KeyD:'KeyD'};
+function paint(message){
+ state.textContent=message;enable.disabled=!port||!!session||opening||releasing;
+ release.disabled=!session;document.querySelectorAll('[data-code]').forEach(b=>{
+  b.disabled=!ready;b.classList.toggle('pressed',pressed.has(b.dataset.code));
+ });
+}
+function call(action,args={}){
+ return new Promise((resolve,reject)=>{
+  if(!port){reject(new Error('Canvas disconnected'));return;}
+  const id=String(++serial),timer=setTimeout(()=>{pending.delete(id);reject(new Error('Canvas request timed out; keyboard released'));},1500);
+  pending.set(id,{resolve,reject,timer});port.postMessage({id,method:'call',args:{action,...args}});
+ });
+}
+async function disarm(message='Keyboard released. Enable again to continue.'){
+ const previous=session;session=null;ready=false;pressed.clear();releasing=!!previous;paint(message);
+ if(previous){
+  try{const r=await call('keyboard_release',{session_id:previous});
+   if(!r.busy){releasing=false;paint('Stopped. Keyboard control released.');return;}
+   paint('Stopping; wait for confirmed stop before saving.');
+  }catch(e){paint(e.message+'. Checking the chassis watchdog stop.');}
+  for(let i=0;i<40;i++){
+   await new Promise(resolve=>setTimeout(resolve,200));
+   try{const r=await call('keyboard_status');
+    if(!r.busy){releasing=false;paint('Stopped. Keyboard control released.');return;}
+    if(r.state==='stop_unconfirmed')break;
+   }catch(e){break;}
+  }
+  paint('Stop not yet confirmed. Use Stop all motion and inspect card info before continuing.');
+ }
+}
+window.addEventListener('message',event=>{
+ if(port||event.source!==parent||event.data?.protocol!=='motus.workbench/1'||!event.ports[0])return;
+ port=event.ports[0];port.onmessage=event=>{
+  const r=event.data,p=pending.get(r?.id);if(!p)return;pending.delete(r.id);clearTimeout(p.timer);
+  r.error?p.reject(new Error(r.error)):p.resolve(r.result);
+ };port.start();paint('Connected. Start mapping, then explicitly enable keyboard control.');
+});
+enable.onclick=async()=>{
+ if(session||opening||releasing)return;opening=true;pressed.clear();paint('Preparing keyboard control; no direction will be retained.');
+ try{const r=await call('keyboard_open');session=r.session_id;seq=0;ready=false;
+  if(!session)throw new Error('No keyboard lease returned');
+  paint('Checking chassis and stopping old tasks in background. Please wait.');
+ }catch(e){paint(e.message);}finally{opening=false;paint(state.textContent);window.focus();}
+};
+release.onclick=()=>disarm();
+document.getElementById('stop').onclick=async()=>{
+ session=null;ready=false;releasing=true;pressed.clear();paint('Stopping all motion; waiting for confirmation.');
+ try{await call('stop');const r=await call('keyboard_status');
+  releasing=!!r.busy;paint(releasing?'Stop still pending; inspect card info.':'Keyboard stopped. Inspect card info for the whole-body stop result.');
+ }catch(e){paint(e.message+' Inspect card info for stop confirmation.');}
+};
+window.addEventListener('keydown',e=>{
+ const code=aliases[e.code];if(!code||!e.altKey||!ready||e.repeat)return;
+ e.preventDefault();pressed.add(code);paint('Keyboard active. Release the direction key or Alt to stop.');
+});
+window.addEventListener('keyup',e=>{
+ if(e.code==='AltLeft'||e.code==='AltRight')pressed.clear();
+ else if(aliases[e.code])pressed.delete(aliases[e.code]);
+ paint(state.textContent);
+});
+document.querySelectorAll('[data-code]').forEach(b=>{
+ b.onpointerdown=e=>{if(!ready)return;e.preventDefault();b.setPointerCapture(e.pointerId);pressed.add(b.dataset.code);paint(state.textContent);};
+ for(const name of ['pointerup','pointercancel','lostpointercapture'])b.addEventListener(name,()=>{pressed.delete(b.dataset.code);paint(state.textContent);});
+});
+window.addEventListener('blur',()=>{if(session)disarm('Panel lost focus. Keyboard released.');});
+document.addEventListener('visibilitychange',()=>{if(document.hidden&&session)disarm('Tab hidden. Keyboard released.');});
+window.addEventListener('pagehide',()=>{if(session)disarm('Panel closed.');});
+setInterval(async()=>{
+ if(!session||inflight)return;const current=session;inflight=true;
+ const vx=(Number(pressed.has('KeyW'))-Number(pressed.has('KeyS')))*.15;
+ const vw=(Number(pressed.has('KeyA'))-Number(pressed.has('KeyD')))*.3;
+ try{
+  const r=await call('keyboard_command',{session_id:current,seq:++seq,values:ready?[vx,vw]:[0,0]});
+  if(session!==current)return;
+  if(r.state==='ready'&&!ready){pressed.clear();ready=true;paint('Ready. Release all keys, then hold Alt + a direction.');}
+  else if(r.state==='idle'||r.state==='stopping'){await disarm(r.last_error||'Keyboard stopped. Enable again to continue.');}
+ }catch(e){if(session===current)await disarm(e.message);}finally{inflight=false;}
+},80);
+</script></body></html>

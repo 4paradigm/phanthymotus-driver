@@ -167,9 +167,13 @@ class BaseServo:
                             raise RuntimeError('stop before changing input_topic')
                         return self._start_reply()
                     joining_start = self.bundle.spatial.chassis_start_in_progress()
-                    if self.bundle._transition is not None and not joining_start:
+                    boot_pending = self.bundle.spatial.boot_remote_pending()
+                    if self.bundle._transition is not None and not (joining_start or boot_pending):
                         raise RuntimeError('base is busy; stop the current action first')
                     defer_control = ('base' in self.bundle.tracker._active
+                                     or self.bundle.spatial.mapping_active()
+                                     or boot_pending
+                                     or self.bundle.spatial.preserve_upper_route()
                                      or (self.bundle.spatial.unresolved() and not joining_start))
                     self.bundle.state.require_motion_enabled()
                     self._sink = self._new_sink()
@@ -211,6 +215,7 @@ class BaseServo:
                         raise RuntimeError('start with input_topic first')
                     joining_start = self.bundle.spatial.chassis_start_in_progress()
                     if ((self.bundle._transition is not None and not joining_start)
+                            or self.bundle.spatial.mapping_active()
                             or 'base' in self.bundle.tracker._active
                             or (self.bundle.spatial.unresolved() and not joining_start)):
                         raise RuntimeError('base is busy; stop the current action first')

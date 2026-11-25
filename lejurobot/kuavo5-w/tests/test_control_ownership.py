@@ -156,7 +156,7 @@ class ControlOwnershipTests(unittest.TestCase):
         self.bundle.prepare_mapping_velocity(self.bundle._stop_epoch)
         self.bundle.state.require_motion((3,))
         self.assertTrue(self.bundle.tracker.current('arms', arm[0]))
-        self.assertIs(self.bundle.state.read('upper_velocity_enabled')[0], True)
+        self.assertIs(self.bundle.state.read('upper_velocity_enabled')[0], False)
 
     def test_mapping_route_cannot_override_uncertain_navigation(self):
         self.bundle.spatial._uncertain = True

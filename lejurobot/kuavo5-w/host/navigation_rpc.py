@@ -295,6 +295,223 @@ def map_save_status(name, root=Path('/home/jt/jmap_config/jmaps')):
         return {'complete': False}
 
 
+def tracker_command(rospy, operation, request=None):
+    """Pause the actual LQR task, not only the Java dispatch task wrapper.
+
+    The factory DELETE operation cannot remove the currently executing edge.
+    Keep that task paused until a new point goal has been accepted instead.
+    """
+    import rosgraph
+    import rosservice
+    from jaten_msgs.srv import PathTrackRequestService
+    from jaten_msgs.msg import PathTrackRequest, TrackEdge, MotionState
+    from geometry_msgs.msg import Twist
+    name = '/path_track_request_service'
+    master = rosgraph.Master('/motus_navigation_rpc')
+    owners = dict(master.getSystemState()[2]).get(name, [])
+    headers = rosservice.get_service_headers(name, master.lookupService(name))
+    if (owners != ['/lqr_path_track'] or headers.get('type') != PathTrackRequestService._type
+            or headers.get('md5sum') != PathTrackRequestService._md5sum):
+        raise RuntimeError('native_tracker_service_identity_mismatch')
+    message = PathTrackRequest()
+    message.header.stamp = rospy.Time.now()
+    message.request_id = int.from_bytes(os.urandom(2), 'big') or 1
+    message.op.operation = operation  # factory OP_PAUSE=3, OP_RESUME=4
+    if operation not in (3, 4):
+        raise ValueError('unsupported_tracker_control_operation')
+    # This factory binary logs edge_to_add.front()/back() BEFORE checking op,
+    # and segfaults on the valid empty PAUSE/RESUME payload. Supply an inert
+    # preview object for that logger only. edge_num stays zero; OP_ADD is never
+    # used and the pause/resume handlers ignore these geometry fields.
+    message.edge_num = 0
+    message.edge_to_add = [TrackEdge()]
+    if request is not None:
+        request['_command_unresolved'] = True
+    try:
+        response = rospy.ServiceProxy(name, PathTrackRequestService)(request=message, next_area=False)
+    except Exception:
+        if request is not None:
+            request['_older_command_unresolved'] = True
+        raise
+    if request is not None:
+        request['_command_unresolved'] = False
+    if response.request_id != message.request_id:
+        raise RuntimeError('native_tracker_request_unconfirmed')
+    # A repeated pause/resume can be rejected as already in that state. Do
+    # not infer success from the service boolean: verify fresh runtime state.
+    empty = response.num_edge_remain == 0
+    end, quiet_since, count = time.monotonic() + 4., None, 0
+    while time.monotonic() < end:
+        motion = rospy.wait_for_message('/mpc_path_track/motion_state', MotionState, timeout=1.)
+        # Factory MotionState.header.stamp is the last EVENT time, not the
+        # publication time (verified while it publishes continuously). A new
+        # nonlatched connection provides receipt freshness, not that stamp.
+        if not tracker_live_message(motion):
+            continue
+        if operation == 4:
+            if motion.motion_type in range(1, 8):
+                return
+            continue
+        if not empty and motion.motion_type != 8:  # factory CAR_PAUSED
+            continue
+        velocity = rospy.wait_for_message('/twist_mux_new/in/nav/mpc_path_track', Twist, timeout=1.)
+        if not tracker_live_message(velocity):
+            continue
+        values = (velocity.linear.x, velocity.linear.y, velocity.linear.z,
+                  velocity.angular.x, velocity.angular.y, velocity.angular.z)
+        now = time.monotonic()
+        quiet = all(math.isfinite(v) and abs(v) <= 1e-6 for v in values)
+        quiet_since = now if quiet and quiet_since is None else quiet_since if quiet else None
+        count = count + 1 if quiet else 0
+        if quiet_since is not None and now - quiet_since >= .3 and count >= 3:
+            return
+    raise RuntimeError('native_tracker_pause_unconfirmed' if operation == 3
+                       else 'native_tracker_resume_unconfirmed')
+
+
+def tracker_live_message(message):
+    header = getattr(message, '_connection_header', {}) or {}
+    return header.get('callerid') == '/lqr_path_track' and header.get('latching') == '0'
+
+
+def confirm_software_stop(rospy, expected, require_healthy=False):
+    from jaten_msgs.msg import RobotChassisState
+    end = time.monotonic() + 3.
+    while time.monotonic() < end:
+        state = rospy.wait_for_message('/jaten_behavior_manager/robot_state', RobotChassisState, timeout=1.)
+        if require_healthy and (state.estop or state.bumper or state.driver_error):
+            raise RuntimeError('chassis_hardware_stop_or_fault_active')
+        if state.soft_estop == expected:
+            return
+    raise RuntimeError('chassis_software_stop_feedback_unconfirmed')
+
+
+def confirm_tracker_target(rospy, target):
+    """Do not release a paused old path merely because a goal was queued."""
+    from nav_msgs.msg import Path as RosPath
+    end, since, count = time.monotonic() + 6., None, 0
+    while time.monotonic() < end:
+        try:
+            path = rospy.wait_for_message('/lqr_path_track/tracking_path', RosPath,
+                                          timeout=min(1., max(.01, end - time.monotonic())))
+        except rospy.ROSException:
+            # Planning may not publish during the first one-second sample.
+            # Keep the stop asserted for the complete bounded confirmation window.
+            since, count = None, 0
+            continue
+        if not tracker_live_message(path) or path.header.frame_id.strip('/') != 'map' or not path.poses:
+            continue
+        point = path.poses[-1].pose.position
+        matches = math.hypot(point.x - target['x'], point.y - target['y']) <= .1
+        now = time.monotonic()
+        since = now if matches and since is None else since if matches else None
+        count = count + 1 if matches else 0
+        if since is not None and now - since >= .2 and count >= 3:
+            return
+    raise RuntimeError('native_tracker_target_unconfirmed')
+
+
+def select_navigation_source(rospy, expected='nav_mpc_path_track'):
+    """One finite switch request with a new mux acknowledgement, never a latch."""
+    import threading
+    from std_msgs.msg import String
+    if expected not in ('nav_mpc_path_track', 'nav_mpc_move_base'):
+        raise ValueError('unsupported_navigation_source')
+    condition = threading.Condition()
+    seen = {'initial': False, 'sent': False, 'source': None}
+    def feedback(message):
+        with condition:
+            seen['initial'] = True
+            if seen['sent']:
+                seen['source'] = message.data
+            condition.notify_all()
+    subscriber = rospy.Subscriber('/twist_mux_new/out/nav_source_used', String, feedback, queue_size=10)
+    publisher = None
+    try:
+        publisher = rospy.Publisher('/twist_mux_new/in/switch/nav_source', String, queue_size=1, latch=False)
+        end = time.monotonic() + 3.
+        with condition:
+            while not seen['initial'] or not publisher.get_num_connections():
+                remaining = end - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError('native_navigation_mux_unavailable')
+                condition.wait(min(.05, remaining))
+            # Drain the initial retained value before issuing the switch.
+            seen['sent'] = True
+            publisher.publish(String(data=expected))
+            while seen['source'] != expected:
+                remaining = end - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError('native_navigation_mux_handoff_unconfirmed')
+                condition.wait(remaining)
+    finally:
+        subscriber.unregister()
+        if publisher is not None:
+            publisher.unregister()
+
+
+def remote_joy_neutral(message, owner):
+    header = getattr(message, '_connection_header', {}) or {}
+    axes, buttons = getattr(message, 'axes', ()), getattr(message, 'buttons', ())
+    return (isinstance(owner, str) and owner.startswith('/')
+            and header.get('callerid') == owner and header.get('latching') == '0'
+            and len(axes) == 8 and len(buttons) == 11
+            and all(type(v) in (int, float) and math.isfinite(v) and abs(v) <= 1.05 for v in axes)
+            and all(abs(axes[i]) <= .03 for i in (0, 1, 3, 4, 6, 7))
+            and all(type(v) is int and v == 0 for v in buttons))
+
+
+def remote_idle_guard(rospy, owner):
+    """Live guard retained through mux selection and software-stop release.
+
+    Ignore initial latched upper velocity alone: require >=3 callbacks spanning
+    0.3s plus fresh nonlatched G12. No ROS input is fabricated by this probe.
+    """
+    import threading
+    from geometry_msgs.msg import Twist
+    from sensor_msgs.msg import Joy
+    lock, sample = threading.Lock(), {}
+    def joy(message):
+        with lock:
+            sample.update(joy_at=time.monotonic(), neutral=remote_joy_neutral(message, owner))
+    def velocity(message):
+        values = (message.linear.x, message.linear.y, message.linear.z,
+                  message.angular.x, message.angular.y, message.angular.z)
+        header = getattr(message, '_connection_header', {}) or {}
+        quiet = (header.get('callerid') == '/nodelet_manager'
+                 and all(math.isfinite(v) and abs(v) <= 1e-6 for v in values))
+        now = time.monotonic()
+        with lock:
+            sample['since'] = sample.get('since', now) if quiet else now
+            sample['count'] = sample.get('count', 0)+1 if quiet else 0
+            sample.update(velocity_at=now, quiet=quiet)
+    subscriptions = [rospy.Subscriber('/joy', Joy, joy, queue_size=1, tcp_nodelay=True),
+                     rospy.Subscriber('/move_base/base_cmd_vel', Twist, velocity, queue_size=1, tcp_nodelay=True)]
+    def check():
+        now = time.monotonic()
+        with lock:
+            if (sample.get('neutral') is not True or now-sample.get('joy_at', 0) > .3
+                    or sample.get('quiet') is not True or now-sample.get('velocity_at', 0) > .3
+                    or sample.get('count', 0) < 3 or now-sample.get('since', now) < .3):
+                raise RuntimeError('boot_remote_fresh_neutral_or_zero_output_unconfirmed')
+    def close():
+        for subscription in subscriptions:
+            subscription.unregister()
+    try:
+        end = time.monotonic()+3.
+        while True:
+            try:
+                check()
+                return check, close
+            except RuntimeError:
+                if time.monotonic() >= end:
+                    raise
+                time.sleep(.02)
+    except Exception:
+        close()
+        raise
+
+
 def main(request):
     if request['operation'] in ('map_upload_begin', 'map_upload_abort', 'map_upload_chunk',
                                 'map_upload_commit', 'map_delete'):
@@ -362,7 +579,7 @@ def main(request):
             raise RuntimeError('native_navigation_service_abi_mismatch')
     if operation == 'probe':
         return {'owner': owners[0][0], 'services': names}
-    if operation in ('prepare', 'soft_stop'):
+    if operation in ('prepare', 'remote_ready', 'soft_stop', 'manual_hold'):
         from jaten_msgs.msg import RobotChassisState
         proxy = rospy.ServiceProxy(names['cancel'], types['cancel'])
         def state():
@@ -380,34 +597,58 @@ def main(request):
         def healthy(value):
             if value.estop or value.bumper or value.driver_error:
                 raise RuntimeError('chassis_hardware_stop_or_fault_active')
-        if operation == 'soft_stop':
+        if operation in ('soft_stop', 'manual_hold'):
             command(0)
-            command(2)
+            confirm_software_stop(rospy, True)
+            if operation == 'soft_stop':
+                command(2)
+                tracker_command(rospy, 3, request)
             confirm_stationary(rospy, Odometry)
             if not state().soft_estop:
                 raise RuntimeError('chassis_soft_stop_unconfirmed')
             return {'success': True, 'stationary': True, 'software_estop': True}
         request['_preparation_stage'] = 'read_fault_state'
         healthy(state())
+        request['_preparation_stage'] = 'hold_software_stop'
+        command(0)
+        confirm_software_stop(rospy, True)
         request['_preparation_stage'] = 'cancel_old_task'
         command(2)  # Cancel old tasks BEFORE releasing a software stop.
+        request['_preparation_stage'] = 'pause_old_tracker'
+        tracker_command(rospy, 3, request)
         request['_preparation_stage'] = 'confirm_cancel_stationary'
         confirm_stationary(rospy, Odometry)
         current = state()
         healthy(current)
         released = bool(current.soft_estop)
+        guard, close_guard = None, None
         try:
+            if operation == 'remote_ready':
+                if (current.manual_mode or current.mapping or not current.driver_enable):
+                    raise RuntimeError('boot_remote_requires_healthy_auto_nonmapping')
+                guard, close_guard = remote_idle_guard(rospy, args.get('g12_owner'))
+                select_navigation_source(rospy, 'nav_mpc_move_base')
+                guard()
+                current = state()
+                healthy(current)
+                if current.manual_mode or current.mapping or not current.driver_enable or not current.soft_estop:
+                    raise RuntimeError('boot_remote_chassis_state_changed')
+                guard()  # state() can block; do not release on an older neutral check.
             if released:
                 request['_preparation_stage'] = 'release_software_stop'
                 command(1)
             request['_preparation_stage'] = 'confirm_release_state'
             end = time.monotonic() + 3.
             while time.monotonic() < end:
+                if guard is not None:
+                    guard()
                 current = state()
+                if guard is not None:
+                    guard()
                 healthy(current)
                 if not current.soft_estop:
                     request['_preparation_stage'] = 'confirm_release_stationary'
-                    confirm_stationary(rospy, Odometry)
+                    confirm_stationary(rospy, Odometry, guard=guard)
                     return {'success': True, 'stationary': True, 'software_estop': False,
                             'old_task_cancelled': True, 'released': released}
             raise RuntimeError('chassis_release_feedback_unconfirmed')
@@ -417,6 +658,9 @@ def main(request):
             except Exception:
                 pass
             raise
+        finally:
+            if close_guard is not None:
+                close_guard()
     if operation not in names:
         raise ValueError('unsupported_navigation_operation')
     proxy = rospy.ServiceProxy(names[operation], types[operation])
@@ -426,8 +670,6 @@ def main(request):
         # control without changing the chassis AUTO mode or its safety limits.
         # Keep the handoff in the same ordered RPC as goal submission.
         dispatch = rospy.ServiceProxy(names['cancel'], types['cancel'])
-        if not dispatch(control_mode=4).success:  # SetDispatchMode.STATUS_IDLE
-            return {'success': False, 'stage': 'dispatch_handoff'}
         options = MoveToTargetOptions()
         options.avoid_enabled = True  # Never expose an obstacle-disable switch.
         options.allow_rotation = True
@@ -436,26 +678,91 @@ def main(request):
         options.angular_velocity = .3
         options.position_threshold = .1
         options.angle_threshold = .1
-        response = proxy(x=args['x'], y=args['y'], theta=args['yaw'], options=options)
+        # Full-body control may already be enabled. Keep the chassis stopped
+        # until the old tracker is held, the mux has acknowledged ownership,
+        # and the replacement goal has actually been accepted.
+        def mutate(callback):
+            request['_command_unresolved'] = True
+            result = callback()
+            request['_command_unresolved'] = False
+            return result
+        try:
+            request['_navigation_stage'] = 'hold_and_cancel'
+            for mode in (0, 2):
+                if not mutate(lambda: dispatch(control_mode=mode)).success:
+                    raise RuntimeError('native_navigation_stop_or_cancel_rejected')
+                if mode == 0:
+                    confirm_software_stop(rospy, True)
+            request['_navigation_stage'] = 'pause_old_tracker'
+            tracker_command(rospy, 3, request)
+            confirm_stationary(rospy, Odometry)
+            request['_navigation_stage'] = 'dispatch_handoff'
+            if not mutate(lambda: dispatch(control_mode=4)).success:  # STATUS_IDLE is not a mux switch.
+                return {'success': False, 'stage': 'dispatch_handoff'}
+            request['_navigation_stage'] = 'mux_handoff'
+            select_navigation_source(rospy)
+            request['_navigation_stage'] = 'goal_submit'
+            request['_goal_submitted'] = True
+            response = mutate(lambda: proxy(x=args['x'], y=args['y'], theta=args['yaw'], options=options))
+            if not response.success:
+                return {name: getattr(response, name) for name in response.__slots__}
+            if not getattr(response, 'task_id', ''):
+                raise RuntimeError('native_navigation_task_id_missing')
+            request['_navigation_stage'] = 'confirm_new_path'
+            confirm_tracker_target(rospy, args)
+            request['_navigation_stage'] = 'resume_new_tracker'
+            tracker_command(rospy, 4, request)
+            # Goal submission can itself change ownership on factory images.
+            request['_navigation_stage'] = 'confirm_mux_handoff'
+            select_navigation_source(rospy)
+            request['_navigation_stage'] = 'release_software_stop'
+            confirm_software_stop(rospy, True, require_healthy=True)
+            if not mutate(lambda: dispatch(control_mode=1)).success:
+                raise RuntimeError('native_navigation_release_rejected')
+            confirm_software_stop(rospy, False, require_healthy=True)
+        except Exception:
+            try:
+                if not dispatch(control_mode=0).success:
+                    request['_older_command_unresolved'] = True
+                else:
+                    confirm_software_stop(rospy, True)
+            except Exception:
+                request['_older_command_unresolved'] = True
+            raise
     elif operation == 'check':
         response = proxy(task_id=args['task_id'], blocking=False, timeout=0.)
     else:
+        dispatch = rospy.ServiceProxy(names['cancel'], types['cancel'])
+        if not dispatch(control_mode=0).success:
+            raise RuntimeError('native_navigation_soft_stop_rejected')
+        confirm_software_stop(rospy, True)
         response = proxy(control_mode=2)  # SetDispatchMode.CANCEL_CURRENT_TASK
         if not response.success:
             raise RuntimeError('native_navigation_cancel_rejected')
+        tracker_command(rospy, 3, request)
         confirm_stationary(rospy, Odometry)
         return {'success': True, 'stationary': True,
-                'completion_basis': 'native_cancel_and_fresh_stationary_odometry'}
+                'completion_basis': 'native_cancel_tracker_pause_and_fresh_stationary_odometry'}
     return {name: getattr(response, name) for name in response.__slots__}
 
 
-def confirm_stationary(rospy, Odometry):
+def confirm_stationary(rospy, Odometry, guard=None):
     # A successful cancel response alone is not evidence of stopping.
     # Require new, distinctly stamped, stationary odometry spanning .3s.
     issued = time.time()
     end, since, previous = time.monotonic() + 5., None, None
     while time.monotonic() < end:
-        msg = rospy.wait_for_message('/odom', Odometry, timeout=1.)
+        if guard is not None:
+            guard()
+        try:
+            msg = rospy.wait_for_message('/odom', Odometry, timeout=.1 if guard is not None else 1.)
+        except rospy.ROSException:
+            if guard is None:
+                raise
+            guard()
+            continue
+        if guard is not None:
+            guard()
         stamp = msg.header.stamp.to_sec()
         if stamp <= issued or not 0 <= time.time() - stamp <= .5 or (previous is not None and stamp <= previous):
             continue
@@ -478,10 +785,13 @@ if __name__ == '__main__':
     except Exception:
         # A completed rejection/feedback failure can be stopped and retried.
         # A ROS transport failure may leave the controller service executing.
-        if isinstance(request, dict) and request.get('operation') == 'prepare':
-            result = {'success': False, 'stage': request.get('_preparation_stage', 'validate_runtime'),
+        if isinstance(request, dict) and request.get('operation') in ('prepare', 'remote_ready', 'navigate'):
+            stage_key = '_navigation_stage' if request['operation'] == 'navigate' else '_preparation_stage'
+            result = {'success': False, 'stage': request.get(stage_key, 'validate_runtime'),
                       'delivery_uncertain': bool(
                 request.get('_command_unresolved') or request.get('_older_command_unresolved'))}
+            if request['operation'] == 'navigate':
+                result['goal_submitted'] = bool(request.get('_goal_submitted'))
             print(json.dumps({'ok': True, 'result': result}), flush=True)
         else:
             print(json.dumps({'ok': False, 'error': 'native_navigation_rpc_failed'}), flush=True)

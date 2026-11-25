@@ -55,7 +55,7 @@ class JatenClient:
         request = {'operation': operation, 'args': args, 'ros_ip': target['ros_ip'],
                    'master': manager.settings.get('master', 'http://192.168.26.1:11311')}
         source = self._source
-        timeout = 45 if operation in ('prepare', 'soft_stop') else 25 if operation == 'cancel' else 15
+        timeout = 45 if operation in ('prepare', 'remote_ready', 'soft_stop', 'navigate') else 25 if operation == 'cancel' else 15
         if operation == 'relocalize':
             helper = (Path(__file__).parent / 'host/map_relocalize.py').read_text()
             # Load the same ROS libraries as the factory Cartographer process.
@@ -72,6 +72,10 @@ print(result.stdout, end='')
         if not isinstance(result, dict):
             raise RuntimeError('invalid_native_navigation_response')
         return result
+
+    def keyboard_stream(self):
+        from mapping_keyboard import FactoryKeyboardStream
+        return FactoryKeyboardStream(self)
 
     def http(self, path, body=None):
         request = urllib.request.Request(self.base + path, data=body,

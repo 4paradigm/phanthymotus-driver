@@ -10,6 +10,7 @@ from uuid import uuid4
 
 from spatial_client import JatenClient, MapCommandRejected, NavigationStateUnavailable
 from map_storage import MapArchive, migrate_database, safe_name
+from mapping_keyboard import MappingKeyboard
 
 
 NAV_SPEED_MIN, NAV_SPEED_MAX, NAV_SPEED_DEFAULT = .05, .5, .15
@@ -57,6 +58,12 @@ class SpatialStore:
                 return json.loads(row[0]) if row else None
             db.execute('INSERT OR REPLACE INTO state VALUES (?,?)', (key, json.dumps(value)))
             db.commit()
+
+    def claim_boot_remote(self, boot_id):
+        """Cross-process one-shot claim, durable before any startup control write."""
+        with self.lock, self.db() as db:
+            return db.execute('INSERT OR IGNORE INTO state VALUES (?,?)',
+                ('boot_remote:' + boot_id, json.dumps({'consumed': True}))).rowcount == 1
 
     def tags(self, identity):
         with self.lock:
@@ -124,6 +131,7 @@ class ControlledSpatialPlugin:
         'navigate_to_pose': (['x', 'y', 'yaw', 'speed'], '导航到map系位姿，按任务ID跟踪ACP'),
         'navigate_to_tag': (['tag_name', 'speed'], '导航到当前地图的语义点'),
         'stop_nav': ([], '原生取消当前导航并确认新鲜里程计停稳'),
+        'mapping_console': ([], '≤0.15 m/s、0.3 rad/s；打开建图键盘面板，不使能、不移动'),
     }
 
     def __init__(self, bundle, config=None, client=None):
@@ -165,9 +173,16 @@ class ControlledSpatialPlugin:
         self._map_pending = None
         self._workers = set()
         self._map_deadline = float('inf')
+        self._keyboard_pending = False
+        self.base_preparation_required = False
+        self.keyboard = MappingKeyboard(self)
 
     def get_tool(self):
-        props = {'action': {'type': 'string', 'enum': list(self.ACTIONS)},
+        keyboard_actions = ['keyboard_open', 'keyboard_command', 'keyboard_release', 'keyboard_status']
+        props = {'action': {'type': 'string', 'enum': [*self.ACTIONS, *keyboard_actions]},
+                 'session_id': {'type': 'string'}, 'seq': {'type': 'integer', 'minimum': 0},
+                 'values': {'type': 'array', 'items': {'type': 'number'}, 'minItems': 2, 'maxItems': 2,
+                            'description': '≤0.15 m/s、0.3 rad/s；面板内部使用[vx,vw]，无侧移'},
                  **{k: {'type': 'string'} for k in ('map_name', 'name', 'description', 'tag_name')},
                  **{k: {'type': 'number', 'description': 'map坐标系位置，米'} for k in ('x', 'y')},
                  'confirm_delete': {'type': 'boolean', 'description': '确认永久删除地图及关联点位'},
@@ -182,6 +197,9 @@ class ControlledSpatialPlugin:
         return {'name': self.PREFIX, 'type': 'actuator', 'multiInstance': False,
                 'description': f'{NAV_SPEED_MIN:g}–{NAV_SPEED_MAX:g} m/s；Kuavo 5-W人工建图、打点与厂商底盘原生导航；导航独占底盘速度，保持全身BaseArm，可并行控制手臂/头部/下肢。',
                 'inputSchema': {'type': 'object', 'properties': props, 'required': ['action'],
+                    'x-workbench': {'protocol': 'motus.workbench/1', 'kind': 'mapping-control',
+                        'title': 'Mapping keyboard control', 'entry': 'mapping_console',
+                        'actions': ['info', 'stop', *keyboard_actions]},
                     'x-resource': 'base', 'x-hooks': {'on_interrupt_motion': {'action': 'stop_nav'}},
                     'x-completion': {'actions': ['navigate_to_pose', 'navigate_to_tag', 'start_mapping', 'stop_mapping', 'load_map', 'delete_map'], 'timeout': 1830},
                     'x-action-params': {k: {'params': p, 'description': d, 'required': required.get(k, [])}
@@ -195,16 +213,22 @@ class ControlledSpatialPlugin:
                 self._uncertain = bool(pending.get('uncertain'))
                 self._map_pending = pending.get('map_transition')
                 self._preparation = pending.get('chassis_preparation')
+                self._keyboard_pending = bool(pending.get('keyboard_stop_unconfirmed'))
             self._restored = True
 
     def _persist(self):
         self.store.state('pending', {'navigation': self._task, 'uncertain': self._uncertain,
-                                    'map_transition': self._map_pending, 'chassis_preparation': self._preparation})
+                                    'map_transition': self._map_pending, 'chassis_preparation': self._preparation,
+                                    'keyboard_stop_unconfirmed': self._keyboard_pending})
 
     def unresolved(self):
         self._restore()
         return (self._uncertain or self._task is not None or self._map_pending is not None
-                or self._preparation is not None)
+                or self._preparation is not None or self._keyboard_pending)
+
+    def mapping_active(self):
+        self._restore()
+        return self.store.path.exists() and self.store.state('mapping') is not None
 
     def chassis_start_in_progress(self):
         """Caller holds tracker.lock: a live shared start can be joined, not owned.
@@ -223,6 +247,10 @@ class ControlledSpatialPlugin:
                 and not self._uncertain and self._task is None and self._map_pending is None)
 
     def motion_block_reason(self):
+        if self._keyboard_pending:
+            return 'mapping keyboard owns the base or its stop is unconfirmed; close keyboard and confirm stop_nav'
+        if self.mapping_active():
+            return 'manual mapping owns the chassis; finish mapping before another base controller'
         if not self.unresolved():
             return None
         if self._map_pending is not None:
@@ -236,6 +264,11 @@ class ControlledSpatialPlugin:
         remain blocked. Never reinterpret those as a healthy parallel action.
         Caller holds tracker.lock, so a stop cannot invalidate this check midway.
         """
+        mapping = self.store.state('mapping') if self.store.path.exists() else None
+        if mapping and mapping.get('phase') == 'mapping':
+            return (channel != 'base' and not self._uncertain and self._task is None
+                    and self._map_pending is None and self._preparation is None
+                    and (not self._keyboard_pending or self.keyboard.session is not None))
         task = self._task
         return (channel != 'base' and task is not None and bool(task.get('task_id'))
                 and not self._uncertain and self._map_pending is None and self._preparation is None
@@ -247,15 +280,45 @@ class ControlledSpatialPlugin:
         if any(agv.get(k) is not False for k in ('estopButtonEvent', 'bumperEvent', 'driverError')):
             raise RuntimeError('chassis_hardware_stop_or_fault_is_active')
 
+    def preserve_upper_route(self):
+        """Lifecycle attachment must not stop an already-ready G12/upper route."""
+        state = self.bundle.state
+        boot = state.snapshot().get('controller_boot')
+        if not boot or boot.get('state') != 'complete' or boot['age_s'] > 3.:
+            return False
+        try:
+            enabled = state.confirmed_enable()
+        except RuntimeError:
+            return False
+        mode, seen = state.read('mpc_mode')
+        return (enabled is True and mode == 3 and time.monotonic()-seen <= 2.
+                and state.read('upper_velocity_enabled')[0] is True)
+
+    def boot_remote_pending(self):
+        remote = getattr(self.bundle, 'boot_remote', None)
+        return (remote is not None and remote.enabled and not remote.cancelled
+                and remote.status['state'] in ('waiting', 'preparing'))
+
     def start_chassis(self):
         """Share one background preflight across both base cards and a stop epoch."""
         if not self.bundle.ros1.connection[0]:
             return {'state': 'error', 'error': 'control_connection_is_disconnected'}
         with self.bundle.tracker.lock:
+            if self.boot_remote_pending():
+                return {'state': 'ready', 'preparation_deferred': True,
+                        'message': 'First-boot remote preparation is pending; card startup will not take chassis control.'}
+            if self.mapping_active() or self._keyboard_pending:
+                return {'state': 'ready', 'preparation_deferred': True,
+                        'active_base_controller': 'mapping_keyboard',
+                        'message': 'Manual mapping owns the chassis; startup will not change its mode or enable state.'}
             active = self.bundle.tracker._active.get('base')
             if active is not None:
                 return {'state': 'running', 'active_base_controller': active[1],
                         'message': 'Base control is already reserved; keeping its current controller.'}
+            if not self.unresolved() and self.preserve_upper_route():
+                return {'state': 'ready', 'preparation_deferred': True,
+                        'active_base_controller': 'existing_upper_control',
+                        'message': 'Upper control is already enabled; startup preserves the current remote-control route.'}
         key = (self.bundle._stop_epoch, self.bundle.ros1.connection)
         with self._startup_guard:
             if self._startup_thread and self._startup_thread.is_alive():
@@ -356,6 +419,8 @@ class ControlledSpatialPlugin:
         token = None
         try:
             self._restore()
+            if self.mapping_active() or self._keyboard_pending:
+                raise RuntimeError('manual_mapping_owns_chassis_no_startup_preparation')
             if self.unresolved():
                 raise RuntimeError('previous_chassis_operation_unresolved_stop_first')
             if not self.bundle.ros1.connection[0]:
@@ -378,6 +443,7 @@ class ControlledSpatialPlugin:
                         or result.get('software_estop') is not False or result.get('old_task_cancelled') is not True):
                     stage = result.get('stage')
                     known = {'read_fault_state', 'cancel_old_task', 'confirm_cancel_stationary',
+                             'hold_software_stop', 'pause_old_tracker',
                              'release_software_stop', 'confirm_release_state', 'confirm_release_stationary',
                              'validate_runtime'}
                     raise RuntimeError('chassis_preparation_failed_at_' + stage if stage in known
@@ -398,6 +464,7 @@ class ControlledSpatialPlugin:
                 self._preparation = None
                 self._persist()
                 self.bundle.state.motion_blocked = was_blocked
+                self.base_preparation_required = False
             return {**result, 'completion_basis': 'old_task_cancelled_and_fresh_stationary_release_feedback'}
         except Exception:
             if token is not None:
@@ -488,6 +555,17 @@ class ControlledSpatialPlugin:
     def dispatch(self, action, args):
         try:
             self._restore()
+            if action == 'mapping_console':
+                return {'protocol': 'motus.workbench/1',
+                        'html': (Path(__file__).parent/'resource/mapping_keyboard.html').read_text()}
+            if action == 'keyboard_status':
+                return self.keyboard.info()
+            if action == 'keyboard_open':
+                return self.keyboard.open()
+            if action == 'keyboard_command':
+                return self.keyboard.command(args)
+            if action == 'keyboard_release':
+                return self.keyboard.stop(text(args.get('session_id'), 'session_id'))
             if action == 'start':
                 return self.start_chassis()
             if action == 'info':
@@ -498,6 +576,8 @@ class ControlledSpatialPlugin:
                           'map_transition': self._map_pending, 'chassis_preparation': self._preparation,
                           'startup': startup}
                 result['control_ownership'] = self.bundle.control_ownership()
+                result['keyboard'] = self.keyboard.info()
+                result['busy'] = result['keyboard']['busy'] or self._keyboard_pending
                 result['storage'] = {'database': str(self.store.path),
                     'factory_maps': '/home/jt/jmap_config/jmaps',
                     'archive': self.archive.snapshot() if self.archive else {'state': 'disabled'}}
@@ -622,11 +702,17 @@ class ControlledSpatialPlugin:
                     self._persist()
                     response = self.client.native('navigate', **target, speed=speed)
                     if response.get('success') is False:
-                        self._uncertain = False
-                        self._task = None
+                        self._uncertain = bool(response.get('delivery_uncertain'))
+                        if not self._uncertain and not response.get('goal_submitted'):
+                            self._task = None
                         self._persist()
                         if response.get('stage') == 'dispatch_handoff':
                             raise RuntimeError('native_navigation_dispatch_handoff_rejected')
+                        stage = response.get('stage')
+                        if stage in ('hold_and_cancel', 'pause_old_tracker', 'mux_handoff',
+                                     'goal_submit', 'confirm_new_path', 'resume_new_tracker', 'confirm_mux_handoff',
+                                     'release_software_stop', 'validate_runtime'):
+                            raise RuntimeError('native_navigation_failed_at_' + stage)
                         raise RuntimeError('native_navigation_goal_rejected')
                     task_id = response.get('task_id')
                     if response.get('success') is not True or not isinstance(task_id, str) or not task_id or len(task_id) > 160:
@@ -712,6 +798,17 @@ class ControlledSpatialPlugin:
         out SUBMIT is unresolved even if a newer cancel is acknowledged.
         """
         self._restore()
+        self.keyboard.stop()
+        if self._keyboard_pending:
+            # An orphaned SSH helper never resumes after a lost heartbeat. Still
+            # require an ordered native stop before clearing its persisted fence.
+            response = self.client.native('soft_stop')
+            if (response.get('success') is not True or response.get('stationary') is not True
+                    or response.get('software_estop') is not True
+                    or (self.keyboard.thread and self.keyboard.thread.is_alive())):
+                raise RuntimeError('mapping_keyboard_stop_unconfirmed')
+            self._keyboard_pending = False
+            self._persist()
         if self._map_pending is not None:
             raise RuntimeError('map_transition_unconfirmed_inspect_info')
         with self._native_lock:
@@ -806,6 +903,8 @@ class ControlledSpatialPlugin:
                 raise RuntimeError('finish_or_reconcile_mapping_before_loading')
         else:
             raise ValueError('unsupported_map_action')
+        if self.keyboard.session is not None or self._keyboard_pending:
+            raise RuntimeError('release_mapping_keyboard_and_confirm_stop_before_map_change')
         restore_archive = False
         if action in ('start_mapping', 'load_map', 'delete_map'):
             exists = args['map_name'] in [Path(m.get('fileName', '')).stem for m in self.client.maps()]
@@ -838,6 +937,12 @@ class ControlledSpatialPlugin:
                     or (self.unresolved() and not (recovering_save or recovering_delete))):
                 raise RuntimeError('base_busy_or_navigation_unresolved')
             aid, cancelled = self.bundle.tracker.begin('base', self.PREFIX)
+            # A previous startup result cannot release the stop left by a
+            # later manual session. Future upper-MPC actions need fresh prep.
+            if action != 'delete_map':
+                self.base_preparation_required = True
+                with self._startup_guard:
+                    self._startup_key = None
             self._map_pending = {'operation': action, 'action_id': aid}
             if recovering_save:
                 self._map_pending['stage'] = 'SaveCartoMap'
@@ -965,6 +1070,12 @@ class ControlledSpatialPlugin:
         recovering_save = action == 'stop_mapping' and mapping and mapping['phase'] == 'saving'
         if not recovering_save:
             self._require_stationary()
+        hold = self.client.native('soft_stop' if action in ('start_mapping', 'load_map') else 'manual_hold')
+        if (hold.get('success') is not True or hold.get('software_estop') is not True
+                or hold.get('stationary') is not True):
+            raise RuntimeError('map_operation_requires_confirmed_software_stop')
+        if cancelled.is_set():
+            raise RuntimeError('map_operation_interrupted')
         if action == 'start_mapping':
             if mapping:
                 raise RuntimeError('mapping_session_already_exists')
@@ -976,14 +1087,11 @@ class ControlledSpatialPlugin:
             self._command('ChangeMode', {'mode': 'MANUAL'}, cancelled)
             self._command('StartCartoMapping', {}, cancelled)
             self._wait(lambda: self.client.observe()['agvState'].get('isMapping') is True, cancelled)
-            # The upper-board G12 remote reaches JaTen through MPC's automatic
-            # velocity source, not the chassis-local MANUAL joystick source.
-            # Restore that route after the factory mapping transition; require
-            # mapping to remain active before advertising a usable session.
-            self._command('ChangeMode', {'mode': 'AUTO'}, cancelled)
+            # Factory web RobotMotion is the MANUAL route. Never restore the
+            # unrelated upper-board remote/MPC velocity source during mapping.
             def mapping_remote_ready():
                 state = self.client.observe()['agvState']
-                return state.get('isMapping') is True and state.get('runningMode') == 'AUTO'
+                return state.get('isMapping') is True and state.get('runningMode') == 'MANUAL'
             self._wait(mapping_remote_ready, cancelled)
             try:
                 self._require_stationary()
@@ -995,7 +1103,8 @@ class ControlledSpatialPlugin:
             mapping['phase'] = 'mapping'
             self.store.state('mapping', mapping)
             return {'state': 'mapping', 'map_name': name,
-                    'remote_control_route': 'upper_board_mpc', 'chassis_mode': 'AUTO'}
+                    'remote_control_route': 'factory_RobotMotion', 'chassis_mode': 'MANUAL',
+                    'keyboard_control': 'open_mapping_console_and_enable_explicitly', 'software_stop': True}
         if action == 'stop_mapping':
             if not mapping or mapping['phase'] not in ('mapping', 'saving'):
                 raise RuntimeError('no_confirmed_mapping_session_inspect_info')
@@ -1022,6 +1131,9 @@ class ControlledSpatialPlugin:
                                                    for m in self.client.maps()], cancelled, 1500)
             self._command('AgvSystemRestart', {}, cancelled)
             self._wait(lambda: self.client.observe()['agvState'].get('isMapping') is False, cancelled, 60)
+            hold = self.client.native('manual_hold')
+            if hold.get('software_estop') is not True or hold.get('stationary') is not True:
+                raise RuntimeError('post_restart_software_stop_unconfirmed')
             self._load(mapping['name'], cancelled)
             new_identity = self._identity()
             self.store.bind_mapping((mapping['name'], mapping['token']), new_identity,
@@ -1162,6 +1274,9 @@ class ControlledSpatialPlugin:
 
     def close(self):
         self._closed.set()
+        self.keyboard.stop()
+        if self.keyboard.thread:
+            self._workers.add(self.keyboard.thread)
         if self.archive is not None:
             self.archive.wake.set()
             if self.archive.thread is not None:

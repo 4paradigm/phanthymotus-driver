@@ -10,6 +10,10 @@ host_runtime:
   enabled: true
   # Always wait for the boot owner to confirm initialization/BaseArm/pause.
   controller_boot_required: true
+  # One durable attempt per controller host boot, after initialization/pause.
+  # Requires verified fresh neutral G12, no operator action/map/task, and AUTO.
+  # Container restarts and software stops never replay this handoff.
+  remote_ready_on_first_boot: true
 provisioning:
   enabled: true
   master: http://192.168.26.1:11311

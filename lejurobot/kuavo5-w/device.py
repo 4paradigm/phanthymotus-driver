@@ -26,6 +26,7 @@ from startup import StartupChecks
 from controlled_spatial import ControlledSpatialPlugin
 from spatial_map import SpatialMap
 from base_servo import BaseServo
+from boot_remote import BootRemote
 from base_limits import LINEAR_LIMIT, ANGULAR_LIMIT, SPEED_FRACTIONS
 
 
@@ -162,6 +163,8 @@ class RobotState:
                     in ('external', 'service') else None,
                 'error': _safe_log(value['error'], 100) if isinstance(value.get('error'), str) else None,
                 'meaning': 'boot_result_not_current_control_state'}
+            for key in ('boot_id', 'ready_age_s', 'g12_owner', 'g12_age_s', 'g12_neutral'):
+                self._controller_boot[key] = value.get(key)
             self._controller_boot_at = time.monotonic()
 
     def require_boot_complete(self):
@@ -1215,6 +1218,7 @@ class KuavoBundle:
         self.spatial_map = SpatialMap(ros2_node, namespace, self.spatial.archive,
                                       self.spatial.store, self.spatial.preview_pose_updates)
         self.base_servo = BaseServo(self, ros2_node)
+        self.boot_remote = BootRemote(self, config.get('host_runtime', {}).get('remote_ready_on_first_boot', False))
         if "plugins" in config:
             plugin_config = dict(config['plugins'])
             # Preserve old deployments, but an explicit new setting wins.
@@ -1269,7 +1273,7 @@ class KuavoBundle:
             if self._mode_unresolved():
                 raise RuntimeError('remote mode change is unresolved; motion remains blocked')
             base_only = action in ('prepare_chassis', 'mapping_velocity')
-            if base_only and self.spatial.unresolved():
+            if self.spatial.mapping_active() or (base_only and self.spatial.unresolved()):
                 raise RuntimeError(self.spatial.motion_block_reason())
             occupied = 'base' in self.tracker._active if base_only else bool(self.tracker._active)
             if self._closing or self._transition is not None or occupied:
@@ -1358,7 +1362,22 @@ class KuavoBundle:
 
     def start_motion(self, channel, tool, modes, publish, validate=None, request_epoch=None, notify=True):
         """One user action owns resume -> mode -> target, interruptible at each step."""
-        joined = self._wait_for_chassis_start(request_epoch) if channel != 'base' else None
+        with self.tracker.lock:
+            self.boot_remote.cancel('motion_requested')
+        fresh_base_start = (channel == 'base' and tool != 'controlled_spatial'
+                            and self.spatial.base_preparation_required and not self.spatial.mapping_active())
+        if fresh_base_start:
+            with self.tracker.lock:
+                if request_epoch is not None and request_epoch != self._stop_epoch:
+                    raise InterruptedError('motion request superseded by stop')
+                self.state.require_motion_enabled()
+                self.sensors.require_profile()
+                if validate:
+                    validate()
+            prepared = self.spatial.start_chassis()
+            if prepared.get('state') == 'error':
+                raise RuntimeError(prepared['error'])
+        joined = self._wait_for_chassis_start(request_epoch) if channel != 'base' or fresh_base_start else None
         if not self.tracker.lock.acquire(timeout=DISPATCH_LOCK_TIMEOUT_S):
             raise RuntimeError('control transition is busy; query state before retrying')
         try:
@@ -1377,7 +1396,8 @@ class KuavoBundle:
                 raise RuntimeError('motion command delivery is uncertain; controller reconciliation is required')
             if channel == 'base' and self.spatial.startup_status().get('state') == 'loading':
                 raise RuntimeError('Checking chassis status in background, please wait.')
-            if self.spatial.unresolved() and not self.spatial.allows_independent_motion(channel):
+            mapping = self.spatial.mapping_active()
+            if (self.spatial.unresolved() or mapping) and not self.spatial.allows_independent_motion(channel):
                 raise RuntimeError(self.spatial.motion_block_reason())
             if self._resume_unresolved():
                 raise RuntimeError('remote resume is unresolved; motion remains blocked')
@@ -1402,6 +1422,8 @@ class KuavoBundle:
             # heartbeat. read() invalidates it on a connection-generation change.
             velocity, _ = self.state.read('upper_velocity_enabled')
             velocity_ready = channel != 'base' or velocity is upper_velocity
+            if mapping and not (enabled is True and not self.state.motion_blocked and compatible and fresh):
+                raise RuntimeError('manual_mapping_disallows_shared_enable_or_mode_changes; finish mapping first')
             if enabled is True and not self.state.motion_blocked and compatible and fresh and velocity_ready:
                 return self._publish_motion_locked(channel, tool, modes, publish, validate, preparation, notify=notify)
             base_handoff_only = (channel == 'base' and enabled is True and not self.state.motion_blocked
@@ -1463,14 +1485,15 @@ class KuavoBundle:
             self._end_control(token)
 
     def prepare_mapping_velocity(self, request_epoch):
-        """Restore the factory remote's MPC route without enabling motors."""
+        """Fence off upper MPC velocity for factory MANUAL web mapping."""
         with self.tracker.lock:
             if request_epoch != self._stop_epoch:
                 raise InterruptedError('mapping preparation superseded by stop')
             token, _, was_blocked = self._begin_control('mapping_velocity')
+            self.base_servo.mark_paused()
         try:
             self.confirm_control(token, '/enable_vel_control', 'std_srvs/SetBool',
-                {'data': True}, 'success', 'upper_velocity_enabled', True)
+                {'data': False}, 'success', 'upper_velocity_enabled', False)
             with self.tracker.lock:
                 self._check_transition(token)
                 self.state.motion_blocked = was_blocked
@@ -1499,15 +1522,20 @@ class KuavoBundle:
             source, source_at = self.state.read('base_velocity_source')
             owners = {channel: active[1] for channel, active in self.tracker._active.items()}
             transition = self._transition
+            mapping = self.spatial.mapping_active()
             return {'mode_policy': 'BaseArm', 'required_mode': CARD_CONTROL_MODE,
+                    'boot_remote': self.boot_remote.info(),
                     'measured_mode': mode, 'control_enabled': enabled,
                     'motion_blocked': self.state.motion_blocked,
-                    'base_velocity_route': ('upper_mpc' if velocity is True else
+                    'base_velocity_route': ('factory_manual' if mapping and velocity is False else
+                                            'upper_mpc' if velocity is True else
                                             'native_navigation' if velocity is False else 'unknown'),
                     'observed_chassis_velocity_source': source,
                     'observed_source_age_s': time.monotonic()-source_at if source is not None else None,
                     'active_resources': owners,
-                    'base_exclusive': ['base_drive', 'base_servo', 'controlled_spatial', 'remote_control'],
+                    'base_exclusive': ['base_drive', 'base_servo', 'controlled_spatial', 'mapping_keyboard', 'remote_control'],
+                    'manual_mapping': mapping,
+                    'mapping_keyboard': self.spatial.keyboard.info(),
                     'transition': transition['action'] if transition is not None else None,
                     'transition_owner': transition.get('tool', 'shared_control') if transition else None,
                     'transition_age_s': max(0., time.monotonic() - transition['started_at'])
@@ -1618,7 +1646,9 @@ class KuavoBundle:
                 return {'state': 'idle'}  # An old preparation cannot pause a newer action.
             if expected is not None and not self.tracker.current(*expected):
                 return {'state': 'idle'}  # An old worker cannot cancel a newer action.
+            self.boot_remote.cancel('software_pause_requested')
             self.base_servo.mark_paused()
+            self.spatial.keyboard.invalidate()
             self._stop_epoch += 1
             interrupted = self._transition is not None
             unresolved = self._resume_unresolved()
@@ -1725,6 +1755,7 @@ class KuavoBundle:
         for name in self._auto_start:
             if name in allowed and name in self._enabled:
                 self.dispatch(name, {'action': 'start'})
+        self.boot_remote.start()
 
     def dispatch(self, name, args):
         args = dict(args)
@@ -1734,6 +1765,12 @@ class KuavoBundle:
             return None
         if self._closing:
             return {"state": "error", "error": "driver is shutting down"}
+        if name in ('base_drive', 'base_servo', 'controlled_spatial', 'arm', 'leg', 'head') and action not in (
+                'start', 'info', 'get_pose', 'get_height', 'list_maps', 'list_tags', 'mapping_console',
+                'keyboard_status', 'tag_place', 'untag_place'):
+            # Cancellation is an Event/flag only; lifecycle-only head/arm/leg
+            # attachment must not wait behind a motor-control transition lock.
+            self.boot_remote.cancel('operator_control_requested')
         if name == 'base_drive' and action in ('move', 'move_relative'):
             try:
                 self.base_servo.preempt()
@@ -1774,6 +1811,7 @@ class KuavoBundle:
             if result.get("error"):
                 print(f"[shutdown] {_safe_log(result.get('error'))}", flush=True)
         self.base_servo.close()
+        self.boot_remote.close()
         self.state.close()
         self.spatial_map.close()
         self.spatial.close()
