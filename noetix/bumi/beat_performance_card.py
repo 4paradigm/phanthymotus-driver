@@ -392,7 +392,17 @@ class BeatPerformancePlugin:
             if self._cancelled(generation):
                 return
 
-            # Only a fully validated performance ever touches the body.
+            # Protection mode blocks every command.  Refuse before taking the
+            # body or writing anything -- not even a DEFAULT in cleanup.
+            mode = self._read_workmode()
+            if mode == _PROTECTION_MODE:
+                with self._lock:
+                    self._protection = True
+                self._fail(generation,
+                           protection_result("beat_performance", mode)["error"])
+                return
+
+            # Only a fully validated, unprotected performance touches the body.
             if not self._loco.reserve_body_action("beat_performance"):
                 self._fail(generation,
                            "body is reserved by another action; no command was sent")

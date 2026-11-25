@@ -410,10 +410,9 @@ def test_protection_mode_sends_no_action_and_reports_it_honestly(
     plugin.dispatch("start", {"audio_file": upload, "confirm": True})
     plugin._thread.join(timeout=3.0)
 
-    assert loco.edges == []
-    # Only the final zero-velocity release is allowed; no action edge runs.
-    assert [item for item, _, _ in loco.commands if item[0] == "velocity"] == [
-        ("velocity", 0.0, 0.0, 0.0)]
+    # Protection is refused before any reservation, preparation or command.
+    assert loco.commands == []
+    assert loco.reserved is False
     info = plugin.dispatch("info", {})
     assert info["protection"] is True
     assert info["state"] == "error"
