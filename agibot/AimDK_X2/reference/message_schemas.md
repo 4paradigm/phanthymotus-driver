@@ -60,6 +60,31 @@ hal/srv/SetPmuLed.srv:         req: CommonRequest request; string trace_id;
                                 resp: ResponseHeader header; uint16 status_code
 ```
 
+## `joints` skeleton stream
+
+The `joint_state` card exposes the raw, synchronous `GetAllJointState` result grouped as
+`leg`, `waist`, `arm`, and `head`. The separate `joints` card polls that same read-only service
+and publishes `sensor/skeleton` JSON to `/<ros_namespace>/agibot_x2/joints` for visualization:
+
+```json
+{
+  "joints": [
+    {
+      "idx": 0,
+      "name": "<JointState.name>",
+      "q": 0.0,
+      "dq": 0.0,
+      "tau": 0.0,
+      "error_code": 0
+    }
+  ]
+}
+```
+
+The list order is always `leg`, `waist`, `arm`, then `head`, preserving AimDK's order inside each
+group. `q`, `dq`, and `tau` map directly to `JointState.position`, `.velocity`, and `.effort`.
+AimDK's response has no motor-temperature field, so this card deliberately does not invent one.
+
 ## Motion control (`mc`)
 
 ```
