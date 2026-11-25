@@ -309,6 +309,10 @@ class _ActionSequence:
             self._thread = thread
         thread.start()
 
+    def running(self) -> bool:
+        with self._lock:
+            return self._thread is not None and self._thread.is_alive()
+
     def cancel(self) -> bool:
         with self._lock:
             cancel_event = self._cancel_event
@@ -3211,6 +3215,8 @@ class HeadGesturePlugin:
         }
 
     def start(self):
+        if self._publisher is not None:
+            return
         try:
             from bodyctrl_msgs.msg import (
                 CmdSetMotorPosition, MotorStatusMsg, PowerBoardKeyStatus)
@@ -3517,6 +3523,36 @@ class HeadGesturePlugin:
                 "another node may be publishing competing /head/cmd_pos commands",
             ],
         )
+
+    def face_follow_ready(self) -> dict | None:
+        if self._sequence.running():
+            return self._error_result("head_gesture_active", "Wait for the head gesture to finish")
+        with self._feedback_condition:
+            issue = self._preflight()
+            if issue is not None:
+                return issue
+            now = time.monotonic()
+            if (self._power_status_time is None or now - self._power_status_time > 0.5
+                    or now - self._head_status_time > 0.5):
+                return self._error_result("head_feedback_stale", "Fresh head and power feedback required")
+            roll, pitch, yaw = (_rad2deg(self._head_status[i]["pos"]) for i in (1, 2, 3))
+            if not (abs(roll) <= 26 and abs(pitch) <= 12 and abs(yaw) <= 30):
+                return self._error_result("head_outside_follow_range", "Center the head before following")
+        return None
+
+    def follow_face(self, dx: float, dy: float) -> dict:
+        # Keep the feedback snapshot and the command in the same critical section.
+        with self._feedback_condition:
+            issue = self.face_follow_ready()
+            if issue is not None:
+                return issue
+            roll, pitch, yaw = (_rad2deg(self._head_status[i]["pos"]) for i in (1, 2, 3))
+            # Image right is negative yaw; image down is positive pitch.
+            next_yaw = _clamp(yaw + _clamp(-dx * 4, -2, 2), -30, 30)
+            next_pitch = _clamp(pitch + _clamp(dy * 3, -2, 2), -12, 12)
+            if abs(next_yaw - yaw) < 0.1 and abs(next_pitch - pitch) < 0.1:
+                return {"state": "angle_limit"}
+            return self._publish_pose(next_yaw, next_pitch, roll, 10)
 
     def _publish_pose(self, yaw_deg: float, pitch_deg: float,
                       roll_deg: float, speed_deg: float) -> dict:

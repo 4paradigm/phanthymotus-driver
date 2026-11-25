@@ -101,6 +101,8 @@ plugins:
     enabled: true
   head_gesture:
     enabled: true
+  head_face_follow:
+    enabled: true  # Advertise the card; motion requires its arm action.
   arm:
     enabled: true
   arm_gesture:
