@@ -166,6 +166,8 @@ def test_servo_watchdog_fires_at_1000_ms_without_admitting_stale_commands(servo,
     assert servo.native.calls[-1] == servo.native.calls[-2]
     assert p._sink.stats()['watchdog_strikes'] == 1
     rate = started['control_interface']['rate']
+    assert rate['max_feedback_gap_ms'] == 300
+    assert started['control_interface']['navigation'] == {'use_obstacle_history': False}
     assert rate['watchdog_ms'] == 1000
     assert rate['max_command_ttl_ms'] == 1000
     assert rate['max_obs_age_ms'] == 1000
@@ -208,6 +210,7 @@ def test_servo_caps_command_ttl_at_1000_ms(servo, monkeypatch, age_ms, verdict):
 
 @pytest.mark.parametrize(('ttl_ms', 'obs_age_ms', 'remaining_ms'), [
     (250, None, 180),  # 70 ms already elapsed in transit
+    (300, None, 230),
     (1500, None, 930),  # descriptor caps TTL before subtracting transit
     (1000, 600, 400),  # observation expires before the command
 ])

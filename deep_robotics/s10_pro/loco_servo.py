@@ -70,7 +70,9 @@ def build_descriptor(expected_hz=10.0, settings=None):
         # Estimated standing width and the existing longitudinal sweep extent.
         "footprint": {"half_width": 0.20, "half_length": 0.23, "source": "estimate"},
         "rate": {"max_hz": 20.0, "expected_hz": float(expected_hz), "watchdog_ms": 1000,
-                 "max_command_ttl_ms": 1000, "max_obs_age_ms": 1000},
+                 "max_command_ttl_ms": 1000, "max_obs_age_ms": 1000,
+                 "max_feedback_gap_ms": 300},
+        "navigation": {"use_obstacle_history": False},
         "force_torque": None,
     }
 
