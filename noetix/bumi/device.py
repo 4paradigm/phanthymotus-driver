@@ -417,6 +417,47 @@ class LocoPlugin:
         """Let the streaming chassis card be paused before we drive it ourselves."""
         self._servo = servo
 
+    def preempt_for(self, reason: str) -> bool:
+        """Pause a streaming chassis policy before an explicit body action.
+
+        Exposed so the beat-performance card can win over a policy that is
+        mid-plan.  Without this, a 10 Hz stream could publish velocities into
+        the robot between a beat's action edge and its DEFAULT release.
+        """
+        return self._preempt_servo(reason)
+
+    def publish_action_edge(self, command_name: str, index: int = 0,
+                            hold_s: float = 0.01) -> None:
+        """Send one event command and release it with DEFAULT.
+
+        Shared with every other writer through ``_publish_cmd``'s lock and
+        >=2 ms limiter.  The hold exceeds the vendor's 2 ms minimum and
+        matches the 10 ms command loop used by the vendor demo; the two writes
+        are the whole edge, so repeated calls cannot leave an action held.
+        """
+        self._publish_cmd(0, 0, 0, _get_control_cmd(command_name), index)
+        time.sleep(hold_s)
+        self._publish_cmd(0, 0, 0, _get_default_cmd(), 0)
+
+    def prepare_walking_mode(self, requested_action: str) -> dict:
+        """Bring the body to walking via the guarded semantic-action path.
+
+        Reservation and protection checks stay here rather than in the caller
+        so an externally driven card cannot bypass workmode=26 or start while
+        a rotation still owns the chassis.
+        """
+        with self._rotate_lock:
+            self._body_action = requested_action
+            self._rotate_stop_event.set()
+        try:
+            if not self._wait_for_rotate_idle():
+                return {"state": "error", "command_sent": False,
+                        "error": "rotation has not stopped; body was not prepared"}
+            return self._prepare_workmode(2, requested_action)
+        finally:
+            with self._rotate_lock:
+                self._body_action = None
+
     def _distance_full_scale(self):
         """Measured normalised-command-to-m/s calibration from the servo card.
 

@@ -159,6 +159,17 @@ class BumiDeviceBundle:
             ))
             print("[bundle] LocoServoPlugin loaded")
 
+        if plugins_cfg.get("beat_performance", {}).get("enabled", False):
+            if high_ctrl is not None and loco_plugin is not None:
+                from beat_performance_card import BeatPerformancePlugin
+                self._plugins.append(BeatPerformancePlugin(
+                    plugins_cfg["beat_performance"], namespace, executor,
+                    high_ctrl, loco_plugin))
+                print("[bundle] BeatPerformancePlugin loaded")
+            else:
+                # This card sends body commands; without the call-shaped loco
+                # plugin there is no shared >=2 ms limiter to write through.
+                print("[bundle] BeatPerformancePlugin skipped: needs loco and high controller")
         if plugins_cfg.get("mic", {}).get("enabled", False) and media_ctrl is not None:
             from device import MicPlugin
             self._plugins.append(MicPlugin(plugins_cfg["mic"], namespace, executor, media_ctrl))
