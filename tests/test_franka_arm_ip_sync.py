@@ -47,8 +47,11 @@ class ControllerConfigurationTests(unittest.TestCase):
         self.assertEqual(card['title'], 'Controller Configuration')
         self.assertEqual(set(card['configSchema']['properties']), {'username', 'password'})
         password = card['configSchema']['properties']['password']
-        self.assertEqual(password['default'], 'ros')
+        # The saved password is never published back to the form.
+        self.assertNotIn('default', password)
         self.assertTrue(password['x-sensitive'])
+        self.assertTrue(password['writeOnly'])
+        self.assertEqual(self.plugin.dispatch('start', {})['state'], 'running')
         self.assertEqual((card['topic_in'], card['topic_out']), ([], []))
         self.assertIsNone(self.plugin.dispatch('info', {}))
         with self.assertRaises(RuntimeError):
@@ -83,6 +86,9 @@ class ControllerConfigurationTests(unittest.TestCase):
         self.assertEqual((self.state / 'credentials.json').stat().st_mode & 0o777, 0o600)
         restarted = controller.ControllerConfiguration(ARMS)
         self.assertEqual((restarted.username, restarted.password), ('operator', 'test-password'))
+        # A writeOnly field comes back empty; that keeps, not resets, the password.
+        restarted.dispatch('config', {'username': 'operator', 'password': ''})
+        self.assertEqual(restarted.password, 'test-password')
         with self.assertRaises(RuntimeError):
             restarted.snapshot()
 

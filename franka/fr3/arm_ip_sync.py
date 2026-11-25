@@ -86,8 +86,9 @@ class ControllerConfiguration:
             "inputSchema": {"type": "object", "properties": {}},
             "configSchema": {"type": "object", "properties": {
                 "username": {"type": "string", "title": "SSH username", "default": self.username, "scope": "tool"},
+                # Never echoed back: an empty field keeps the saved password.
                 "password": {"type": "string", "title": "SSH password", "format": "password",
-                             "default": "ros", "scope": "tool", "x-sensitive": True},
+                             "scope": "tool", "x-sensitive": True, "writeOnly": True},
             }},
             "topic_in": [], "topic_out": [],
         }]
@@ -123,12 +124,14 @@ class ControllerConfiguration:
 
     def dispatch(self, action, args):
         if action in ("start", "stop", self.PREFIX):
-            return {"ok": True, "state": "ready" if action != "stop" else "idle"}
+            # A sensor reports running once started (the canvas lifecycle contract).
+            return {"ok": True, "state": "running" if action != "stop" else "idle"}
         if action != "config":
             return None
         with self.lock:
             username = args.get("username", self.username)
-            password = args.get("password", self.password)
+            # writeOnly: the form submits an empty field unless the user typed one.
+            password = args.get("password") or self.password
             if not isinstance(username, str) or not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_.-]{0,63}", username or "pnp"):
                 return {"ok": False, "message": "Invalid SSH username"}
             if not isinstance(password, str) or any(char in password for char in "\r\n\x00"):
