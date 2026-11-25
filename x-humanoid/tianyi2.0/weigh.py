@@ -1189,7 +1189,11 @@ class WeighEngine:
                 return self._error("force_data_unavailable", side,
                                    f"{s} 手没有新鲜的力数据，无法判断掌上是否有物体")
             if problem is None:
-                if load > cfg["retract_max_load_kg"]:
+                if load > cfg["retract_max_load_kg"] and args.get("_override_load"):
+                    # 人在 reset 提示后再点了一次：读数说有东西，但人确认是空的
+                    # （典型情况：去皮时手上已经有东西，拿走后读数反而"多"了）。
+                    self._log(f"[weigh] retract {s}: reading {load * 1000:.0f} g, confirmed empty by user")
+                elif load > cfg["retract_max_load_kg"]:
                     return self._error("object_on_hand", side,
                                        f"{s} 手掌上还有约 {load * 1000:.0f} g，先取走物体再收回",
                                        load_kg=_r(load))
@@ -1419,31 +1423,33 @@ class WeighEngine:
         return res
 
     def reset(self, args: dict) -> dict:
-        """卡片的 reset：张开手指、放下手臂、清除去皮。掌上还有物品时拒绝并语音提示。
+        """卡片的 reset：张开手指、放下手臂、清除去皮。
 
-        判断不了掌上有没有东西（load_unknown，例如驱动重启后零点丢了）时也先拒绝并提示；
-        reset_confirm_window_s 秒内对同一个 side 再调用一次 reset，视为人已确认掌心是空的。"""
+        读数显示掌上有东西（object_on_hand），或判断不了（load_unknown，例如驱动重启后零点丢了）
+        时，先拒绝并语音提示；reset_confirm_window_s 秒内对同一个 side 再调用一次 reset，视为
+        人已确认掌心是空的，照常复位。读数可能是错的：去皮时手上已经有东西，拿走后 |ΔF|
+        同样会显示"有东西"（2026-11-25 真机上就这样卡住过），所以 object_on_hand 也允许人确认。"""
         side = self._side_arg(args)
         window = self.cfg["reset_confirm_window_s"]
         deadline = self._reset_confirm.pop(side, None)
         confirmed = deadline is not None and self._clock() <= deadline
-        res = self.retract({"side": side, "confirm_empty": confirmed})
+        res = self.retract({"side": side, "confirm_empty": confirmed, "_override_load": confirmed})
         if res.get("state") == "retracted":
             for s in self._sides_of(res["side"]):
                 self._tare[s] = None
                 self._last[s] = None
             return dict(res, state="reset", **({"confirmed_empty": True} if confirmed else {}))
-        speech = {"object_on_hand": "手上还有东西，请先拿走，再复位",
-                  "load_unknown": f"无法确认手上有没有东西。确认是空的话，请在{window:g}秒内再点一次复位"
-                  }.get(res.get("code"))
+        confirm = f"确认手上是空的话，请在{window:g}秒内再点一次复位"
+        speech = {"object_on_hand": f"手上还有东西，请先拿走。{confirm}",
+                  "load_unknown": f"无法确认手上有没有东西。{confirm}"}.get(res.get("code"))
         if speech:
             problem = self._announce(speech)
             if problem:
                 res = dict(res, announce_problems=[problem])
-        if res.get("code") == "load_unknown":
             # 提示播完才开始计时，人听完再点
             self._reset_confirm[side] = self._clock() + window
-            res = dict(res, error=f"无法判断掌上是否有物体；确认掌心已空后，{window:g} 秒内再调用一次 reset",
+            what = "掌上读数显示还有物体" if res.get("code") == "object_on_hand" else "无法判断掌上是否有物体"
+            res = dict(res, error=f"{what}；先取走物体，确认掌心已空后 {window:g} 秒内再调用一次 reset",
                        confirm_within_s=window)
         return res
 

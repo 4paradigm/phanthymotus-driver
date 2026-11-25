@@ -1464,7 +1464,8 @@ def test_reset_with_object_refuses_and_says_so(hanging):
     res = hanging.engine.reset({})
     assert res["code"] == "object_on_hand", res
     assert len(hanging.arm_calls) == n_arm and len(hanging.hand_calls) == n_hand
-    assert hanging.tts_texts[-1] == "手上还有东西，请先拿走，再复位"
+    assert hanging.tts_texts[-1] == "手上还有东西，请先拿走。确认手上是空的话，请在10秒内再点一次复位"
+    assert res["confirm_within_s"] == 10
 
 
 def test_reset_long_after_weighing_still_checks_the_palm(tmp_path):
@@ -1579,7 +1580,7 @@ def test_reset_without_zero_asks_and_a_second_press_confirms(tmp_path):
     n_moves = len(r.moves())
     res = r.engine.reset({})
     assert res["code"] == "load_unknown" and res["confirm_within_s"] == 10, res
-    assert r.tts_texts[-1] == "无法确认手上有没有东西。确认是空的话，请在10秒内再点一次复位"
+    assert r.tts_texts[-1] == "无法确认手上有没有东西。确认手上是空的话，请在10秒内再点一次复位"
     assert len(r.moves()) == n_moves
     r.warm(5)
     res = r.engine.reset({})
@@ -1618,12 +1619,42 @@ def test_reset_confirmation_is_per_side(tmp_path):
     assert r.engine.reset({})["state"] == "reset"           # 右手的确认还在
 
 
-def test_reset_with_object_does_not_arm_a_confirmation(hanging):
+def test_reset_with_object_reading_can_be_confirmed_by_a_second_press(hanging):
+    """读数说有东西、人确认是空的（例如去皮时手上已经有东西）：10 秒内再点一次就复位。"""
     place_after_prompt(hanging, 0.59)
     hanging.engine.auto_weigh({})
+    n_moves = len(hanging.moves())
     assert hanging.engine.reset({})["code"] == "object_on_hand"
-    assert hanging.engine._reset_confirm == {}
+    assert len(hanging.moves()) == n_moves
+    hanging.warm(3)
+    res = hanging.engine.reset({})
+    assert res["state"] == "reset" and res["confirmed_empty"], res
+    assert [m["right_positions"] for m in hanging.moves()[n_moves:]] == [MID, REST]
+    assert any("confirmed empty by user" in line for line in hanging.logs)
+
+
+def test_tare_taken_with_object_on_palm_does_not_lock_the_arm_up(tmp_path):
+    """2026-11-25 真机：去皮时手上已经放了东西，拿走后读数显示"有 124 g"，reset 一直被拒。"""
+    r = _hanging_rig(tmp_path)
+    r.engine.pose({})
+    r.mass = 0.104                                      # 去皮前就放上了
+    r.warm(1)
+    r.engine.tare({})
+    r.mass = 0.0                                        # 拿走
+    r.warm(1)
+    assert r.engine.reset({})["code"] == "object_on_hand"
+    r.warm(2)
+    assert r.engine.reset({})["state"] == "reset"
+
+
+def test_reset_object_confirmation_expires(hanging):
+    place_after_prompt(hanging, 0.59)
+    hanging.engine.auto_weigh({})
+    n_moves = len(hanging.moves())
     assert hanging.engine.reset({})["code"] == "object_on_hand"
+    hanging.warm(11)
+    assert hanging.engine.reset({})["code"] == "object_on_hand"
+    assert len(hanging.moves()) == n_moves
 
 
 # ── 播报：先说在做什么、要等多久，等"请放物品"再放 ─────────────────────────────
