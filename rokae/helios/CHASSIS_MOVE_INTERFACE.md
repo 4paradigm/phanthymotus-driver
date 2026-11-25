@@ -41,6 +41,10 @@ Verified on the robot on 2026-11-23 (files in /tmp, removed afterwards; no speed
 
 The worker subscribes to `odometry.odom_state` (x/y m, theta rad, vx/vy m/s, w rad/s) and forwards it to the Driver at ~2 Hz; `info` shows it with its age. Each move result carries the measured displacement in the start pose's body frame (`forward_m`, `left_m`, `distance_m`, `yaw_deg`), taken 0.3 s after zero speed, so a commanded move can be checked against what the base actually did.
 
+## Steerable wheels and move timing
+
+The FH-6-140-X-DP base has steerable wheels. When the direction changes (for example forward after a lateral move) it first turns the wheels and only then drives; on the robot a 1 s forward move right after lateral moves only straightened the wheels, and the next one moved about 5 cm. `duration_s` therefore counts from the moment odometry shows the base following the command (measured speed at least 30% of the command), waiting at most 2 s for that; with no fresh odometry it counts from the first command. The move result reports the wait as `start_delay_s`, and the watchdog allows for it.
+
 ## Chassis prerequisites
 
 The vendor controller accepts SDK speed only in **auto mode on a loaded map with the robot localised**. Observed on the robot (2026-11-23/24):

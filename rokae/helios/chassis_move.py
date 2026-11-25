@@ -38,6 +38,9 @@ WATCHDOG_MARGIN_S = 3.0
 # Before the worker reports move_acquired it may still be retrying set_third_speed_ctrl
 # while the chassis wakes its motors (3 attempts x 3 s RPC timeout, see the worker).
 ACQUIRE_BUDGET_S = 10.0
+# After acquisition the worker may wait up to this long for steerable wheels to turn
+# before the move's duration starts (worker STEER_GRACE_S).
+STEER_GRACE_S = 2.0
 
 
 def acp_notify(action_id, status, result):
@@ -164,7 +167,7 @@ class SdkWorkerLink:
                 self._on_move_acquired(event.get("id"))
             elif kind == "move_done":
                 self._on_move_done(event.get("id"), event.get("status", "error"), event.get("message", ""),
-                                   event.get("odometry"))
+                                   event.get("odometry"), event.get("start_delay_s"))
         # Worker exited: the chassis stops on missing speed commands.
         self._on_move_done(None, "error", self._fatal or "chassis SDK worker exited")
 
@@ -364,7 +367,8 @@ class HeliosChassisMove:
                 return {"error": "a timed base move is already running; send stop first"}
             # Until the worker holds speed control, allow for the chassis waking its motors.
             self._active = {"id": action_id, "duration": duration,
-                            "deadline": self._clock() + ACQUIRE_BUDGET_S + duration + WATCHDOG_MARGIN_S}
+                            "deadline": self._clock() + ACQUIRE_BUDGET_S + STEER_GRACE_S + duration
+                            + WATCHDOG_MARGIN_S}
         try:
             self.link.send({"op": "move", "id": action_id, "vx": vx, "vy": vy,
                             "wz": math.radians(vyaw), "duration_s": duration})
@@ -398,12 +402,14 @@ class HeliosChassisMove:
         with self._lock:
             active = self._active
             if active is not None and active["id"] == action_id:
-                active["deadline"] = self._clock() + active["duration"] + WATCHDOG_MARGIN_S
+                active["deadline"] = self._clock() + STEER_GRACE_S + active["duration"] + WATCHDOG_MARGIN_S
 
-    def _on_move_done(self, action_id, status, message, odometry=None):
+    def _on_move_done(self, action_id, status, message, odometry=None, start_delay_s=None):
         result = {"message": message} if message else {}
         if odometry:
             result["odometry"] = odometry
+        if start_delay_s:  # time spent turning the wheels before the move's duration started
+            result["start_delay_s"] = start_delay_s
         if status == "error" and message:
             result["error"] = message
         self._finish(action_id, status, result)

@@ -81,6 +81,42 @@ def test_session_refuses_without_speed_control_and_never_sends():
     assert nav.calls == ["acquire"] * 3 + ["release"]
 
 
+def test_duration_starts_when_odometry_shows_motion():
+    # Steerable wheels turn first after a direction change; time the move from real motion.
+    nav = FakeNav()
+    speed, clock = session(nav)
+    status, _ = speed.run(0.05, 0, 0, 1.0, threading.Event(), moving=lambda: clock.now >= 0.8)
+    moving_sends = [x for x in nav.sent if x != (0.0, 0.0, 0.0)]
+    assert status == "completed" and speed.start_delay_s == 0.8
+    assert 88 <= len(moving_sends) <= 92  # 0.8 s turning + 1.0 s driving at 50 Hz
+
+
+def test_steering_wait_is_capped():
+    nav = FakeNav()
+    speed, clock = session(nav)
+    speed.run(0.05, 0, 0, 1.0, threading.Event(), moving=lambda: False)
+    assert speed.start_delay_s == 2.0 and clock.now < 3.5  # never waits longer than STEER_GRACE_S
+
+
+def test_stop_during_steering_wait_cancels():
+    nav = FakeNav()
+    speed, clock = session(nav)
+    stop = threading.Event()
+    status, _ = speed.run(0.05, 0, 0, 1.0, stop, moving=lambda: stop.set() or False)
+    assert status == "cancelled" and nav.calls[-1] == "release"
+
+
+def test_moving_check_uses_fresh_odometry_only():
+    events = []
+    worker = Worker(FakeNav(), events.append, 50, odom=OdomTracker(events.append))
+    check = worker._moving_check(0.1, 0, 0)
+    assert check() is True  # no odometry yet: do not extend the move
+    worker._odom.on_odom(type("O", (), {"x": 0.0, "y": 0.0, "theta": 0.0, "vx": 0.0, "vy": 0.0, "w": 0.0})())
+    assert check() is False  # standing still while the wheels turn
+    worker._odom.on_odom(type("O", (), {"x": 0.0, "y": 0.0, "theta": 0.0, "vx": 0.05, "vy": 0.0, "w": 0.0})())
+    assert check() is True
+
+
 def test_session_retries_acquire_rpc_timeouts_then_moves():
     # Seen on the robot after a restart: the first call times out while the chassis wakes.
     nav = FakeNav()
@@ -333,14 +369,14 @@ def test_watchdog_allows_motor_wake_up_until_speed_control_is_acquired():
     clock = FakeClock()
     move, link, notes = card(clock=clock)
     result = move.dispatch("move", {"vx": 0.1, "duration_s": 1})
-    clock.now = 9.0  # still acquiring (chassis waking): not cut off
+    clock.now = 11.0  # still acquiring (chassis waking): not cut off
     time.sleep(0.5)
     assert link.killed == 0 and not notes
-    move._on_move_acquired(result["action_id"])  # acquired at t=9: 1 s move + 3 s margin from now
-    clock.now = 12.5
+    move._on_move_acquired(result["action_id"])  # acquired at t=11: 2 s steering + 1 s move + 3 s margin
+    clock.now = 16.5
     time.sleep(0.5)
     assert link.killed == 0 and not notes
-    clock.now = 13.5
+    clock.now = 17.5
     for _ in range(50):
         if notes:
             break
@@ -378,7 +414,7 @@ FAKE_SDK = {
     """,
     "odometry.py": """
         class _O:
-            x = 1.0; y = 2.0; theta = 0.0; vx = 0.0; vy = 0.0; w = 0.0
+            x = 1.0; y = 2.0; theta = 0.0; vx = 0.1; vy = 0.0; w = 0.0
         def has_odom_dev():
             return True
         def odom_state(cb):

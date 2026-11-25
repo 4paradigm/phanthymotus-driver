@@ -31,6 +31,11 @@ MAX_SEND_FAILURES = 3
 # Each attempt is bounded by the RPC call timeout (3 s), so acquisition takes at most ~10 s.
 ACQUIRE_ATTEMPTS = 3
 ACQUIRE_RETRY_DELAY_S = 0.5
+# The Helios base has steerable wheels: when the direction changes (e.g. forward after a
+# lateral move) it first turns the wheels and only then drives. duration_s counts from
+# the moment odometry shows the base moving, waiting at most STEER_GRACE_S for that.
+STEER_GRACE_S = 2.0
+MOVING_FRACTION = 0.3  # measured speed >= 30% of the command counts as moving
 
 
 def _twist(nav, vx, vy, wz):
@@ -69,8 +74,15 @@ class SpeedSession:
                 self._sleep(ACQUIRE_RETRY_DELAY_S)
         return False, reason
 
-    def run(self, vx, vy, wz, duration_s, stop_event, blocked=lambda: None, on_acquired=lambda: None):
-        """Return (status, message); status is completed, cancelled or error."""
+    def run(self, vx, vy, wz, duration_s, stop_event, blocked=lambda: None, on_acquired=lambda: None,
+            moving=None):
+        """Return (status, message); status is completed, cancelled or error.
+
+        `moving()` reports whether odometry shows the base following the command (None:
+        no odometry, time from the first command). The duration starts once it does, or
+        after STEER_GRACE_S at most; `self.start_delay_s` records the wait.
+        """
+        self.start_delay_s = 0.0
         for value in (vx, vy, wz, duration_s):
             if not math.isfinite(value):
                 return "error", "non-finite command"
@@ -88,7 +100,8 @@ class SpeedSession:
         status, message = "completed", ""
         try:
             twist = _twist(self._nav, vx, vy, wz)
-            deadline = self._clock() + duration_s
+            first = self._clock()
+            deadline = None if moving is not None else first + duration_s
             failures = 0
             while True:
                 if stop_event.is_set():
@@ -98,7 +111,11 @@ class SpeedSession:
                 if reason:
                     status, message = "error", reason
                     break
-                if self._clock() >= deadline:
+                now = self._clock()
+                if deadline is None and (now - first >= STEER_GRACE_S or moving()):
+                    deadline = now + duration_s
+                    self.start_delay_s = round(now - first, 2)
+                if deadline is not None and now >= deadline:
                     break
                 if self._nav.send_third_expected_speed(twist):
                     failures = 0
@@ -240,14 +257,29 @@ class Worker:
         try:
             status, text = self._session.run(
                 vx, vy, wz, duration_s, stop_event, self._blocked,
-                on_acquired=lambda: self._emit({"event": "move_acquired", "id": move_id}))
+                on_acquired=lambda: self._emit({"event": "move_acquired", "id": move_id}),
+                moving=self._moving_check(vx, vy, wz) if self._odom else None)
         except Exception as exc:  # always report: a silent thread death left the Driver waiting
             status, text = "error", f"{type(exc).__name__}: {exc}"
         if self._odom:
             time.sleep(0.3)  # let the final odometry sample arrive after zero speed
         end = self._odom.snapshot() if self._odom else None
         self._emit({"event": "move_done", "id": move_id, "status": status, "message": text,
-                    "odometry": OdomTracker.displacement(start, end)})
+                    "odometry": OdomTracker.displacement(start, end),
+                    "start_delay_s": getattr(self._session, "start_delay_s", 0.0)})
+
+    def _moving_check(self, vx, vy, wz):
+        """True once odometry shows the base following the command; True if odometry is stale."""
+        linear, angular = math.hypot(vx, vy), abs(wz)
+
+        def moving():
+            sample = self._odom.snapshot(max_age_s=0.5)
+            if sample is None:
+                return True  # no fresh feedback: never extend a move on a guess
+            if linear > 0 and math.hypot(sample.get("vx", 0.0), sample.get("vy", 0.0)) >= MOVING_FRACTION * linear:
+                return True
+            return angular > 0 and abs(sample.get("w", 0.0)) >= MOVING_FRACTION * angular
+        return moving
 
     def stop(self, timeout_s=3.0):
         with self._lock:
