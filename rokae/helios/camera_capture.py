@@ -122,7 +122,7 @@ class JpegFramer:
 class CameraCapture:
     """One camera owner, reconnecting capture, bounded first-frame wait and stop."""
 
-    def __init__(self, source, callback, fps=5, *, device_resolver=resolve_device,
+    def __init__(self, source, callback, fps=15, *, device_resolver=resolve_device,
                  command_builder=capture_command, stall_timeout_s=4):
         self.source = source
         self.callback = callback

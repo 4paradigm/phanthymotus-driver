@@ -6,7 +6,7 @@
 |---|---|---|
 | `joints` | sensor | 关节骨架和逐轴状态，默认 10 Hz |
 | `battery` | sensor | 两块电池状态，默认 1 Hz |
-| `camera_rgb` | sensor，支持多实例 | 选择一路彩色相机，标准 JPEG / FPS 视图，默认 5 fps |
+| `camera_rgb` | sensor，支持多实例 | 选择一路彩色相机，标准 JPEG / FPS 视图，默认 15 fps |
 | `model` | resource | 运行时读取本机 iNex 的 URDF，骨架渲染器自动调用 |
 
 ## 数据与单位
@@ -77,7 +77,7 @@
 
 底盘前后两台 S10 相机不在选择器中：底盘配置当前 `read_rgb=0`，没有已验证的 RGB 数据源。此 Driver 不启用底盘 RGB、不重载避障感知、不把深度/红外画面当作 RGB。详细来源、采集约束及未完成事项见 [CAMERA_INTERFACE.md](CAMERA_INTERFACE.md)。
 
-部署片段只映射已验证的五个 `/dev/video*` 彩色节点；启动时同时核对 sysfs 内核设备名称，防止重启重新编号后读错深度、红外或元数据节点。若节点编号改变，更新部署映射再用 bot 镜像验证，不能改成映射整个 `/dev` 或使用 privileged。`camera_publish_fps` 控制输出帧率，默认 5（允许 1～15）；先丢帧再缩放编码，避免堆积历史帧。
+部署片段只映射已验证的五个 `/dev/video*` 彩色节点；启动时同时核对 sysfs 内核设备名称，防止重启重新编号后读错深度、红外或元数据节点。若节点编号改变，更新部署映射再用 bot 镜像验证，不能改成映射整个 `/dev` 或使用 privileged。`camera_publish_fps` 控制输出帧率，默认 15（允许 1～15，与 G1/Go2 采图帧率一致）；先丢帧再缩放编码，避免堆积历史帧。
 
 ## 本地验证
 

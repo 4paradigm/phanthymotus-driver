@@ -286,3 +286,11 @@ def test_invalid_requests_do_not_open_any_device(args):
 def test_invalid_publish_rates(fps):
     with pytest.raises(ValueError):
         HeliosCamera({"camera_publish_fps": fps})
+
+
+def test_default_publish_rate_is_15_fps():
+    import yaml
+    config = yaml.safe_load((Path(__file__).parents[1] / "rokae/helios/config.yaml").read_text())
+    assert config["camera_publish_fps"] == 15
+    camera, _ = plugin()
+    assert camera.dispatch("info", {"instance_id": "a"})["target_fps"] == 15

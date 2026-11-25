@@ -71,7 +71,7 @@ class HeliosCamera:
     def __init__(self, config, namespace="rokae_helios", ros2=None, *, stream_factory=None):
         self._ros2 = ros2
         self._namespace = namespace
-        self._fps = config.get("camera_publish_fps", 5)
+        self._fps = config.get("camera_publish_fps", 15)
         if isinstance(self._fps, bool) or not isinstance(self._fps, int) or not 1 <= self._fps <= 15:
             raise ValueError("camera_publish_fps must be an integer from 1 to 15")
         if not re.fullmatch(r"[a-zA-Z0-9_]+", namespace):
