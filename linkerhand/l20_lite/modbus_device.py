@@ -9,11 +9,11 @@ import os
 import glob
 import ssl
 import urllib.request
-from dataclasses import dataclass
 from uuid import uuid4
 
 from common.vendor_runtime import action_schema, tool
-from modbus_client import JOINT_COUNT, L20LiteModbusClient, ModbusResponseTimeout, _bytes, _remaining_time
+from modbus_client import (JOINT_COUNT, L20LiteModbusClient,
+                           ModbusResponseTimeout, _bytes, _remaining_time)
 
 JOINT_NAMES = [
     "thumb_root", "thumb_sway", "index_root", "middle_root", "ring_root",
@@ -46,64 +46,53 @@ def _named(values: list[int]) -> dict[str, int]:
     return dict(zip(JOINT_NAMES, values))
 
 
-@dataclass
-class _SerialPort:
-    path: str
-    client: L20LiteModbusClient
-    users: int = 0
-    retired: bool = False
+def confirm_motion_ok(args: dict) -> bool:
+    """Accept an explicit motion confirmation from an MCP/canvas call.
+
+    The canvas renders the `confirm_motion` checkbox as a string in some
+    paths: a checked box arrives as `"true"`, not Python `True`. Only these
+    two exact spellings count as confirmation — `"false"`, `"True"`, `1`,
+    empty and missing all fail closed. Relaxing the type here does not lower
+    the safety gate: the operator still has to explicitly check the box.
+    """
+    value = args.get("confirm_motion")
+    return value is True or value == "true"
 
 
 class L20LiteConnection:
-    """Open on first use and share one serial descriptor per physical port."""
+    """Open the serial device on first use, never on server startup."""
 
-    def __init__(self, config: dict, *, ports: dict[str, _SerialPort] | None = None,
-                 port_lock: threading.RLock | None = None):
+    def __init__(self, config: dict):
         self.port = str(config.get("serial_port", "/dev/ttyUSB0"))
         self.side = str(config.get("side", "right")).lower()
         if self.side not in ("right", "left"):
             raise ValueError("side must be right or left")
         self.baudrate = int(config.get("baudrate", 115200))
         self.timeout_s = float(config.get("response_timeout_s", 0.5))
-        self._ports = ports if ports is not None else {}
-        self._lock = port_lock if port_lock is not None else threading.RLock()
-        self._serial_port: _SerialPort | None = None
-        self._target: L20LiteModbusClient | None = None
-
-    @property
-    def _client(self) -> L20LiteModbusClient | None:
-        return self._target
+        self._client: L20LiteModbusClient | None = None
+        self._lock = threading.Lock()
 
     def get(self, side: str | None = None) -> L20LiteModbusClient:
         target_side = side or self.side
         if target_side not in ("left", "right"):
             raise ValueError("side must be left or right")
         with self._lock:
-            # Existing holders can finish using the port. A new request
-            # renews a retired connection after its holders release it.
-            if self._serial_port is not None and self._serial_port.retired:
-                self.close()
-            if self._client is not None and self._client.side == target_side:
-                return self._client
-            if self._serial_port is None:
-                path = os.path.realpath(self.port)
-                shared = self._ports.get(path)
-                if shared is not None and shared.retired:
-                    raise OSError(f"RS485 port {path} is waiting for existing connections to release")
-                if shared is None:
-                    client = L20LiteModbusClient(
-                        self.port, target_side, baudrate=self.baudrate, timeout_s=self.timeout_s,
-                    )
-                    shared = self._ports[path] = _SerialPort(path, client)
-                shared.users += 1
-                self._serial_port = shared
-            self._target = self._serial_port.client.for_side(target_side)
-            return self._target
+            if self._client is not None and self._client.side != target_side:
+                self._client.close()
+                self._client = None
+            if self._client is None:
+                self._client = L20LiteModbusClient(
+                    self.port, target_side, baudrate=self.baudrate,
+                    timeout_s=self.timeout_s,
+                )
+            return self._client
 
     def detect_sides(self, *, deadline: float | None = None) -> list[str]:
         """Probe only the two known slave IDs using read-only position frames."""
         with self._lock:
-            client = self.get(self._client.side if self._client is not None else None)
+            client = self._client
+        if client is None:
+            client = self.get()
         found = []
         try:
             for side in ("right", "left"):
@@ -114,39 +103,21 @@ class L20LiteConnection:
                         _remaining_time(deadline)
                     continue
                 found.append(side)
-        except TimeoutError:
-            # An expired poll cannot determine whether the adapter is stale.
-            raise
         except Exception:
             # A bad frame or disconnected adapter is not evidence of absence.
-            self.invalidate()
+            self.close()
             raise
         if not found:
             # A USB adapter may have been unplugged and reinserted at this path.
             # Do not keep a stale file descriptor across the next probe.
-            self.invalidate()
-        return found
-
-    def _close_port(self, port: _SerialPort) -> None:
-        if self._ports.get(port.path) is port:
-            del self._ports[port.path]
-        port.client.close()
-
-    def invalidate(self) -> None:
-        with self._lock:
-            if self._serial_port is not None:
-                # Reserve the path until the last existing holder releases it.
-                self._serial_port.retired = True
             self.close()
+        return found
 
     def close(self) -> None:
         with self._lock:
-            port, self._serial_port = self._serial_port, None
-            self._target = None
-            if port is not None:
-                port.users -= 1
-                if port.users == 0:
-                    self._close_port(port)
+            client, self._client = self._client, None
+        if client is not None:
+            client.close()
 
 
 class HandPlugin:
@@ -477,7 +448,7 @@ class HandPlugin:
         return {"state": "running", "action_id": active["action_id"]}
 
     def dispatch(self, action: str, args: dict) -> dict | None:
-        if action in MOTION_ACTIONS and args.get("confirm_motion") is not True:
+        if action in MOTION_ACTIONS and not confirm_motion_ok(args):
             raise ValueError("confirm_motion must be true for every movement request")
         if action == "start":
             # Canvas lifecycle marker; opening a card must not move the hand.
@@ -551,7 +522,7 @@ class HandPlugin:
         return None
 
 
-def build_plugins(config: dict, namespace: str, ros2) -> list:
+def build_plugins(config: dict, _namespace: str, _ros2) -> list:
     hand_config = config.get("plugins", {}).get("hand", {})
     hand = MultiHandPlugin(config, hand_config)
     plugins = [hand] if hand_config.get("enabled", True) else []
@@ -559,12 +530,15 @@ def build_plugins(config: dict, namespace: str, ros2) -> list:
     if gesture_config.get("enabled", False):
         from gesture_device import GesturePlugin
         plugins.append(GesturePlugin(hand, gesture_config))
+    follow_config = config.get("plugins", {}).get("hand_visual_follow", {})
+    if follow_config.get("enabled", False):
+        from visual_follow import VisualFollowPlugin
+        plugins.append(VisualFollowPlugin(hand, follow_config, _ros2))
     tactile_config = config.get("plugins", {}).get("hand_tactile", {})
     if tactile_config.get("enabled", False):
         from lite_tactile import LiteTactilePlugin
-
         plugins.append(LiteTactilePlugin(hand, tactile_config, global_config=config,
-                                         ros2=ros2, namespace=namespace))
+                                         ros2=_ros2, namespace=_namespace))
     return plugins
 
 
@@ -580,20 +554,16 @@ class MultiHandPlugin:
         # Serial discovery and motion never overlap. Two cards may be queued,
         # but no second controller may open/probe a moving RS-485 port.
         self._bus_lock = threading.RLock()
-        self._serial_ports: dict[str, _SerialPort] = {}
-        self._serial_port_lock = threading.RLock()
+        # Tactile polls reuse a confirmed port; a missing port is retried at
+        # most once per 2 s so discovery does not run at poll_hz.
         self._tactile_ports: dict[str, str] = {}
         self._tactile_retry_at: dict[str, float] = {}
         self._bindings: dict[str, str] = {}
         self._controllers: dict[str, HandPlugin] = {}
         self._stopped_instances: set[str] = set()
         self._legacy_owner: str | None = None
-        self._legacy = HandPlugin(self._connection(), hand_config,
+        self._legacy = HandPlugin(L20LiteConnection(config), hand_config,
                                   motion_lock=self._bus_lock)
-
-    def _connection(self, **overrides) -> L20LiteConnection:
-        return L20LiteConnection({**self.config, **overrides}, ports=self._serial_ports,
-                                 port_lock=self._serial_port_lock)
 
     def get_tool(self) -> dict:
         definition = self._legacy.get_tool()
@@ -654,7 +624,7 @@ class MultiHandPlugin:
                                  [self._legacy, *self._controllers.values()]
                                  if controller.connection._client is not None
                                  and os.path.realpath(controller.connection.port) == port), None)
-                connection = existing or self._connection(serial_port=port)
+                connection = existing or L20LiteConnection({**self.config, "serial_port": port})
                 try:
                     sides = connection.detect_sides(deadline=deadline)
                 except (OSError, TimeoutError):
@@ -681,7 +651,7 @@ class MultiHandPlugin:
                 # The old path may now point at a different device. Do not
                 # write even zero torque through an unverified stale port.
                 controller.connection.close()
-            connection = self._connection(side=side, serial_port=port)
+            connection = L20LiteConnection({**self.config, "side": side, "serial_port": port})
             single_config = {**self.hand_config, "auto_detect_gestures": False}
             controller = HandPlugin(connection, single_config, motion_lock=self._bus_lock)
             self._controllers[instance_id] = controller
@@ -705,6 +675,7 @@ class MultiHandPlugin:
             missing = f"{'左手' if side == 'left' else '右手'}未连接"
             if time.monotonic() < self._tactile_retry_at.get(side, 0.0):
                 raise ValueError(missing)
+            # Discovery probes every port; never let it overlap a motion.
             self._acquire_bus(deadline)
             try:
                 port = self._discover(deadline=deadline).get(side)
@@ -712,11 +683,12 @@ class MultiHandPlugin:
             finally:
                 self._bus_lock.release()
             if port is None:
-                # Discovery probes every port; do not repeat it at poll_hz.
                 self._tactile_retry_at[side] = time.monotonic() + 2.0
                 raise ValueError(missing)
             self._tactile_ports[side] = port
-        connection = self._connection(side=side, serial_port=port)
+        # The board-specific controller owns its own descriptor; a tactile
+        # read uses a dedicated one so stop()/rebind of a card cannot close it.
+        connection = L20LiteConnection({**self.config, "side": side, "serial_port": port})
         results: dict = {}
         try:
             for finger in fingers:
@@ -733,7 +705,7 @@ class MultiHandPlugin:
                 except (TimeoutError, ValueError, RuntimeError) as exc:
                     results[finger] = exc
                 except OSError:
-                    connection.invalidate()
+                    connection.close()
                     raise
                 finally:
                     self._bus_lock.release()
@@ -744,7 +716,7 @@ class MultiHandPlugin:
             raise
         finally:
             connection.close()
-        if (all(isinstance(value, Exception) for value in results.values())
+        if (results and all(isinstance(value, Exception) for value in results.values())
                 and any(isinstance(value, (ModbusResponseTimeout, ValueError, RuntimeError))
                         for value in results.values())):
             # No valid reply confirmed this port. An exhausted round budget
@@ -846,7 +818,7 @@ class MultiHandPlugin:
             with self._lock:
                 self._stopped_instances.add(instance_id)
             return result
-        if action in MOTION_ACTIONS and args.get("confirm_motion") is not True:
+        if action in MOTION_ACTIONS and not confirm_motion_ok(args):
             raise ValueError("confirm_motion must be true for every movement request")
         found = self._discover()
         port = found.get(side)
