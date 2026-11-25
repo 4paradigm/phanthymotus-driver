@@ -727,7 +727,7 @@ def test_stop_move_interrupts_running_rotate(monkeypatch):
 
 
 def test_rotate_refuses_non_walking_and_protection_modes(monkeypatch):
-    # 模式拒绝与 _do_move 逐字一致：26 → protection；非 2 → workmode + switch_mode 指引。
+    # 模式拒绝与 _do_move 一致：26 → protection；非 2/3 → workmode + walking_mode 指引。
     # 两种情况都必须在发出任何指令之前就拒绝（fake.cmds 为空）。
     module, _ = _load_device(monkeypatch)
 
@@ -744,7 +744,7 @@ def test_rotate_refuses_non_walking_and_protection_modes(monkeypatch):
     result = plugin_ready.dispatch(
         'rotate', {'_tool_name': 'loco_relative_move', 'angle_deg': 60})
     assert result['state'] == 'error'
-    assert 'workmode' in result['error'] and 'switch_mode' in result['error']
+    assert 'workmode' in result['error'] and 'walking_mode' in result['error']
     assert fake_ready.cmds == []                        # 未发任何指令
 
 

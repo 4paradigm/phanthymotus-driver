@@ -114,11 +114,12 @@ class WalkingModeClient:
             data.extend(part)
         return bytes(data)
 
-    def get_status(self) -> int:
-        deadline = time.monotonic() + self.timeout
+    def get_status(self, *, deadline: float | None = None) -> int:
+        query_deadline = time.monotonic() + self.timeout
+        deadline = min(query_deadline, deadline) if deadline is not None else query_deadline
         if self._deadline is not None:
             deadline = min(deadline, self._deadline)
-        self._send({"cmd": "get_status"})
+        self._send({"cmd": "get_status"}, timeout=deadline - time.monotonic())
         while time.monotonic() < deadline:
             header = self._read_exact(16, deadline)
             if header[:8] != MAGIC:
@@ -139,5 +140,7 @@ class WalkingModeClient:
             status = details.get("status") if isinstance(details, dict) else None
             if type(status) is not int:
                 raise AppProtocolError("App status is missing an integer mode code")
+            if time.monotonic() >= deadline:
+                raise TimeoutError("App status query timed out")
             return status
         raise TimeoutError("No App status response within the query deadline")

@@ -67,7 +67,7 @@ class WalkingModePlugin:
 
     @contextmanager
     def cancel_and_brake(self):
-        """Serialize cancellation and the chassis brake with mode writes."""
+        """Serialize cancellation and braking with mode writes and completion."""
         with self._state_lock:
             self._cancel.set()
             yield
@@ -129,15 +129,16 @@ class WalkingModePlugin:
                                    deadline=request_deadline) as client:
                 app_mode = client.get_status()
                 sdk_mode = int(self._high_ctrl.get_mode())
-                if self._cancel.is_set():
-                    return self._error("cancelled", model, "切换已取消。")
-                if app_mode != sdk_mode or app_mode not in (2, 3):
-                    return self._error("feedback_mismatch", model, "App 与 SDK 模式不一致，未发送切换命令。",
-                                       app_workmode=app_mode, observed_workmode=sdk_mode)
-                if sdk_mode == wanted:
-                    return {"state": "completed", "walking_model": model,
-                            "observed_workmode": sdk_mode, "app_workmode": app_mode,
-                            "command_sent": False, "mode_verified": True}
+                with self._state_lock:
+                    if self._cancel.is_set():
+                        return self._error("cancelled", model, "切换已取消。")
+                    if app_mode != sdk_mode or app_mode not in (2, 3):
+                        return self._error("feedback_mismatch", model, "App 与 SDK 模式不一致，未发送切换命令。",
+                                           app_workmode=app_mode, observed_workmode=sdk_mode)
+                    if sdk_mode == wanted:
+                        return {"state": "completed", "walking_model": model,
+                                "observed_workmode": sdk_mode, "app_workmode": app_mode,
+                                "command_sent": False, "mode_verified": True}
                 preempted = self._loco._preempt_servo("walking_mode")
                 self._stationary()
                 if int(self._high_ctrl.get_mode()) != sdk_mode:
@@ -154,25 +155,30 @@ class WalkingModePlugin:
                 deadline = min(request_deadline, time.monotonic() + self._verify_timeout)
                 confirmed = 0
                 while time.monotonic() < deadline and not self._cancel.is_set():
-                    app_mode = client.get_status()
+                    app_mode = client.get_status(deadline=deadline)
                     sdk_mode = int(self._high_ctrl.get_mode())
-                    if 26 in (app_mode, sdk_mode):
-                        return self._error("protection", model, "机器人进入保护模式，请现场检查。",
-                                           command_sent=True, observed_workmode=sdk_mode,
-                                           app_workmode=app_mode, preempted_loco_servo=preempted)
-                    confirmed = confirmed + 1 if app_mode == sdk_mode == wanted else 0
-                    if confirmed >= 2:
-                        return {"state": "completed", "walking_model": model,
-                                "observed_workmode": sdk_mode, "app_workmode": app_mode,
-                                "command_sent": True, "mode_verified": True,
-                                "preempted_loco_servo": preempted}
+                    # Commit success under the brake's lock, after both reads.
+                    with self._state_lock:
+                        if self._cancel.is_set() or time.monotonic() >= deadline:
+                            break
+                        if 26 in (app_mode, sdk_mode):
+                            return self._error("protection", model, "机器人进入保护模式，请现场检查。",
+                                               command_sent=True, observed_workmode=sdk_mode,
+                                               app_workmode=app_mode, preempted_loco_servo=preempted)
+                        confirmed = confirmed + 1 if app_mode == sdk_mode == wanted else 0
+                        if confirmed >= 2:
+                            return {"state": "completed", "walking_model": model,
+                                    "observed_workmode": sdk_mode, "app_workmode": app_mode,
+                                    "command_sent": True, "mode_verified": True,
+                                    "preempted_loco_servo": preempted}
                     self._cancel.wait(min(0.1, max(0, deadline - time.monotonic())))
             return self._error("cancelled" if self._cancel.is_set() else "mode_not_confirmed",
                                model, "未确认目标模式；未重发或自动回退。", command_sent=sent,
                                observed_workmode=sdk_mode, app_workmode=app_mode,
                                preempted_loco_servo=preempted)
         except (OSError, TypeError, ValueError, RuntimeError) as exc:
-            return self._error("mode_switch_failed", model, str(exc), command_sent=sent,
+            return self._error("cancelled" if self._cancel.is_set() else "mode_switch_failed",
+                               model, str(exc), command_sent=sent,
                                command_may_have_been_sent=attempted,
                                observed_workmode=sdk_mode, app_workmode=app_mode,
                                preempted_loco_servo=preempted)
