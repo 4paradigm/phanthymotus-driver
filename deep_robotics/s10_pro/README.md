@@ -240,7 +240,7 @@ model calibration files:
 The user confirmed on2026-11-17 that target S10Pro robots have matching front
 cameras/lenses, horizontal front-facing upright mounting, and lidar_link
 coincident with the body origin and X-forward/Y-left/Z-up axes. Under these
-conditions the packaged values are available by explicit opt-in. Their
+conditions the packaged values are the default fallback. Their
 reprojection on an individual robot is unverified. No NOS machine-id lookup is
 needed to select it. An altered mounting or lens requires its own calibration.
 
@@ -248,10 +248,11 @@ At each fresh start, the driver first reads
 `/opt/phanthy-motus/data/s10_pro/camera_front_extrinsics.json` (override with
 `S10_FRONT_CAMERA_EXTRINSICS`), a driver deployment interface. An existing
 per-unit record has precedence. If the default path is absent and no maintenance
-matrix is configured, startup returns `CALIBRATION_MISSING` unless
-`allow_standard_extrinsics` is enabled. Opting in reads the packaged record
-and exposes `calibration_warning` in both the card status and camera metadata.
-A deployment file marked as the shared standard mount also requires opt-in. An explicit override never falls back if missing or invalid.
+matrix is configured, the driver reads the packaged record and exposes
+`calibration_warning` in both the card status and camera metadata. Setting
+`allow_standard_extrinsics` to `false` disables both the fallback and deployment
+files marked as the shared standard mount. An explicit override reports an
+error if missing or invalid.
 The image's intrinsics are loaded from JSON as well; missing/corrupt resources
 produce a camera error and refuse enabled rectification, rather than guessing K
 or emitting unrectified video under rectified metadata.
@@ -318,7 +319,7 @@ The existing maintenance `config` API and saved settings remain compatible:
 | `cloud_frame_id` | The exact calibrated `header.frame_id` of that source | Obtained from deployment calibration |
 | `camera_optical_from_cloud` | Measured rigid 4x4 transform | Obtained from deployment calibration; no guessed default |
 | `min_depth_m` / `max_depth_m` | Accepted positive optical-Z range, in metres | `0.1` / `50.0` |
-| `allow_standard_extrinsics` | Allow the shared front mounting transform with unverified per-unit reprojection | `false` |
+| `allow_standard_extrinsics` | Allow the shared front mounting transform with unverified per-unit reprojection | `true` |
 | `rate_hz` | Maximum number of clouds submitted per second | `5.0`, configurable up to `15.0` |
 
 The transform uses column vectors:

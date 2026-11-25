@@ -44,7 +44,7 @@ INPUT_ERROR_CODES = (None, "CLOUD_PUBLISHER_UNAVAILABLE", "CLOUD_DATA_TIMEOUT",
                      "CLOUD_RELAY_FAILED", "CLOUD_RELAY_STALE", "CLOUD_RELAY_DATA_TIMEOUT")
 DEFAULTS = {
     "cloud_topic": "/LIDAR/POINTS", "cloud_frame_id": "",
-    "camera_optical_from_cloud": None, "allow_standard_extrinsics": False,
+    "camera_optical_from_cloud": None, "allow_standard_extrinsics": True,
     "min_depth_m": 0.1, "max_depth_m": 50.0, "rate_hz": 5.0,
 }
 
@@ -408,7 +408,7 @@ class FrontDepthPlugin:
             "camera_optical_from_cloud": {"type": "string", "title": "雷达到前相机光学坐标的 4×4 外参",
                 "description": "Measured rigid transform as a JSON 4x4 array; translation in metres. No default."},
             "allow_standard_extrinsics": {"type": "boolean", "title": "允许使用未验证的标准外参",
-                "description": "仅在已确认本机相机、镜头和安装位姿符合标准安装时启用。"},
+                "description": "标准安装默认使用共享外参。相机、镜头或安装位姿有变更时请使用单机标定。"},
             "min_depth_m": {"type": "number", "title": "最小深度（米）", "minimum": 0},
             "max_depth_m": {"type": "number", "title": "最大深度（米）", "maximum": 65.535},
             "rate_hz": {"type": "number", "title": "最大输出频率（Hz）", "exclusiveMinimum": 0, "maximum": 15},

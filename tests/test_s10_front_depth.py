@@ -216,7 +216,7 @@ def test_default_canvas_start_loads_directed_calibration_readonly(rig):
 
 def test_confirmed_robot_mounting_record_projects_front_right_and_up(rig):
     path = DRIVER / "resource/calibration/s10_pro_standard_front.json"
-    plugin = module().FrontDepthPlugin({}, "robot", rig.nodes,
+    plugin = module().FrontDepthPlugin({"camera_front_depth": {"allow_standard_extrinsics": False}}, "robot", rig.nodes,
                                       config_path=rig.path, extrinsics_path=path)
     assert plugin.dispatch("start", {})["code"] == "STANDARD_EXTRINSICS_DISABLED"
     assert plugin.dispatch("config", {"allow_standard_extrinsics": True})["state"] == "configured"
@@ -257,18 +257,13 @@ def automatic_plugin(rig, monkeypatch, identity):
     return plugin
 
 
-def test_empty_data_volume_requires_explicit_opt_in_before_using_standard_calibration(rig, monkeypatch):
+def test_empty_data_volume_uses_standard_calibration_by_default(rig, monkeypatch):
     plugin = automatic_plugin(rig, monkeypatch,
         '482fc8b97c9e88f56cad0e892fc3ebfecddc47c570d078588e448d81945b6640')
-    assert plugin.get_tool()['configSchema']['properties']['allow_standard_extrinsics']['default'] is False
-    result = plugin.dispatch('start', {})
-    assert result['code'] == 'CALIBRATION_MISSING'
-    assert not rig.subscriptions and not rig.publishers and not rig.relays
-    assert not rig.path.exists()
+    assert plugin.get_tool()['configSchema']['properties']['allow_standard_extrinsics']['default'] is True
+    defaults = yaml.safe_load((DRIVER / 'config.yaml').read_text())
+    assert defaults['camera_front_depth']['allow_standard_extrinsics'] is True
     assert plugin.dispatch('config', {'allow_standard_extrinsics': 'false'})['state'] == 'error'
-    assert plugin.dispatch('config', {'allow_standard_extrinsics': True})['state'] == 'configured'
-    plugin = module().FrontDepthPlugin({}, 'robot', rig.nodes, config_path=rig.path)
-    plugin.extrinsics_path = rig.extrinsics_path
     result = plugin.dispatch('start', {})
     try:
         assert result['state'] == 'running', result
@@ -278,6 +273,7 @@ def test_empty_data_volume_requires_explicit_opt_in_before_using_standard_calibr
             [1, 0, 0, -.27065], [0, 0, 0, 1]]
         assert result['camera_info'][0]['vendor']['extrinsics_source'].startswith('bundled:')
         assert not rig.extrinsics_path.exists()
+        assert not rig.path.exists()
         assert result['calibration_warning']
         assert result['camera_info'][0]['vendor']['reprojection_verified'] is False
         assert plugin.dispatch('config', {'allow_standard_extrinsics': False})['state'] == 'configured'

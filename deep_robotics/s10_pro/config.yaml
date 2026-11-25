@@ -58,7 +58,7 @@ camera_front_depth:
   cloud_topic: "/LIDAR/POINTS"
   cloud_frame_id: ""
   camera_optical_from_cloud: null
-  allow_standard_extrinsics: false
+  allow_standard_extrinsics: true
   min_depth_m: 0.1
   max_depth_m: 50.0
   rate_hz: 5.0
