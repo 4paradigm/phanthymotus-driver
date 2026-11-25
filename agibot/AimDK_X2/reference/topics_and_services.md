@@ -32,6 +32,7 @@ mangled-name encoding of `_` used by their own tooling — not a typo.
 | `/aimdk_5Fmsgs/srv/ExecuteActionResource` | `linkcraft` | |
 | `/aimdk_5Fmsgs/srv/SetPmuLed` | `pmu_led` | |
 | `/aimdk_5Fmsgs/srv/PlayTts` | `tts` | |
+| `/aima/hal/audio/playback` | `speaker` | accepts canvas `audio/pcm-16k`, converts it to vendor `AudioPlayback` |
 | `/aimdk_5Fmsgs/srv/PlayEmoji` | `emoji` | |
 | `/aimdk_5Fmsgs/srv/SetMicSourceRequest`, `GetMicSourceRequest` | `mic_source` | |
 | `/aimdk_5Fmsgs/srv/GetStoredMapByName` | `map_get` | |
@@ -43,9 +44,8 @@ new plugin in `device.py` if a use case comes up:
 
 - `/agent/process_audio_output`, `/face_ui_proxy/status` — top-level status topics, purpose not
   fully documented in the SDK's public catalog.
-- `/aima/hal/audio/capture`, `/aima/hal/audio/playback`, `/aima/hal/audio/focus_response`,
-  `/aima/hal/audio/play_state` — raw audio I/O topics; this driver relies on `tts`/`PlayTts`
-  instead of raw audio playback.
+- `/aima/hal/audio/capture`, `/aima/hal/audio/focus_response`, `/aima/hal/audio/play_state` —
+  raw audio topics not exposed as a card.  `speaker` is the only raw playback bridge.
 - `/aima/hal/sensor/rgb_head_rear/*`, `/aima/hal/sensor/stereo_head_front_{left,right}/*` —
   additional cameras beyond the front RGBD pair this driver exposes.
 - `/aima/hal/sensor/touch_head` — head touch sensor, no dedicated tool yet.
