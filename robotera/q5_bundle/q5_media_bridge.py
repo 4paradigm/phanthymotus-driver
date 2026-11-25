@@ -31,6 +31,73 @@ import threading
 import time
 
 from fastdds_transport import configure_bundled_fastdds_transport
+from playback_telemetry import parse_audio_format
+
+
+_SUPPORTED_SPEAKER_FORMATS = {"audio/pcm-16k", "pcm_16k_16bit_mono"}
+_SPEAKER_FAILURE_DEDUPE_LIMIT = 256
+_SPEAKER_FAILURE_MERGE_LIMIT = 64
+
+
+def _queue_speaker_failure(failure_q, failure: dict, seen_ids: dict,
+                           overflow_epoch=None) -> bool:
+    """Offer one failure without blocking; coalesce overload conservatively."""
+    speech_id = str(failure.get("speech_id") or "")
+    if not speech_id or speech_id in seen_ids:
+        return False
+
+    item = dict(failure)
+    try:
+        failure_q.put_nowait(item)
+    except queue.Full:
+        failed_epoch = int(item.get("speaker_epoch", -1))
+        if overflow_epoch is not None:
+            lock = overflow_epoch.get_lock()
+            with lock:
+                overflow_epoch.value = max(
+                    int(overflow_epoch.value), failed_epoch)
+        evicted = None
+        try:
+            evicted = failure_q.get_nowait()
+        except queue.Empty:
+            pass
+        speech_ids = []
+        for candidate in (evicted or {}).get("speech_ids", []):
+            if str(candidate) not in speech_ids:
+                speech_ids.append(str(candidate))
+        for candidate in ((evicted or {}).get("speech_id"), speech_id):
+            if candidate and str(candidate) not in speech_ids:
+                speech_ids.append(str(candidate))
+        item = {
+            "fail_all": True,
+            "speech_id": speech_id,
+            "speech_ids": speech_ids[-_SPEAKER_FAILURE_MERGE_LIMIT:],
+            "through_epoch": failed_epoch,
+            "code": "SPEAKER_FAILURE_QUEUE_OVERFLOW",
+            "message": "speaker failure notification queue overloaded",
+        }
+        seen_ids[speech_id] = None
+        while len(seen_ids) > _SPEAKER_FAILURE_DEDUPE_LIMIT:
+            del seen_ids[next(iter(seen_ids))]
+        try:
+            failure_q.put_nowait(item)
+        except queue.Full:
+            return False
+    else:
+        seen_ids[speech_id] = None
+        while len(seen_ids) > _SPEAKER_FAILURE_DEDUPE_LIMIT:
+            del seen_ids[next(iter(seen_ids))]
+    return True
+
+
+def speaker_chunk_from_message(msg) -> dict:
+    """Validate an AudioChunk and retain optional utterance metadata."""
+    metadata = parse_audio_format(str(msg.format))
+    if metadata.base_format not in _SUPPORTED_SPEAKER_FORMATS:
+        raise ValueError(f"unsupported audio format: {metadata.base_format!r}")
+    if not metadata.valid:
+        raise ValueError(metadata.error or "invalid playback metadata")
+    return {"pcm": bytes(msg.data), "metadata": metadata}
 
 
 class BridgeWorker:
@@ -51,6 +118,9 @@ class BridgeWorker:
         self._media_lock = threading.Lock()
         self._audio_q = self._ctx.Queue(maxsize=100)
         self._speaker_q = self._ctx.Queue(maxsize=64)
+        self._speaker_fail_q = self._ctx.Queue(maxsize=64)
+        self._speaker_fail_epoch = self._ctx.Value("q", -1)
+        self._speaker_seen_fail_epoch = -1
         self._proc = None
         self._debug = debug
         self._namespace = namespace
@@ -60,6 +130,7 @@ class BridgeWorker:
         self._proc = self._ctx.Process(
             target=_run_bridge_subprocess,
             args=(self._cmd_q, self._sensor_q, self._media_qs, self._audio_q, self._speaker_q,
+                  self._speaker_fail_q, self._speaker_fail_epoch,
                   self._debug, self._namespace),
             name="q5_bridge_worker", daemon=True,
         )
@@ -110,6 +181,28 @@ class BridgeWorker:
         except Exception:
             pass
 
+    def publish_speaker_event(self, event: dict):
+        try:
+            self._cmd_q.put_nowait({"kind": "speaker_event", "event": dict(event)})
+        except Exception:
+            pass
+
+    def pop_speaker_failure(self):
+        with self._speaker_fail_epoch.get_lock():
+            failed_epoch = int(self._speaker_fail_epoch.value)
+        if failed_epoch > self._speaker_seen_fail_epoch:
+            self._speaker_seen_fail_epoch = failed_epoch
+            return {
+                "fail_all": True,
+                "through_epoch": failed_epoch,
+                "code": "SPEAKER_FAILURE_QUEUE_OVERFLOW",
+                "message": "speaker failure notification queue overloaded",
+            }
+        try:
+            return self._speaker_fail_q.get_nowait()
+        except queue.Empty:
+            return None
+
     def pop_speaker_chunk(self):
         try:
             return self._speaker_q.get_nowait()
@@ -130,7 +223,9 @@ class BridgeWorker:
 
 
 def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_qs: dict[str, mp.Queue],
-                           audio_q: mp.Queue, speaker_q: mp.Queue, debug: bool, namespace: str):
+                           audio_q: mp.Queue, speaker_q: mp.Queue,
+                          speaker_fail_q: mp.Queue, speaker_fail_epoch,
+                          debug: bool, namespace: str):
     """Subprocess entry point — runs in separate process with own DDS domain."""
     try:
         from common import logsafe
@@ -205,6 +300,8 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_qs: dict[s
     pub_depth = node.create_publisher(Image, f"{prefix}/camera/depth", QOS_MEDIA)
     pub_depth_preview = node.create_publisher(CompressedImage, f"{prefix}/camera/depth_preview", QOS_MEDIA)
     pub_pointcloud = node.create_publisher(UInt8MultiArray, f"{prefix}/camera/pointcloud", QOS_MEDIA)
+    pub_speaker_events = node.create_publisher(
+        String, f"{prefix}/speaker/playback_events", QOS_MEDIA)
     # Audio is a live lossy stream. Match the audio cards used by the other
     # drivers so Agent Core/FastDDS subscribers can request BEST_EFFORT without
     # a reliability negotiation mismatch or unnecessary retransmission delay.
@@ -215,41 +312,69 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_qs: dict[s
     speaker_duplicate_frames_dropped = 0
     last_speaker_digest = b""
     last_speaker_frame_at = 0.0
-
-    supported_audio_formats = {"audio/pcm-16k", "pcm_16k_16bit_mono"}
+    invalid_format_count = 0
+    last_invalid_format_warning_at = None
+    speaker_failed_ids = {}
+    speaker_epoch = int(speaker_fail_epoch.value) + 1
 
     def _on_speaker(msg):
         nonlocal speaker_frames_received, speaker_duplicate_frames_dropped
         nonlocal last_speaker_digest, last_speaker_frame_at
+        nonlocal invalid_format_count, last_invalid_format_warning_at
+        nonlocal speaker_epoch
         # Agent Core's remote microphone uses pcm_16k_16bit_mono while
         # perception TTS uses audio/pcm-16k. Both carry S16_LE, 16 kHz mono.
-        if msg.format not in supported_audio_formats:
-            node.get_logger().warning(
-                f"speaker ignored unsupported audio format: {msg.format!r}")
-            return
         try:
-            pcm = bytes(msg.data)
+            item = speaker_chunk_from_message(msg)
+            if (item["metadata"].tracked
+                    and item["metadata"].speech_id in speaker_failed_ids):
+                return
+            item["speaker_epoch"] = speaker_epoch
+            pcm = item["pcm"]
             # Two phanthy_bus_bridge publishers were observed on connected
             # browser-mic topics.  They can relay the exact same packet within
             # milliseconds; submitting both makes live speech garbled.  Do not
             # collapse regular repeated samples (such as silence), only an
             # identical packet that arrives in this short duplicate window.
-            now = time.monotonic()
-            digest = hashlib.blake2s(pcm, digest_size=8).digest()
-            browser_frame = msg.header.stamp.sec == 0 and msg.header.stamp.nanosec == 0
-            if (browser_frame and digest == last_speaker_digest
-                    and now - last_speaker_frame_at < 0.02):
-                speaker_duplicate_frames_dropped += 1
+            if not item["metadata"].tracked:
+                now = time.monotonic()
+                digest = hashlib.blake2s(pcm, digest_size=8).digest()
+                browser_frame = msg.header.stamp.sec == 0 and msg.header.stamp.nanosec == 0
+                if (browser_frame and digest == last_speaker_digest
+                        and now - last_speaker_frame_at < 0.02):
+                    speaker_duplicate_frames_dropped += 1
+                    return
+                last_speaker_digest = digest
+                last_speaker_frame_at = now
+            try:
+                speaker_q.put_nowait(item)
+            except queue.Full:
+                # Do not lose tracked EOF or other tracked chunks silently.
+                if item["metadata"].tracked:
+                    _queue_speaker_failure(speaker_fail_q, {
+                        "speech_id": item["metadata"].speech_id,
+                        "speaker_epoch": speaker_epoch,
+                        "code": "SPEAKER_QUEUE_OVERFLOW",
+                        "message": "tracked speaker chunk dropped because the queue is full",
+                    }, speaker_failed_ids, speaker_fail_epoch)
+                    speaker_epoch += 1
                 return
-            last_speaker_digest = digest
-            last_speaker_frame_at = now
-            speaker_q.put_nowait(pcm)
             speaker_frames_received += 1
             if speaker_frames_received == 1:
                 node.get_logger().info("speaker received first PCM frame")
             elif speaker_duplicate_frames_dropped and speaker_frames_received % 100 == 0:
                 node.get_logger().info(
                     f"speaker dropped {speaker_duplicate_frames_dropped} duplicate PCM frames")
+        except ValueError:
+            invalid_format_count += 1
+            now = time.monotonic()
+            if (last_invalid_format_warning_at is None
+                    or now - last_invalid_format_warning_at >= 5.0):
+                node.get_logger().warning(
+                    f"speaker rejected {invalid_format_count} chunks with "
+                    "unsupported audio format or invalid metadata")
+                invalid_format_count = 0
+                last_invalid_format_warning_at = now
         except Exception:
             pass
 
@@ -392,6 +517,8 @@ def _run_bridge_subprocess(cmd_q: mp.Queue, sensor_q: mp.Queue, media_qs: dict[s
                     AudioChunk, str(cmd["topic"]), _on_speaker, QOS_AUDIO)
                 node.get_logger().info(
                     f"speaker subscribed to {cmd['topic']} (BEST_EFFORT)")
+            elif isinstance(cmd, dict) and cmd.get("kind") == "speaker_event":
+                _publish_json(pub_speaker_events, cmd.get("event") or {})
             elif debug:
                 node.get_logger().debug(f"bridge cmd: {cmd}")
         except Exception:
