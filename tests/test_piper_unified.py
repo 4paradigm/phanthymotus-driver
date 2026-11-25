@@ -70,7 +70,7 @@ class UnifiedTests(unittest.TestCase):
     def test_three_card_schema_topics_and_legacy_request_rejection(self):
         self.config['camera'] = {'live': {'enabled': True}}
         tools = {t['name']: t for t in self.bundle.get_all_tools()}
-        self.assertEqual(set(tools), {'arm_control', 'joints', 'model', 'piper_photo', 'piper_camera_live'})
+        self.assertEqual(set(tools), {'arm_control', 'joints', 'model', 'piper_photo', 'piper_camera_live', 'piper_health'})
         arm = tools['arm_control']
         self.assertEqual(arm['title'], 'Arm control')
         schema = arm['inputSchema']
@@ -84,7 +84,11 @@ class UnifiedTests(unittest.TestCase):
         self.assertEqual(tools['joints']['topic_out'][0]['format'], 'sensor/skeleton')
         self.assertEqual(tools['joints']['title'], 'Joints')
         self.assertEqual(tools['joints']['type'], 'sensor')
-        self.assertFalse(any(t['format'] == 'data/json' for tool in tools.values() for t in tool.get('topic_out', [])))
+        self.assertEqual(tools['piper_health']['type'], 'sensor')
+        self.assertEqual(tools['piper_health']['topic_out'], [
+            {'topic': '/piper_arm1/piper/state/health', 'format': 'data/json'}])
+        self.assertFalse(any(t['format'] == 'data/json' for name, tool in tools.items()
+                             if name != 'piper_health' for t in tool.get('topic_out', [])))
         self.assertIn('tip-relative', arm['description'])
         self.assertIn('Every control action first exits', arm['description'])
         for old in ('move_forward', 'exit_teaching_and_hold', 'enable', 'switch', 'move_joint', 'set_position', 'open_gripper', 'close_gripper'):
@@ -107,6 +111,15 @@ class UnifiedTests(unittest.TestCase):
         self.assertEqual(len(info['snapshot']['tip_pose_mm_deg']), 6)
         self.assertEqual(len(info['snapshot']['joint_limits_deg']), 6)
         self.assertIn('urdf', self.bundle.dispatch('model', {}))
+        self.assertEqual(self.sdk.calls, [])
+
+    def test_disconnected_info_remains_available_for_core_discovery(self):
+        self.runtime.disconnect()
+        with patch.object(self.runtime, 'connected', side_effect=AssertionError('Info must not reconnect')):
+            info = self.call('info')
+        self.assertFalse(info['snapshot']['connected'])
+        self.assertFalse(info['snapshot']['fresh'])
+        self.assertFalse(info['snapshot']['controller_recovery']['required'])
         self.assertEqual(self.sdk.calls, [])
 
     def test_tip_axes_follow_rotation_in_all_six_directions(self):
