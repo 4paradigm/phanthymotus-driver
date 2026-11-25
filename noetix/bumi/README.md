@@ -561,36 +561,47 @@ whole-image delta has not been measured yet: do not publish a
 `INSTALL_POSE_DEPS=1` image until the ARM64 `docker inspect` numbers are
 recorded in that file.** Publishing the default image is unaffected.
 
-### `upper_body_mirror` — driving the arms
+### `upper_body_mimic` — driving the arms
 
 The second card closes the loop: it subscribes to the angles topic above and
 commands the arms. It is **disabled by default**, and it is **not** an
 arm-only card.
 
 `LowController.set_joint` accepts exactly 21 motor commands — any other length
-raises — so every tick this card sends all 21: the fifteen joints it does not
-track hold the position they are measured at, and the six arm joints follow the
-operator. Sending 21 commands means taking the motors from whatever drove them
-before, so the card says plainly what it is: a whole-body takeover that keeps
-the legs still and implements no balance controller. Arm swings still move the
-centre of mass; the first runs belong on a supported robot.
+raises — so every tick this card sends all 21: the thirteen leg/waist joints
+and the two shoulder-yaw joints (humeral rotation is invisible to a monocular
+camera) hold their measured position, and the six observable arm joints follow
+the operator. Sending 21 commands means taking the motors from whatever drove
+them before, so the card says plainly what it is: a whole-body takeover that
+keeps the legs still and implements no balance controller. Arm swings still
+move the centre of mass; the first runs belong on a supported robot.
 
 What it does to stay inside that envelope:
 
-- targets are clamped inside the mechanical stops with a 10° margin, so the
-  elbow never fully straightens;
-- every axis is rate limited (30°/s by default), applied to the commanded pose
-  rather than trusting the upstream filter to have smoothed enough;
-- the first command after `start` is the pose the arm is already in, so
-  enabling the card is never itself a movement;
-- once mirroring has begun, an operator missing for `lost_timeout_s` makes the
-  arms drift back to zero at the same rate limit instead of freezing in
-  mid-air; a card started with nobody in frame simply holds;
-- workmode 26 (protection), a missing controller, and an SDK failure all refuse
-  to command rather than retrying into a robot that has said no.
+- mechanical stops are read from the shipped `resource/bumi_model.urdf` (all
+  eight arm joints, yaw included), with a 10° inward margin so the elbow never
+  fully straightens;
+- motion follows PR #485's preview bounds: **2 rad/s velocity and 6 rad/s²
+  acceleration** per joint, applied to the commanded pose with a trapezoidal
+  profile that brakes before the stop instead of reversing instantly;
+- the first command starts from the measured pose at zero velocity, so
+  enabling the card never snaps the arms to zero;
+- `tracked: false`, a missing or non-finite axis, or a stream older than
+  `lost_timeout_s` returns the arms to the **safe pose** (arms down, elbow
+  slightly bent). The last human command is never held;
+- only workmode 2 (`walking`) is allowed, checked on every tick. Any exit —
+  protection (26), disabled (30), unreadable mode — stops commanding and needs
+  a fresh `start`;
+- `dds_contention_verified: true` is mandatory before `start`. The operator
+  must first confirm on the real robot that `LowController` and
+  `HighController` do not fight over DDS; software cannot prove this, so the
+  switch is deliberately manual and defaults to false;
+- a missing controller and an SDK failure refuse to command rather than
+  retrying into a robot that has said no.
 
-Rate, timeout, margin and the four gains live in `config.yaml`. The angle source
-defaults to `/{namespace}/upper_body_track/angles`; `start` takes an
-`angles_topic` override for wiring a different source. Setting
-`send_commands: false` runs the whole pipeline and skips only `set_joint`, which
-is how to check the mapping and the limits without letting the robot move.
+Velocity, acceleration, timeout, margin and the four gains live in
+`config.yaml`. The angle source defaults to `/{namespace}/upper_body_track/angles`;
+`start` takes an `angles_topic` override for wiring a different source. Setting
+`send_commands: false` runs the whole pipeline and skips only `set_joint`:
+recorded angles-topic frames can be republished to that topic as a **DryRun
+replay** to check mapping, limits and trajectories without moving the robot.

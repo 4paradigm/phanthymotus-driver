@@ -151,7 +151,7 @@ RUN cd /work/noetix_sdk_bumi && \
     make -j$(nproc) highcontrol_py lowcontrol_py mediacontrol_py && \
     echo "[build] pybind modules built successfully"
 
-# Verify .so files exist. `lowcontrol_py` is what `upper_body_mirror` needs to
+# Verify .so files exist. `lowcontrol_py` is what `upper_body_mimic` needs to
 # command the motors; without it that card starts and immediately reports
 # "low-level SDK unavailable", which is a card that can never move the robot.
 RUN ls /work/noetix_sdk_bumi/build/highcontrol_py*.so && \
@@ -180,8 +180,8 @@ COPY sound_direction.py /work/sound_direction.py
 COPY direction_card.py /work/direction_card.py
 COPY upper_body_track_spec.py /work/upper_body_track_spec.py
 COPY upper_body_track_card.py /work/upper_body_track_card.py
-COPY upper_body_mirror_spec.py /work/upper_body_mirror_spec.py
-COPY upper_body_mirror_card.py /work/upper_body_mirror_card.py
+COPY upper_body_mimic_spec.py /work/upper_body_mimic_spec.py
+COPY upper_body_mimic_card.py /work/upper_body_mimic_card.py
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/
 

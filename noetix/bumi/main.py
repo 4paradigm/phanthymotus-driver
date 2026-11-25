@@ -201,19 +201,19 @@ class BumiDeviceBundle:
                 plugins_cfg["upper_body_track"], namespace, executor))
             print("[bundle] UpperBodyTrackPlugin loaded")
 
-        if plugins_cfg.get("upper_body_mirror", {}).get("enabled", False):
+        if plugins_cfg.get("upper_body_mimic", {}).get("enabled", False):
             # Unlike the tracking card above, this one *writes* motors, so it is
             # gated on the controller existing — the guidance that a card which
             # reports a subsystem must not be gated on it, but a card that acts
             # on a subsystem must be. Without a controller there is nothing to
             # command, and the card would report "ready" while doing nothing.
             if high_ctrl is None:
-                print("[bundle] UpperBodyMirrorPlugin skipped: no high controller")
+                print("[bundle] UpperBodyMimicPlugin skipped: no high controller")
             else:
-                from upper_body_mirror_card import UpperBodyMirrorPlugin
-                self._plugins.append(UpperBodyMirrorPlugin(
-                    plugins_cfg["upper_body_mirror"], namespace, executor, high_ctrl))
-                print("[bundle] UpperBodyMirrorPlugin loaded")
+                from upper_body_mimic_card import UpperBodyMimicPlugin
+                self._plugins.append(UpperBodyMimicPlugin(
+                    plugins_cfg["upper_body_mimic"], namespace, executor, high_ctrl))
+                print("[bundle] UpperBodyMimicPlugin loaded")
 
         if plugins_cfg.get("motion_state", {}).get("enabled", False) and high_ctrl is not None:
             from device import MotionStatePlugin

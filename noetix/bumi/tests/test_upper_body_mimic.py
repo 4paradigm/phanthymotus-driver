@@ -1,6 +1,6 @@
 """The mirror card's rules, exercised off a robot.
 
-`upper_body_mirror_spec` imports no ROS and no SDK, so most of this runs with
+`upper_body_mimic_spec` imports no ROS and no SDK, so most of this runs with
 nothing installed. What is worth pinning down is not that the list has 21 items
 but the four decisions that would fail *silently* on real hardware:
 
@@ -22,7 +22,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import upper_body_mirror_spec as spec  # noqa: E402
+import upper_body_mimic_spec as spec  # noqa: E402
 
 
 def _measured(*arm_radians):
@@ -132,53 +132,59 @@ def test_the_elbow_never_fully_straightens():
     A fully extended elbow is the pose closest to a singularity, and it is also
     where an overshoot has no structure left to absorb it.
     """
-    assert spec.clamp_arm("left", "elbow", 0.0) == pytest.approx(-10.0)
-    assert spec.clamp_arm("left", "elbow", 40.0) == pytest.approx(-10.0)
-    assert spec.clamp_arm("left", "elbow", -200.0) == pytest.approx(-119.0)
+    elbow_low, elbow_high = spec.HARD_LIMIT_DEG["left"]["elbow"]
+    bent = elbow_high - spec.LIMIT_MARGIN_DEG
+    stop = elbow_low + spec.LIMIT_MARGIN_DEG
+    assert spec.clamp_arm("left", "elbow", 0.0) == pytest.approx(bent)
+    assert spec.clamp_arm("left", "elbow", 40.0) == pytest.approx(bent)
+    assert spec.clamp_arm("left", "elbow", -200.0) == pytest.approx(stop)
 
 
 def test_the_two_arms_have_mirrored_roll_limits():
     """-100 is out of range on the left and legal on the right.
 
-    The margin is applied *inward*: the left roll range is (-8, 111), so the
-    lower stop becomes 2, not -18. Reading the sign of the margin wrong here is
-    how a clamp silently allows the arm to cross its own body.
+    The margin is applied *inward*: the left roll lower stop moves up by the
+    margin, not down. Reading the sign wrong lets the arm cross its own body.
     """
-    assert spec.clamp_arm("left", "roll", -100.0) == pytest.approx(2.0)
+    left_low = spec.HARD_LIMIT_DEG["left"]["roll"][0] + spec.LIMIT_MARGIN_DEG
+    right_high = spec.HARD_LIMIT_DEG["right"]["roll"][1] - spec.LIMIT_MARGIN_DEG
+    assert spec.clamp_arm("left", "roll", -100.0) == pytest.approx(left_low)
     assert spec.clamp_arm("right", "roll", -100.0) == pytest.approx(-100.0)
-    assert spec.clamp_arm("right", "roll", 100.0) == pytest.approx(-2.0)
+    assert spec.clamp_arm("right", "roll", 100.0) == pytest.approx(right_high)
 
 
 def test_a_margin_wide_enough_to_invert_a_range_collapses_to_the_midpoint():
+    low_raw, high_raw = spec.HARD_LIMIT_DEG["right"]["roll"]
     low, high = spec._effective_range("right", "roll", 80.0)
-    assert low == high == pytest.approx((-111.0 + 80.0 + 8.0 - 80.0) / 2.0)
+    assert low == high == pytest.approx((low_raw + high_raw) / 2.0)
 
 
 # ── missing and unmeasured axes ──────────────────────────────────────────────
 
-def test_an_unmeasured_arm_holds_instead_of_driving_to_zero():
-    """-999 is the tracker's 'never measured'; it is not a target angle."""
+def test_an_unmeasured_arm_returns_to_the_safe_pose():
+    """-999 means 'never measured'; keeping the old command would freeze an
+    arm in a pose the camera can no longer see."""
     measured = _measured(0.2, 0.3, 0.4, 0.5, 0.6, 0.7)
     targets = _targets(l_pitch=spec.UNMEASURED_DEG, r_pitch=20.0)
     commands = spec.build_joint_commands(
         measured, targets,
         keep_kp=10.0, keep_kd=0.5, arm_kp=5.0, arm_kd=0.5)
-    assert commands[0]["pos"] == measured[0]
-    assert commands[0]["kp"] == 10.0
+    assert commands[0]["pos"] == pytest.approx(math.radians(0.0))
+    assert commands[0]["kp"] == 5.0
     assert commands[10]["pos"] == pytest.approx(math.radians(20.0))
 
 
-def test_a_missing_field_reads_as_unmeasured_not_as_zero():
+def test_a_missing_field_returns_to_the_safe_pose():
     targets = spec.targets_from_payload({"tracked": True, "l_pitch_deg": 12.0})
     assert targets["l_pitch"] == pytest.approx(12.0)
-    assert targets["l_roll"] == spec.UNMEASURED_DEG
-    assert targets["r_elbow"] == spec.UNMEASURED_DEG
+    assert targets["l_roll"] == pytest.approx(0.0)
+    assert targets["r_elbow"] == pytest.approx(0.0)
 
 
-def test_a_non_numeric_field_is_unmeasured_rather_than_an_exception():
+def test_a_non_numeric_field_returns_to_the_safe_pose():
     targets = spec.targets_from_payload({"l_pitch_deg": None, "r_pitch_deg": "abc"})
-    assert targets["l_pitch"] == spec.UNMEASURED_DEG
-    assert targets["r_pitch"] == spec.UNMEASURED_DEG
+    assert targets["l_pitch"] == pytest.approx(0.0)
+    assert targets["r_pitch"] == pytest.approx(0.0)
 
 
 def test_a_payload_that_is_not_an_object_is_rejected():
@@ -186,36 +192,86 @@ def test_a_payload_that_is_not_an_object_is_rejected():
         spec.targets_from_payload([1, 2, 3])
 
 
-# ── rate limiting ────────────────────────────────────────────────────────────
+# ── dynamics: PR #485's 2 rad/s and 6 rad/s² ─────────────────────────────────
 
-def test_the_rate_limit_steps_toward_the_target_without_overshooting():
-    assert spec.step_toward(0.0, 30.0, 0.6) == pytest.approx(0.6)
-    assert spec.step_toward(0.0, 0.2, 0.6) == pytest.approx(0.2)
-    assert spec.step_toward(0.0, -30.0, 0.6) == pytest.approx(-0.6)
-
-
-def test_thirty_degrees_a_second_at_fifty_hertz_is_point_six_a_tick():
-    assert spec.max_step_for(30.0, 50.0) == pytest.approx(0.6)
+def test_the_preview_bounds_are_used_in_degrees():
+    assert spec.MAX_VELOCITY_RAD_S == pytest.approx(2.0)
+    assert spec.MAX_ACCELERATION_RAD_S2 == pytest.approx(6.0)
+    assert spec.MAX_VELOCITY_DEG_S == pytest.approx(math.degrees(2.0))
+    assert spec.MAX_ACCELERATION_DEG_S2 == pytest.approx(math.degrees(6.0))
 
 
-def test_the_same_rate_limit_moves_less_per_tick_at_a_higher_rate():
-    slow = spec.max_step_for(30.0, 10.0)
-    fast = spec.max_step_for(30.0, 50.0)
-    assert slow > fast
-    assert slow == pytest.approx(3.0)
-    assert fast == pytest.approx(0.6)
+def test_acceleration_is_limited_before_velocity():
+    dt = 0.02
+    position, velocity = spec.step_with_accel(
+        0.0, 0.0, 1000.0, dt, spec.MAX_VELOCITY_DEG_S,
+        spec.MAX_ACCELERATION_DEG_S2)
+    assert velocity == pytest.approx(spec.MAX_ACCELERATION_DEG_S2 * dt)
+    assert position == pytest.approx(velocity * dt)
 
 
-def test_a_zero_rate_limit_is_rejected_rather_than_free_running():
-    with pytest.raises(ValueError):
-        spec.max_step_for(0.0, 50.0)
+def test_velocity_never_exceeds_the_bound():
+    velocity = 0.0
+    position = 0.0
+    for _ in range(200):
+        position, velocity = spec.step_with_accel(
+            position, velocity, 1000.0, 0.02,
+            spec.MAX_VELOCITY_DEG_S, spec.MAX_ACCELERATION_DEG_S2)
+        assert abs(velocity) <= spec.MAX_VELOCITY_DEG_S + 1e-9
+    assert velocity == pytest.approx(spec.MAX_VELOCITY_DEG_S)
+
+
+def test_the_axis_brakes_instead_of_overshooting_the_target():
+    """A trapezoid must decelerate in time; a naive limiter slams the stop."""
+    position, velocity = 0.0, spec.MAX_VELOCITY_DEG_S
+    for _ in range(30):
+        position, velocity = spec.step_with_accel(
+            position, velocity, 30.0, 0.02,
+            spec.MAX_VELOCITY_DEG_S, spec.MAX_ACCELERATION_DEG_S2)
+        assert position <= 30.0 + 1e-9
+    assert position == pytest.approx(30.0)
+
+
+def test_reversing_direction_pays_the_acceleration_cost():
+    """Instant reversal at the top of a swing is the jerk the bound removes."""
+    position, velocity = 0.0, 0.0
+    for _ in range(20):
+        position, velocity = spec.step_with_accel(
+            position, velocity, 1000.0, 0.02,
+            spec.MAX_VELOCITY_DEG_S, spec.MAX_ACCELERATION_DEG_S2)
+    assert velocity > 0.0, "the axis never got moving"
+    back_position, back_velocity = spec.step_with_accel(
+        position, velocity, 0.0, 0.02, spec.MAX_VELOCITY_DEG_S,
+        spec.MAX_ACCELERATION_DEG_S2)
+    assert back_velocity > 0.0, "velocity must not flip in one tick"
+    assert back_position > position, "direction must not reverse instantly"
 
 
 def test_the_limit_is_applied_to_every_axis_at_once():
     current = dict(spec.ZERO_TARGETS_DEG)
-    desired = {key: 100.0 for key in spec.ZERO_TARGETS_DEG}
-    stepped = spec.rate_limited_targets(current, desired, 0.6)
-    assert all(value == pytest.approx(0.6) for value in stepped.values())
+    desired = {key: 1000.0 for key in spec.ZERO_TARGETS_DEG}
+    positions, velocities = spec.accel_limited_targets(current, {}, desired, 0.02)
+    assert len(positions) == 6
+    assert len(velocities) == 6
+    assert all(value > 0.0 for value in positions.values())
+
+
+def test_bounds_are_read_from_the_urdf_not_a_guessed_table():
+    assert spec.URDF_LIMITS_LOADED is True, spec.URDF_LIMITS_ERROR
+    assert spec.HARD_LIMIT_DEG["left"]["pitch"][0] == pytest.approx(
+        math.degrees(-2.36), abs=0.1)
+    assert spec.HARD_LIMIT_DEG["right"]["roll"][1] == pytest.approx(
+        math.degrees(0.14), abs=0.1)
+    # Shoulder yaw is one of the eight URDF joints even though the card holds it.
+    assert "yaw" in spec.HARD_LIMIT_DEG["left"]
+
+
+def test_trajectory_targets_are_clamped_inside_the_urdf_stops():
+    clamped = spec.clamp_targets({"l_pitch": 1000.0, "l_roll": -1000.0})
+    assert clamped["l_pitch"] == pytest.approx(
+        spec.HARD_LIMIT_DEG["left"]["pitch"][1] - spec.LIMIT_MARGIN_DEG)
+    assert clamped["l_roll"] == pytest.approx(
+        spec.HARD_LIMIT_DEG["left"]["roll"][0] + spec.LIMIT_MARGIN_DEG)
 
 
 # ── first command ────────────────────────────────────────────────────────────
@@ -280,8 +336,8 @@ def _load_card_module(monkeypatch):
     ):
         monkeypatch.setitem(sys.modules, name, module)
 
-    path = Path(__file__).resolve().parent.parent / "upper_body_mirror_card.py"
-    module_spec = importlib.util.spec_from_file_location("upper_body_mirror_card", path)
+    path = Path(__file__).resolve().parent.parent / "upper_body_mimic_card.py"
+    module_spec = importlib.util.spec_from_file_location("upper_body_mimic_card", path)
     module = importlib.util.module_from_spec(module_spec)
     module_spec.loader.exec_module(module)
     return module
@@ -338,8 +394,11 @@ def _plugin(monkeypatch, *, mode=2, pose=None, config=None):
     card = _load_card_module(monkeypatch)
     high = _FakeHighCtrl(mode=mode, pose=pose)
     low = _FakeLowCtrl()
-    plugin = card.UpperBodyMirrorPlugin(
-        config or {}, "bumi", types.SimpleNamespace(add_node=lambda *_: None),
+    # Every ordinary test has already done the operator sign-off; the gate
+    # itself has its own explicit regression below.
+    settings = {"dds_contention_verified": True, **(config or {})}
+    plugin = card.UpperBodyMimicPlugin(
+        settings, "bumi", types.SimpleNamespace(add_node=lambda *_: None),
         high_ctrl=high)
     # The SDK probe would try to import the ARM64 bindings; the fake replaces
     # both halves of `_ensure_low_level`.
@@ -370,10 +429,10 @@ def test_the_tool_is_an_actuator_that_declares_the_motors_it_takes(monkeypatch):
     two cards cannot quietly fight for the same motors.
     """
     card = _load_card_module(monkeypatch)
-    plugin = card.UpperBodyMirrorPlugin(
+    plugin = card.UpperBodyMimicPlugin(
         {}, "bumi", types.SimpleNamespace(add_node=lambda *_: None))
     tool = plugin.get_tool()
-    assert tool["name"] == "upper_body_mirror"
+    assert tool["name"] == "upper_body_mimic"
     assert tool["type"] == "actuator"
     assert tool["topic_out"] == []
     assert tool["inputSchema"]["x-resource"] == ["base", "arm_l", "arm_r"]
@@ -381,29 +440,53 @@ def test_the_tool_is_an_actuator_that_declares_the_motors_it_takes(monkeypatch):
     assert tool["inputSchema"]["required"] == ["action"]
 
 
-def test_start_refuses_in_protection_mode(monkeypatch):
-    """Workmode 26 is the robot's own fault call; taking the motors undoes it."""
+def test_start_refuses_outside_walking_mode(monkeypatch):
+    """Only workmode=2 is permitted — protection and disabled are not 'close'."""
     _card, plugin, _high, low = _plugin(monkeypatch, mode=26)
     result = plugin.dispatch("start", {})
     assert result["state"] == "error"
-    assert "protection" in result["error"]
+    assert "only workmode=2" in result["error"]
     assert low.calls == []
+
+
+def test_start_refuses_without_the_dds_sign_off(monkeypatch):
+    """The operator must confirm Low/High coexistence before any motion."""
+    card = _load_card_module(monkeypatch)
+    high = _FakeHighCtrl(mode=2, pose=[0.0] * 21)
+    plugin = card.UpperBodyMimicPlugin(
+        {}, "bumi", types.SimpleNamespace(add_node=lambda *_: None), high_ctrl=high)
+    result = plugin.dispatch("start", {})
+    assert result["state"] == "error"
+    assert "DDS contention not verified" in result["error"]
+
+
+def test_start_refuses_when_the_urdf_limits_are_missing(monkeypatch):
+    """Guessed mechanical stops are not acceptable on a real robot."""
+    card = _load_card_module(monkeypatch)
+    monkeypatch.setattr(card.spec, "URDF_LIMITS_LOADED", False)
+    high = _FakeHighCtrl(mode=2, pose=[0.0] * 21)
+    plugin = card.UpperBodyMimicPlugin(
+        {"dds_contention_verified": True}, "bumi",
+        types.SimpleNamespace(add_node=lambda *_: None), high_ctrl=high)
+    result = plugin.dispatch("start", {})
+    assert result["state"] == "error"
+    assert "URDF limits unavailable" in result["error"]
 
 
 def test_start_refuses_without_a_controller(monkeypatch):
     card = _load_card_module(monkeypatch)
-    plugin = card.UpperBodyMirrorPlugin(
+    plugin = card.UpperBodyMimicPlugin(
         {}, "bumi", types.SimpleNamespace(add_node=lambda *_: None), high_ctrl=None)
     result = plugin.dispatch("start", {})
     assert result["state"] == "error"
     assert "controller" in result["error"]
 
 
-def test_start_begins_from_the_current_pose_without_moving(monkeypatch):
-    """The first command must equal the measured pose, not the zero target.
+def test_start_begins_from_the_current_pose_without_a_jump(monkeypatch):
+    """The first command must start at the measured pose, not at zero.
 
-    Each axis gets a value inside its own effective range, because a measured
-    angle outside a limit is meant to be clamped — that is the clamp working.
+    With a 6 rad/s² bound the first tick advances only one acceleration step;
+    that is the smooth start the bound exists for, not the old "snap to zero".
     """
     pose = [0.5] * 21
     inside_range = {
@@ -428,8 +511,9 @@ def test_start_begins_from_the_current_pose_without_moving(monkeypatch):
         assert low.calls, "control loop never sent a command"
         first = low.calls[0]
         assert len(first) == 21
+        one_step = spec.MAX_ACCELERATION_RAD_S2 / (plugin._control_hz ** 2)
         for index in spec.ARM_INDEXES:
-            assert first[index].pos == pytest.approx(pose[index], abs=1e-3)
+            assert first[index].pos == pytest.approx(pose[index], abs=one_step + 1e-3)
     finally:
         plugin.dispatch("stop", {})
 
@@ -437,9 +521,8 @@ def test_start_begins_from_the_current_pose_without_moving(monkeypatch):
 def test_a_lost_operator_drifts_back_toward_zero(monkeypatch):
     """Freezing an arm in mid-air is the failure this replaces.
 
-    Drift-back starts only after mirroring has actually begun — a card started
-    with nobody in frame holds instead of lowering the arms. So the operator is
-    delivered first, then the stream goes silent and the timeout expires.
+    Deliver the operator first, then let the stream go silent and the timeout
+    expire; the command must walk back to the safe pose rather than hold.
     """
     import json
     import time
@@ -468,8 +551,8 @@ def test_a_lost_operator_drifts_back_toward_zero(monkeypatch):
         plugin.dispatch("stop", {})
 
 
-def test_a_card_started_with_nobody_in_frame_holds_its_pose(monkeypatch):
-    """Lowering the arms before mirroring began is movement nobody asked for."""
+def test_a_card_started_with_nobody_in_frame_returns_to_the_safe_pose(monkeypatch):
+    """No tracking means no human command to keep: return to the safe pose."""
     import time
 
     pose = [0.0] * 21
@@ -478,9 +561,10 @@ def test_a_card_started_with_nobody_in_frame_holds_its_pose(monkeypatch):
         monkeypatch, pose=pose, config={"lost_timeout_s": 0.1})
     plugin.dispatch("start", {})
     try:
-        time.sleep(0.3)  # well past the lost timeout, but nothing was ever tracked
+        time.sleep(0.3)  # well past the lost timeout, nothing was ever tracked
         assert low.calls, "control loop never sent a command"
-        assert low.calls[-1][0].pos == pytest.approx(math.radians(40.0), abs=1e-3)
+        assert low.calls[-1][0].pos < math.radians(30.0), \
+            "arm did not move toward the safe pose"
         info = plugin.dispatch("info", {})
         assert info["lost"] is True
     finally:
@@ -529,37 +613,39 @@ def test_a_valid_frame_sets_the_targets(monkeypatch):
 
 
 def test_range_checks_raise_instead_of_clamping(monkeypatch):
-    """A 300 deg/s limit is not 'fast', it is the limiter doing nothing."""
+    """A 100 rad/s bound is not 'fast', it is the limiter doing nothing."""
     card = _load_card_module(monkeypatch)
     executor = types.SimpleNamespace(add_node=lambda *_: None)
     with pytest.raises(ValueError):
-        card.UpperBodyMirrorPlugin({"rate_limit_deg_s": 300.0}, "bumi", executor)
+        card.UpperBodyMimicPlugin({"max_velocity_rad_s": 100.0}, "bumi", executor)
     with pytest.raises(ValueError):
-        card.UpperBodyMirrorPlugin({"control_hz": 5.0}, "bumi", executor)
+        card.UpperBodyMimicPlugin({"max_acceleration_rad_s2": 100.0}, "bumi", executor)
     with pytest.raises(ValueError):
-        card.UpperBodyMirrorPlugin({"keep_kp": 0.0}, "bumi", executor)
+        card.UpperBodyMimicPlugin({"control_hz": 5.0}, "bumi", executor)
+    with pytest.raises(ValueError):
+        card.UpperBodyMimicPlugin({"keep_kp": 0.0}, "bumi", executor)
 
 
 # ── non-finite input and feedback ────────────────────────────────────────────
 
-def test_a_nan_payload_axis_is_treated_as_unmeasured():
+def test_a_nan_payload_axis_returns_to_the_safe_pose():
     """NaN compares False against every clamp bound, so it would reach the motor.
 
     `clamp_arm` uses `<` and `>`, both of which are False for NaN, so the value
-    passes through untouched and lands in `MotorCmd.pos`. Treating it like
-    "never measured" holds the joint instead.
+    passes through untouched and lands in `MotorCmd.pos`. Treat it as lost
+    tracking and drive to the safe pose instead.
     """
     targets = spec.targets_from_payload(
         {"l_pitch_deg": float("nan"), "r_pitch_deg": 10.0})
-    assert targets["l_pitch"] == spec.UNMEASURED_DEG
+    assert targets["l_pitch"] == pytest.approx(0.0)
     assert targets["r_pitch"] == pytest.approx(10.0)
 
 
-def test_an_infinite_payload_axis_is_treated_as_unmeasured():
+def test_an_infinite_payload_axis_returns_to_the_safe_pose():
     targets = spec.targets_from_payload(
         {"l_pitch_deg": float("inf"), "r_pitch_deg": float("-inf")})
-    assert targets["l_pitch"] == spec.UNMEASURED_DEG
-    assert targets["r_pitch"] == spec.UNMEASURED_DEG
+    assert targets["l_pitch"] == pytest.approx(0.0)
+    assert targets["r_pitch"] == pytest.approx(0.0)
 
 
 def test_non_finite_measured_positions_are_rejected():
@@ -575,21 +661,21 @@ def test_non_finite_measured_positions_are_rejected():
                                   arm_kp=5.0, arm_kd=0.5)
 
 
-def test_a_non_finite_target_holds_instead_of_reaching_the_motor():
+def test_a_non_finite_target_goes_to_the_safe_pose_not_the_motor():
     measured = _measured(0.2, 0.3, -0.4, 0.5, -0.6, -0.7)
     targets = _targets(l_pitch=float("nan"), r_pitch=float("inf"))
     commands = spec.build_joint_commands(
         measured, targets,
         keep_kp=10.0, keep_kd=0.5, arm_kp=5.0, arm_kd=0.5)
-    assert commands[0]["pos"] == measured[0]
-    assert commands[0]["kp"] == 10.0
-    assert commands[10]["pos"] == measured[10]
+    assert commands[0]["pos"] == pytest.approx(0.0)
+    assert commands[0]["kp"] == 5.0
+    assert commands[10]["pos"] == pytest.approx(0.0)
 
 
-# ── protection mode is not a start-time check ────────────────────────────────
+# ── workmode is not a start-time-only check ──────────────────────────────────
 
-def test_entering_protection_during_a_run_stops_commanding(monkeypatch):
-    """Workmode 26 can arrive mid-run (a fall, a motor fault).
+def test_leaving_walking_mode_during_a_run_stops_commanding(monkeypatch):
+    """Any exit from workmode 2 can arrive mid-run (a fall, an estop).
 
     Re-reading it only at `start` means the loop keeps writing set_joint after
     the robot has said stop — overriding the one safety decision it made alone.
@@ -605,10 +691,10 @@ def test_entering_protection_during_a_run_stops_commanding(monkeypatch):
         time.sleep(0.2)
         info = plugin.dispatch("info", {})
         assert info["state"] == "error"
-        assert "protection" in info["last_error"]
+        assert "workmode left 2" in info["last_error"]
         after = len(low.calls)
         time.sleep(0.2)
-        assert len(low.calls) == after, "kept commanding after protection mode"
+        assert len(low.calls) == after, "kept commanding after workmode exit"
     finally:
         plugin.dispatch("stop", {})
 
@@ -650,3 +736,68 @@ def test_measured_arm_deg_rejects_non_finite_feedback():
     measured[0] = float("nan")
     with pytest.raises(ValueError):
         spec.measured_arm_deg(measured)
+
+
+# ── lifecycle and low-confidence frames ──────────────────────────────────────
+
+def test_repeated_start_stop_never_leaves_two_writers(monkeypatch):
+    """A forgotten worker would keep writing set_joint into the next run."""
+    import time
+
+    _card, plugin, _high, low = _plugin(monkeypatch)
+    workers = []
+    for _ in range(5):
+        plugin.dispatch("start", {})
+        worker = plugin._worker
+        assert worker is not None
+        workers.append(worker)
+        time.sleep(0.03)
+        plugin.dispatch("stop", {})
+        assert worker.is_alive() is False
+        assert plugin._worker is None
+    assert len({id(worker) for worker in workers}) == 5
+    settled = len(low.calls)
+    time.sleep(0.1)
+    assert len(low.calls) == settled, "a stale worker kept commanding"
+
+
+def test_a_low_confidence_frame_drives_back_to_the_safe_pose(monkeypatch):
+    """`tracked=false` is not 'hold': it is lost tracking."""
+    import json
+    import time
+
+    _card, plugin, _high, low = _plugin(monkeypatch)
+    plugin.dispatch("start", {})
+    try:
+        person = json.dumps({
+            "tracked": True,
+            "l_pitch_deg": 60.0, "l_roll_deg": 20.0, "l_elbow_deg": -30.0,
+            "r_pitch_deg": 60.0, "r_roll_deg": -20.0, "r_elbow_deg": -30.0,
+        })
+        plugin._on_angles(types.SimpleNamespace(data=person))
+        time.sleep(0.2)
+        assert low.calls
+        tracked_pose = low.calls[-1][0].pos
+        occluded = json.dumps({
+            "tracked": False,
+            "l_pitch_deg": 60.0, "l_roll_deg": 20.0, "l_elbow_deg": -30.0,
+            "r_pitch_deg": 60.0, "r_roll_deg": -20.0, "r_elbow_deg": -30.0,
+        })
+        plugin._on_angles(types.SimpleNamespace(data=occluded))
+        # The arm must first brake and then reverse; 0.8 s covers both phases
+        # under the 6 rad/s² bound instead of mistaking braking for a hold.
+        time.sleep(0.8)
+        assert low.calls[-1][0].pos < tracked_pose, \
+            "low-confidence frame kept the last human command"
+    finally:
+        plugin.dispatch("stop", {})
+
+
+def test_info_reports_the_safety_sign_off(monkeypatch):
+    _card, plugin, _high, _low = _plugin(monkeypatch)
+    info = plugin.dispatch("info", {})
+    assert info["dds_contention_verified"] is True
+    assert info["urdf_limits_loaded"] is True
+    assert info["walking_mode_ok"] is True
+    assert info["max_velocity_rad_s"] == pytest.approx(2.0)
+    assert info["max_acceleration_rad_s2"] == pytest.approx(6.0)

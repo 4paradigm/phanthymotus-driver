@@ -1,32 +1,37 @@
-"""`upper_body_mirror` — drive Bumi's arms from the `upper_body_track` angles.
+"""`upper_body_mimic` — drive Bumi's arms from the `upper_body_track` angles.
 
 This is the writing half of upper-body mirroring. The read-only card publishes
 six retargeted arm angles; this one turns them into motor commands.
 
 It is not an "arm card", and that distinction matters more than anything else
 in this file. `LowController.set_joint` takes exactly 21 commands — it rejects
-anything else — so every tick this card sends all 21 motors: fifteen hold the
-position they are measured at, six follow the operator. Sending 21 commands
-means taking the motors away from whatever was driving them, which is why the
-plugin is disabled by default, refuses to start in protection mode, and is
-documented as a whole-body takeover rather than an arm feature. The card does
-not implement a balance controller: it holds the legs where they already are
-and relies on the fact that a standing robot whose legs do not move stays
-standing. Large arm swings still shift the centre of mass, so the first runs
-belong on a supported robot.
+anything else — so every tick this card sends all 21 motors: thirteen leg/waist
+joints and the two unobservable shoulder-yaw joints hold their measured
+position, six arm joints follow the operator. Sending 21 commands means taking
+the motors away from whatever was driving them, which is why the plugin is
+disabled by default, requires an explicit DDS sign-off, and is documented as a
+whole-body takeover rather than an arm feature. The card does not implement a
+balance controller: it holds the legs where they already are. Large arm swings
+still shift the centre of mass, so the first runs belong on a supported robot.
 
 Safety properties, each of which has a test:
 
-- rate limited to `rate_limit_deg_s`, applied to the *commanded* pose
-- clamped inside the mechanical stops with a margin
+- workmode must be 2 (`walking`) at start and on every tick; leaving it stops
+  commanding and latches the run as an operator intervention
+- `LowController`/`HighController` coexistence must be verified on the real
+  robot and acknowledged with `dds_contention_verified: true` before `start`
+- 2 rad/s velocity and 6 rad/s² acceleration bounds (PR #485 preview), applied
+  to the commanded pose; mechanical stops come from the shipped URDF
 - the first command after `start` is the pose the arm is already in
-- operator lost from frame → drift back to zero at the same rate limit
-- protection mode, missing controller, and SDK failure all refuse to command
+- lost or low-confidence tracking → return to the safe pose, never hold the
+  last human command
+- missing controller, unreadable workmode and SDK failure all refuse to command
 """
 
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 import sys
 import threading
@@ -36,7 +41,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
 
-import upper_body_mirror_spec as spec
+import upper_body_mimic_spec as spec
 
 # The camera path uses a best-effort, depth-1 subscription so a stalled consumer
 # cannot make the publisher queue frames. The angles topic is published by the
@@ -48,10 +53,12 @@ _LATEST_QOS = QoSProfile(
     durability=DurabilityPolicy.VOLATILE,
 )
 
-#: `device.py`'s `_WORKMODE_NAMES[26]`. In protection mode the robot's own
-#: controller has decided something is wrong; taking the motors anyway would
-#: undo the only safety decision the robot made on its own.
+#: `device.py`'s `_WORKMODE_NAMES`: only walking mode is acceptable. Any exit
+#: from 2 — including protection (26) and disabled (30) — is treated as a
+#: latched operator/robot intervention: the run stops and must be re-armed.
+_WALKING_WORKMODE = 2
 _PROTECTION_WORKMODE = 26
+_DISABLED_WORKMODE = 30
 
 _SDK_PATH = "/work/noetix_sdk_bumi/build"
 
@@ -100,8 +107,8 @@ def _probe_low_level(timeout_s: float = 10.0) -> tuple[bool, str]:
     return False, "LowController probe failed: " + (detail[-1] if detail else "unknown")
 
 
-class UpperBodyMirrorPlugin:
-    PREFIX = "upper_body_mirror"
+class UpperBodyMimicPlugin:
+    PREFIX = "upper_body_mimic"
 
     def __init__(self, plugin_config: dict, namespace: str,
                  executor, high_ctrl=None):
@@ -112,7 +119,16 @@ class UpperBodyMirrorPlugin:
         self._high_ctrl = high_ctrl
 
         self._control_hz = float(cfg.get("control_hz", 50.0))
-        self._rate_limit_deg_s = float(cfg.get("rate_limit_deg_s", 30.0))
+        # PR #485 preview bounds, in rad/s and rad/s²; the spec converts them.
+        self._max_velocity_rad_s = float(cfg.get("max_velocity_rad_s",
+                                                  spec.MAX_VELOCITY_RAD_S))
+        self._max_acceleration_rad_s2 = float(cfg.get(
+            "max_acceleration_rad_s2", spec.MAX_ACCELERATION_RAD_S2))
+        self._max_velocity_deg_s = math.degrees(self._max_velocity_rad_s)
+        self._max_acceleration_deg_s2 = math.degrees(self._max_acceleration_rad_s2)
+        #: The operator must confirm on the real robot that LowController and
+        #: HighController do not fight over DDS before any motion is allowed.
+        self._dds_verified = bool(cfg.get("dds_contention_verified", False))
         self._lost_timeout_s = float(cfg.get("lost_timeout_s", 0.5))
         self._margin_deg = float(cfg.get("limit_margin_deg", spec.LIMIT_MARGIN_DEG))
         self._keep_kp = float(cfg.get("keep_kp", 10.0))
@@ -125,7 +141,7 @@ class UpperBodyMirrorPlugin:
         #: robot without letting it move.
         self._send_commands = bool(cfg.get("send_commands", True))
 
-        self._node = Node("bumi_upper_body_mirror")
+        self._node = Node("bumi_upper_body_mimic")
         executor.add_node(self._node)
 
         self._angles_sub = None
@@ -139,14 +155,9 @@ class UpperBodyMirrorPlugin:
         self._latest_at = 0.0
 
         self._commanded_deg = None
+        self._velocity_deg_s = {key: 0.0 for key in spec.ZERO_TARGETS_DEG}
         self._low_ctrl = None
         self._motor_cmd_cls = None
-
-        #: Whether this run has ever seen a tracked operator. The drift-back
-        #: behaviour only makes sense once mirroring has started: a card that
-        #: was just started with nobody in frame must leave the arms where they
-        #: are, not begin lowering them before it ever knew where "down" was.
-        self._ever_tracked = False
 
         self._status = "idle"
         self._ticks = 0
@@ -162,13 +173,14 @@ class UpperBodyMirrorPlugin:
         """Range checks belong here, not as silent clamps on the way out.
 
         A 200 Hz control loop is not "responsive", it is a budget the process
-        cannot meet; a 300 deg/s limit is not "fast", it is the number at which
-        the limiter stops protecting anything. Both would present as plausible
-        numbers in `info`, which is why they raise instead.
+        cannot meet; a wide velocity/acceleration bound is not "fast", it is
+        the number at which the limiter stops protecting anything. Both would
+        present as plausible numbers in `info`, which is why they raise.
         """
         checks = (
             ("control_hz", self._control_hz, 10.0, 200.0),
-            ("rate_limit_deg_s", self._rate_limit_deg_s, 1.0, 180.0),
+            ("max_velocity_rad_s", self._max_velocity_rad_s, 0.1, 5.0),
+            ("max_acceleration_rad_s2", self._max_acceleration_rad_s2, 0.1, 30.0),
             ("lost_timeout_s", self._lost_timeout_s, 0.1, 5.0),
             ("limit_margin_deg", self._margin_deg, 0.0, 30.0),
         )
@@ -186,16 +198,18 @@ class UpperBodyMirrorPlugin:
 
     def get_tool(self) -> dict:
         return {
-            "name": "upper_body_mirror",
+            "name": "upper_body_mimic",
             "type": "actuator",
             "multiInstance": False,
             "description": (
                 "把人的上半身动作镜像到 Bumi 的手臂上。订阅上半身跟踪卡输出的六个手臂角度，"
-                "每帧下发 21 条电机指令：15 个非手臂关节保持在实测位置，6 个手臂关节跟随人。"
-                "注意：LowController 只接受 21 条指令，所以这张卡在运行时接管了全部电机（包括腿），"
-                "它不做平衡控制，只是让你站着的腿保持不动；手臂大幅摆动仍会改变重心，"
-                "首次运行请确保机器人有支撑。人在画面外超过 lost_timeout 后手臂会按限速缓慢回到零位。"
-                "默认关闭，需在 config.yaml 打开并在画布上显式 start 才会真正下发指令。"
+                "每帧下发 21 条电机指令：13 个腿/腰关节和 2 个单目不可观测的肩关节保持在实测位置，"
+                "6 个手臂关节跟随人。注意：LowController 只接受 21 条指令，所以这张卡在运行时"
+                "接管了全部电机（包括腿），它不做平衡控制；手臂大幅摆动仍会改变重心，"
+                "首次运行请确保机器人有支撑。只在 workmode=2（walking）下运行，离开该模式立即停止；"
+                "跟踪丢失或置信度不足时按 2 rad/s、6 rad/s² 回到安全姿态，不保留上一帧人的命令。"
+                "限位取自机器人 URDF。默认关闭，且必须先在真机确认 LowController 与 HighController"
+                "不抢 DDS 控制权并把 dds_contention_verified 设为 true，才能 start。"
             ),
             "inputSchema": {
                 "type": "object",
@@ -270,12 +284,23 @@ class UpperBodyMirrorPlugin:
             return {"state": "error",
                     "error": "no robot controller: the SDK did not initialise"}
 
+        if not spec.URDF_LIMITS_LOADED:
+            return {"state": "error",
+                    "error": f"URDF limits unavailable: {spec.URDF_LIMITS_ERROR}"}
+        if not self._dds_verified:
+            return {"state": "error",
+                    "error": ("DDS contention not verified: confirm on the real "
+                              "robot that LowController and HighController do "
+                              "not fight, then set dds_contention_verified: true")}
+
         mode = self._read_workmode()
         if mode is None:
             return {"state": "error", "error": "could not read workmode"}
-        if mode == _PROTECTION_WORKMODE:
+        if mode != _WALKING_WORKMODE:
+            name = {_PROTECTION_WORKMODE: "protection",
+                    _DISABLED_WORKMODE: "disabled"}.get(mode, "not walking")
             return {"state": "error", "workmode": mode,
-                    "error": "robot is in protection mode; refusing to take the motors"}
+                    "error": f"robot is {name}; only workmode=2 may be driven"}
 
         error = self._ensure_low_level()
         if error:
@@ -296,11 +321,11 @@ class UpperBodyMirrorPlugin:
         # command would be the rate limiter's first step away from zero, which
         # is a jump the operator never asked for.
         self._commanded_deg = spec.measured_arm_deg(measured)
+        self._velocity_deg_s = {key: 0.0 for key in spec.ZERO_TARGETS_DEG}
         self._angles_topic = topic
         self._ticks = 0
         self._last_error = None
         self._lost = True
-        self._ever_tracked = False
         self._last_workmode = mode
         with self._lock:
             self._latest_targets = dict(spec.ZERO_TARGETS_DEG)
@@ -315,7 +340,7 @@ class UpperBodyMirrorPlugin:
         self._run_token = token
         self._worker = threading.Thread(
             target=self._control_loop, args=(token,),
-            daemon=True, name="upper_body_mirror")
+            daemon=True, name="upper_body_mimic")
         self._worker.start()
 
         self._status = "running"
@@ -324,7 +349,8 @@ class UpperBodyMirrorPlugin:
             "angles_topic": topic,
             "workmode": mode,
             "control_hz": self._control_hz,
-            "rate_limit_deg_s": self._rate_limit_deg_s,
+            "max_velocity_rad_s": self._max_velocity_rad_s,
+            "max_acceleration_rad_s2": self._max_acceleration_rad_s2,
             "send_commands": self._send_commands,
             "commanded_deg": {k: round(v, 1) for k, v in self._commanded_deg.items()},
         }
@@ -361,10 +387,13 @@ class UpperBodyMirrorPlugin:
             "lost": self._lost,
             "angles_age_ms": age_ms,
             "workmode": mode,
-            "protection": mode == _PROTECTION_WORKMODE,
+            "walking_mode_ok": mode == _WALKING_WORKMODE,
+            "dds_contention_verified": self._dds_verified,
+            "urdf_limits_loaded": spec.URDF_LIMITS_LOADED,
             "ticks": self._ticks,
             "control_hz": self._control_hz,
-            "rate_limit_deg_s": self._rate_limit_deg_s,
+            "max_velocity_rad_s": self._max_velocity_rad_s,
+            "max_acceleration_rad_s2": self._max_acceleration_rad_s2,
             "gains": {
                 "keep_kp": self._keep_kp, "keep_kd": self._keep_kd,
                 "arm_kp": self._arm_kp, "arm_kd": self._arm_kd,
@@ -444,29 +473,24 @@ class UpperBodyMirrorPlugin:
             self._latest_targets = targets
             self._latest_tracked = tracked
             self._latest_at = time.monotonic()
-            if tracked:
-                self._ever_tracked = True
 
     def _control_loop(self, token) -> None:
         period = 1.0 / self._control_hz
-        max_step = spec.max_step_for(self._rate_limit_deg_s, self._control_hz)
         next_at = time.monotonic()
         log = self._node.get_logger()
 
         while not self._stop_event.is_set() and token is self._run_token:
-            # Protection is re-read every tick, not just at start. The robot can
-            # enter workmode 26 while the card is running — a fall, a motor
-            # fault — and continuing to write set_joint would override the one
-            # safety decision the robot made on its own.
+            # Workmode is re-read every tick, not just at start. Leaving 2 — a
+            # fall, a motor fault, an operator pressing estop — is a latched
+            # intervention: stop writing rather than override the robot.
             mode = self._read_workmode()
-            if mode is None or mode == _PROTECTION_WORKMODE:
+            if mode != _WALKING_WORKMODE:
                 self._last_error = (
-                    "robot entered protection mode; stopped commanding"
-                    if mode == _PROTECTION_WORKMODE
-                    else "workmode unreadable; stopped commanding")
+                    f"workmode left 2 (now {mode}); stopped commanding"
+                    if mode is not None else "workmode unreadable; stopped commanding")
                 self._status = "error"
                 self._stop_event.set()
-                log.error(f"upper_body_mirror stopped: {self._last_error}")
+                log.error(f"upper_body_mimic stopped: {self._last_error}")
                 break
 
             now = time.monotonic()
@@ -474,27 +498,18 @@ class UpperBodyMirrorPlugin:
                 targets = dict(self._latest_targets)
                 tracked = self._latest_tracked
                 last_at = self._latest_at
-                ever_tracked = self._ever_tracked
 
-            # Losing the operator is not an error, it is an expected state: the
-            # person walked away. Drift back rather than freezing an arm in
-            # mid-air where nobody can predict what it will do next.
-            #
-            # Before the first tracked frame there is nothing to drift back
-            # from: the card has just started, the operator may still be walking
-            # into frame, and lowering the arms now would be a movement nobody
-            # asked for. Hold until mirroring has actually begun.
+            # Low confidence (`tracked=false`) and a stale stream are the same
+            # state: return to the safe pose. Never keep the last human
+            # command — an unobserved arm must not stay frozen mid-air.
             lost = (not tracked) or (last_at == 0.0) or \
                    (now - last_at > self._lost_timeout_s)
-            if lost and ever_tracked:
-                desired = dict(spec.ZERO_TARGETS_DEG)
-            elif lost:
-                desired = dict(self._commanded_deg)
-            else:
-                desired = targets
+            desired = spec.safe_pose_deg() if lost else targets
+            desired = spec.clamp_targets(desired, self._margin_deg)
 
-            self._commanded_deg = spec.rate_limited_targets(
-                self._commanded_deg, desired, max_step)
+            self._commanded_deg, self._velocity_deg_s = spec.accel_limited_targets(
+                self._commanded_deg, self._velocity_deg_s, desired, period,
+                self._max_velocity_deg_s, self._max_acceleration_deg_s2)
 
             try:
                 measured = self._measured_rad()
@@ -509,7 +524,7 @@ class UpperBodyMirrorPlugin:
                 self._last_error = f"{type(exc).__name__}: {exc}"
                 self._status = "error"
                 self._stop_event.set()
-                log.error(f"upper_body_mirror stopped: {self._last_error}")
+                log.error(f"upper_body_mimic stopped: {self._last_error}")
                 break
 
             self._lost = lost

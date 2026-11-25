@@ -120,16 +120,20 @@ plugins:
     filter_beta: 0.02
   # 驱动上半身镜像：订阅上面那张卡输出的六轴角度，实时驱动 Bumi 的 6 个手臂关节。
   # 注意：LowController.set_joint 只接受 21 条指令，所以这张卡在运行时接管了全部
-  # 电机——腿保持实测位置不动，但它不做平衡控制，也不是"只动手臂"。默认关闭，
-  # 需要在画布上显式 start 才会真正下发；首次测试请确保机器人有支撑。
-  upper_body_mirror:
+  # 电机——13 个腿/腰关节和 2 个单目不可观测的肩偏航关节保持实测位置，另外 6 个
+  # 关节跟随人。它不做平衡控制，也不是"只动手臂"。默认关闭，且必须先做 DDS 共存
+  # 验证（见 README/SOP）再打开 dds_contention_verified，才允许 start。
+  upper_body_mimic:
     enabled: false   # 默认关闭：会真实驱动机器人
+    dds_contention_verified: false  # 真机确认 Low/High 不抢 DDS 后手动改 true
     # 角度来源，默认即本 bundle 内跟踪卡输出的话题；接别的源时才需要改。
     # angles_topic: /<namespace>/upper_body_track/angles
     control_hz: 50            # 内部下发频率；高于跟踪卡的 10Hz，用来插值平滑
-    rate_limit_deg_s: 30      # 单个关节最大角速度；有人扶、无吊架时建议 ≤30
-    lost_timeout_s: 0.5       # 超过此时长没有跟踪结果即视为人已离开，按限速回零
-    limit_margin_deg: 10      # 在机械硬限位基础上再向内留的余量（肘部因此不会完全伸直）
+    # 与 #485 的 Gazebo preview 一致；限位直接读 resource/bumi_model.urdf。
+    max_velocity_rad_s: 2.0
+    max_acceleration_rad_s2: 6.0
+    lost_timeout_s: 0.5       # 超过此时长没有跟踪结果即丢失，按限幅回安全姿态
+    limit_margin_deg: 10      # 在 URDF 硬限位基础上再向内留的余量（肘部不会完全伸直）
     # 增益：非手臂关节用 keep_* 把站立姿态撑住，手臂用 arm_* 跟随。
     keep_kp: 10.0
     keep_kd: 0.5
