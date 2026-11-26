@@ -48,7 +48,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Keep Pink/Pinocchio wheels isolated from system ROS/OpenCV NumPy.
 RUN python3 -m venv /opt/panther-pink && \
-    /opt/panther-pink/bin/pip install --no-cache-dir --quiet --only-binary :all: --python-platform aarch64 \
+    /opt/panther-pink/bin/pip install --no-cache-dir --quiet \
         --index-url https://mirrors.tencentyun.com/pypi/simple/ \
         'pin-pink==4.0.0' 'daqp'
 
