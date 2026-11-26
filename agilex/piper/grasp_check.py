@@ -14,6 +14,31 @@ SAMPLE_INTERVAL_S = 0.03
 MAX_WIDTH_DRIFT_MM = 0.5
 
 
+GRASP_PARAMETERS = {
+    "min_width_mm": {"type": "number", "minimum": 0, "title": "目标开度下限（mm）",
+                     "description": "夹稳目标物后多次读取开度，填稳定读数中的最小值。须大于空夹开度加空夹容差。"},
+    "max_width_mm": {"type": "number", "minimum": 0, "title": "目标开度上限（mm）",
+                     "description": "夹稳目标物后多次读取开度，填稳定读数中的最大值。"},
+    "empty_width_mm": {"type": "number", "minimum": 0, "title": "空夹开度（mm）",
+                       "description": "填空夹稳定开度。若读数略低于 0，填 0，并用空夹容差覆盖实测偏差。"},
+    "empty_tolerance_mm": {"type": "number", "exclusiveMinimum": 0, "title": "空夹容差（mm）",
+                           "description": "多次空夹读数相对空夹开度的允许偏差。依据实测波动填写，须大于 0。"},
+    "holding_effort_threshold_nm": {
+        "type": "number", "title": "保持力矩阈值（N·m）",
+        "description": "按夹稳目标物时的力矩标定。填同方向的非零阈值，保留正负号。",
+    },
+}
+
+
+def _calibration_value(args, key, low):
+    try:
+        return number(args, key, None, low, inf)
+    except ValueError as exc:
+        label = GRASP_PARAMETERS[key]["title"]
+        requirement = "大于等于 0" if low == 0 else "有限"
+        raise ValueError(f"请在「{label}」填写{requirement} 的数值。") from exc
+
+
 def grasp_status(samples, minimum, maximum, empty_width, empty_tolerance, effort_threshold):
     widths = [sample["width_mm"] for sample in samples]
     low, high = min(widths), max(widths)
@@ -38,33 +63,19 @@ class PiperGraspCheck:
         self.runtime = runtime
 
     def get_tools(self):
-        properties = {
-            "min_width_mm": {"type": "number", "minimum": 0,
-                             "description": "Minimum expected opening around the workpiece in mm."},
-            "max_width_mm": {"type": "number", "minimum": 0,
-                             "description": "Maximum expected opening around the workpiece in mm."},
-            "empty_width_mm": {"type": "number", "minimum": 0,
-                               "description": "Measured opening with the jaws closed empty, in mm."},
-            "empty_tolerance_mm": {"type": "number", "exclusiveMinimum": 0,
-                                   "description": "Measured tolerance around the empty-closed opening in mm."},
-            "holding_effort_threshold_nm": {
-                "type": "number",
-                "description": "Nonzero signed gripper motor torque threshold in N m, calibrated while holding a known part.",
-            },
-        }
         actions = {
-            "read_feedback": ([], "Read current gripper opening, motor torque, enable and fault status."),
-            "check_grasp": (list(properties), "Estimate the grasp from fresh feedback. Supply all five calibrated inputs."),
+            "read_feedback": ([], "读取夹爪开度、力矩、使能与故障状态，无需填写参数。"),
+            "check_grasp": (list(GRASP_PARAMETERS), "填写五项实测标定参数，判断夹爪是否稳定夹持。"),
         }
-        schema = action_schema(actions, properties)
-        schema["additionalProperties"] = False
+        schema = action_schema(actions, {key: dict(definition) for key, definition in GRASP_PARAMETERS.items()})
+        schema.update({"additionalProperties": False, "x-manual-execution": True})
         schema["properties"]["action"].update(
-            title="Action", default="read_feedback",
-            oneOf=[{"const": "read_feedback", "title": "Read gripper feedback"},
-                   {"const": "check_grasp", "title": "Check grasp"}],
+            title="操作", default="read_feedback",
+            oneOf=[{"const": "read_feedback", "title": "读取反馈（无需填写）"},
+                   {"const": "check_grasp", "title": "判断是否夹住"}],
         )
-        definition = tool(self.name, "sensor", "Read-only PiPER gripper feedback and calibrated grasp estimation.", schema)
-        return [{**definition, "title": "Grasp check"}]
+        description = "先在空夹闭合和夹稳目标物时分别读取反馈。开度看 width_mm，力矩看 effort_nm，再填写标定参数。"
+        return [{**tool(self.name, "sensor", description, schema), "title": "夹持确认"}]
 
     def start(self):
         return {"state": "ready"}
@@ -79,19 +90,25 @@ class PiperGraspCheck:
             reasons = snapshot["reasons"]
             return {"state": "unavailable", "gripper": None,
                     "reason": reasons.get("gripper") or reasons.get("connection") or "No fresh gripper feedback."}
-        return {"state": "ok", "gripper": feedback,
+        summary = f"当前开度 {feedback['width_mm']:g} mm，力矩 {feedback['effort_nm']:+g} N·m"
+        return {"state": "ok", "message": summary, "gripper": feedback,
                 "feedback_age_ms": max(0, round((time() - feedback["feedback_time"]) * 1000))}
 
     def check_grasp(self, args):
-        minimum = number(args, "min_width_mm", None, 0, inf)
-        maximum = number(args, "max_width_mm", None, minimum, inf)
-        empty_width = number(args, "empty_width_mm", None, 0, inf)
-        empty_tolerance = number(args, "empty_tolerance_mm", None, 0, inf)
-        effort_threshold = number(args, "holding_effort_threshold_nm", None, -inf, inf)
-        if not empty_tolerance or not effort_threshold:
-            raise ValueError("Empty tolerance and signed holding torque threshold must be nonzero.")
+        minimum = _calibration_value(args, "min_width_mm", 0)
+        maximum = _calibration_value(args, "max_width_mm", 0)
+        if maximum < minimum:
+            raise ValueError("目标开度上限不能小于目标开度下限。")
+        empty_width = _calibration_value(args, "empty_width_mm", 0)
+        empty_tolerance = _calibration_value(args, "empty_tolerance_mm", 0)
+        if not empty_tolerance:
+            raise ValueError("空夹容差须大于 0 mm，请按实测空夹波动填写。")
+        effort_threshold = _calibration_value(args, "holding_effort_threshold_nm", -inf)
+        if not effort_threshold:
+            raise ValueError("保持力矩阈值不能为 0，请按实测夹持力矩填写并保留正负号。")
         if minimum <= empty_width + empty_tolerance:
-            return {"state": "indeterminate", "is_grasped": None, "reason": "expected_opening_overlaps_empty_band"}
+            return {"state": "indeterminate", "is_grasped": None, "reason": "expected_opening_overlaps_empty_band",
+                    "message": "目标开度下限须大于空夹开度与空夹容差之和，请核对标定读数。"}
 
         samples = []
         deadline = monotonic() + CHECK_TIMEOUT_S

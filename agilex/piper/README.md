@@ -66,14 +66,24 @@ change the previous movement result.
 
 ## Grasp check
 
-**Grasp check** (`piper_grasp_check`) is a separate read-only sensor card.
-Use **Read gripper feedback** to record the opening and signed motor torque
-for a closed empty gripper and for a known held part on the installed jaws.
-Use **Check grasp** after the gripper has settled. Enter the expected opening
-range of the held part (`min_width_mm`, `max_width_mm`), the measured empty
-opening and tolerance (`empty_width_mm`, `empty_tolerance_mm`), and a nonzero
-`holding_effort_threshold_nm` in the measured holding direction. The card
-uses these inputs only to evaluate measured feedback.
+**夹持确认** (`piper_grasp_check`) is a read-only sensor.
+Use **读取反馈（无需填写）** with the jaws empty and closed, then with a known
+part held steadily. Record several opening (`width_mm`) and signed torque
+(`effort_nm`) readings in each
+case. Once the gripper has settled, select **判断是否夹住** and fill the five
+fields with the workcell's measured values.
+
+| Canvas field | What to enter |
+| --- | --- |
+| 目标开度下限（mm） / 目标开度上限（mm） | Lowest and highest stable openings around the known part. The lower bound must exceed the empty opening plus its tolerance. |
+| 空夹开度（mm） | Reference opening with the empty jaws closed. If the feedback is slightly below zero, use zero and include the offset in the measured tolerance. |
+| 空夹容差（mm） | Positive allowance for the measured variation around that reference. |
+| 保持力矩阈值（N·m） | Nonzero threshold calibrated from the held part. Use the observed holding direction and keep the sign. |
+
+For example, if stable held openings range from 19.8 to 20.3 mm, the empty
+reference is 0.2 mm with a 0.4 mm allowance, and holding torque is around
+−0.35 N·m, a calibrated negative threshold might be −0.25 N·m.
+These numbers illustrate the fields; measure the actual jaws and target part.
 
 The result is `grasped` (`is_grasped: true`) when at least three distinct,
 fresh frames spanning 120 ms show openings in the expected range with at
