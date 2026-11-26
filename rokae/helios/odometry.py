@@ -62,7 +62,7 @@ class SpeedFeedbackClient(StreamFeedbackClient):
 
 
 class HeliosOdometry:
-    PREFIX = "odometry"
+    PREFIX = "loco_state"
 
     def __init__(self, config, namespace="rokae_helios", ros2=None, client=None, native=None):
         self._config = config
@@ -100,7 +100,7 @@ class HeliosOdometry:
 
     def get_tools(self):
         sensor = tool(
-            "odometry", "sensor",
+            self.PREFIX, "sensor",
             "Helios 里程计，持续显示原厂底盘坐标中的 x、y、yaw 和机体系速度。"
             "位姿由原厂 SDK 提供，单位为米和弧度。标准端口同时提供 Navi 速度反馈。",
             topic_out=self._topics,
@@ -227,6 +227,6 @@ class HeliosOdometry:
                 self.start()
                 return {"state": "running" if action == "start" else "configured", "topic_out": self._topics}
             if action == "stop":
-                # Match loco_state: the canvas's stop leaves observation active.
+                # Stopping the card on the canvas leaves observation active.
                 return {"state": "idle", "topic_out": self._topics}
-            raise ValueError(f"unsupported odometry action: {action}")
+            raise ValueError(f"unsupported {self.PREFIX} action: {action}")

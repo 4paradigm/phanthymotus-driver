@@ -6,7 +6,7 @@
 |---|---|---|
 | `joints` | sensor | 关节骨架和逐轴状态，默认 10 Hz |
 | `battery` | sensor | 两块电池状态，默认 1 Hz |
-| `odometry` | sensor | 原厂里程计位置和朝向、机体系速度，默认 10 Hz |
+| `loco_state` | sensor | 原厂里程计位置和朝向、机体系速度，默认 10 Hz |
 | `model` | resource | 运行时读取本机 iNex 的 URDF，骨架渲染器自动调用 |
 
 ## 数据与单位
@@ -22,8 +22,8 @@
 - 卡片持续采样。画布停卡或启动时保留原厂坐标，Driver 退出时关闭两路订阅。
   断线、过期或 SDK 缺失时相应数据为空，两路反馈独立判断状态和接收时间。
 
-升级后，已有画布若仍引用旧的 `state/relative_pose`，重新添加 `odometry` 卡片即可选用
-`loco/state`。Navi 继续订阅原来的 `state/odom` 话题。位姿部署与接口说明见
+升级后，已有画布若仍显示旧的 `odometry` 卡片，刷新 Driver 工具列表并更新为 `loco_state`。
+Navi 继续订阅原来的 `state/odom` 话题。位姿部署与接口说明见
 [ODOMETRY_INTERFACE.md](ODOMETRY_INTERFACE.md)。
 
 ### 关节与电池
@@ -70,7 +70,7 @@
 
 ## 画布与 Core 前端
 
-在卡片共享配置中保存状态地址，再将需要的 `joints`、`battery` 或 `odometry` 加入画布并启动。`model` 无需单独运行；首次请求时读取同一 iNex 地址的 `/api/robot_3d_model` 及其同源 `urdf_url`，核对 20 轴名称后在进程内缓存。没有把厂家模型打入镜像。模型服务暂不可用时明确返回错误，不影响传感器订阅启动。监控页从 `joints` 自动生成骨架。
+在卡片共享配置中保存状态地址，再将需要的 `joints`、`battery` 或 `loco_state` 加入画布并启动。`model` 无需单独运行；首次请求时读取同一 iNex 地址的 `/api/robot_3d_model` 及其同源 `urdf_url`，核对 20 轴名称后在进程内缓存。没有把厂家模型打入镜像。模型服务暂不可用时明确返回错误，不影响传感器订阅启动。监控页从 `joints` 自动生成骨架。
 
 官方 Core 无需修改即可使用：监控页按真实 Driver ID 读取 URDF 显示骨架，电池在日志视图每字段一行、"最新"模式每字段一格。已知差异：
 

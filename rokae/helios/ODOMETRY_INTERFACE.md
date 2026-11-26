@@ -1,6 +1,6 @@
 # Helios 里程计原始位姿和速度
 
-`odometry` 参考天轶 `loco_state` 的双输出。显示话题为 `/{namespace}/loco/state`，
+Helios `loco_state` 参考天轶同名卡片的双输出。显示话题为 `/{namespace}/loco/state`，
 提供 `position`、`rpy`、`velocity`、`yaw_speed`、坐标系、可用状态及两路接收时间。
 计算话题为 `/{namespace}/state/odom`，载体是 `std_msgs/String` JSON。
 

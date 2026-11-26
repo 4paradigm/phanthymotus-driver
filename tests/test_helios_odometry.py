@@ -135,7 +135,7 @@ def test_schema_and_independent_bundle_lifecycle():
     plugin = HeliosOdometry(CONFIG, "test_robot", native=native_pose())
     battery = HeliosBattery(CONFIG)
     bundle = DriverBundle([battery, plugin])
-    tool = next(t for t in bundle.get_all_tools() if t["name"] == "odometry")
+    tool = next(t for t in bundle.get_all_tools() if t["name"] == "loco_state")
     assert tool["type"] == "sensor" and not tool["multiInstance"]
     assert tool["configSchema"]["properties"]["odometry_state_url"]["x-sensitive"]
     assert tool["topic_out"] == [
@@ -143,7 +143,9 @@ def test_schema_and_independent_bundle_lifecycle():
         {"topic": "/test_robot/state/odom", "format": "state/odom"},
     ]
     observe(plugin, 1, 2, .3, speed=(0, 0, 0))
-    assert bundle.dispatch("odometry", {})["data"]["available"]
+    assert bundle.dispatch("loco_state", {})["data"]["available"]
+    assert bundle.dispatch("loco_state", {"action": "info"})["topic_out"] == tool["topic_out"]
+    assert bundle.dispatch("odometry", {}) is None
     bundle.dispatch("battery", {"action": "stop"})
     assert plugin.payload()["available"]
     with pytest.raises(ValueError):
