@@ -830,12 +830,16 @@ def build_plugins(config: dict, _namespace: str, _ros2) -> list:
     grasp_config = config.get("plugins", {}).get("hand_grasp", {})
     if grasp_config.get("enabled", True):
         from adaptive_grasp_device import AdaptiveGraspPlugin
-        plugins.append(AdaptiveGraspPlugin(hand_plugin, grasp_config, global_config=config))
+        plugins.append(AdaptiveGraspPlugin(hand_plugin, grasp_config, global_config=config, ros2=_ros2))
 
     tactile_config = config.get("plugins", {}).get("hand_tactile")
     if tactile_config and tactile_config.get("enabled", True):
         from tactile_device import TactilePlugin
         plugins.append(TactilePlugin(hand_plugin, tactile_config, global_config=config, ros2=_ros2, namespace=_namespace))
+
+    if config.get("plugins", {}).get("l20_mujoco", {}).get("enabled", False):
+        from mujoco_card.preview_cards import PreviewCards
+        plugins.append(PreviewCards(config))
 
     joints_config = config.get("plugins", {}).get("joints")
     if joints_config and joints_config.get("enabled", True):

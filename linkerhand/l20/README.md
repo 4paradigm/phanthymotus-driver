@@ -1,4 +1,4 @@
-# LinkerHand L20 USB-CAN 驱动与五张卡片
+# LinkerHand L20 USB-CAN 驱动与 MuJoCo 仿真卡片
 
 本目录适配第四范式 Agent Core / PhanthyMotus，当前开发和实测设备为 **L20-10**：16 个主动关节、USB-CAN、五指指尖触觉反馈。L20 Lite（又称 L10）的 RS-485/Modbus 驱动位于相邻的 `l20_lite` 目录。
 
@@ -9,6 +9,9 @@
 | `hand_grasp` | `actuator` | 自适应接触停止抓取、释放和状态读取 |
 | `hand_tactile` | `sensor` | 按卡片选择采集左右手触觉，发布供 Core 渲染的实时触觉数据 |
 | `joints` | `sensor` | 每张卡片选择左手或右手，CAN 接口自动匹配，持续读取 16 主动关节实测位置，只输出该手的实时骨架 |
+| `model` | `resource` | 查询该手的模型资源 |
+| `l20_mujoco` | `processor` | 实时播放左右手的关节轨迹，并回放最近完整动作 |
+| `hand_grasp_sim`、`hand_gesture_sim` | `actuator` | 仅向虚拟手发送抓取或手势轨迹 |
 
 另有 `model`（`resource`）向 Core 提供左右手骨架 URDF，不是画布卡片。
 
@@ -98,11 +101,23 @@
 
 动作受理后返回 `state=running` 和 `action_id`，最终通过 ACP 上报 `completed/error/cancelled`。`get_state` 可读取当前状态和 `last_result`，无需再次运动或访问 CAN；画布结果框若仍显示最初的 `running`，应读取最终结果确认流程是否结束。结果中的 `grasp_confirmed=false` 表示没有确认物体已抓稳；达到位置边界或收拢观察时间结束也可能进入保持，应结合 `outcome`、各指停止原因和触觉数据判断，不能将流程完成视为抓稳保证。
 
+#### 参数化轻握与触觉反馈
+
+`hand_grasp` 负责单只手的运动、接触和保持。普通包络抓取可直接用 `adaptive_grasp`；需要分阶段交接时，空手调用 `prepare` 建立基线并设置本次动作的 `speed`、`output_limit`、`contact_peak`、`peak_ceiling`、`approach_travel` 和 `max_corrections`。只读 `preview_settings` 复用同一参数校验，`settings` 是拟用数值，`parameter_limits` 是可选范围，预览不连接硬件或替换当前准备任务。输出限值、阈值与位置行程都使用设备原始单位。单指达到所选峰值时，该指保持、暂停向内补夹，其余手指继续包握。预览和状态中的 `hard_stop_peak_raw` 是整手过压截停值，为设定峰值的 1.5 倍向上取整，最多 255。任一触觉阵列达到原始满量程时也会立即触发整手保护。补夹预算为 0 时仅监测。
+
+物品就位后调用 `close_until_contact`。每指在首个有效接触帧停止进给；同一指连续三帧峰值的算术均值达到 contact_peak 就记录本轮抓握动作成功并锁定该指。短暂接触未确认、随后连续两帧清零时，该指可重新搜索。其余手指继续小步收拢直至各自触物或到达限位。无名指、小指的搜索行程预算比基础值多 20%，仍受原始位置范围和逐关节限位约束。预览和准备回执的 `travel_by_finger` 给出五指预算。
+
+右手轻握准备完成后，用本轮 `prepare_id` 和原样的 `placement_notice` 调用 `close_until_contact`。画布展示提示后驱动倒计时五秒。人手须始终在闭合路径外。放好即抓，沉默到时也抓；“停止／等一下”取消这轮。摆放控制只在已准备的右手上生效。已持物时等待明确释放。
+
+`grasp_action_succeeded` 记录收拢时任意一指三帧均值首次达标，完整的过压帧同样参与该指均值，达标和截停可以发生在同一帧。回执给出最强窗口的三个原始峰值 `peak_samples_raw` 和均值。本轮归零和后续保护均保留该结果。其他指继续包握。搜索结束后直接进入 `monitoring` 或 `hold_without_signal`，有新鲜滑动证据且预算允许才补夹，无须单独移交。监测期间的真实保护单独报告。
+
+调用方可以逐次设置速度、输出限值、接触阈值、峰值和行程。`preview_settings` 返回可选范围和保护阈值，`get_state` 返回本次采样、停止原因和保持状态。选择 `gentle_limits=true` 时使用较保守的参数范围。右手在准备阶段向中指一侧设置拇指侧摆；收拢阶段维持起始旋转，指根和末节分别受行程约束。回执中的 `thumb_alignment_enabled` 指收拢时的动态旋转补偿，当前关闭。
+
 ### 2.4 `hand_tactile`：独立触觉传感器
 
 类型为 `sensor`，不发送位置、速度或扭矩控制指令，不要求运动确认。
 
-卡片不显示 `ACTION` 下拉框和执行按钮。左右手在齿轮的实例设置中通过 `BOUND_SIDE` 选择；齿轮同时保留“高级：CAN 接口”（默认 `can0`，不是 CAN ID）及共享采集频率。触觉卡片的 CAN 接口按实例设置，与执行器共享 CAN 设置独立；调整执行器接口不会切换已有触觉流或改写其话题路径。`instance_id` 由 Core 自动传入，不作为用户输入项展示。
+独立查询使用 `read_contact`，可选 `finger`（单指或 all）和本次原始阈值 `threshold`。返回每指当前标量、阵列峰值与接触标记；两类数据均无效时接触标记为 null。左右手在齿轮的实例设置中通过 `BOUND_SIDE` 选择；齿轮同时保留“高级：CAN 接口”（默认 `can0`，不是 CAN ID）及共享采集频率。触觉卡片的 CAN 接口按实例设置，与执行器共享 CAN 设置独立；调整执行器接口不会切换已有触觉流或改写其话题路径。`instance_id` 由 Core 自动传入，不作为用户输入项展示。
 
 首次使用时，在齿轮中选择左右手并保存，再开启智能控制，点击“查看数据流”即可查看热力图。后台保留平台需要的 `info/start/stop/config` 生命周期接口：启动自动采集，停止或删除卡片仅移除本卡片对采集流的使用，其他卡片仍使用的目标继续采集，不控制关节电机。切换左右手后，已打开的抽屉仍订阅旧话题，请关闭并重新打开。容器重启后，平台启动时会重新应用保存的实例配置。显示热力图需要支持 `sensor/tactile` 的 Core 版本。
 
@@ -222,7 +237,7 @@ PYTHONPATH=. python3 linkerhand/l20/hardware_smoke.py --tactile-matrix
 
 2026-10-30 验证：以上固定组合完成 `linux/arm64` 镜像构建，镜像内核对依赖版本后，离线回归为 1001 项通过、1 项跳过（旧协议不适用的五指位置回复用例）。新增 ACP 回归使用实际工作线程入口，覆盖有／无卡片 ID 时完成通知失败、终态查询及同一物理目标后续运动被拒绝；不连接真实 CAN。
 
-`Dockerfile` 包含五张卡片的 Python 模块及 `resource/` 模型文件。完整构建时需把仓库 `common/` 加入构建上下文；`driver.yaml` 已通过 `build_context_extras` 声明该目录，并列出三张 actuator、两张 sensor 和 `model` 资源。以下命令在仓库根目录构建本地 ARM64 镜像，不推送镜像仓库：
+`Dockerfile` 包含实手与仿真卡片的 Python 模块及 `resource/` 模型文件。完整构建时需把仓库 `common/` 加入构建上下文；`driver.yaml` 已通过 `build_context_extras` 声明该目录，并列出五张 actuator、两张 sensor、一张 processor 和 `model` 资源。以下命令在仓库根目录构建本地 ARM64 镜像，不推送镜像仓库：
 
 ```bash
 l20_build_context=$(mktemp -d /tmp/linkerhand-l20-build.XXXXXX)
@@ -247,7 +262,7 @@ docker restart embodied-linkerhand-l20
 docker logs --since 1m --tail 60 embodied-linkerhand-l20
 ```
 
-底层通信模块等文件也有变更时应一并复制。`docker cp` 修改容器可写层，不更新原镜像；以后删除并重建容器，应使用包含最新文件的 ARM64 镜像。重启会清空内存中的运行任务和抓握模式，不保留执行器绑定；刷新页面后应看到五张卡片，执行器按动作区选择左右手，`hand_grasp` 提供 `adaptive_grasp`、`release`、`get_state` 三个公开动作。
+底层通信模块等文件也有变更时应一并复制。`docker cp` 修改容器可写层，不更新原镜像；以后删除并重建容器，应使用包含最新文件的 ARM64 镜像。重启会清空内存中的运行任务和抓握模式，不保留执行器绑定；刷新页面后可在同一 L20 服务下查看卡片，执行器按动作区选择左右手，`hand_grasp` 提供 `adaptive_grasp`、`release`、`get_state` 三个公开动作。
 
 ## 5. 执行目标、共享 CAN 与停止行为
 

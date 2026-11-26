@@ -14,6 +14,14 @@ right_can_id: 0x27
 response_timeout_s: 0.5
 
 plugins:
+  hand_gesture_sim:
+    enabled: true
+  hand_grasp_sim:
+    enabled: true
+  l20_mujoco:
+    enabled: true
+    worker_port: 15769
+
   hand:
     enabled: true
     auto_detect_gestures: true

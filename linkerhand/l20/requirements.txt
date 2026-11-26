@@ -1,2 +1,4 @@
 python-can==4.6.1
 PyYAML==5.4.1
+mujoco==3.2.7
+Pillow==11.3.0

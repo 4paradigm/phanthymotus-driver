@@ -116,8 +116,12 @@ class TactilePlugin:
                 "start": ([], "启动触觉数据后台连续采集与流式推送"),
                 "stop": ([], "停止触觉数据流推送"),
                 "config": ([], "按提供的字段更新实例左右手／CAN 接口或共享采集频率"),
+                "read_contact": (["finger", "threshold"], "读取指定手指或全部手指的触觉标量、最新有效阵列峰值及给定阈值下的接触状态。无有效采样时返回未知"),
             },
-            {},
+            {"finger": {"type": "string", "enum": ["all", *FINGER_NAMES], "default": "all",
+                        "description": "选择要观察的手指"},
+             "threshold": {"type": "integer", "minimum": 1, "maximum": 255,
+                           "default": self.contact_threshold, "description": "本次接触判定的原始读数阈值"}},
         )
 
         definition = tool(
@@ -254,7 +258,7 @@ class TactilePlugin:
 
     # ── Data Reading ──────────────────────────────────────────────────
 
-    def _read_tactile_snapshot(self, side: str, channel: str, *, cancel=None) -> dict[str, Any]:
+    def _read_tactile_snapshot(self, side: str, channel: str, *, cancel=None, fresh_matrix=False) -> dict[str, Any]:
         # Serialize direct queries with background acquisition. The CAN client's
         # fresh-query APIs require new replies, never a previous cache value.
         with self._sample_lock:
@@ -287,7 +291,7 @@ class TactilePlugin:
             entry = self._matrix_cache.setdefault(key, {})
             matrix_fresh = False
             due = time.monotonic() - entry.get("requested_at", -float("inf")) >= self.matrix_interval_s
-            if self.matrix_enabled and client is not None and due:
+            if self.matrix_enabled and client is not None and (due or fresh_matrix):
                 entry["requested_at"] = time.monotonic()
                 self._last_matrix_req_time = entry["requested_at"]
                 try:
@@ -545,6 +549,28 @@ class TactilePlugin:
                 "bound_side": side,
                 "topic_out": self.topic_out(side, channel),
             }
+
+        if action == "read_contact":
+            finger = args.get("finger", "all")
+            if finger not in ("all", *FINGER_NAMES):
+                raise ValueError("未知的手指")
+            threshold = args.get("threshold", self.contact_threshold)
+            if type(threshold) is not int or not 1 <= threshold <= 255:
+                raise ValueError("threshold 必须是 1 到 255 之间的整数")
+            with self._lifecycle_lock:
+                reader = self._streams.get((side, channel), self)
+            sample = reader._read_tactile_snapshot(side, channel, fresh_matrix=True)
+            readings = {}
+            for name in FINGER_NAMES if finger == "all" else [finger]:
+                scalar = sample["touch_scalar"][name] if sample["scalar_valid"] else None
+                peak = (max(map(max, sample["touch_matrix"][name]))
+                        if sample["matrix_valid"] and sample["matrix_fresh"] else None)
+                values = [v for v in (scalar, peak) if v is not None]
+                readings[name] = {"scalar": scalar, "matrix_peak": peak,
+                                  "contact": max(values) >= threshold if values else None}
+            return {"state": sample["state"], "bound_side": side, "can_channel": channel,
+                    "threshold": threshold, "readings": readings, "timestamp": sample["timestamp"],
+                    "matrix_fresh": sample["matrix_fresh"], "errors": sample["errors"]}
 
         if action == "get_state":
             with self._lifecycle_lock:

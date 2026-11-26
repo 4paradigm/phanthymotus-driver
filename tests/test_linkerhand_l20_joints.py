@@ -1016,7 +1016,7 @@ def test_shipped_config_has_no_rate_setting_and_registers_joints_last():
     joints_config = config["plugins"]["joints"]
     assert "poll_hz" not in joints_config
     plugins = build_plugins(config, "", None)
-    assert [p.PREFIX for p in plugins] == ["hand", "hand_gesture", "hand_grasp", "hand_tactile", "joints"]
+    assert [p.PREFIX for p in plugins] == ["hand", "hand_gesture", "hand_grasp", "hand_tactile", "l20_mujoco", "joints"]
     joints = plugins[-1]
     assert joints.query_timeout_s == joints_config["query_timeout_s"]
     assert JOINT_NAMES_16 and POLL_HZ == 30.0

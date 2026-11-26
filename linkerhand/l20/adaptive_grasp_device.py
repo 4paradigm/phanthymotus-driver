@@ -23,14 +23,19 @@ Features:
 """
 from __future__ import annotations
 
+import json
 import logging
 import math
+import os
 import threading
 import time
 from typing import Any
 from uuid import uuid4
 
 from common.vendor_runtime import action_schema, tool
+from dataclasses import asdict
+from grasp_feedback import (GENTLE_DEFAULT_TRAVEL, GENTLE_MAX, SEARCH_WATCHDOG_S, SETTING_FIELDS, FeedbackGrasp,
+                            contact_patches, empty_baseline, parameter_limits, settings_from)
 from can_client import FINGER_NAMES, validate_position_vector, vector20_to_named16
 from hand_device import (
     HandPlugin,
@@ -54,6 +59,21 @@ DEFAULT_CLOSE_LIMIT_POSE = [
      60,   0,   0,   0,   0,  70, 200, 132,  55,   0,  73, 255, 255, 255, 255, 142,   0,   0,   0,   0
 ]
 
+# With the configured base yaw of 70, 115 aligns the thumb with the middle
+# finger across the palm at the measured right-hand closing posture.
+RIGHT_GENTLE_THUMB_YAW_OFFSET = 45
+# Lower raw values curl the distal segment. Let the root complete the wrap
+# while keeping the right thumb pad facing the opposing contact area.
+RIGHT_GENTLE_THUMB_TIP_MIN_RAW = 195
+
+
+def _finger_tip_travel_percent(side, gentle):
+    # For the four opposing digits only. The thumb uses its own calibrated limit.
+    return 75 if side == "right" and gentle else 100
+
+
+FINGER_LABELS = dict(thumb="拇指", index="食指", middle="中指", ring="无名指", pinky="小指")
+
 FINGER_JOINTS = {
     "thumb":  {"root": 0, "tip": 15},
     "index":  {"root": 1, "tip": 16},
@@ -62,7 +82,10 @@ FINGER_JOINTS = {
     "pinky":  {"root": 4, "tip": 19},
 }
 
-TEST_ACTIONS = ("adaptive_grasp", "release")
+PLACEMENT_NOTICE = "请从上方摆好物品，人手避开闭合路径。说“放好了”立即抓，五秒无回复自动抓，说“等一下”或“停止”取消。"
+PLACEMENT_SECONDS = 5.0
+
+MOTION_ACTIONS = ("adaptive_grasp", "prepare", "close_until_contact", "release")
 
 
 class TestGraspFault(RuntimeError):
@@ -104,7 +127,7 @@ class AdaptiveGraspPlugin:
     PREFIX = "hand_grasp"
     __test__ = False
 
-    def __init__(self, hand: HandPlugin | None, config: dict, global_config: dict | None = None):
+    def __init__(self, hand: HandPlugin | None, config: dict, global_config: dict | None = None, ros2=None):
         self.hand = hand
         self.config = config or {}
         self.global_config = global_config or (hand.config if hand else {})
@@ -118,6 +141,10 @@ class AdaptiveGraspPlugin:
         self._delivery_failed = False
         self._last_result: dict | None = None
         self._worker_context = threading.local()
+        self._prepared = {}
+        self._ros2 = ros2
+        self._placement_node = None
+        self.default_gentle_limits = os.environ.get('L20_DEFAULT_GENTLE_LIMITS') == '1'
 
         # Configuration parameters
         self.approach_speed = int(self.config.get("approach_speed", 85))
@@ -168,12 +195,24 @@ class AdaptiveGraspPlugin:
         self.close_limit_pose = validate_position_vector(raw_limit, "close_limit_pose")
 
     def get_tool(self) -> dict:
+        limits = parameter_limits(True)
+        peak = limits["peak_ceiling"]
+        contact = limits["contact_peak"]
+        selection = (f"轻握 peak_ceiling 可选 {peak['minimum']}–{peak['maximum']}，"
+                     f"contact_peak 可选 {contact['minimum']}–{contact['maximum']}，"
+                     f"output_limit 最高 {limits['output_limit']['maximum']}。")
         schema = action_schema(
             {
                 "adaptive_grasp": (
                     ["bound_side", "speed_ratio", "confirm_motion"],
                     "自适应抓取：触觉达阈停整指，位置持续受阻停对应关节，保持至 release；这是接触停止，不是恒压控制",
                 ),
+                "preview_settings": (["bound_side", "gentle_limits", *SETTING_FIELDS],
+                    "只读校验拟选参数，返回可选范围和预览数值，不移动手。"+selection),
+                "prepare": (["bound_side", "gentle_limits", *SETTING_FIELDS, "confirm_motion"],
+                    "空手张开到准备姿态并采集触觉基线，返回准备编号与生效参数。"+selection),
+                "close_until_contact": (["bound_side", "prepare_id", "placement_notice", "confirm_motion"],
+                    "按当前准备记录逐指收拢；启用右手摆放倒计时时需传入 prepare_id 和 placement_notice。三帧均值达标即动作成功，完整的过压帧也计入均值并在当帧保护；归零保持，自动监测至释放"),
                 "release": (
                     ["bound_side", "confirm_motion"],
                     "五指同步恢复准备姿态放开物体，再完全张开并卸力",
@@ -190,15 +229,23 @@ class AdaptiveGraspPlugin:
                     "description": "本次操作的灵巧手，必须选择左手或右手",
                 },
                 "instance_id": {"type": "string"},
+                "gentle_limits": {"type": "boolean", "default": self.default_gentle_limits,
+                                  "description": f"启用整手反馈抓取的统一参数边界；六项整数分别选值：{GENTLE_MAX}"},
+                **{name: {"type": "integer", "minimum": low, "maximum": high,
+                          "default": default, "description": desc}
+                   for name, (low, high, default, desc) in SETTING_FIELDS.items()},
                 "speed_ratio": {
                     "type": "string", "enum": list(SPEED_RATIOS), "default": "1.0x",
                     "description": "抓取电机速度：1.0x=85，1.5x=128，2.0x=170，2.5x=212，3.0x=255；不改变触觉阈值或位置步长",
                 },
                 "confirm_motion": {
                     "type": "boolean",
-                    "const": True,
-                    "description": "确认周围安全后传入 true",
+                    "const": True, "enum": [False, True],
+                    "description": "现场确认后选择 true",
                 },
+                "prepare_id": {"type": "string", "description": "右手轻握本轮已经返回 prepared 的 action_id"},
+                "placement_notice": {"type": "string", "enum":[PLACEMENT_NOTICE],
+                                     "description": "画布本轮摆放提示，随工具调用显示；右手轻握必填"},
                 "wait_for_result": {
                     "type": "boolean",
                     "const": False,
@@ -207,23 +254,40 @@ class AdaptiveGraspPlugin:
                 },
             },
         )
+        for name, bounds in limits.items():
+            field = schema["properties"][name]
+            field["description"] += f"；轻握可选整数 {bounds['minimum']}–{bounds['maximum']}"
+        schema["properties"]["contact_peak"]["description"] += "；收拢时同一指连续三帧峰值的算术平均达到此值即记本轮动作成功，归零保持，达标后自动监测"
+        if self.default_gentle_limits:
+            travel = schema["properties"]["approach_travel"]
+            travel["default"] = GENTLE_DEFAULT_TRAVEL
+            travel["description"] += f"；本机轻握默认 {GENTLE_DEFAULT_TRAVEL}，允许独立选至 {GENTLE_MAX['approach_travel']}，无名指和小指预算增加 20%，每指触物即停"
+        if self.global_config.get("side") == "right":
+            schema["properties"]["bound_side"]["enum"] = ["right", "left"]
         schema["allOf"] = [
             {
-                "if": {"properties": {"action": {"enum": list(TEST_ACTIONS)}}},
+                "if": {"properties": {"action": {"enum": list(MOTION_ACTIONS)}}},
                 "then": {
                     "required": ["bound_side", "confirm_motion"],
                     "properties": {"bound_side": {"enum": ["left", "right"]}},
                 },
             },
             {
-                "if": {"properties": {"action": {"const": "get_state"}}},
+                "if": {"properties": {"action": {"enum": ["get_state", "preview_settings"]}}},
                 "then": {"required": ["bound_side"],
                          "properties": {"bound_side": {"enum": ["left", "right"]}}},
             },
         ]
+        # The split model tools retain property descriptions; the raw MCP schema
+        # also enforces the conditional bounds, preserving explicit generic use.
+        condition = {"properties": {"action": {"enum": ["prepare", "preview_settings"]},
+                                    "gentle_limits": {"const": True}}, "required": ["action"]}
+        if not self.default_gentle_limits:
+            condition["required"].append("gentle_limits")
+        schema["allOf"].append({"if": condition, "then": {"properties": limits}})
         schema["x-is-dangerous"] = True
         schema["x-completion"] = {
-            "actions": list(TEST_ACTIONS),
+            "actions": list(MOTION_ACTIONS),
             "timeout": max(30, math.ceil(4 * self.pose_timeout_s + self.timeout_s
                                          + self.matrix_recovery_timeout_s + 2)),
         }
@@ -231,7 +295,7 @@ class AdaptiveGraspPlugin:
         definition = tool(
             self.PREFIX,
             "actuator",
-            "LinkerHand L20 自适应接触停止抓取、保持、释放与状态读取；使用五指12×6阵列峰值和实际位置反馈",
+            "L20 整手抓取、参数化收拢、保持与滑动监测、释放与状态读取；支持位置和触觉反馈",
             schema,
         )
         definition["title"] = "L20 自适应抓取"
@@ -261,11 +325,74 @@ class AdaptiveGraspPlugin:
         return definition
 
     def start(self) -> None:
-        pass
+        if self._ros2 is None or self._placement_node is not None:
+            return
+        from rclpy.node import Node
+        from std_msgs.msg import String
+        node = Node("l20_placement_" + uuid4().hex[:8], context=self._ros2.ctx_core)
+        try:
+            node.create_subscription(String, "/remote_control/message", self._placement_input, 10)
+            self._ros2.executor_core.add_node(node)
+        except Exception:
+            node.destroy_node()
+            raise
+        self._placement_node = node
+
+    def _placement_input(self, message):
+        try:
+            data = json.loads(message.data)
+            text = data["text"].strip().strip("。，！？.!? ").lower()
+            sent = float(data["ts"])
+        except (AttributeError, ValueError, TypeError, KeyError):
+            return
+        if not math.isfinite(sent) or sent > time.time() + 0.1:
+            return
+        cancel = any(word in text for word in ("等一下", "等等", "等下", "停止", "取消", "暂停", "别抓", "不要抓", "先别", "没放好", "没准备好")) or text in ("停","等","stop","cancel")
+        ready = text in ("放好了", "摆好了", "已就位", "就位", "好了", "可以抓", "放好了，可以抓", "ok", "准备好了")
+        if not (cancel or ready):
+            return
+        key = ("right", self.global_config.get("can_channel","can0"))
+        with self._lock:
+            active = self._active.get(key)
+            if cancel:
+                prepared = self._prepared.get(key)
+                if prepared and prepared.get("timed_placement") and sent >= prepared["request_time"]:
+                    self._prepared.pop(key)
+                if (active and active["options"].get("timed_placement") and sent >= active["options"]["request_time"]
+                        and (active["action"]=="prepare" or active.get("placement_open"))):
+                    active["stop_event"].set()
+                return
+            if active and active.get("placement_open") and sent >= active["placement_start_wall"]:
+                active["placement_ready"].set()
+
+    def _input_available(self):
+        node = self._placement_node
+        if node is None:
+            return False
+        publishers = node.get_publishers_info_by_topic("/remote_control/message")
+        return len(publishers) == 1 and publishers[0].node_name == "phanthy_bus_bridge"
+
+    def _wait_for_placement(self, active):
+        self._set_tactile_status(phase="waiting_for_placement", message=PLACEMENT_NOTICE)
+        while True:
+            self._check_stop()
+            if not self._input_available():
+                raise TestGraspFault("placement_input_unavailable","摆放回复通道不可用，本轮取消合手")
+            with self._lock:
+                self._check_stop()
+                if active["placement_ready"].is_set() or time.monotonic() >= active["placement_deadline"]:
+                    active["placement_open"] = False
+                    return
+            self._wait(0.025)
 
     def stop(self) -> None:
         self._stop.set()
+        node, self._placement_node = self._placement_node, None
+        if node is not None:
+            self._ros2.executor_core.remove_node(node)
+            node.destroy_node()
         with self._lock:
+            self._prepared.clear()
             for active in self._active.values():
                 active["stop_event"].set()
             controllers = list(self._controllers.items())
@@ -406,7 +533,8 @@ class AdaptiveGraspPlugin:
                 # Missing observations cannot count as a continuous stall window.
                 detector.windows.clear()
                 self._set_tactile_status(
-                    phase="recovering_tactile", sample_state="waiting", matrix_valid=False,
+                    phase="recovering_tactile", sample_state="waiting", matrix_valid=False, slip_monitoring_available=False,
+                    tactile_contact_confirmed=False, contact_fingers=[], opposed_now=False,
                     position_valid=False, actual_positions=None,
                     peaks={f: None for f in FINGER_NAMES},
                     matrix_query_attempts=attempts, matrix_retries=attempts - 1,
@@ -697,6 +825,192 @@ class AdaptiveGraspPlugin:
             "target_positions": vector20_to_named16(cmd),
         }
 
+    def _prepare_feedback_grasp(self, client, ctrl, active):
+        profile = active["options"]["settings"]
+        with ctrl._motion_lock:
+            self._check_stop()
+            client.set_speeds([profile.speed] * 5)
+            client.set_currents([profile.output_limit] * 5)
+        self._open_hand(client, ctrl)
+        self._move_pose(client, ctrl, active["options"]["prep_pose"], "五指轻握准备姿态")
+        frames = []
+        for _ in range(3):
+            self._check_stop()
+            matrix = client.get_fresh_matrix_touch(timeout_s=self.matrix_timeout_s,
+                                                  cancel=active["stop_event"])
+            peaks = self._matrix_peaks(matrix)
+            if max(peaks.values()) >= profile.contact_peak:
+                raise TestGraspFault("tare_contact", "空手采样时已有压力，请移开物品再准备")
+            frames.append(matrix)
+        active["empty_baseline"] = empty_baseline(frames)
+        limits = parameter_limits(active["options"]["gentle_limits"])
+        return {"message": (f"准备完毕，本轮峰值 {profile.peak_ceiling}，"
+                            f"可选上限 {limits['peak_ceiling']['maximum']}，整手截停值 {profile.hard_stop_peak_raw}；准备完成，可以发出本轮摆放提示"),
+                "parameter_limits": limits, "settings": asdict(profile), "state": "prepared",
+                "next_action": "close_until_contact", "prepare_id": active["action_id"],
+                "placement_notice": PLACEMENT_NOTICE if active["options"].get("timed_placement") else None,
+                "hard_stop_peak_raw": profile.hard_stop_peak_raw,
+                "travel_by_finger": profile.travel_by_finger,
+                "finger_tip_travel_percent": active["options"]["finger_tip_travel_percent"],
+                "thumb_tip_min_raw": active["options"]["close_limit_pose"][15],
+                "gentle_limits": active["options"]["gentle_limits"],
+                "thumb_yaw_target": active["options"]["prep_pose"][5]}
+
+    def _notify_contact(self, active, sample):
+        verified = sample["tactile_contact_confirmed"]
+        phase = sample["phase"]
+        try:
+            self._acp_callback(active["action_id"], "completed", {
+                "state": phase,
+                "holding": True, "grasp_action_succeeded": sample["grasp_action_succeeded"],
+                "grasp_confirmed": sample["grasp_confirmed"], "tactile_contact_confirmed": verified,
+                "contact_fingers": sample["contact_fingers"], "search_stop": sample["search_stop"],
+                "thumb_middle_contact_seen": sample["thumb_middle_contact_seen"],
+                "remaining_fingers": sample["remaining_fingers"], "travel_limited_fingers": sample["travel_limited_fingers"],
+                "approach_contact_windows": sample["approach_contact_windows"], "peaks": sample["peaks"],
+                "message": sample["message"],
+                "action_id": active["action_id"], "bound_side": active["side"],
+                "can_channel": active["device_key"][1],
+            })
+        except Exception as exc:
+            self._delivery_failed = True
+            logger.warning("轻握接触回调失败: %s", exc)
+
+    def _run_feedback_grasp(self, client, ctrl, active):
+        options = active["options"]
+        profile = options["settings"]
+        with ctrl._motion_lock:
+            self._check_stop()
+            initial = client.get_positions_vector()
+            if any(abs(initial[i] - options["prep_pose"][i]) > self.position_tolerance
+                   for i in range(20) if i not in (11, 12, 13, 14)):
+                raise TestGraspFault("prepare_pose_changed", "准备姿态已改变，请移开物品重新准备")
+            client.set_speeds([profile.speed] * 5)
+            client.set_currents([profile.output_limit] * 5)
+        control = FeedbackGrasp(profile, initial, options["close_limit_pose"],
+                                finger_tip_travel_percent=options["finger_tip_travel_percent"])
+        if options["prep_pose"][5] != self.prep_pose[5]:
+            # Preserve the prepared yaw setpoint in subsequent whole-hand position packets.
+            control.target[5] = options["prep_pose"][5]
+        detector = _JointStallDetector(self.stall_error_threshold, self.stall_position_tolerance,
+                                       self.stall_duration_s)
+        seq = 0
+        hold_since = None
+        while True:
+            self._check_stop()
+            try:
+                matrix, recovery = self._read_matrix_with_recovery(client, detector)
+                if recovery["matrix_retries"]:
+                    control.contact_history.clear()
+                    control.loss_frames = 0
+                    control.clear_frames = dict.fromkeys(FINGER_NAMES, 0)
+                    control.at_limit_frames = dict.fromkeys(FINGER_NAMES, 0)
+                    control.slip_frames = dict.fromkeys(FINGER_NAMES, 0)
+                patches = contact_patches(matrix, options["baseline"])
+                with ctrl._motion_lock:
+                    self._check_stop()
+                    actual = client.get_positions_vector()
+                    now = time.monotonic()
+                    if control.update(patches, actual, now, hold_since is not None):
+                        self._check_stop()
+                        client.set_joint_positions(control.target)
+            except InterruptedError:
+                raise
+            except Exception as exc:
+                if not active.get("contact_ack"):
+                    raise
+                control.paused = f"反馈中断，已停止补夹，请托住物品：{exc}"
+                self._set_tactile_status(phase="needs_support", monitoring=False,
+                                         tactile_contact_confirmed=False, grasp_confirmed=bool(control.best_contact_windows), contact_fingers=[], opposed_now=False,
+                                         slip_monitoring_available=False,
+                                         matrix_valid=False, position_valid=False,
+                                         message=control.paused)
+                break
+            seq += 1
+            if control.paused and not active.get("contact_ack"):
+                code = "tactile_peak_limit" if control.overpressure_fingers else "approach_limit"
+                peak_values = {f: p.peak for f, p in patches.items()}
+                details = {"grasp_action_succeeded": bool(control.best_contact_windows),
+                           "thumb_middle_contact_seen": control.thumb_middle_contact_seen,
+                           "approach_contact_windows": control.best_contact_windows.copy(),
+                           "trigger_peaks": peak_values, "trigger_fingers": list(control.overpressure_fingers),
+                           "peak_ceiling_raw": profile.peak_ceiling, "hard_stop_peak_raw": profile.hard_stop_peak_raw,
+                           "peak_limited_fingers": list(control.peak_limited_fingers),
+                           "saturated_fingers": list(control.saturated_fingers), "search_stop": control.search_stop}
+                self._set_tactile_status(report=False, phase="needs_support", monitoring=False,
+                                         sample_sequence=seq, sample_timestamp=time.time(), matrix_valid=True,
+                                         peaks=peak_values, stop_reason=code, **details,
+                                         actual_positions=vector20_to_named16(actual), message=control.paused)
+                raise TestGraspFault(code, control.paused, details)
+            if hold_since is None and not control.paused and control.best_contact_windows and control.search_stop in ("contact_faded","fingers_settled"):
+                hold_since = now
+            elapsed = now - hold_since if hold_since is not None else 0.0
+            if control.paused:
+                phase, msg = "needs_support", control.paused
+            elif control.waiting_for_signal:
+                phase = "hold_without_signal"
+                msg = "本轮抓握动作成功，保持姿态；当前持续触觉不足，等新信号后自动恢复滑动监测"
+                means = "、".join(f"{FINGER_LABELS[f]} {w['mean_peak_raw']:g}" for f, w in control.best_contact_windows.items())
+                msg += f"（本轮各指最强连续三帧均值：{means}）"
+            elif control.seek_contact:
+                if control.best_contact_windows:
+                    phase, msg = "wrapping", "本轮抓握动作成功，其余手指仍在收拢，请继续承托"
+                else:
+                    phase, msg = "approaching", "逐指搜索接触，请继续托住物品"
+            elif control.search_stop in ("no_progress", "watchdog"):
+                reason = "关节持续无进展" if control.search_stop == "no_progress" else "已达保护时限"
+                phase = "needs_support" if control.best_contact_windows else "unverified_hold"
+                msg = f"{reason}，分指搜索已停，请继续承托并检查"
+            elif not control.best_contact_windows:
+                phase, msg = "unverified_hold", "各指已达限位，尚未确认夹持，请继续承托"
+            elif not control.stable_fingers:
+                phase, msg = "rechecking_contact", "正在重新确认指尖接触，请保持承托或接稳物品"
+            else:
+                phase, msg = "monitoring", "本轮抓握动作成功，按当前位置保持并自动监测滑动，直到明确要求释放"
+            if control.paused and control.best_contact_windows:
+                msg = "本轮抓握动作已成功；随后触发保护。" + msg
+            if control.peak_limited_fingers and not control.paused:
+                msg += f"；{', '.join(control.peak_limited_fingers)} 达到设定峰值，该指暂停加紧"
+            fingers = [f for f in FINGER_NAMES if f in control.stable_fingers]
+            confirmed = bool(fingers) and not control.paused
+            succeeded = bool(control.best_contact_windows)
+            sample = self._set_tactile_status(
+                report=False, phase=phase, message=msg, settings=asdict(profile),
+                grasp_action_succeeded=succeeded,
+                thumb_middle_contact_seen=control.thumb_middle_contact_seen,
+                thumb_alignment_enabled=control.align_thumb, thumb_rotation_locked=control.thumb_rotation_locked,
+                finger_tip_travel_percent=control.finger_tip_travel_percent,
+                thumb_tip_min_raw=options["close_limit_pose"][15],
+                travel_by_finger=profile.travel_by_finger, remaining_fingers=control.remaining_fingers,
+                travel_limited_fingers=[f for f in FINGER_NAMES if f in control.travel_limited],
+                matrix_valid=True, position_valid=True, monitoring=not control.paused,
+                sample_sequence=seq, sample_timestamp=time.time(), sample_state="fresh",
+                peaks={f: p.peak for f, p in patches.items()}, actual_positions=vector20_to_named16(actual),
+                peak_limited_fingers=list(control.peak_limited_fingers), hard_stop_peak_raw=profile.hard_stop_peak_raw,
+                saturated_fingers=list(control.saturated_fingers),
+                search_stop=control.search_stop, trigger_fingers=list(control.overpressure_fingers),
+                stop_reason="tactile_peak_limit" if control.overpressure_fingers else control.search_stop,
+                tactile_contact_confirmed=confirmed,
+                approach_contact_windows=control.best_contact_windows.copy(),
+                slip_monitoring_available=bool(hold_since is not None and confirmed and not control.waiting_for_signal
+                                               and profile.max_corrections),
+                target_positions=vector20_to_named16(control.target), contact_fingers=fingers,
+                opposed_now=control.opposed, relief_count=control.relief_count, corrections=control.corrections, last_slip_fingers=control.last_evidence,
+                output_limit_raw=profile.output_limit, peak_ceiling_raw=profile.peak_ceiling,
+                hold_elapsed_s=round(elapsed, 2), grasp_confirmed=succeeded)
+            if not control.seek_contact and not active.get("contact_ack"):
+                with self._lock:
+                    self._check_stop()
+                    active["contact_ack"] = True
+                    self._states[active["device_key"]] = "holding"
+                threading.Thread(target=self._notify_contact, args=(active, sample), daemon=True).start()
+            if control.paused:
+                break
+            self._wait(self.poll_interval_s)
+        # Preserve the last bounded posture while the operator supports the load.
+        while True:
+            self._wait(0.2)
+
     def _do_release(self, client, ctrl) -> dict:
         target = validate_position_vector(ctrl._open_pose, "open_pose")
         with ctrl._motion_lock:
@@ -715,11 +1029,12 @@ class AdaptiveGraspPlugin:
                     "torque_released": True,
                     "holding": False,
                 }
-            client.set_speeds([self.release_speed] * 5)
-            client.set_currents([self.motion_current] * 5)
+            options = getattr(self._worker_context, 'active', {}).get('options', {})
+            client.set_speeds([options.get('release_speed', self.release_speed)] * 5)
+            client.set_currents([options.get('release_limit', self.motion_current)] * 5)
 
         # 1. 恢复准备姿态松开物体
-        self._move_pose(client, ctrl, self.prep_pose, "恢复准备姿态并松开物体")
+        self._move_pose(client, ctrl, options.get("prep_pose", self.prep_pose), "恢复准备姿态并松开物体")
         # 2. 完全张开
         measured = self._open_hand(client, ctrl)
         # 3. 电机卸力
@@ -774,6 +1089,12 @@ class AdaptiveGraspPlugin:
 
             if active["action"] == "release":
                 result = self._do_release(client, ctrl)
+            elif active["action"] == "prepare":
+                result = self._prepare_feedback_grasp(client, ctrl, active)
+            elif active["action"] == "close_until_contact":
+                if active.get("placement_open"):
+                    self._wait_for_placement(active)
+                result = self._run_feedback_grasp(client, ctrl, active)
             else:
                 result = self._do_adaptive_grasp(client, ctrl, active["options"])
             self._check_stop()
@@ -781,9 +1102,9 @@ class AdaptiveGraspPlugin:
         except InterruptedError as exc:
             status, result = "cancelled", {"message": str(exc), "state": "cancelled", "holding": False}
         except Exception as exc:
-            label = "释放" if active["action"] == "release" else "自适应抓取"
+            label = "释放" if active["action"] == "release" else "抓取控制"
             status, result = "error", {
-                "message": f"{label}失败：{exc}",
+                "message": f"{label}停止：{exc}",
                 "state": "error",
                 "error_code": getattr(exc, "code", "device_error"),
                 "holding": False,
@@ -799,6 +1120,17 @@ class AdaptiveGraspPlugin:
                     status, result = "cancelled", {"message": "motion stopped", "state": "cancelled", "holding": False}
 
                 keep = status == "completed" and active["action"] == "adaptive_grasp"
+                if status == "completed" and active["action"] == "prepare":
+                    self._prepared[device_key] = {
+                        "settings": active["options"]["settings"],
+                        "prep_pose": active["options"]["prep_pose"],
+                        "close_limit_pose": active["options"]["close_limit_pose"],
+                        "finger_tip_travel_percent": active["options"]["finger_tip_travel_percent"],
+                        "gentle_limits": active["options"]["gentle_limits"],
+                        "timed_placement": active["options"]["timed_placement"],
+                        "prepare_id": active["action_id"], "request_time": active["options"]["request_time"],
+                        "baseline": active["empty_baseline"],
+                    }
                 if keep:
                     ctrl._grasp_owner = active["owner"]
                     ctrl._holding_torque = active["options"]["motion_current"]
@@ -814,10 +1146,20 @@ class AdaptiveGraspPlugin:
                     release_motion(ctrl, active["owner"])
 
                 if status != "completed":
-                    self._set_tactile_status(phase=status, monitoring=False,
+                    achieved = bool(active["tactile_status"].get("grasp_action_succeeded"))
+                    if active["action"] == "close_until_contact":
+                        result["grasp_action_succeeded"] = result["grasp_confirmed"] = achieved
+                        if achieved:
+                            windows = active["tactile_status"].get("approach_contact_windows") or {}
+                            evidence = "、".join(f"{FINGER_LABELS[f]}三帧均值 {w['mean_peak_raw']:g}"
+                                                for f, w in windows.items())
+                            result["message"] = f"本轮抓握动作已成功（{evidence}）。" + result["message"]
+                    self._set_tactile_status(phase=status, monitoring=False, grasp_confirmed=achieved, slip_monitoring_available=False,
+                                             tactile_contact_confirmed=False, contact_fingers=[], opposed_now=False,
                                              message=result["message"])
                 elif active["action"] == "release":
-                    self._set_tactile_status(phase="released", monitoring=False,
+                    self._set_tactile_status(phase="released", monitoring=False, grasp_confirmed=False, slip_monitoring_available=False,
+                                             tactile_contact_confirmed=False, contact_fingers=[], opposed_now=False,
                                              message=result["message"])
                 result = {
                     "tactile_status": dict(active["tactile_status"]),
@@ -835,11 +1177,23 @@ class AdaptiveGraspPlugin:
                 active["terminal"] = terminal
                 active["done_event"].set()
 
+        if active.get("contact_ack"):
+            return
         try:
             self._acp_callback(active["action_id"], status, result)
         except Exception as exc:
             self._delivery_failed = True
             logger.warning("[ACP] %s: %s", active["action_id"], exc)
+
+    def _select_settings(self, args):
+        gentle = args.get("gentle_limits", self.default_gentle_limits)
+        return settings_from({**args, "gentle_limits": gentle}), gentle
+
+    def _feedback_close_limit(self, side, gentle):
+        limit = self.close_limit_pose.copy()
+        if side == "right" and gentle:
+            limit[15] = max(limit[15], RIGHT_GENTLE_THUMB_TIP_MIN_RAW)
+        return limit
 
     def _start_action(self, instance_id: str, action: str, args: dict) -> dict:
         side = validate_bound_side(args.get("bound_side"))
@@ -860,18 +1214,48 @@ class AdaptiveGraspPlugin:
                     "tactile_threshold": self.tactile_threshold,
                 })
             previous = self._active.get(device_key)
+            if action == "prepare":
+                options["settings"], gentle = self._select_settings(args)
+                options["gentle_limits"] = gentle
+                options["timed_placement"] = gentle and side == "right"
+                options["request_time"] = time.time()
+                options["finger_tip_travel_percent"] = _finger_tip_travel_percent(side, gentle)
+                pose = self.prep_pose.copy()
+                if side == "right" and gentle:
+                    pose[5] = min(255, pose[5] + RIGHT_GENTLE_THUMB_YAW_OFFSET)
+                options["prep_pose"] = pose
+                options["close_limit_pose"] = self._feedback_close_limit(side, gentle)
+            elif action == "close_until_contact":
+                if device_key not in self._prepared:
+                    raise ValueError("请先空手执行 prepare 并等待准备完成")
+                options.update(self._prepared[device_key])
+                if options.get("timed_placement"):
+                    if args.get("prepare_id") != options["prepare_id"] or args.get("placement_notice") != PLACEMENT_NOTICE:
+                        raise ValueError("请使用本轮 prepared 的 prepare_id 和卡片声明的 placement_notice 启动一次摆放倒计时")
+                    if not self._input_available():
+                        raise ValueError("摆放回复通道不可用，本轮未启动倒计时")
+            elif action == "release":
+                prepared = self._prepared.get(device_key)
+                if previous and previous["action"] in ("prepare", "close_until_contact"):
+                    prepared = previous["options"]
+                if prepared:
+                    profile = prepared["settings"]
+                    options.update(release_limit=profile.output_limit, release_speed=profile.speed,
+                                   prep_pose=prepared["prep_pose"])
             if previous is not None:
                 if action != "release":
-                    raise RuntimeError("当前正在抓握或释放，请先执行 release 后再重新抓取")
+                    raise RuntimeError("已有动作或正在持物，本次抓取未执行；持物时只在用户明确说松开后释放")
                 active = previous if previous["action"] == "release" else None
                 client, side, ctrl = previous["client"], previous["side"], previous["controller"]
             else:
                 if action != "release" and device_key in self._sessions:
-                    raise RuntimeError("当前正在保持抓握，请先执行 release，再重新抓取，避免意外重新开手")
+                    raise RuntimeError("当前正在持物，保持至用户明确要求松开")
                 client, side, ctrl = self._get_client_and_ctrl(side, channel)
                 if not ctrl._motion_lock.acquire(blocking=False):
                     raise RuntimeError("该手正在执行其他动作，请等待结束后再抓握")
                 try:
+                    if action == "prepare" and vars(ctrl).get("_holding_torque", 0):
+                        raise RuntimeError("该手仍有保持出力，等用户明确说松开")
                     claim_motion(ctrl, owner, config=self.global_config)
                     verify_hand_connection(client)
                     ctrl._test_grasp_owner = owner
@@ -883,6 +1267,7 @@ class AdaptiveGraspPlugin:
                 active = None
 
             if active is None:
+                self._prepared.pop(device_key, None)
                 active = {
                     "action": action,
                     "action_id": f"test_{action}_{uuid4().hex[:12]}",
@@ -914,10 +1299,15 @@ class AdaptiveGraspPlugin:
                         "sample_state": "not_requested" if action == "release" else "waiting",
                         "matrix_valid": False, "monitoring": action == "adaptive_grasp",
                         "sample_sequence": 0, "sample_timestamp": None,
+                        "grasp_action_succeeded": False,
                         "peaks": {f: None for f in FINGER_NAMES},
                         "message": "释放动作不依赖触觉" if action == "release" else "准备姿态中，尚未开始采集12×6触觉阵列",
                     },
                 }
+                if action == "close_until_contact" and options.get("timed_placement"):
+                    # Core broadcasts the tool call including the literal placement notice before dispatch.
+                    active.update(placement_open=True, placement_start_wall=time.time(),
+                                  placement_deadline=time.monotonic()+PLACEMENT_SECONDS, placement_ready=threading.Event())
                 self._stop.clear()
                 self._active[device_key] = active
                 self._states[device_key] = "releasing" if action == "release" else "grasping"
@@ -955,11 +1345,37 @@ class AdaptiveGraspPlugin:
             if action == "release"
             else "自适应抓取已开始：准备姿态后读取五指12×6阵列最大值和实际位置；触觉达阈停整指，位置持续受阻停对应关节；用 get_state 查看进度和最终结果，release 释放"
         )
-        return {"message": msg, "state": "running", "action_id": active["action_id"],
-                "tactile_status": dict(active["tactile_status"])}
+        if action == "prepare":
+            msg = "开始张开并空手准备，等待 prepared 后直接发本轮摆放提示"
+        elif action == "close_until_contact":
+            msg = PLACEMENT_NOTICE if active["options"].get("timed_placement") else "开始逐指收拢并自动监测"
+        result = {"message": msg, "state": "running", "action_id": active["action_id"],
+                  "tactile_status": dict(active["tactile_status"])}
+        if action == "prepare":
+            result.update(settings=asdict(active["options"]["settings"]),
+                          hard_stop_peak_raw=active["options"]["settings"].hard_stop_peak_raw,
+                          finger_tip_travel_percent=active["options"]["finger_tip_travel_percent"],
+                          thumb_tip_min_raw=active["options"]["close_limit_pose"][15],
+                          travel_by_finger=active["options"]["settings"].travel_by_finger,
+                          parameter_limits=parameter_limits(active["options"]["gentle_limits"]))
+        if action == "close_until_contact":
+            result["expected_duration_s"] = SEARCH_WATCHDOG_S + self.matrix_recovery_timeout_s
+        return result
 
     def dispatch(self, action: str, args: dict) -> dict | None:
         instance_id = args.get("instance_id") or ""
+        if action == "preview_settings":
+            side = validate_bound_side(args.get("bound_side"))
+            settings, gentle = self._select_settings(args)
+            limits = parameter_limits(gentle)
+            return {"state": "preview", "bound_side": side, "gentle_limits": gentle,
+                    "hard_stop_peak_raw": settings.hard_stop_peak_raw,
+                    "thumb_alignment_enabled": False,
+                    "finger_tip_travel_percent": _finger_tip_travel_percent(side, gentle),
+                    "thumb_tip_min_raw": self._feedback_close_limit(side, gentle)[15],
+                    "settings": asdict(settings), "parameter_limits": limits, "travel_by_finger": settings.travel_by_finger,
+                    "message": (f"拟用峰值 {settings.peak_ceiling}，允许上限 "
+                                f"{limits['peak_ceiling']['maximum']}，整手截停值 {settings.hard_stop_peak_raw}；参数尚未应用")}
         if action == "config":
             with self._lock:
                 settings = {name: _setting(args.get(name, getattr(self, name)), name)
@@ -995,8 +1411,12 @@ class AdaptiveGraspPlugin:
                 last_result = self._results.get(device_key)
                 sample = (active["tactile_status"] if active else
                           (last_result or {}).get("result", {}).get("tactile_status", {}))
+                if active and active["action"] == "close_until_contact" and sample.get("phase") == "unverified_hold":
+                    state = "unverified_hold"
                 message = ("已停止；上一动作结果仅供查阅，张开请执行 release" if state == "idle" else
                            sample.get("message") or "当前没有活动任务或完成记录")
+                if active is None and not self._sessions.get(device_key) and state == "error":
+                    message = "当前无活动或持物；上一次动作已结束，新抓取可直接 prepare。历史回执：" + message
                 return {
                     "state": state,
                     "message": message,
@@ -1004,8 +1424,9 @@ class AdaptiveGraspPlugin:
                     "can_channel": device_key[1],
                     "action_id": active["action_id"] if active else (last_result or {}).get("action_id"),
                     "active_action_id": active["action_id"] if active else None,
-                    "holding": device_key in self._sessions,
+                    "holding": device_key in self._sessions or bool(active and (active.get("contact_ack") or sample.get("grasp_confirmed"))),
                     "monitoring": bool(active and sample.get("monitoring")),
+                    "default_parameter_limits": parameter_limits(self.default_gentle_limits),
                     "last_result": last_result,
                     "tactile_status": dict(sample),
                     "completion_delivery_failed": self._delivery_failed,
@@ -1031,6 +1452,7 @@ class AdaptiveGraspPlugin:
                     targets = []
                 controllers = []
                 for key in targets:
+                    self._prepared.pop(key, None)
                     active = self._active.get(key)
                     if active:
                         active["stop_event"].set()
@@ -1048,7 +1470,7 @@ class AdaptiveGraspPlugin:
                 "torque_released": unloaded,
                 "target_resolved": bool(targets),
             }
-        if action in TEST_ACTIONS:
+        if action in MOTION_ACTIONS:
             if args.get("confirm_motion") is not True:
                 raise ValueError("confirm_motion 必须为 true")
             wait = args.get("wait_for_result", False)

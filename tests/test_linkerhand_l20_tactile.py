@@ -95,7 +95,7 @@ def test_tactile_tool_metadata(fake_hand):
     ]
 
     schema = tool_def["inputSchema"]
-    assert set(schema['properties']) == {'action'}
+    assert set(schema['properties']) == {'action', 'finger', 'threshold'}
     assert set(tool_def['configSchema']['properties']) == {'bound_side', 'can_channel', 'poll_hz'}
     side = tool_def['configSchema']['properties']['bound_side']
     assert side['scope'] == 'instance'
@@ -103,8 +103,7 @@ def test_tactile_tool_metadata(fake_hand):
     assert side['default'] == 'left'
     assert tool_def['configSchema']['properties']['can_channel']['scope'] == 'instance'
     assert "action" in schema["properties"]
-    # Core hides sensor ACTION and execute controls when only lifecycle actions remain.
-    assert set(schema["properties"]["action"]["enum"]) == {"info", "start", "stop", "config"}
+    assert set(schema["properties"]["action"]["enum"]) == {"info", "start", "stop", "config", "read_contact"}
 
 
 def test_tactile_info_and_config(fake_hand):
@@ -717,3 +716,14 @@ def test_anonymous_stream_single_instance_protection_and_multi_instance_isolatio
     finally:
         plugin.stop()
 
+
+def test_read_contact_filters_finger_and_requests_new_matrix(fake_hand):
+    hand, client = fake_hand
+    plugin = TactilePlugin(hand, {"auto_start": False})
+    for _ in range(2):
+        obs = plugin.dispatch("read_contact", {"finger": "index", "threshold": 11})
+        assert obs["matrix_fresh"] and set(obs["readings"]) == {"index"}
+        r = obs["readings"]["index"]
+        assert r["contact"] == (max(r["scalar"], r["matrix_peak"]) >= 11)
+    with pytest.raises(ValueError, match="threshold"):
+        plugin.dispatch("read_contact", {"threshold": 0})
