@@ -6,10 +6,11 @@ hardware_model: helios-2.1
 image_name: rokae-helios
 port: 15747
 mcp_url: http://localhost:15747/mcp
-description: Read-only 20-axis joints and dual-battery status via the installed iNex and chassis UI streams
+description: Read-only 20-axis joints, dual-battery status and dual 3D lidar point clouds
 build_context_extras:
   - ../../common
 cards:
   - {name: joints, type: sensor}
   - {name: battery, type: sensor}
+  - {name: lidar_cloud, type: sensor}
   - {name: model, type: resource}
