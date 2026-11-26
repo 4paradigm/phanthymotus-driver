@@ -28,6 +28,7 @@ def guard_error(reply):
         'keyboard_initial_stop_ownership_lost', 'keyboard_release_rejected',
         'keyboard_command_expired', 'keyboard_watchdog_expired',
         'keyboard_software_stop_is_active', 'keyboard_stop_rejected',
+        'keyboard_fallback_stop_unconfirmed',
         'factory_keyboard_stream_disconnected', 'factory_keyboard_guard_timeout',
         'invalid_factory_websocket_handshake', 'factory_websocket_closed',
         'factory_websocket_api_error', 'factory_motion_rejected',

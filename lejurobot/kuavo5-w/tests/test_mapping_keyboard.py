@@ -128,6 +128,21 @@ class MappingKeyboardTests(unittest.TestCase):
         self.assertIsNone(self.keyboard.last_failure)
         self.assertGreaterEqual(self.keyboard.info()['max_roundtrip_ms'], 250.)
 
+    def test_unconfirmed_ros_fallback_remains_persistently_blocked(self):
+        original = self.stream.read
+        self.stream.confirm_stop = False
+        def read(timeout):
+            if self.stream.held and not self.stream.stopping:
+                return {'state':'error', 'error':'keyboard_fallback_stop_unconfirmed'}
+            return original(timeout)
+        self.stream.read = read
+        self.spatial.dispatch('keyboard_open', {})
+        self.assertTrue(wait_until(lambda:self.keyboard.session is None))
+        self.assertEqual(self.keyboard.last_failure, 'keyboard_fallback_stop_unconfirmed')
+        self.assertEqual(self.keyboard.info()['state'], 'stop_unconfirmed')
+        self.assertTrue(self.spatial.store.state('pending')['keyboard_stop_unconfirmed'])
+        self.assertEqual(self.spatial.dispatch('keyboard_open', {})['state'], 'error')
+
     def test_panel_open_has_no_side_effects_and_exposes_existing_canvas_contract(self):
         page = self.spatial.dispatch('mapping_console', {})
         self.assertEqual(page['protocol'], 'motus.workbench/1')
@@ -502,6 +517,70 @@ class ChassisGuardTests(unittest.TestCase):
                 ws.close()
         self.assertTrue(wire.closed)
 
+    def test_failed_zero_uses_independent_ros_stop_and_requires_held_rest_feedback(self):
+        for fault in (None, 'dispatch_rejected', 'dispatch_error', 'held_feedback', 'rest_feedback', 'held_lost'):
+            with self.subTest(fault=fault):
+                events = []
+                def send(message):
+                    events.append('zero_failed')
+                    raise ConnectionError('factory_websocket_disconnected')
+                def dispatch(**args):
+                    events.append(('dispatch', args['control_mode']))
+                    if fault == 'dispatch_error':
+                        raise ConnectionError('ros unavailable')
+                    return types.SimpleNamespace(success=fault != 'dispatch_rejected')
+                def held(rospy, expected):
+                    events.append('held')
+                    self.assertIs(expected, True)
+                    if fault == 'held_feedback' or (fault == 'held_lost' and events.count('held') == 2):
+                        raise RuntimeError('no held feedback')
+                def rest(*args):
+                    events.append('rest')
+                    if fault == 'rest_feedback':
+                        raise RuntimeError('still moving')
+                namespace = {'confirm_software_stop':held, 'confirm_stationary':rest}
+                ws = types.SimpleNamespace(send=send)
+                if fault:
+                    with self.assertRaisesRegex(RuntimeError, 'keyboard_fallback_stop_unconfirmed'):
+                        remote.confirm_manual_stop(ws, namespace, object(), object(), dispatch)
+                else:
+                    reply = remote.confirm_manual_stop(ws, namespace, object(), object(), dispatch)
+                    self.assertTrue(confirmed_stop(dict(reply, state='stopped')))
+                    self.assertFalse(reply['manual_zero_sent'])
+                    self.assertEqual(events, ['zero_failed', ('dispatch', 0), 'held', 'rest', 'held'])
+                self.assertIn(('dispatch', 0), events)
+                self.assertNotIn(('dispatch', 1), events)
+
+    def test_reader_failure_while_confirming_zero_uses_ros_even_if_odometry_is_static(self):
+        failed, events = threading.Event(), []
+        ws = types.SimpleNamespace(send=lambda message:events.append('zero'), failed=failed)
+        def rest(*args):
+            events.append('rest')
+            failed.set()
+        def dispatch(**args):
+            events.append(('dispatch',args['control_mode']))
+            return types.SimpleNamespace(success=True)
+        namespace = {'confirm_stationary':rest, 'confirm_software_stop':lambda *args:events.append('held')}
+        reply = remote.confirm_manual_stop(ws, namespace, object(), object(), dispatch)
+        self.assertEqual(reply['stop_fallback'], 'local_ros_software_stop')
+        self.assertEqual(events, ['zero','rest',('dispatch',0),'held','rest','held'])
+
+    def test_zero_send_without_stationary_feedback_also_requests_ros_stop(self):
+        events = []
+        def rest(*args):
+            events.append('rest')
+            if events.count('rest') == 1:
+                raise RuntimeError('zero not yet effective')
+        def dispatch(**args):
+            events.append(('dispatch', args['control_mode']))
+            return types.SimpleNamespace(success=True)
+        namespace = {'confirm_stationary':rest, 'confirm_software_stop':lambda *args:events.append('held')}
+        ws = types.SimpleNamespace(send=lambda message:events.append('zero'))
+        reply = remote.confirm_manual_stop(ws, namespace, object(), object(), dispatch)
+        self.assertTrue(confirmed_stop(dict(reply, state='stopped')))
+        self.assertTrue(reply['manual_zero_sent'])
+        self.assertEqual(events, ['zero', 'rest', ('dispatch', 0), 'held', 'rest', 'held'])
+
     def test_manual_stop_sends_zero_before_confirming_rest_without_soft_estop(self):
         for failure in (None, 'send', 'rest'):
             with self.subTest(failure=failure):
@@ -537,7 +616,7 @@ class ChassisGuardTests(unittest.TestCase):
                 self.assertEqual(any(item[0] == 'rest' for item in events), failure != 'send')
 
     def test_full_remote_guard_orders_zero_release_and_stop_on_eof_or_mode_loss(self):
-        for cause in ('eof', 'mode', 'timeout', 'zero_then_turn', 'held_release'):
+        for cause in ('eof', 'mode', 'timeout', 'zero_then_turn', 'held_release', 'zero_write_fail', 'zero_write_fail_unconfirmed'):
             with self.subTest(cause=cause):
                 read_fd, write_fd = os.pipe()
                 state = types.SimpleNamespace(manual_mode=True, mapping=True, estop=False,
@@ -545,7 +624,7 @@ class ChassisGuardTests(unittest.TestCase):
                 commands, outputs, errors = [], [], []
                 def dispatch(**args):
                     commands.append(('dispatch', args['control_mode']))
-                    state.soft_estop = args['control_mode'] == 0
+                    state.soft_estop = args['control_mode'] == 0 and cause != 'zero_write_fail_unconfirmed'
                     return types.SimpleNamespace(success=True)
                 def check_stop(rospy, expected):
                     self.assertEqual(state.soft_estop, expected)
@@ -565,8 +644,9 @@ class ChassisGuardTests(unittest.TestCase):
                     'nav_msgs.msg': types.SimpleNamespace(Odometry=object)}
                 def motion(value):
                     commands.append(('motion', json.loads(value)['params']))
-                    if cause == 'release_on_zero' and len(commands) == 2:
-                        state.soft_estop = False
+                    if cause.startswith('zero_write_fail') and not json.loads(value)['params']['vx'] and any(
+                            kind == 'motion' and params['vx'] for kind, params in commands):
+                        raise ConnectionError('factory_websocket_disconnected')
                 ws = types.SimpleNamespace(send=motion, close=lambda: None)
                 def run():
                     try:
@@ -598,13 +678,25 @@ class ChassisGuardTests(unittest.TestCase):
                             send(4, [0., -.2])
                             self.assertTrue(wait_until(lambda: outputs[-1].get('seq') == 4))
                             self.assertTrue(worker.is_alive())
-                        if cause in ('eof', 'zero_then_turn', 'held_release'):
+                        if cause in ('eof', 'zero_then_turn', 'held_release', 'zero_write_fail', 'zero_write_fail_unconfirmed'):
                             expected_seq = 4 if cause == 'zero_then_turn' else 2
                             self.assertTrue(wait_until(lambda: outputs[-1].get('seq') == expected_seq))
                             os.close(write_fd)
                             write_fd = None
                         worker.join(1)
                         self.assertFalse(worker.is_alive())
+                        if cause.startswith('zero_write_fail'):
+                            self.assertIn(('dispatch', 0), commands)
+                            self.assertEqual(sum(item == ('dispatch', 0) for item in commands), 1)
+                            if cause.endswith('unconfirmed'):
+                                self.assertFalse(any(item['state'] == 'stopped' for item in outputs))
+                                self.assertEqual(str(errors[-1]), 'keyboard_fallback_stop_unconfirmed')
+                            else:
+                                self.assertEqual(outputs[-1]['state'], 'stopped')
+                                self.assertTrue(outputs[-1]['software_estop'])
+                                self.assertFalse(outputs[-1]['manual_zero_sent'])
+                                self.assertEqual(outputs[-1]['stop_fallback'], 'local_ros_software_stop')
+                            continue
                         self.assertEqual(outputs[-1]['state'], 'stopped')
                         self.assertEqual(commands[0], ('motion', {'vx': 0., 'vy': 0., 'vw': 0.}))
                         self.assertEqual(commands[1], ('motion', {'vx': 0., 'vy': 0., 'vw': 0.}))

@@ -164,7 +164,8 @@ class Client:
         if operation == 'manual_auto_guard':
             return {'success':True,'stationary':True,'native_tracker_idle':True,'upper_zero':True}
         if operation == 'manual_stop':
-            return {'success':True,'stationary':True,'manual_zero_sent':True}
+            return {'success':True,'stationary':True,'manual_zero_sent':True,
+                    'completion_basis':'factory_manual_zero_and_fresh_stationary_odometry'}
         if operation == 'upper_handoff':
             return {'success':True,'stationary':True,'software_estop':False,
                     'velocity_source':'nav_mpc_move_base','delivery_uncertain':False}

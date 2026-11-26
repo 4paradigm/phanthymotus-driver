@@ -1,8 +1,9 @@
 """Ephemeral, unprivileged factory-web keyboard guard on the chassis.
 
 Received over the existing SSH stream; never installed or started at boot.
-The watchdog lives beside the factory API, so a lost browser, driver, or SSH
-connection cannot leave a final nonzero RobotMotion command latched remotely.
+The watchdog lives beside the factory API and requests zero on browser, driver,
+or SSH loss, with a separate ROS software-stop fallback if zero cannot be
+confirmed. Failure of both paths remains blocked; physical stop is not assumed.
 NAVIGATION_SOURCE is injected from the same image as this helper.
 """
 import json
@@ -157,6 +158,50 @@ def receive(stream, timeout):
     raise TimeoutError('keyboard_watchdog_expired')
 
 
+def dispatch_proxy(namespace, rospy):
+    """Resolve the chassis-local dispatcher with the verified vendor ABI."""
+    import rosgraph
+    import rosservice
+    from leju_mobile_base_msgs.srv import SetDispatchMode
+    name = '/move_base/set_dispatch_mode'
+    headers = rosservice.get_service_headers(name, rosgraph.Master('/motus_keyboard').lookupService(name))
+    kind = namespace['dispatch_service_class'](SetDispatchMode, headers.get('md5sum'))
+    return rospy.ServiceProxy(name, kind)
+
+
+def confirm_manual_stop(ws, namespace, rospy, Odometry, dispatch=None):
+    """Normal zero/rest; independent ROS stop when the factory route fails."""
+    zero_sent = False
+    try:
+        if ws is None:
+            raise ConnectionError('factory_websocket_disconnected')
+        ws.send(json.dumps({'method': 'RobotMotion', 'id': '1',
+                            'params': {'vx': 0., 'vy': 0., 'vw': 0.}}))
+        zero_sent = True
+        namespace['confirm_stationary'](rospy, Odometry)
+        if getattr(ws, 'failed', None) is not None and ws.failed.is_set():
+            raise ConnectionError('factory_websocket_disconnected')
+        return {'success': True, 'stationary': True, 'manual_zero_sent': True,
+                'completion_basis': 'factory_manual_zero_and_fresh_stationary_odometry'}
+    except Exception as exc:
+        zero_error = guard_error_code(exc)
+    # The failed WebSocket is never used for this fallback. A response alone
+    # does not prove stopping: require the held flag before AND after rest.
+    try:
+        dispatch = dispatch if dispatch is not None else dispatch_proxy(namespace, rospy)
+        if dispatch(control_mode=0).success is not True:
+            raise RuntimeError('keyboard_stop_rejected')
+        namespace['confirm_software_stop'](rospy, True)
+        namespace['confirm_stationary'](rospy, Odometry)
+        namespace['confirm_software_stop'](rospy, True)
+    except Exception:
+        raise RuntimeError('keyboard_fallback_stop_unconfirmed') from None
+    return {'success': True, 'stationary': True, 'software_estop': True,
+            'manual_zero_sent': zero_sent, 'stop_fallback': 'local_ros_software_stop',
+            'zero_error': zero_error,
+            'completion_basis': 'local_ros_software_stop_and_fresh_stationary_odometry'}
+
+
 def manual_zero_stop(request):
     """Factory MANUAL stop: zero RobotMotion plus fresh physical rest."""
     namespace = {'__name__': 'motus_keyboard_navigation'}
@@ -176,14 +221,15 @@ def manual_zero_stop(request):
     state = rospy.wait_for_message('/jaten_behavior_manager/robot_state', RobotChassisState, timeout=2.)
     if state.manual_mode is not True:
         raise RuntimeError('keyboard_manual_stop_requires_manual_mode')
-    ws = FactorySocket()
     try:
-        ws.send(json.dumps({'method':'RobotMotion','id':'1','params':{'vx':0.,'vy':0.,'vw':0.}}))
-        namespace['confirm_stationary'](rospy, Odometry)
-        return {'success':True,'stationary':True,'manual_zero_sent':True,
-                'completion_basis':'factory_manual_zero_and_fresh_stationary_odometry'}
+        ws = FactorySocket()
+    except Exception:
+        ws = None
+    try:
+        return confirm_manual_stop(ws, namespace, rospy, Odometry)
     finally:
-        ws.close()
+        if ws is not None:
+            ws.close()
 
 
 def run(request):
@@ -196,15 +242,9 @@ def run(request):
     if held.get('stationary') is not True:
         raise RuntimeError('keyboard_initial_stop_unconfirmed')
     import rospy
-    import rosgraph
-    import rosservice
     from jaten_msgs.msg import RobotChassisState
-    from leju_mobile_base_msgs.srv import SetDispatchMode
     from nav_msgs.msg import Odometry
-    name = '/move_base/set_dispatch_mode'
-    headers = rosservice.get_service_headers(name, rosgraph.Master('/motus_keyboard').lookupService(name))
-    kind = namespace['dispatch_service_class'](SetDispatchMode, headers.get('md5sum'))
-    dispatch = rospy.ServiceProxy(name, kind)
+    dispatch = dispatch_proxy(namespace, rospy)
 
     latest = [None, 0.]
     def feedback(state):
@@ -269,30 +309,22 @@ def run(request):
             emit({'state': 'ready', 'nonce': nonce, 'seq': seq})
             deadline = time.monotonic()+LEASE_S
     finally:
-        # Local loopback zero does not depend on the failed SSH/browser link.
+        # Neither stop route depends on the failed SSH/browser link. The ROS
+        # fallback is also independent of a broken factory WebSocket.
         failure = sys.exc_info()[1]
         try:
-            zero_sent = False
-            if ws is not None:
-                try:
-                    ws.send(json.dumps({'method': 'RobotMotion', 'id': '1',
-                                        'params': {'vx': 0., 'vy': 0., 'vw': 0.}}))
-                    zero_sent = True
-                except Exception:
-                    pass
-                try:
-                    if not zero_sent:
-                        raise RuntimeError('keyboard_zero_stop_send_unconfirmed')
-                    namespace['confirm_stationary'](rospy, Odometry)
-                    reply = {'state': 'stopped', 'stationary': True, 'manual_zero_sent': True,
-                             'completion_basis':'factory_manual_zero_and_fresh_stationary_odometry'}
-                    if failure is not None and not isinstance(failure, EOFError):
-                        reply['error'] = guard_error_code(failure)
-                    emit(reply)
-                finally:
-                    ws.close()
+            reply = dict(confirm_manual_stop(ws, namespace, rospy, Odometry, dispatch), state='stopped')
+            if failure is not None and not isinstance(failure, EOFError):
+                reply['error'] = guard_error_code(failure)
+            elif reply.get('zero_error'):
+                reply['error'] = reply['zero_error']
+            emit(reply)
         finally:
-            subscription.unregister()
+            try:
+                if ws is not None:
+                    ws.close()
+            finally:
+                subscription.unregister()
 
 
 def guard_error_code(exc):
@@ -303,6 +335,7 @@ def guard_error_code(exc):
         'keyboard_command_expired', 'keyboard_watchdog_expired',
         'keyboard_software_stop_is_active', 'keyboard_stop_rejected',
         'keyboard_manual_stop_requires_manual_mode', 'keyboard_zero_stop_send_unconfirmed',
+        'keyboard_fallback_stop_unconfirmed',
         'invalid_factory_websocket_handshake', 'factory_websocket_closed',
         'factory_websocket_api_error', 'factory_motion_rejected',
         'factory_websocket_disconnected', 'factory_websocket_write_busy'}

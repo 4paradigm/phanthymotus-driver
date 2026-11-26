@@ -10,7 +10,7 @@ from uuid import UUID, uuid4
 
 from spatial_client import JatenClient, MapCommandRejected, NavigationStateUnavailable
 from map_storage import MapArchive, migrate_database, safe_name
-from mapping_keyboard import MappingKeyboard
+from mapping_keyboard import MappingKeyboard, confirmed_stop
 
 
 NAV_SPEED_MIN, NAV_SPEED_MAX, NAV_SPEED_DEFAULT = .05, .5, .15
@@ -487,7 +487,7 @@ class ControlledSpatialPlugin:
             raise RuntimeError('chassis_mode_unknown_before_auto')
         stopped = self.client.native('manual_stop')
         check()
-        if any(stopped.get(key) is not True for key in ('success', 'stationary', 'manual_zero_sent')):
+        if stopped.get('success') is not True or not confirmed_stop(dict(stopped, state='stopped')):
             raise RuntimeError('manual_zero_required_before_auto')
         # AUTO can reactivate a different velocity route. Silence the upper
         # MPC and prove the native tracker has finished before changing mode.
@@ -957,8 +957,7 @@ class ControlledSpatialPlugin:
             # An orphaned SSH helper never resumes after a lost heartbeat. Still
             # require factory MANUAL zero and fresh rest before clearing its fence.
             response = self.client.native('manual_stop')
-            if (response.get('success') is not True or response.get('stationary') is not True
-                    or response.get('manual_zero_sent') is not True
+            if (response.get('success') is not True or not confirmed_stop(dict(response, state='stopped'))
                     or (self.keyboard.thread and self.keyboard.thread.is_alive())):
                 raise RuntimeError('mapping_keyboard_stop_unconfirmed')
             self._keyboard_pending = False
@@ -1454,8 +1453,7 @@ class ControlledSpatialPlugin:
             raise RuntimeError('chassis_mode_unknown_before_map_operation')
         manual_hold = mode == 'MANUAL'
         hold = self.client.native('manual_stop' if manual_hold else 'soft_stop')
-        if (hold.get('success') is not True or hold.get('stationary') is not True
-                or hold.get('manual_zero_sent' if manual_hold else 'software_estop') is not True):
+        if (hold.get('success') is not True or not confirmed_stop(dict(hold, state='stopped'))):
             raise RuntimeError('map_operation_requires_confirmed_manual_stop' if manual_hold
                                else 'map_operation_requires_confirmed_software_stop')
         if cancelled.is_set():

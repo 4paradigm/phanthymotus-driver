@@ -1061,3 +1061,5 @@ audit for timing, geometry limitations and deployment status.
 执行模式核对：所有全身运动卡（base_drive、base_servo、arm、leg、head、原生导航）共同使用上位机 BaseArm=3，不把底盘的 MANUAL/AUTO 当成同一个模式枚举。每次新的底盘执行都读取实际模式；缓存的上位机通路若遇到 MANUAL 或不同 mux 选择会重新交接，避免仅凭旧缓存发目标。原生导航在自动准备前允许“已定位但仍MANUAL/调度停车”，准备后再次核对AUTO再发目标；硬件急停、碰撞、驱动故障、未初始化定位和当前图不匹配仍拒绝。模式改变不会替代载图或重定位。
 
 `info.control_ownership.execution_modes` 提供各卡/地图动作的只读模式要求。arm/leg/head 的执行只准备 BaseArm，不改变底盘模式或速度源；tag_place/get_pose/list_maps/delete_map、spatial_map预览、speaker及传感器不为了读取或显示而切运动模式。已有任务/建图占用时不能用另一张卡的执行隐式抢权，须先结束占用；停止请求不会为了“满足模式”而恢复使能。
+
+键盘故障停车分两路：正常松键保留会话并发 RobotMotion 零速；释放/断连/看门狗退出先用同一厂商连接发零速并确认新鲜里程计静止。如果 WebSocket 已坏、零速写失败或静止不能确认，底盘本地守护改走独立 ROS SetDispatchMode(control_mode=0)，要求软停反馈为真、里程计静止、再核对软停仍为真，才返回已停车。故障兜底不解除软停、不切模式、不发非零目标。两条路径均未确认时返回 keyboard_fallback_stop_unconfirmed 并保留持久化阻断；不能以idle或进程已退出证明真机停住。MANUAL下厂商ROS软停曾有不确认记录，此兜底是否有效仍需真机故障场景验证，单元测试不替代该验证。
