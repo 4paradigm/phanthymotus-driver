@@ -279,6 +279,10 @@ class WeighEngine:
         self._raw_sleep = sleep
         self._log = log
         self._cancel = threading.Event()             # stop() 置位：不再下发任何手臂/手指指令
+        # 本卡下发 move_pos 之后、到位/失败之前为 True：stop 时手臂可能还在朝目标走，要补一条
+        # "停在当前位置"。_cmd_lock 让"检查取消 + 下发指令"和 stop 的补发互斥，补发总在最后。
+        self._cmd_lock = threading.Lock()
+        self._moving = False
         self._lock = threading.Lock()
         self._force = {s: deque() for s in SIDES}    # (t, fx, fy, fz, tx, ty, tz)
         self._joints = {s: deque() for s in SIDES}   # (t, pos[7], speed[7], current[7], error_max)
@@ -919,8 +923,9 @@ class WeighEngine:
             return None
         return f"servo {state}"
 
-    def _call_arm(self, args: dict):
-        self._check_cancel()
+    def _call_arm(self, args: dict, *, on_cancel: bool = False):
+        if not on_cancel:            # 取消后只允许 hold_if_moving 补发的那条"停在当前位置"
+            self._check_cancel()
         if self._arm_call is None:
             return {"state": "error", "code": "arm_card_unavailable",
                     "error": "arm 卡未启用，pose/retract 不可用"}
@@ -932,8 +937,9 @@ class WeighEngine:
             return {"state": "error", "code": "arm_card_unavailable", "error": "arm 卡未启用"}
         return r
 
-    def _freeze(self):
-        """超时未到位：把两臂目标设成当前位置，停止继续用力。只在没有电机故障时调用。"""
+    def _freeze(self, on_cancel: bool = False):
+        """把两臂目标设成当前位置，停止继续用力：超时未到位时，以及 stop 取消了运动中的
+        一段时。只在没有电机故障时调用。"""
         now = self._clock()
         left, right = self._arm_deg("left", now), self._arm_deg("right", now)
         if left is None or right is None:
@@ -946,8 +952,24 @@ class WeighEngine:
         self._log(f"[weigh] freeze: holding right at {_fmt_deg(right)}, left at {_fmt_deg(left)}")
         r = self._call_arm({"action": "move_pos", "left_positions": [round(x, 2) for x in left],
                             "right_positions": [round(x, 2) for x in right],
-                            "speed": self.cfg["pose_speed"]})
+                            "speed": self.cfg["pose_speed"]}, on_cancel=on_cancel)
         return {"sent": True, "arm_result": r.get("state"), "arm_error": r.get("error")}
+
+    def hold_if_moving(self, timeout: float = -1) -> dict:
+        """stop 取消动作后调用：本卡的一段运动还没结束时，把两臂目标设成当前位置。
+        arm 卡的 move_pos 发出目标、看到开始运动就返回，之后手臂由控制器带着走，只取消本卡
+        的等待停不住它。timeout 内拿不到指令锁（arm 卡调用卡住）就不发，由动作线程从那次
+        调用返回、发现被取消时补发。"""
+        if not self._cmd_lock.acquire(timeout=timeout):
+            return {"sent": False, "reason": "arm_call_in_progress"}
+        try:
+            if not self._moving:
+                return {"sent": False, "reason": "not_moving"}
+            self._moving = False
+            self._log("[weigh] cancelled mid-stage: holding both arms where they are")
+            return self._freeze(on_cancel=True)
+        finally:
+            self._cmd_lock.release()
 
     def _move_stage(self, targets: dict, label):
         """targets: {side: 目标角度（度）}。未列出的手臂保持当前角度。阻塞到到位、故障或超时。"""
@@ -983,7 +1005,20 @@ class WeighEngine:
         cmd = {s: targets.get(s, cur[s]) for s in SIDES}
         args = {"action": "move_pos", "left_positions": [round(x, 2) for x in cmd["left"]],
                 "right_positions": [round(x, 2) for x in cmd["right"]], "speed": cfg["pose_speed"]}
-        r = self._call_arm(args)
+        with self._cmd_lock:
+            self._check_cancel()
+            self._moving = True
+            r = self._call_arm(args)
+        try:
+            return self._await_stage(r, cur, targets, label)
+        except Cancelled:
+            self.hold_if_moving()        # stop 已经补发过时这里什么也不做
+            raise
+        finally:
+            self._moving = False
+
+    def _await_stage(self, r, cur, targets, label):
+        cfg = self.cfg
         if not isinstance(r, dict) or r.get("state") == "error" or r.get("error"):
             return {"ok": False, "code": "arm_rejected", "stage": label,
                     "error": (r or {}).get("error"), "arm_result": r}
@@ -1412,11 +1447,11 @@ class WeighEngine:
             if problem == "no_object":
                 return self._finish_auto(self._error(
                     "no_object", side,
-                    f"可以放物品之后 {window:g} 秒内没有检测到物品（阈值 {cfg['detect_kg']} kg）。"
-                    "手臂保持举起，可以再次调用 weigh"), "place", side, seq)
+                    f"可以放物品之后 {window:g} 秒内没有检测到物品（阈值 {cfg['detect_kg']} kg），"
+                    "手臂保持举起"), "place", side, seq)
             if problem:
                 return self._finish_auto(self._error(
-                    problem, side, f"等待放物品时零点不能用了（{problem}），请 reset 后重新称重"),
+                    problem, side, f"等待放物品时零点不能用了（{problem}），要 reset 后重新称重"),
                     "place", side, seq)
         res = self.weigh({"side": side, "timeout_s": cfg["measure_timeout_s"]})
         return self._finish_auto(res, "measure", side, seq)
@@ -1438,7 +1473,7 @@ class WeighEngine:
         ok = res.get("state") == "weighed" and res.get("valid")
         self._tell("result" if ok else "failed", side, text, seq)
         res["to_user"] = text
-        return res
+        return res if ok else {"next_step": USER_DECIDES, **res}
 
     def reset(self, args: dict) -> dict:
         """卡片的 reset：张开手指、放下手臂、清除去皮，完成后告诉用户。
@@ -1467,7 +1502,7 @@ class WeighEngine:
             what = "掌上读数显示还有物体" if res.get("code") == "object_on_hand" else "无法判断掌上是否有物体"
             res = dict(res, error=f"{what}；先取走物体，用户确认掌心已空后 {window:g} 秒内再调用一次 reset",
                        confirm_within_s=window, to_user=text)
-        return res
+        return {"next_step": USER_DECIDES, **res}
 
     def snapshot(self) -> dict:
         """weigh_state 传感器的内容：每只手是否就绪、去皮状态和最近一次测出的结果。不阻塞。"""
@@ -1569,6 +1604,13 @@ RUNNING_STATE = {"weigh": "weighing", "reset": "resetting"}
 # 最坏情况：两段摆臂各约 13 s + 手指 2 × 1.5 s + 去皮 ≤ 10 s + 放物品 ≤ 30 s + 测量 ≤ 10 s ≈ 80 s，
 # 留出余量。
 COMPLETION_TIMEOUT_S = 150
+# 失败结果（weigh 没称成、reset 没放下）最前面带的 next_step。2026-11-26 真机：用户在卡片上
+# 点的 weigh 超时没等到物品，完成通知唤醒了 decision_core（卡片按钮那条路径不认
+# silent_completion），它看到"可以再次调用 weigh"，没问用户就自己调了 reset 把手放下。
+# 放在最前面：Agent Core 只把失败结果的前 600 字交给大模型。
+USER_DECIDES = ("手臂保持现在的样子。接下来再称、复位还是先不动由用户决定：把 to_user 转告用户后"
+                "等用户开口，用户要求了再调用 weigh 或 reset；不要自行调用，也不要替用户确认。")
+
 # weigh_state 发布的消息顶层带的 priority：>0 时 agent-core 直接送 decision_core（见 WeighStatePlugin._produce）
 WAKE_PRIORITY = 1
 SYNC_GRACE_S = 0.5
@@ -1585,6 +1627,7 @@ class WeighPlugin:
     给用户的话经 weigh_state 传感器发布。"""
 
     PREFIX = "weigh"
+    HOLD_LOCK_TIMEOUT_S = 2.0   # stop 时等动作线程手里的 arm 卡调用返回、再补发停住指令的上限
 
     def __init__(self, plugin_config: dict, namespace: str, ros2, arm_call=None, hand_call=None,
                  acp_notify=None, servo_call=None):
@@ -1621,6 +1664,7 @@ class WeighPlugin:
                 "天轶2.0 掌心称重（实验性）。weigh：机器人自己抬起手臂、四指立起托住掌心并去皮，"
                 "然后等人把物品放到掌心，放稳后测量；称完手臂保持举起，可以接着称下一件。"
                 "reset：张开手指、放下手臂（掌上可能还有物品时先请用户确认）。"
+                "两者都会动手臂，只在用户要求时调用；失败后不要自行重试或复位，转告用户、由用户决定。"
                 "side 选 right（默认）、left，或 both（两只手各放一件，重量相加）。"
                 "调用前手臂须垂下或已在托举姿态，周围无人无物。"
                 "卡片自己不出声：过程中要让用户知道的事（正在准备、可以放了、称出的重量、出错原因、"
@@ -1738,6 +1782,11 @@ class WeighPlugin:
         worker = self._worker
         if worker is not None and worker.is_alive():
             self._engine.cancel()
+            # 只取消等待停不住手臂（目标已经发给控制器了）：运动中就把目标改成当前位置，
+            # 等 arm 卡确认后再往下走。
+            held = self._engine.hold_if_moving(timeout=self.HOLD_LOCK_TIMEOUT_S)
+            if held.get("sent") or held.get("reason") == "arm_call_in_progress":
+                print(f"[weigh] stop: hold {held}", flush=True)
             worker.join(timeout=5.0)
             if worker.is_alive():
                 print("[weigh] stop: in-flight action still running after 5 s; "
@@ -1827,7 +1876,7 @@ class WeighPlugin:
         except Cancelled:
             print(f"[weigh] {action} cancelled by stop", flush=True)
             return {"state": "cancelled", "code": "cancelled", "experimental": True,
-                    "error": "卡片已停止，动作被取消；手臂停在当前位置或上一段的目标位置"}
+                    "error": "卡片已停止，动作被取消；手臂停在当前位置（正在运动的已就地停住），没有复位"}
         except ValueError as exc:
             return {"state": "error", "code": "bad_arguments", "error": str(exc)}
         except Exception as exc:
@@ -1939,6 +1988,7 @@ class WeighStatePlugin:
                 "结果：mass_kg / mass_g、valid（false 时不要使用重量）、reasons、seq；side=both 的结果在 "
                 "both_last。in_pose / tare_valid 是消息发出时手臂是否在托举姿态、去皮是否有效。"
                 "last_attempt 是最近一次 weigh 调用的结局（含失败，例如 no_object）。"
+                "kind=failed / reset_confirm 时手臂保持原样，转告后等用户决定，不要自行调用 weigh 或 reset。"
             ),
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._topic, "format": "data/json"}],

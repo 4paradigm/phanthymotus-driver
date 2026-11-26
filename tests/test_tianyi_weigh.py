@@ -1105,7 +1105,8 @@ def test_stop_cancels_pending_weigh_and_sends_nothing_more(hanging, tmp_path):
     real_sleep = hanging.engine._raw_sleep
 
     def slow_sleep(dt):                             # 抬臂等待时卡住，模拟 weigh 进行中
-        entered.set()
+        if hanging.engine._moving:                  # 第一段已经发出、手臂在走
+            entered.set()
         release.wait(0.05)
         real_sleep(dt)
     hanging.engine._raw_sleep = slow_sleep
@@ -1113,9 +1114,16 @@ def test_stop_cancels_pending_weigh_and_sends_nothing_more(hanging, tmp_path):
     assert "action_id" in res
     assert entered.wait(10)
     n_arm, n_hand, n_told = len(hanging.arm_calls), len(hanging.hand_calls), len(hanging.told)
+    raising = hanging.moves()[-1]["right_positions"]
     assert p.dispatch("stop", {}) == {"state": "idle"}
     assert not p._worker.is_alive()                  # stop 等到动作退出
-    assert len(hanging.arm_calls) == n_arm and len(hanging.hand_calls) == n_hand
+    # 抬臂途中 stop：目标已经发给手臂了，只停止等待手臂会继续走完。stop 补发一条
+    # "停在当前位置"（两臂都是当前角度），之后没有下一段，也不动手指
+    hold = hanging.arm_calls[n_arm:]
+    assert [c["action"] for c in hold] == ["move_pos"], hold
+    assert hold[0]["right_positions"] != raising
+    assert hold[0]["right_positions"] == pytest.approx(hanging.pose, abs=0.5)
+    assert len(hanging.hand_calls) == n_hand
     assert len(hanging.told) == n_told               # 也不再发给用户的话
     assert fired.wait(10)
     assert calls[0][1] == "cancelled" and calls[0][2]["code"] == "cancelled"
@@ -1241,6 +1249,7 @@ def test_stop_with_stuck_worker_defers_teardown_and_blocks_new_actions(hanging, 
     assert "action_id" in res and inside.wait(10)
     real_join = p._worker.join
     p._worker.join = lambda timeout=None: real_join(0.2 if timeout else None)   # 测试里别真等 5 s
+    p.HOLD_LOCK_TIMEOUT_S = 0.2
     r = p.dispatch("stop", {})
     assert r["state"] == "stopping" and torn == []
     assert p.dispatch("weigh", {"side": "right"})["code"] in ("stopping", "busy")
@@ -1251,9 +1260,51 @@ def test_stop_with_stuck_worker_defers_teardown_and_blocks_new_actions(hanging, 
     while not torn and time.time() < deadline:
         time.sleep(0.01)
     assert torn == [True] and not p._stopping
-    # 只有卡住的那一条 move_pos 最终送达；取消之后没有第二段，也没有冻结指令
-    assert [c["action"] for c in hanging.arm_calls[n:]] == ["move_pos"]
+    # 卡住的那一条 move_pos 送达后，动作线程发现已取消：补发一条"停在当前位置"，没有第二段
+    after = hanging.arm_calls[n:]
+    assert [c["action"] for c in after] == ["move_pos", "move_pos"]
+    assert after[1]["right_positions"] == hanging.arm_target       # 第二条是停住，不是下一段
+    assert after[1]["right_positions"] != after[0]["right_positions"]
     assert not [c for c in hanging.hand_calls if c["action"] == "set_fingers_raw"]
+
+
+def test_stop_holds_the_arm_before_returning_and_only_once(hanging, tmp_path):
+    """bot 审查（3a0213c）：stop 只置取消标志，手臂会继续朝旧目标走。stop 返回之前就要把
+    停住指令发出去并等 arm 卡确认；动作线程随后醒来也不再补发第二条。"""
+    p, calls, fired = _async_plugin(hanging, tmp_path)
+    p.stop = weigh.WeighPlugin.stop.__get__(p)
+    moving = threading.Event()
+    real_sleep = hanging.engine._raw_sleep
+
+    def slow_sleep(dt):
+        if hanging.engine._moving:
+            moving.set()
+        time.sleep(0.002)
+        real_sleep(dt)
+    hanging.engine._raw_sleep = slow_sleep
+    assert "action_id" in p.dispatch("weigh", {"side": "right"})
+    assert moving.wait(10)
+    n = len(hanging.moves())
+    order_before = len(hanging.order)
+    assert p.dispatch("stop", {}) == {"state": "idle"}
+    assert len(hanging.moves()) == n + 1                  # 恰好一条停住指令
+    assert ("arm", "move_pos") in hanging.order[order_before:]
+    assert fired.wait(10) and calls[0][1] == "cancelled"
+    assert "停在当前位置" in calls[0][2]["error"]
+    assert not hanging.engine._moving
+    hanging.engine._raw_sleep = real_sleep
+    # 手臂确实停住：再过几秒位置不变
+    stopped = list(hanging.pose)
+    hanging.warm(3)
+    assert hanging.pose == pytest.approx(stopped, abs=0.01)
+
+
+def test_cancel_outside_a_stage_sends_no_hold(hanging):
+    hanging.engine.pose({})
+    n = len(hanging.moves())
+    hanging.engine.cancel()
+    assert hanging.engine.hold_if_moving() == {"sent": False, "reason": "not_moving"}
+    assert len(hanging.moves()) == n
 
 
 def test_plugin_prefix_and_marketplace_listing():
@@ -1448,6 +1499,34 @@ def test_weigh_cancelled_while_waiting_for_the_object(hanging):
     with pytest.raises(weigh.Cancelled):
         hanging.engine.auto_weigh({})
     assert hanging.told == [READY]                      # 取消之后不再发消息
+
+
+def test_failures_tell_the_caller_to_leave_the_next_step_to_the_user(hanging):
+    """2026-11-26 真机：weigh 超时没等到物品，decision_core 没问用户就自己调了 reset。
+    失败结果最前面写明下一步由用户决定（Agent Core 只把失败结果的前 600 字交给大模型）。"""
+    res = hanging.engine.auto_weigh({})
+    assert res["code"] == "no_object", res
+    assert list(res)[0] == "next_step" and res["next_step"] == weigh.USER_DECIDES
+    assert "不要自行调用" in res["next_step"] and "可以再次调用" not in res["error"]
+    assert len(json.dumps({k: res[k] for k in ("next_step", "state", "code")}, ensure_ascii=False)) < 600
+    hanging.mass = 0.30                                 # 掌上有东西：reset 要用户确认
+    hanging.warm(1)
+    r = hanging.engine.reset({})
+    assert r["code"] == "object_on_hand" and list(r)[0] == "next_step", r
+    hanging.mass = 0.0
+    hanging.warm(1)
+    place_after_prompt(hanging, 0.59)
+    ok = hanging.engine.auto_weigh({})
+    assert ok["state"] == "weighed" and ok["valid"] and "next_step" not in ok
+    done = hanging.engine.reset({})
+    assert done["state"] == "reset" and "next_step" not in done
+
+
+def test_descriptions_say_only_move_when_the_user_asks(hanging, tmp_path):
+    p, _, _ = _async_plugin(hanging, tmp_path)
+    assert "只在用户要求时调用" in p.get_tool()["description"]
+    sensor = weigh.WeighStatePlugin({}, "ns", _FakeRos2(), p)
+    assert "不要自行调用 weigh 或 reset" in sensor.get_tool()["description"]
 
 
 def test_result_text_for_invalid_results():
