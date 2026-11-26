@@ -192,6 +192,7 @@ FULL_PLUGINS = {
                            "waist_front_d415_depth"]},
     "lidar_cloud": {"enabled": True}, "battery": {"enabled": True},
     "estop": {"enabled": True},
+    "vision_capture": {"enabled": True},
     "mc_mode": {"enabled": True},
     "loco": {"enabled": True}, "arm_control": {"enabled": True},
     "hand_control": {"enabled": True}, "head_control": {"enabled": True},
@@ -318,6 +319,30 @@ class ToolInventoryTests(unittest.TestCase):
         self.assertIn("[fatal] host Jazzy relay is required for A3 cameras", dockerfile)
         self.assertIn("exit 1; fi; trap '/work/agibot/A3/jazzy_relay.sh stop || true' EXIT", dockerfile)
 
+    def test_image_copies_every_root_module(self):
+        # The Dockerfile copies an explicit file list; a new module that is not
+        # listed ships as an ImportError at container start. vision_capture.py
+        # is imported lazily by build_plugins, so its absence would only show up
+        # when the card is enabled — i.e. in production.
+        dockerfile = (DEVICE_DIR / "Dockerfile").read_text(encoding="utf-8")
+        copies = " ".join(line for line in dockerfile.splitlines()
+                          if line.strip().startswith("COPY "))
+        for module in sorted(path.name for path in DEVICE_DIR.glob("*.py")):
+            self.assertIn(module, copies, f"{module} must be COPYed into the image")
+
+    def test_service_fragment_declares_discovery_server(self):
+        # Measured 2026-11-26: without ROS_DISCOVERY_SERVER the driver registers
+        # over HTTP and looks healthy while every robot-domain topic stays silent
+        # (no camera frames, no microphone, no live joints). The deployed
+        # container carried it by hand; the fragment must carry it for every A3.
+        fragment = yaml.safe_load(
+            (DEVICE_DIR / "deploy" / "service.yml").read_text(encoding="utf-8"))
+        env = fragment["agibot-a3"]["environment"]
+        entry = next((item for item in env
+                      if str(item).startswith("ROS_DISCOVERY_SERVER=")), None)
+        self.assertEqual(entry,
+                         "ROS_DISCOVERY_SERVER=10.42.10.10:11811;10.42.10.12:11811")
+
     def test_host_relay_uses_materialized_constrained_profile(self):
         script = (DEVICE_DIR / "jazzy_relay.sh").read_text(encoding="utf-8")
         self.assertIn("HOST_PROFILE=$ROOT/dds-profile.xml", script)
@@ -409,6 +434,7 @@ class ToolInventoryTests(unittest.TestCase):
             "mc_mode", "loco", "arm_control", "hand_control", "head_control",
             "waist_control", "motion_play", "tts", "audio", "interaction",
             "face_play", "skill_play", "controlled_spatial", "auto_charging",
+            "vision_capture",
         }
         for name in expected_actuators:
             self.assertEqual(by_name[name], "actuator", f"'{name}' must be an actuator tool")
@@ -743,6 +769,146 @@ class StartStopLifecycleTests(unittest.TestCase):
                     os.environ.pop("A3_RELAY_ACTIVE_STREAMS", None)
                 else:
                     os.environ["A3_RELAY_ACTIVE_STREAMS"] = previous_active
+
+# ---------------------------------------------------------------------------
+# vision_capture: latest-frame cache + snapshot card wiring
+# ---------------------------------------------------------------------------
+
+JPEG = b"\xff\xd8test-jpeg-payload\xff\xd9"
+
+
+class VisionCaptureTests(unittest.TestCase):
+    """The card reads `A3Nodes.latest_frames` (a LatestFrameCache); the cache is
+    fed by BOTH camera paths (relay forward / in-container re-encode). Each half
+    is pinned here so a refactor of either encoding path cannot silently starve
+    snapshots."""
+
+    KEY = "camera_chest_front_d457_rgb"
+
+    def _build(self, output_dir, relay=False, camera_streams=None, **capture_cfg):
+        config = json.loads(json.dumps(BASE_CONFIG))
+        camera = dict(FULL_PLUGINS["camera"])
+        if camera_streams is not None:
+            camera["streams"] = list(camera_streams)
+        config["plugins"] = dict(FULL_PLUGINS, camera=camera, vision_capture={
+            "enabled": True, "output_dir": str(output_dir), **capture_cfg})
+        if relay:
+            executors = types.ModuleType("rclpy.executors")
+            executors.MultiThreadedExecutor = FakeExecutor
+            control = Path(output_dir) / "active_streams"
+            with patch.dict(os.environ, {
+                "A3_JAZZY_RELAY": "1",
+                "A3_RELAY_CONTROL_FILE": str(control),
+            }), \
+                    patch.dict(sys.modules, {"rclpy.executors": executors}), \
+                    patch.object(sys.modules["rclpy"], "executors", executors, create=True):
+                plugins, _ = build_bundle_plugins(config)
+        else:
+            plugins, _ = build_bundle_plugins(config)
+        return plugins, next(iter(plugins.values())).nodes
+
+    def test_card_is_wired_and_gated_by_config(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plugins, nodes = self._build(temp_dir)
+            find_plugin(plugins, "vision_capture")
+            # The card declared the only stream it consumes, and the cache is
+            # empty until a writer stores a frame.
+            self.assertIn(self.KEY, nodes.latest_frames.registered_keys())
+            self.assertIsNone(nodes.latest_frames.age(self.KEY))
+
+            config = json.loads(json.dumps(BASE_CONFIG))
+            config["plugins"] = dict(FULL_PLUGINS, vision_capture={"enabled": False})
+            plugins, _ = build_bundle_plugins(config)
+            names = {d["name"] for d in tool_definitions(plugins)}
+            self.assertNotIn("vision_capture", names)
+
+    def test_card_is_withheld_when_its_stream_is_not_selected(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plugins, nodes = self._build(temp_dir, camera_streams=["head_left_fisheye"])
+        names = {d["name"] for d in tool_definitions(plugins)}
+        self.assertNotIn("vision_capture", names)
+        self.assertEqual(nodes.latest_frames.registered_keys(), ())
+
+    def test_capture_reads_the_cache_and_writes_jpeg(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plugins, nodes = self._build(temp_dir)
+            card = find_plugin(plugins, "vision_capture")
+
+            # No frame yet: the card must answer, not hang or invent a photo.
+            empty = card.dispatch("capture_photo", {})
+            self.assertEqual(empty["code"], "CAMERA_UNAVAILABLE")
+
+            self.assertTrue(nodes.latest_frames.put(self.KEY, JPEG))
+            saved = card.dispatch("capture_photo", {"image_name": "smoke"})
+            self.assertTrue(saved["ok"], saved)
+            self.assertEqual(saved["filename"], "smoke.jpg")
+            self.assertEqual(
+                (Path(temp_dir) / "photos" / "smoke.jpg").read_bytes(), JPEG)
+            self.assertGreaterEqual(saved["frame_age_s"], 0.0)
+            listed = card.dispatch("list", {})
+            self.assertEqual([f["filename"] for f in listed["files"]], ["smoke.jpg"])
+
+    def test_relay_callback_stashes_compressed_frame(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plugins, nodes = self._build(temp_dir, relay=True)
+            subs = {topic: cb for topic, cb in nodes.media_robot.subscriptions}
+            callback = subs["/test_ns/camera_chest_front_d457_rgb"]
+            pub = nodes.core.publishers["/test_ns/camera_chest_front_d457_rgb"]
+
+            # rclpy deserializes CompressedImage.uint8[] as array('B') — the
+            # shape the host relay subscription really delivers.
+            msg = FakeMsg()
+            msg.data = array.array("B", JPEG)
+            callback(msg)
+
+            frame = nodes.latest_frames.get(self.KEY, 60)
+            self.assertIsNotNone(frame)
+            self.assertEqual(frame.data, JPEG)
+            self.assertIsInstance(frame.data, bytes)
+            self.assertGreaterEqual(frame.age_s, 0.0)
+            # relay path still forwards the untouched frame to the core domain
+            self.assertIs(pub.published[-1], msg)
+
+            # The card must be able to save straight from that cache entry.
+            card = find_plugin(plugins, "vision_capture")
+            saved = card.dispatch("capture_photo", {"image_name": "relay"})
+            self.assertTrue(saved["ok"], saved)
+
+            # bytes payloads (e.g. a locally built CompressedImage) work too.
+            plain = FakeMsg()
+            plain.data = JPEG
+            callback(plain)
+            self.assertEqual(nodes.latest_frames.get(self.KEY, 60).data, JPEG)
+
+    def test_reencode_path_stashes_encoded_output(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plugins, nodes = self._build(temp_dir)
+        pub = nodes.core.publishers[f"/test_ns/{self.KEY}"]
+        out = FakeMsg()
+        out.data = JPEG
+        nodes._encode_and_publish_frame(lambda _msg: out, FakeMsg(), pub,
+                                        "/hal/chest_front_d457_rgb/rgb", self.KEY)
+        self.assertEqual(nodes.latest_frames.get(self.KEY, 60).data, JPEG)
+
+        # Non-bytes payloads (no JPEG in hand) must not poison the cache: the
+        # previous good frame survives.
+        list_out = FakeMsg()
+        list_out.data = [0xFF, 0xD8]
+        nodes._encode_and_publish_frame(lambda _msg: list_out, FakeMsg(), pub,
+                                        "/hal/chest_front_d457_rgb/rgb", self.KEY)
+        self.assertEqual(nodes.latest_frames.get(self.KEY, 60).data, JPEG)
+
+        # Encoder errors keep the previous good frame available.
+        def boom(_msg):
+            raise RuntimeError("encode failed")
+        nodes._encode_and_publish_frame(boom, FakeMsg(), pub,
+                                        "/hal/chest_front_d457_rgb/rgb", self.KEY)
+        self.assertEqual(nodes.latest_frames.get(self.KEY, 60).data, JPEG)
+
+        # Streams nobody registered are not copied into the cache.
+        nodes.latest_frames.put("camera_head_left_fisheye", JPEG)
+        self.assertIsNone(nodes.latest_frames.age("camera_head_left_fisheye"))
+
 
 # ---------------------------------------------------------------------------
 # RPC payload / publisher dispatch tests
