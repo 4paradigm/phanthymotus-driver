@@ -26,6 +26,9 @@ def test_cloud_registration_without_sdk(monkeypatch, tmp_path):
         {"topic": "/rokae_helios/lidar/left_front/points", "message_type": "sensor_msgs/msg/PointCloud2"},
         {"topic": "/rokae_helios/lidar/right_rear/points", "message_type": "sensor_msgs/msg/PointCloud2"},
     ]
+    for port in info["native_topics"]:
+        assert port["topic"] in info["description"]
+        assert port["message_type"] in info["description"]
 
 
 def test_preview_sampling_and_timestamp_alignment():

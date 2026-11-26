@@ -219,14 +219,22 @@ class HeliosLidar:
         self._last_sent.clear()
 
     def dispatch(self, action, args):
-        ports = self.get_tool()["topic_out"]
+        spec = self.get_tool()
+        ports = spec["topic_out"]
         if action == "info":
+            message_type = "sensor_msgs/msg/PointCloud2"
+            description = spec["description"] + (
+                f" 原生 ROS 2 输出使用 {message_type}，话题为 "
+                + " 和 ".join(self._native_topics.values())
+                + "。"
+            )
             return {
-                **self.get_tool(),
+                **spec,
+                "description": description,
                 "frame_id": self._frame_id,
                 "position_unit": "m",
                 "native_topics": [
-                    {"topic": topic, "message_type": "sensor_msgs/msg/PointCloud2"}
+                    {"topic": topic, "message_type": message_type}
                     for topic in self._native_topics.values()
                 ],
             }
