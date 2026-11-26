@@ -1569,6 +1569,8 @@ RUNNING_STATE = {"weigh": "weighing", "reset": "resetting"}
 # 最坏情况：两段摆臂各约 13 s + 手指 2 × 1.5 s + 去皮 ≤ 10 s + 放物品 ≤ 30 s + 测量 ≤ 10 s ≈ 80 s，
 # 留出余量。
 COMPLETION_TIMEOUT_S = 150
+# weigh_state 发布的消息顶层带的 priority：>0 时 agent-core 直接送 decision_core（见 WeighStatePlugin._produce）
+WAKE_PRIORITY = 1
 SYNC_GRACE_S = 0.5
 
 
@@ -1931,7 +1933,8 @@ class WeighStatePlugin:
                 "天轶2.0 掌心称重的进展和结果（实验性，配合 weigh 卡使用）。只在 weigh 卡有话要让用户"
                 "知道时发布一条，平时不发。to_user.text 是给用户的话：正在准备、可以放物品了、称出的重量、"
                 "出错原因、复位结果等，由你决定是否转告、怎么转告（语音、消息等）；它说的是发出时已经"
-                "成立的事，晚一点转告也不会错。to_user.id 每条加一，to_user.kind 是 preparing / ready / "
+                "成立的事，晚一点转告也不会错。weigh 卡自己不出声，你不转告用户就听不到。每条消息都带 "
+                "priority=1，直接送到你这里。to_user.id 每条加一，to_user.kind 是 preparing / ready / "
                 "result / failed / reset_done / reset_confirm。sides.<right|left>.last 是该手最近一次测出的"
                 "结果：mass_kg / mass_g、valid（false 时不要使用重量）、reasons、seq；side=both 的结果在 "
                 "both_last。in_pose / tare_valid 是消息发出时手臂是否在托举姿态、去皮是否有效。"
@@ -1954,6 +1957,14 @@ class WeighStatePlugin:
         if to_user is not None:
             snap["to_user"] = to_user           # 这一条，而不是发布时最新的那条
         payload = {"to_user": snap.pop("to_user", None), **snap}
+        if to_user is not None:
+            # 发布出去的每一条都是要转告用户的话。agent-core 的 collector 把没带
+            # priority 的话题消息当传感器读数（P=0），先交给后台监控子代理判断
+            # 要不要上报；它不知道本卡不出声，实测会把"可以放了"之类判成不急、
+            # 只记进记忆，decision_core 不被唤醒，话就没人说。JSON 顶层的
+            # priority 由 collector 原样采用（_extract_priority），P>0 直接送
+            # decision_core。read 读到的快照不是新消息，不带。
+            payload["priority"] = WAKE_PRIORITY
         payload["timestamp_ms"] = int(time.time() * 1000)
         return payload
 

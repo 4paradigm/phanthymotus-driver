@@ -1560,6 +1560,8 @@ def test_weigh_state_sensor_reads_the_latest_result(hanging, tmp_path):
     assert after["seq"] == 1 and last["seq"] == 1 and last["mass_g"] == res["mass_g"] and last["valid"]
     assert after["sides"]["left"]["last"] is None and after["timestamp_ms"] > 0
     assert list(after)[0] == "to_user" and after["to_user"]["kind"] == "result"
+    assert "priority" not in after                      # read 的快照不是新消息
+    assert "priority=1" in tool["description"] and "不出声" in tool["description"]
     json.dumps(after)                                   # 能直接发成 data/json
     assert sensor.dispatch("bogus", {})["state"] == "error"
 
@@ -1575,6 +1577,8 @@ def test_weigh_state_publishes_one_message_per_thing_to_tell_and_nothing_else(ha
         assert _wait_for(lambda: len(pub.sent) == 3), pub.sent
         assert [m["to_user"]["kind"] for m in pub.sent] == ["preparing", "ready", "result"]
         assert [m["to_user"]["text"] for m in pub.sent] == hanging.told
+        # 顶层 priority>0：agent-core 直接送 decision_core，不经后台监控子代理过滤
+        assert all(m["priority"] == weigh.WAKE_PRIORITY >= 1 for m in pub.sent)
         # 结果那一条里已经带着这次的重量
         assert pub.sent[-1]["sides"]["right"]["last"]["mass_g"] == res["mass_g"]
         time.sleep(1.5)
