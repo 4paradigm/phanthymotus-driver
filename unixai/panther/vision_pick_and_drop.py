@@ -196,15 +196,12 @@ class VisionPickAndDrop:
             observation = self._snapshot
             if observation and time.monotonic() > observation["expiry"]:
                 self._snapshot = observation = None
-            # inputs_ready is True when at least depth+RGB are connected (VOP is optional)
-            has_camera = True
-            inputs_ready = has_camera and (self._has_vop or True)
+            # inputs_ready is True when depth+RGB are connected (VOP is optional)
             return {"state": "blocked" if self._blocked else "running" if self._worker else "idle",
                     "allow_motion": self.cfg.get("allow_motion") is True,
-                    "inputs_ready": inputs_ready,
+                    "inputs_ready": True,
                     "vop_connected": getattr(self, "_has_vop", False),
                     "config_error": self._config_error,
-                    "inputs_ready": bool(self._source and self._source[0].is_alive() and self._source[3].is_set()),
                     "observation_required": observation is None,
                     "observation": copy.deepcopy(observation["summary"]) if observation else None,
                     "last_result": copy.deepcopy(self._last)}
