@@ -18,10 +18,13 @@ def test_cloud_registration_without_sdk(monkeypatch, tmp_path):
     assert not status["sdk_installed"]
     assert status["preview_sources"] == []
     assert {source["available"] for source in status["sources"].values()} == {False}
-    assert status["topic_out"] == [
-        {"topic": "/rokae_helios/lidar/preview", "format": "sensor/pointcloud"},
-        {"topic": "/rokae_helios/lidar/left_front/points", "format": "sensor/pointcloud2"},
-        {"topic": "/rokae_helios/lidar/right_rear/points", "format": "sensor/pointcloud2"},
+    preview = [{"topic": "/rokae_helios/lidar/preview", "format": "sensor/pointcloud"}]
+    assert status["topic_out"] == plugin.get_tool()["topic_out"] == preview
+    info = plugin.dispatch("info", {})
+    assert info["topic_out"] == preview
+    assert info["native_topics"] == [
+        {"topic": "/rokae_helios/lidar/left_front/points", "message_type": "sensor_msgs/msg/PointCloud2"},
+        {"topic": "/rokae_helios/lidar/right_rear/points", "message_type": "sensor_msgs/msg/PointCloud2"},
     ]
 
 

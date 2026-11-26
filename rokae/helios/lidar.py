@@ -151,8 +151,8 @@ class HeliosLidar:
         self._namespace = namespace
         self._frame_id = f"{namespace}/chassis_cloud"
         self._preview = {"topic": f"/{namespace}/lidar/preview", "format": "sensor/pointcloud"}
-        self._native = {
-            source: {"topic": f"/{namespace}/lidar/{name}/points", "format": "sensor/pointcloud2"}
+        self._native_topics = {
+            source: f"/{namespace}/lidar/{name}/points"
             for source, name in SOURCES.items()
         }
         self._last_sent = {}
@@ -161,7 +161,7 @@ class HeliosLidar:
         return tool(
             self.NAME, "sensor",
             "Helios 左前与右后雷达三维点云。两路叠加抽样预览，两路原生 XYZ 用于下游处理，单位为米。",
-            topic_out=[self._preview, *self._native.values()],
+            topic_out=[self._preview],
         )
 
     def start(self):
@@ -178,8 +178,8 @@ class HeliosLidar:
         node = Node("helios_lidar", namespace=self._namespace, context=self._ros2.ctx_core)
         try:
             preview = node.create_publisher(UInt8MultiArray, self._preview["topic"], qos)
-            native = {source: node.create_publisher(PointCloud2, port["topic"], qos)
-                      for source, port in self._native.items()}
+            native = {source: node.create_publisher(PointCloud2, topic, qos)
+                      for source, topic in self._native_topics.items()}
             displayed = ()
 
             def publish():
@@ -221,7 +221,15 @@ class HeliosLidar:
     def dispatch(self, action, args):
         ports = self.get_tool()["topic_out"]
         if action == "info":
-            return {**self.get_tool(), "frame_id": self._frame_id, "position_unit": "m"}
+            return {
+                **self.get_tool(),
+                "frame_id": self._frame_id,
+                "position_unit": "m",
+                "native_topics": [
+                    {"topic": topic, "message_type": "sensor_msgs/msg/PointCloud2"}
+                    for topic in self._native_topics.values()
+                ],
+            }
         if action in (self.NAME, "read", "status", "start", "config"):
             clouds = self._client.snapshot()
             now = time.monotonic()

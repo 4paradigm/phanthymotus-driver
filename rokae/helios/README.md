@@ -61,6 +61,8 @@
 | `/rokae_helios/lidar/left_front/points` | 左前 `sensor_msgs/msg/PointCloud2` |
 | `/rokae_helios/lidar/right_rear/points` | 右后 `sensor_msgs/msg/PointCloud2` |
 
+卡片的 `topic_out` 只登记拼接预览，供 Core 监控显示。`info` 的 `native_topics` 列出两路原生输出的 `topic` 和 `message_type`，供下游直接订阅 ROS 2 话题。
+
 原生输出保留每帧有效 XYZ，单位为米，沿用厂家底盘坐标与采样时间戳。使用传感器数据 QoS（Best Effort，队列深度 1）。Core 预览叠加采样时间相差不超过 250 ms 的两帧，时间差更大时显示较新的一路。SDK 每 1.48 秒重新订阅以跳过积压，刷新率随链路和点量变化。
 
 SDK 及匹配的 Python 解释器从机身以只读方式挂载。将 [compose.native-lidar.yml](deploy/compose.native-lidar.yml) 合并在 bot 生成的 Driver Compose 文件之后，并设置 `HELIOS_SDK_PYTHON_DIR` 和 `HELIOS_VMR_SDK_DIR` 指向机身已有目录。预期容器内路径为 `/opt/sdk-python/bin/python3.12` 和 `/opt/vmr-sdk/lib`。未挂载时，卡片状态返回 `sdk_installed: false`，关节和电池仍可使用。底盘 SDK 地址和端口由 `config.yaml` 中的 `lidar_sdk_host`、`lidar_sdk_port` 配置。
