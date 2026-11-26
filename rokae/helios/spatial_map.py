@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import threading
 import time
 
@@ -62,25 +63,42 @@ class HeliosSpatialMap:
             raise
 
     def _launch(self):
-        env = dict(os.environ, PYTHONPATH=str(self._sdk),
+        driver_root = Path(__file__).resolve().parents[2]
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join((str(self._sdk), str(driver_root))),
                    LD_LIBRARY_PATH=os.pathsep.join([str(self._sdk), str(self._python.parent.parent / "lib")]))
         worker = Path(__file__).with_name("spatial_map_worker.py")
-        proc = subprocess.Popen([str(self._python), str(worker), self._host, str(self._port)],
-                                env=env, stdout=subprocess.PIPE, text=True, encoding="utf-8")
+        read_fd, write_fd = os.pipe()
+        try:
+            with os.fdopen(write_fd, "wb") as output:
+                proc = subprocess.Popen(
+                    [str(self._python), str(worker), self._host, str(self._port), str(output.fileno())],
+                    pass_fds=(output.fileno(),), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, encoding="utf-8", errors="replace")
+        except OSError:
+            os.close(read_fd)
+            raise
         self._process = proc
         self._last_read = time.monotonic()
-        threading.Thread(target=self._receive, args=(proc,), name="helios-spatial-map", daemon=True).start()
+        threading.Thread(target=self._receive, args=(proc, read_fd), name="helios-spatial-map", daemon=True).start()
+        threading.Thread(target=self._relay_logs, args=(proc,), name="helios-spatial-map-logs", daemon=True).start()
 
-    def _receive(self, proc):
+    @staticmethod
+    def _relay_logs(proc):
         with proc.stdout as stream:
             for line in stream:
-                if line.startswith("SPATIAL_MAP "):
-                    data = json.loads(line.removeprefix("SPATIAL_MAP "))
-                    with self._lock:
-                        if proc is not self._process:
-                            return
-                        self._data = data
-                        self._last_read = time.monotonic()
+                print(line.rstrip("\n"), file=sys.stderr)
+
+    def _receive(self, proc, read_fd):
+        with os.fdopen(read_fd, encoding="utf-8") as stream:
+            for line in stream:
+                if not line.endswith("\n"):  # Worker stopped mid-snapshot.
+                    return
+                data = json.loads(line)
+                with self._lock:
+                    if proc is not self._process:
+                        return
+                    self._data = data
+                    self._last_read = time.monotonic()
 
     def _end_process(self):
         proc, self._process = self._process, None

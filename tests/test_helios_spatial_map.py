@@ -1,13 +1,18 @@
 """Contracts for the two SDK station classes and the Helios sensor lifecycle."""
 
+import json
+from pathlib import Path
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
+from common import logsafe
 from common.vendor_runtime import DriverBundle
 from rokae.helios import spatial_map_worker as worker
 from rokae.helios.spatial_map import HeliosSpatialMap
+from test_helios_joints import wait_for
 
 
 def test_station_ids_types_and_empty_map():
@@ -59,3 +64,43 @@ def test_canvas_read_start_stop_without_vendor_runtime(monkeypatch, tmp_path):
     with pytest.raises(ValueError, match="runtime mounts"):
         bundle.dispatch("spatial_map", {"action": "start"})
     assert bundle.dispatch("spatial_map", {"action": "stop"})["state"] == "idle"
+
+
+def test_worker_logs_and_full_station_snapshot_use_separate_pipes(tmp_path, monkeypatch, capfd):
+    (tmp_path / "py_client_common.py").write_text(
+        "import os, sys\n"
+        "from common.logsafe import LineAtomicStream\n"
+        "class ClientConfig: pass\n"
+        "def init_client(config):\n"
+        "    assert isinstance(sys.stderr, LineAtomicStream)\n"
+        "    os.write(2, b'native\\x00 diagnostic\\n')\n"
+        "    print('SDK ready', flush=True)\n"
+        "    return True\n"
+        "def close_client(): pass\n")
+    (tmp_path / "map_manager.py").write_text(
+        "def has_map_manager(): return True\ndef get_current_map_name(): return 'lab'\n")
+    (tmp_path / "localization.py").write_text("def has_location_dev(): return False\n")
+    (tmp_path / "map_reader.py").write_text(
+        "from types import SimpleNamespace\n"
+        "def has_map_reader(): return True\n"
+        "def get_work_points(): return [SimpleNamespace(id=i, name=f'工位{i}') for i in range(256)]\n"
+        "def get_charge_points(): return []\n")
+    monkeypatch.setattr(sys, "stderr", logsafe.LineAtomicStream(2))
+    sensor = HeliosSpatialMap({})
+    sensor._python, sensor._sdk = Path(sys.executable), tmp_path
+    try:
+        sensor._launch()
+        wait_for(lambda: sensor.payload()["stations"] is not None)
+        stations = sensor.payload()["stations"]
+        assert len(stations) == 256 and stations[-1] == {"id": 255, "name": "工位255", "type": "work"}
+        assert len(json.dumps(stations, ensure_ascii=False).encode()) > logsafe.PIPE_BUF
+        logs = []
+
+        def diagnostics_received():
+            logs.extend(capfd.readouterr().err.splitlines())
+            return "native diagnostic" in logs and "SDK ready" in logs
+
+        wait_for(diagnostics_received)
+        assert not any("工位" in line for line in logs)
+    finally:
+        sensor.stop()

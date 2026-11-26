@@ -2,6 +2,7 @@
 
 import json
 import math
+import os
 import sys
 import time
 
@@ -44,7 +45,7 @@ class LocationFeedback:
         return None
 
 
-def run(host, port):
+def run(host, port, snapshots):
     import localization
     import map_manager
     import map_reader
@@ -66,20 +67,24 @@ def run(host, port):
                 subscribed = True
             map_name, stations = read_stations(map_manager, map_reader)
             feedback = location.fresh()
-            emit({"state": "online" if feedback is not None else "partial",
-                  "map_name": map_name, "stations": stations, "localization": feedback})
+            emit(snapshots, {"state": "online" if feedback is not None else "partial",
+                             "map_name": map_name, "stations": stations, "localization": feedback})
             time.sleep(2)
     finally:
         rpc.close_client()
 
 
-def emit(data):
-    print("SPATIAL_MAP " + json.dumps(data, ensure_ascii=False, allow_nan=False), flush=True)
+def emit(snapshots, data):
+    print(json.dumps(data, ensure_ascii=False, allow_nan=False), file=snapshots, flush=True)
 
 
 if __name__ == "__main__":
-    try:
-        run(sys.argv[1], int(sys.argv[2]))
-    except Exception as exc:
-        emit({"state": "unavailable", "message": str(exc)})
-        sys.exit(1)
+    from common import logsafe
+
+    logsafe.install(check_fd=False)
+    with os.fdopen(int(sys.argv[3]), "w", encoding="utf-8") as snapshots:
+        try:
+            run(sys.argv[1], int(sys.argv[2]), snapshots)
+        except Exception as exc:
+            emit(snapshots, {"state": "unavailable", "message": str(exc)})
+            sys.exit(1)
