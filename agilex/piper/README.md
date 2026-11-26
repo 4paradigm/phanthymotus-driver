@@ -58,11 +58,27 @@ The `data/json` stream is `/<namespace>/piper/state/joint_motor_telemetry`
 at 5 Hz. It reports J1–J6 motor and driver temperatures (°C), driver voltage
 (V), driver current (A), and the host receive timestamp for each fresh sample.
 
-The card uses the driver's configured CAN interface and shared feedback cache.
-Deploy one runtime per arm with distinct CAN interfaces and ROS namespaces
-when monitoring both follower arms. The card's Start and Stop operate only on
-the stream. Info reads the current cache. All three operations are read-only
-with respect to the arm.
+By default the card uses the driver's configured CAN interface and shared
+feedback cache. For two follower arms on separate Linux SocketCAN interfaces,
+configure the actual interface and role mapping in `config.yaml` or a file
+selected with `CONFIG_PATH`:
+
+```yaml
+can_interface: can0
+motor_telemetry:
+  secondary_can_interface: can1
+  arm_roles:
+    can0: left_follower
+    can1: right_follower
+```
+
+The primary J1–J6 fields stay at the top level for compatibility. The second
+arm has its own readings, receive timestamps and `feedback_status` under
+`additional_arms.can1`. `arm_role` is included for configured roles. Choose
+`motor_telemetry.only: true` to expose only this sensor and use receive-only
+SocketCAN connections for both interfaces. The card opens its dedicated
+receivers when started and closes them when stopped. Info reads the current
+cache. None of these sensor operations sends CAN commands.
 
 A joint with no frame or a frame older than 0.5 seconds has null readings.
 The overall feedback status is `fresh`, `partial` or `unavailable`. To verify

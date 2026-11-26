@@ -3,9 +3,10 @@
 import threading
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
-from agilex.piper.arm import MOTOR_FEEDBACK_IDS, PiperDriver
+from agilex.piper.arm import MOTOR_FEEDBACK_IDS, MotorTelemetry, PiperDriver
+from agilex.piper.device import build_plugins
 from agilex.piper.motor_telemetry import JointMotorTelemetryPlugin, TOOL_NAME
 from common.vendor_runtime import DriverBundle
 
@@ -46,6 +47,63 @@ class MotorTelemetryTests(unittest.TestCase):
             "received_at_unix_s": 99.9,
         })
         self.assertEqual(data["J6"]["motor_temperature_c"], 26)
+        self.assertNotIn("additional_arms", data)
+
+    def test_two_arms_keep_independent_measurements_and_freshness(self):
+        right_feedback = Mock(return_value=(MotorTelemetry(41, 45, 23.6, 0, 99.8),) * 6)
+        plugin = JointMotorTelemetryPlugin(
+            self.driver.get_motor_telemetry, namespace="aloha/piper", can_interface="can0",
+            secondary_can_interface="can1",
+            arm_roles={"can0": "left_follower", "can1": "right_follower"},
+            ros2=object(), clock=lambda: self.now, publisher_factory=self.publisher,
+        )
+        with patch("agilex.piper.motor_telemetry.PiperDriver") as factory:
+            factory.return_value.get_motor_telemetry = right_feedback
+            plugin.start()
+            plugin.start()
+            factory.assert_called_once_with("can1")
+            factory.return_value.connect.assert_called_once_with(read_only=True)
+        self.addCleanup(plugin.stop)
+        self.publisher.call_args.args[-1]()
+        _, payload = plugin._transport.publish.call_args.args
+        right = payload["additional_arms"]["can1"]
+        self.assertEqual((payload["arm_role"], right["arm_role"]), ("left_follower", "right_follower"))
+        self.assertEqual((payload["J1"]["motor_temperature_c"], right["J1"]["motor_temperature_c"]), (21, 41))
+        self.assertEqual((payload["feedback_status"], right["feedback_status"]), ("fresh", "fresh"))
+        self.assertEqual(right["J1"]["driver_current_a"], 0)
+
+        right_feedback.return_value = ()
+        payload = plugin.info()["telemetry"]
+        self.assertEqual(payload["feedback_status"], "fresh")
+        right = payload["additional_arms"]["can1"]
+        self.assertEqual(right["feedback_status"], "unavailable")
+        self.assertIsNone(right["J1"]["motor_temperature_c"])
+
+    def test_telemetry_only_config_exposes_one_card_and_uses_two_passive_connections(self):
+        [plugin] = build_plugins({"can_interface": "can0", "motor_telemetry": {
+            "only": True, "secondary_can_interface": "can1",
+        }}, "aloha", None)
+        self.assertEqual([tool["name"] for tool in DriverBundle([plugin]).get_all_tools()], [TOOL_NAME])
+        first, second = Mock(), Mock()
+        with patch("agilex.piper.motor_telemetry.PiperDriver", side_effect=[first, second]):
+            plugin.start()
+            plugin.stop()
+        for receiver in (first, second):
+            receiver.connect.assert_called_once_with(read_only=True)
+            receiver.close.assert_called_once_with()
+
+    def test_start_cleans_up_if_secondary_receiver_fails(self):
+        [plugin] = build_plugins({"motor_telemetry": {
+            "only": True, "secondary_can_interface": "can1",
+        }}, "aloha", None)
+        first, second = Mock(), Mock()
+        second.connect.side_effect = OSError("CAN interface unavailable")
+        with patch("agilex.piper.motor_telemetry.PiperDriver", side_effect=[first, second]):
+            with self.assertRaises(OSError):
+                plugin.start()
+        first.close.assert_called_once_with()
+        second.close.assert_called_once_with()
+        self.assertEqual(plugin.info()["state"], "idle")
 
     def test_missing_stale_and_future_frames_do_not_reuse_readings(self):
         times = self.driver.arm.frame_times

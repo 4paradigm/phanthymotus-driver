@@ -1,12 +1,14 @@
 """Read-only joint motor telemetry on the existing PiPER sensor transport."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from contextlib import ExitStack
 from dataclasses import asdict
 from functools import partial
+import re
 import threading
 import time
 
-from agilex.piper.arm import MOTOR_FEEDBACK_IDS, MotorTelemetry
+from agilex.piper.arm import MOTOR_FEEDBACK_IDS, MotorTelemetry, PiperDriver
 from agilex.piper.monitor import RosMonitorPublisher
 from common.vendor_runtime import tool
 
@@ -14,20 +16,40 @@ from common.vendor_runtime import tool
 TOOL_NAME = "piper_joint_motor_telemetry"
 PUBLISH_HZ = 5
 MAX_FEEDBACK_AGE_S = 0.5
+FeedbackReader = Callable[[], tuple[MotorTelemetry | None, ...]]
 
 
 class JointMotorTelemetryPlugin:
     def __init__(
         self,
-        read_feedback: Callable[[], tuple[MotorTelemetry | None, ...]],
+        read_feedback: FeedbackReader | None,
         *,
         namespace: str,
         can_interface: str,
         ros2=None,
         clock: Callable[[], float] = time.time,
         publisher_factory=None,
+        secondary_can_interface: str | None = None,
+        arm_roles: Mapping[str, str] | None = None,
     ):
+        if secondary_can_interface is not None and (
+            not isinstance(secondary_can_interface, str) or not re.fullmatch(r"[\w.-]{1,15}", secondary_can_interface, re.ASCII)
+        ):
+            raise ValueError("motor_telemetry.secondary_can_interface must be a SocketCAN interface name.")
+        if secondary_can_interface == can_interface:
+            raise ValueError("Each telemetry source must use a different CAN interface.")
+        interfaces = {can_interface} if secondary_can_interface is None else {can_interface, secondary_can_interface}
+        if arm_roles is not None and (
+            not isinstance(arm_roles, Mapping) or not set(arm_roles) <= interfaces
+            or any(role not in ("left_follower", "right_follower") for role in arm_roles.values())
+            or len(set(arm_roles.values())) != len(arm_roles)
+        ):
+            raise ValueError("motor_telemetry.arm_roles must map configured interfaces to follower roles.")
         self._read_feedback = read_feedback
+        self._secondary_can_interface = secondary_can_interface
+        self._passive_receivers = {}
+        self._passive_cleanup = ExitStack()
+        self._arm_roles = dict(arm_roles or {})
         self._namespace = namespace
         self._can_interface = can_interface
         self._ros2 = ros2
@@ -57,9 +79,26 @@ class JointMotorTelemetryPlugin:
         return definition
 
     def _sample(self):
-        samples = self._read_feedback()
+        primary = self._sample_arm(self._can_interface)
+        secondary = self._secondary_can_interface
+        if secondary is not None:
+            primary["additional_arms"] = {
+                secondary: self._sample_arm(secondary),
+            }
+        return primary
+
+    def _sample_arm(self, interface):
+        receiver = self._passive_receivers.get(interface)
+        if receiver is not None:
+            samples = receiver.get_motor_telemetry()
+        elif interface == self._can_interface and self._read_feedback is not None:
+            samples = self._read_feedback()
+        else:
+            samples = ()
         now = self._clock()
-        result = {"can_interface": self._can_interface, "feedback_status": "unavailable"}
+        result = {"can_interface": interface, "feedback_status": "unavailable"}
+        if interface in self._arm_roles:
+            result["arm_role"] = self._arm_roles[interface]
         valid_count = 0
         for index in range(len(MOTOR_FEEDBACK_IDS)):
             sample = samples[index] if index < len(samples) else None
@@ -87,21 +126,38 @@ class JointMotorTelemetryPlugin:
             if not self._running:
                 self._generation += 1
                 generation = self._generation
-                if self._ros2 is not None:
-                    self._transport = self._publisher_factory(
-                        self._ros2, self._namespace, self._topics(), 1 / PUBLISH_HZ,
-                        lambda: self._tick(generation),
-                    )
+                passive = [] if self._read_feedback is not None else [self._can_interface]
+                if self._secondary_can_interface is not None:
+                    passive.append(self._secondary_can_interface)
+                with ExitStack() as cleanup:
+                    receivers = {}
+                    for interface in passive:
+                        driver = PiperDriver(interface)
+                        cleanup.callback(driver.close)
+                        driver.connect(read_only=True)
+                        receivers[interface] = driver
+                    if self._ros2 is not None:
+                        self._transport = self._publisher_factory(
+                            self._ros2, self._namespace, self._topics(), 1 / PUBLISH_HZ,
+                            lambda: self._tick(generation),
+                        )
+                    self._passive_receivers = receivers
+                    self._passive_cleanup = cleanup.pop_all()
                 self._running = True
             return {"state": "running", "topic_out": self._topics()}
 
     def stop(self):
-        with self._lock:
-            transport, self._transport = self._transport, None
-            self._running = False
-            self._publish_error = None
-        if transport is not None:
-            transport.close()
+        transport = None
+        try:
+            with self._lock:
+                transport, self._transport = self._transport, None
+                self._passive_receivers = {}
+                self._running = False
+                self._publish_error = None
+                self._passive_cleanup.close()
+        finally:
+            if transport is not None:
+                transport.close()
         return {"state": "idle", "topic_out": self._topics()}
 
     def info(self):

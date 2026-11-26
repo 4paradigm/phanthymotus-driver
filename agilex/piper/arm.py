@@ -16,6 +16,10 @@ import threading
 MOTOR_FEEDBACK_IDS = tuple(range(0x261, 0x267))
 
 
+def _reject_telemetry_transmit(*args, **kwargs):
+    raise RuntimeError("The PiPER telemetry receiver is receive-only.")
+
+
 @dataclass(frozen=True)
 class ArmState:
     joints_deg: tuple[float, ...]
@@ -59,8 +63,11 @@ class PiperDriver:
         self.usb_index = 0
         self.last_transport_diagnostics = {}
 
-    def connect(self):
+    def connect(self, *, read_only=False):
         from piper_sdk import C_PiperInterface_V2
+
+        if read_only and self.can_transport != "socketcan":
+            raise ValueError("The passive telemetry receiver requires SocketCAN.")
 
         class ObservedInterface(C_PiperInterface_V2):
             # SDK aggregate timestamps can hide one stale joint/motor frame.
@@ -103,8 +110,12 @@ class PiperDriver:
         with self.arm.frame_lock:
             self.arm.frame_times.clear()
             self.arm.frame_counts.clear()
-        self.arm.ConnectPort(can_init=True, piper_init=False)
+        if read_only:
+            self.arm._arm_can.SendCanMessage = _reject_telemetry_transmit
         try:
+            self.arm.ConnectPort(can_init=True, piper_init=False)
+            if read_only:
+                return self
             deadline = time.monotonic() + 2
             while True:
                 try:
