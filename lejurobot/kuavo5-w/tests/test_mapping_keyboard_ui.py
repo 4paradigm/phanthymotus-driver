@@ -16,9 +16,10 @@ const listeners={},docListeners={},elements={};let tick,statusTick,ready=false,f
 function element(){return {disabled:false,textContent:'',dataset:{},classList:{toggle(){}},addEventListener(){},setPointerCapture(){}};}
 for(const id of ['state','release','stop'])elements[id]=element();
 const buttons=['KeyW','KeyS','KeyA','KeyD'].map(code=>({...element(),dataset:{code}}));
-const requests=[];
+const requests=[],requestTimeouts=[];
 let mappingStarting=true,stopPending=false;
 const port={start(){},postMessage(m){requests.push(m.args);let result={state:'ready'};
+ if(m.args.action==='stop')result={state:'idle'};
  if(m.args.action==='keyboard_open')result=mappingStarting?{state:'loading',mapping_state:'starting'}:{state:'loading',session_id:'lease'};
  if(m.args.action==='keyboard_status')result={state:stopPending?'stop_unconfirmed':'idle',busy:stopPending,mapping_state:mappingStarting?'starting':'mapping',console_authorized:true};
  if(m.args.action==='keyboard_command')result={state:ready?'ready':'loading'};
@@ -26,7 +27,7 @@ const port={start(){},postMessage(m){requests.push(m.args);let result={state:'re
  if(m.args.action==='keyboard_open'&&holdOpen){heldOpen=m;return;}
  queueMicrotask(()=>port.onmessage({data:{id:m.id,result}}));
 }};
-const parent={};const context={parent,setTimeout(fn,ms){if(ms===500){mappingStarting=false;queueMicrotask(fn);return 0;}return setTimeout(fn,ms);},clearTimeout,Promise,Map,Set,Number,Error,Date,
+const parent={};const context={parent,setTimeout(fn,ms){if(ms===500){mappingStarting=false;queueMicrotask(fn);return 0;}requestTimeouts.push(ms);return setTimeout(fn,ms);},clearTimeout,Promise,Map,Set,Number,Error,Date,
  setInterval(fn,ms){if(ms===80)tick=fn;else statusTick=fn;},window:{focus(){focused=true;},addEventListener(k,f){listeners[k]=f;}},
  document:{hidden:false,hasFocus(){return focused;},getElementById(id){return elements[id];},querySelectorAll(){return buttons;},
  addEventListener(k,f){docListeners[k]=f;}}};
@@ -66,9 +67,12 @@ const values=()=>JSON.parse(JSON.stringify(requests.filter(x=>x.action==='keyboa
  await elements.stop.onclick();assert.equal(requests.at(-2).action,'stop');assert.equal(requests.at(-1).action,'keyboard_status');
  await statusTick();assert(elements.state.textContent.includes('pending'));
  stopPending=false;await statusTick();
- assert(elements.state.textContent.includes('Stopped.'),'Late stop confirmation must clear stale stop warning');
+ assert(elements.state.textContent.includes('All motion stopped.'),'Late stop confirmation must clear stale stop warning');
  const stopped=requests.length;focused=true;listeners.focus();await tick();
  assert.equal(requests.length,stopped,'Stop all motion must not automatically re-arm on focus');
+ assert(requestTimeouts.includes(60000),'Whole-body stop must not inherit the 1.5s command reply timeout');
+ assert(requestTimeouts.includes(12000),'Lease release must allow its bounded stop confirmation');
+ assert(!fs.readFileSync(process.argv[1],'utf8').includes('Canvas request timed out; keyboard released'),'A missing reply cannot claim confirmed release');
 })().catch(e=>{console.error(e);process.exitCode=1;});
 '''
         result = subprocess.run(['node', '-e', script, str(html)], capture_output=True, text=True, timeout=10)

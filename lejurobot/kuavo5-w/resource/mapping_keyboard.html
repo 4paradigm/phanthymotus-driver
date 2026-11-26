@@ -27,7 +27,7 @@ After preparation completes, release all keys and press again.</p>
 <p class="muted">Saving mapping automatically releases keyboard control and confirms the stop first.
 A hardware emergency stop remains independent of this panel.</p>
 <script>
-let port=null,serial=0,session=null,seq=0,ready=false,inflight=false,opening=false,releasing=false,suspended=false,generation=0,statusChecking=false;
+let port=null,serial=0,session=null,seq=0,ready=false,inflight=false,opening=false,releasing=false,suspended=false,generation=0,statusChecking=false,wholeStopPending=false,wholeStopConfirmed=false;
 const pending=new Map(),pressed=new Set(),state=document.getElementById('state');
 const release=document.getElementById('release');
 const aliases={KeyI:'KeyW',KeyK:'KeyS',KeyJ:'KeyA',KeyL:'KeyD',KeyW:'KeyW',KeyS:'KeyS',KeyA:'KeyA',KeyD:'KeyD'};
@@ -40,7 +40,8 @@ function paint(message){
 function call(action,args={}){
  return new Promise((resolve,reject)=>{
   if(!port){reject(new Error('Canvas disconnected'));return;}
-  const id=String(++serial),timer=setTimeout(()=>{pending.delete(id);reject(new Error('Canvas request timed out; keyboard released'));},1500);
+  const timeout=action==='stop'?60000:action==='keyboard_release'?12000:1500;
+  const id=String(++serial),timer=setTimeout(()=>{pending.delete(id);reject(new Error('Canvas reply timed out. Stop is not confirmed.'));},timeout);
   pending.set(id,{resolve,reject,timer});port.postMessage({id,method:'call',args:{action,...args}});
  });
 }
@@ -97,10 +98,14 @@ async function arm(){
 }
 release.onclick=()=>disarm();
 document.getElementById('stop').onclick=async()=>{
+ if(wholeStopPending)return;
+ wholeStopPending=true;wholeStopConfirmed=false;
  suspended=true;++generation;session=null;ready=false;releasing=true;pressed.clear();paint('Stopping all motion; waiting for confirmation.');
- try{await call('stop');const r=await call('keyboard_status');
-  releasing=!!r.busy;paint(releasing?'Stop still pending; inspect card info.':'Keyboard stopped. Inspect card info for the whole-body stop result.');
+ try{const stopped=await call('stop');wholeStopConfirmed=stopped.state==='idle'||stopped.state==='paused';
+  const r=await call('keyboard_status');
+  releasing=!!r.busy;paint(releasing?'Stop still pending; inspect card info.':wholeStopConfirmed?'All motion stopped.':'Keyboard stopped. Whole-body stop is not confirmed; inspect card info.');
  }catch(e){paint(e.message+' Inspect card info for stop confirmation.');}
+ finally{wholeStopPending=false;}
 };
 window.addEventListener('keydown',e=>{
  const code=aliases[e.code];if(!code||!e.altKey||!ready||e.repeat)return;
@@ -138,7 +143,7 @@ setInterval(async()=>{
  try{const result=await call('keyboard_status');
   if(!result.busy&&result.state==='idle'){
    releasing=false;pressed.clear();ready=false;
-   paint('Stopped. Keyboard control released. Refocus this panel to continue mapping.');
+   paint(suspended?(wholeStopConfirmed?'All motion stopped.':wholeStopPending?'Keyboard stopped. Waiting for whole-body stop confirmation.':'Keyboard stopped. Whole-body stop is not confirmed; inspect card info.'):'Stopped. Keyboard control released. Refocus this panel to continue mapping.');
   }
  }catch(e){/* Keep the stop warning until a positive status arrives. */}
  finally{statusChecking=false;}

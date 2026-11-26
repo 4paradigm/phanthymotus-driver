@@ -17,7 +17,7 @@ from unittest.mock import patch
 
 import test_controlled_spatial as spatial_fixtures
 from controlled_spatial import ControlledSpatialPlugin, SpatialStore
-from mapping_keyboard import confirmed_stop
+from mapping_keyboard import confirmed_stop, FactoryKeyboardStream
 import test_driver as driver_fixtures
 from test_driver import wait_until
 
@@ -365,6 +365,33 @@ class MappingCardCoexistenceTests(unittest.TestCase):
 
 
 class ChassisGuardTests(unittest.TestCase):
+    def test_chunked_guard_replies_keep_stop_after_coalesced_ready_and_timeout(self):
+        reader,writer=os.pipe()
+        stream=object.__new__(FactoryKeyboardStream)
+        stream._read_buffer=bytearray()
+        with os.fdopen(reader,'rb',buffering=0) as source:
+            stream.process=types.SimpleNamespace(stdout=source)
+            try:
+                os.write(writer,b'{"state":"ready","seq":1}\n{"state":"stopped",')
+                self.assertEqual(stream.read(.1)['state'],'ready')
+                with self.assertRaisesRegex(TimeoutError,'guard_timeout'):
+                    stream.read(.02)
+                os.write(writer,b'"stationary":true,"software_estop":true}\n')
+                self.assertTrue(confirmed_stop(stream.read(.1)))
+            finally:
+                os.close(writer)
+
+    def test_guard_reply_parser_drains_all_buffered_lines_before_eof(self):
+        reader,writer=os.pipe()
+        stream=object.__new__(FactoryKeyboardStream)
+        stream._read_buffer=bytearray()
+        with os.fdopen(reader,'rb',buffering=0) as source:
+            stream.process=types.SimpleNamespace(stdout=source)
+            os.write(writer,b'{"state":"held"}\n{"state":"ready"}\n');os.close(writer)
+            self.assertEqual(stream.read(.1)['state'],'held')
+            self.assertEqual(stream.read(.1)['state'],'ready')
+            with self.assertRaises(ConnectionError):stream.read(.1)
+
     def test_factory_websocket_masks_commands_answers_ping_and_rejects_api_errors(self):
         class Wire:
             def __init__(self):

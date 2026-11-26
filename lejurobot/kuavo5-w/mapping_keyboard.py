@@ -36,6 +36,7 @@ def guard_error(reply):
 class FactoryKeyboardStream:
     def __init__(self, client):
         self.stop_lock = threading.Lock()
+        self._read_buffer = bytearray()
         manager = client.provisioner
         target = manager._target('chassis')
         source = ('NAVIGATION_SOURCE = ' + repr(client._source) + '\n' +
@@ -47,21 +48,26 @@ class FactoryKeyboardStream:
         os.set_blocking(self.process.stdin.fileno(), False)
 
     def read(self, timeout):
-        end, data = time.monotonic()+timeout, bytearray()
+        end = time.monotonic()+timeout
         while time.monotonic() < end:
-            if not select.select([self.process.stdout], [], [], min(.05, max(0., end-time.monotonic())))[0]:
-                continue
-            part = os.read(self.process.stdout.fileno(), 1)
-            if not part:
-                raise ConnectionError('factory_keyboard_stream_disconnected')
-            if part == b'\n':
+            newline = self._read_buffer.find(b'\n')
+            if newline >= 0:
+                if newline > 1024:
+                    raise ValueError('oversized_keyboard_guard_reply')
+                data = bytes(self._read_buffer[:newline])
+                del self._read_buffer[:newline+1]
                 value = json.loads(data)
                 if not isinstance(value, dict):
                     raise ValueError('invalid_keyboard_guard_reply')
                 return value
-            data.extend(part)
-            if len(data) > 1024:
+            if len(self._read_buffer) > 1024:
                 raise ValueError('oversized_keyboard_guard_reply')
+            if not select.select([self.process.stdout], [], [], min(.05, max(0., end-time.monotonic())))[0]:
+                continue
+            part = os.read(self.process.stdout.fileno(), 4096)
+            if not part:
+                raise ConnectionError('factory_keyboard_stream_disconnected')
+            self._read_buffer.extend(part)
         raise TimeoutError('factory_keyboard_guard_timeout')
 
     def send(self, value):
