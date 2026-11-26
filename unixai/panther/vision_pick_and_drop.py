@@ -138,21 +138,33 @@ class VisionPickAndDrop:
     def _start_input(self, args):
         rgb = self.device.topics["camera_color"]["topic"]
         depth = self.device.topics["camera_depth"]["topic"]
-        topic = rgb + "/objects"
         inputs = args.get("input_topics", [])
-        if (not isinstance(inputs, list) or len(inputs) != 3 or any(not isinstance(v, str) for v in inputs)
-                or set(inputs) != {rgb, depth, topic}):
-            raise ValueError("connect Panther depth, Panther RGB and VOP consuming that same RGB topic")
+        if not isinstance(inputs, list) or len(inputs) < 2 or len(inputs) > 3:
+            raise ValueError("connect at least Panther depth and RGB; optionally VOP objects")
+        valid_topics = {depth, rgb}
+        if len(inputs) == 3:
+            valid_topics.add(rgb + "/objects")
+        if not all(isinstance(v, str) for v in inputs) or not set(inputs).issubset(valid_topics):
+            raise ValueError("invalid input topics")
+        has_vop = len(inputs) == 3
         if self._source and self._source[0].is_alive():
             return self.info()
         self._stop_requested = False
         self._snapshot = None
         self._close_input()
         inbox, closing, ready = self._ctx.Queue(maxsize=4), self._ctx.Event(), self._ctx.Event()
-        process = self._ctx.Process(target=_receive, args=(topic, int(os.environ.get("AGENT_CORE_ROS_DOMAIN_ID", "42")),
-            "/opt/phanthy-motus/dds-local.xml", inbox, ready, closing, "panther_pick_vop", 256 * 1024), daemon=True)
-        process.start()
-        self._source = process, inbox, closing, ready
+        if has_vop:
+            vop_topic = rgb + "/objects"
+            process = self._ctx.Process(target=_receive, args=(vop_topic,
+                int(os.environ.get("AGENT_CORE_ROS_DOMAIN_ID", "42")),
+                "/opt/phanthy-motus/dds-local.xml", inbox, ready, closing, "panther_pick_vop", 256 * 1024), daemon=True)
+            process.start()
+            self._source = process, inbox, closing, ready
+            self._has_vop = True
+        else:
+            # No VOP: just arm the camera subscription (no ROS subscription needed)
+            self._source = None
+            self._has_vop = False
         return self.info()
 
     def _close_input(self):
@@ -186,6 +198,8 @@ class VisionPickAndDrop:
                 self._snapshot = observation = None
             return {"state": "blocked" if self._blocked else "running" if self._worker else "idle",
                     "allow_motion": self.cfg.get("allow_motion") is True,
+                    "inputs_ready": self._has_vop if self._source else True,
+                    "vop_connected": getattr(self, "_has_vop", False),
                     "config_error": self._config_error,
                     "inputs_ready": bool(self._source and self._source[0].is_alive() and self._source[3].is_set()),
                     "observation_required": observation is None,
@@ -376,26 +390,30 @@ class VisionPickAndDrop:
         reference = self._joints()
         after = time.time() + .6
         limit = time.monotonic() + 10.
-        inbox = self._source[1]
+        if self._has_vop:
+            inbox = self._source[1]
+        else:
+            inbox = None
         while time.monotonic() < limit:
             self._check_cancel()
             self._same_joints(reference)
             self._same_base(base)
-            try:
-                payload, _ = inbox.get(timeout=.1)
-                now = time.time()
-                stamp = number(payload["timestamp"], now - 2., now + .05)
-                started = stamp - number(payload["latency_ms"], 0, 2000) / 1000.
-                if started < after:
-                    continue
-                objects = object_list(payload)
-            except (queue.Empty, KeyError, TypeError, ValueError):
-                continue
-            photo = self.device._camera.pick_snapshot(after, started, self.cfg["base_frame"])
+            photo = self.device._camera.pick_snapshot(after, time.time(), self.cfg["base_frame"])
             if photo is not None:
                 self._same_joints(reference)
                 self._check_cancel()
                 height, width = photo["depth"].shape
+                objects = []
+                if inbox is not None:
+                    try:
+                        payload, _ = inbox.get(timeout=.1)
+                        now = time.time()
+                        stamp = number(payload["timestamp"], now - 2., now + .05)
+                        started = stamp - number(payload["latency_ms"], 0, 2000) / 1000.
+                        if started >= after:
+                            objects = object_list(payload)
+                    except (queue.Empty, KeyError, TypeError, ValueError):
+                        pass
                 summary = {"observation_id": uuid4().hex, "captured_at": photo["stamp"], "width": width,
                            "height": height, "objects": objects, "count": len(objects),
                            "synchronization": "stationary_window_approximate"}
@@ -404,7 +422,7 @@ class VisionPickAndDrop:
                     self._snapshot = {**photo, "summary": summary, "joints": reference,
                                       "base": base, "expiry": time.monotonic() + 30.}
                 return summary
-        raise RuntimeError("no fresh registered RGB-D/VOP observation; check camera and optical TF")
+        raise RuntimeError("no fresh registered RGB-D observation; check camera and optical TF")
 
     def _run(self, action, action_id, snapshot, target):
         status = "error"
