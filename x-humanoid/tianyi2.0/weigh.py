@@ -1397,7 +1397,7 @@ class WeighEngine:
         return (f"已开始称重（{SIDE_NAMES.get(side, side)}）。{prep}；准备好后最多等 {window:g} 秒，"
                 f"让人把物品放到{_PALM.get(side, side)}，放稳后约 {cfg['default_duration_s']:g} 秒出结果。"
                 "这期间要让用户知道的事（正在准备、可以放了、称出的重量、出错原因）会作为给用户的话"
-                "（to_user）发到 weigh_state 传感器，由你决定是否、如何转告用户（语音、消息等）。"
+                "（to_user）发到 weigh_state 传感器，收到一条就原样转告用户一条（在机器人身边就用播报工具说出来）。"
                 f"完成通知是静默的、不带重量；重量见 weigh_state 的 {last}.mass_g，valid=true 才可用。"
                 f"结束前不要再调用 weigh，也不要操作{arm}和手。")
 
@@ -1628,6 +1628,12 @@ USER_DECIDES = ("手臂保持现在的样子。接下来再称、复位还是先
 
 # weigh_state 发布的消息顶层带的 priority：>0 时 agent-core 直接送 decision_core（见 WeighStatePlugin._produce）
 WAKE_PRIORITY = 1
+# 同样只放在发布出去的消息里，排在最前面。agent-core 的系统提示说传感器事件"大多数情况无需主动回应"，
+# 真机上大模型收到"可以放了"就直接 finish 了；收到"正在准备"还以为要它去称，自己又调了一次 weigh
+# （卡片上点的称重它不知道）。光写在工具描述里不够，每条消息自己说清楚。
+RELAY_INSTRUCTION = ("这是称重卡要对用户说的话，卡片自己不出声。虽然是传感器消息，也要现在就把 to_user.text "
+                     "原样转告用户（在机器人身边就用播报工具说出来）。称重或复位是卡片自己在做的，可能是用户"
+                     "在卡片上点的；不要因为这条消息调用 weigh 或 reset，用户开口要求时才调用。")
 SYNC_GRACE_S = 0.5
 
 
@@ -1683,7 +1689,9 @@ class WeighPlugin:
                 "side 选 right（默认）、left，或 both（两只手各放一件，重量相加）。"
                 "调用前手臂须垂下或已在托举姿态，周围无人无物。"
                 "卡片自己不出声：过程中要让用户知道的事（正在准备、可以放了、称出的重量、出错原因、"
-                "复位结果）作为给用户的话（to_user）发到 weigh_state 传感器，由你决定是否、如何转告用户。"
+                "复位结果）作为给用户的话（to_user）发到 weigh_state 传感器，收到就要原样转告用户，"
+                "不转告用户就听不到。weigh_state 的消息不是让你动手：称重也可能是用户在卡片上发起的，"
+                "收到 preparing / ready 等消息不要再调用 weigh。"
                 "完成通知是静默的、不带重量；重量看 weigh_state 的 sides.<side>.last.mass_g"
                 "（both 看 both_last；valid=true 才可用）。"
                 f"适用约 {cfg['detect_kg']} kg 以上的静止物体，不能替代电子秤计量。"
@@ -1998,9 +2006,11 @@ class WeighStatePlugin:
             "description": (
                 "天轶2.0 掌心称重的进展和结果（实验性，配合 weigh 卡使用）。只在 weigh 卡有话要让用户"
                 "知道时发布一条，平时不发。to_user.text 是给用户的话：正在准备、可以放物品了、称出的重量、"
-                "出错原因、复位结果等，由你决定是否转告、怎么转告（语音、消息等）；它说的是发出时已经"
-                "成立的事，晚一点转告也不会错。weigh 卡自己不出声，你不转告用户就听不到。每条消息都带 "
-                "priority=1，直接送到你这里。to_user.id 每条加一，to_user.kind 是 preparing / ready / "
+                "出错原因、复位结果等。它虽然是传感器消息，却不能忽略：收到一条就原样转告用户一条（在机器人"
+                "身边就用播报工具说出来）；它说的是发出时已经成立的事，晚一点转告也不会错。weigh 卡自己不出声，"
+                "你不转告用户就听不到。每条消息都带 priority=1，直接送到你这里，顶层的 instruction 重复了"
+                "这条要求。称重和复位是 weigh 卡自己在做的，也可能是用户在卡片上点的；这些消息不是让你动手，"
+                "不要因为收到它们调用 weigh 或 reset。to_user.id 每条加一，to_user.kind 是 preparing / ready / "
                 "result / failed / reset_done / reset_confirm。sides.<right|left>.last 是该手最近一次测出的"
                 "结果：mass_kg / mass_g、valid（false 时不要使用重量）、reasons、seq；side=both 的结果在 "
                 "both_last。in_pose / tare_valid 是消息发出时手臂是否在托举姿态、去皮是否有效。"
@@ -2025,6 +2035,7 @@ class WeighStatePlugin:
             snap["to_user"] = to_user           # 这一条，而不是发布时最新的那条
         payload = {"to_user": snap.pop("to_user", None), **snap}
         if to_user is not None:
+            payload = {"instruction": RELAY_INSTRUCTION, **payload}
             # 发布出去的每一条都是要转告用户的话。agent-core 的 collector 把没带
             # priority 的话题消息当传感器读数（P=0），先交给后台监控子代理判断
             # 要不要上报；它不知道本卡不出声，实测会把"可以放了"之类判成不急、

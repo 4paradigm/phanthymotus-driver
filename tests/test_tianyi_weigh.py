@@ -1590,6 +1590,8 @@ def test_failures_tell_the_caller_to_leave_the_next_step_to_the_user(hanging):
 def test_descriptions_say_only_move_when_the_user_asks(hanging, tmp_path):
     p, _, _ = _async_plugin(hanging, tmp_path)
     assert "只在用户要求时调用" in p.get_tool()["description"]
+    assert "不要再调用 weigh" in p.get_tool()["description"]        # 卡片上点的称重，大模型别再发一次
+    assert "原样转告用户" in p.get_tool()["description"] and "由你决定" not in p.get_tool()["description"]
     assert p.get_tool()["inputSchema"]["x-is-dangerous"] is True
     sensor = weigh.WeighStatePlugin({}, "ns", _FakeRos2(), p)
     assert "不要自行调用 weigh 或 reset" in sensor.get_tool()["description"]
@@ -1693,7 +1695,8 @@ def test_weigh_state_sensor_reads_the_latest_result(hanging, tmp_path):
     tool = sensor.get_tool()
     assert tool["name"] == "weigh_state" and tool["type"] == "sensor"
     assert tool["topic_out"] == [{"topic": "/ns/state/weigh", "format": "data/json"}]
-    assert "to_user" in tool["description"] and "由你决定" in tool["description"]
+    assert "to_user" in tool["description"] and "原样转告用户" in tool["description"]
+    assert "不能忽略" in tool["description"] and "不要因为收到它们调用 weigh" in tool["description"]
     assert sensor.dispatch("info", {})["state"] == "idle"
     before = sensor.dispatch("read", {})
     assert before["seq"] == 0 and before["sides"]["right"]["last"] is None and before["to_user"] is None
@@ -1705,7 +1708,7 @@ def test_weigh_state_sensor_reads_the_latest_result(hanging, tmp_path):
     assert after["seq"] == 1 and last["seq"] == 1 and last["mass_g"] == res["mass_g"] and last["valid"]
     assert after["sides"]["left"]["last"] is None and after["timestamp_ms"] > 0
     assert list(after)[0] == "to_user" and after["to_user"]["kind"] == "result"
-    assert "priority" not in after                      # read 的快照不是新消息
+    assert "priority" not in after and "instruction" not in after   # read 的快照不是新消息
     assert "priority=1" in tool["description"] and "不出声" in tool["description"]
     json.dumps(after)                                   # 能直接发成 data/json
     assert sensor.dispatch("bogus", {})["state"] == "error"
@@ -1724,6 +1727,10 @@ def test_weigh_state_publishes_one_message_per_thing_to_tell_and_nothing_else(ha
         assert [m["to_user"]["text"] for m in pub.sent] == hanging.told
         # 顶层 priority>0：agent-core 直接送 decision_core，不经后台监控子代理过滤
         assert all(m["priority"] == weigh.WAKE_PRIORITY >= 1 for m in pub.sent)
+        # 每条都先说清楚：这是要转告用户的话，不是让大模型去调用 weigh
+        assert all(list(m)[0] == "instruction" and m["instruction"] == weigh.RELAY_INSTRUCTION
+                   for m in pub.sent)
+        assert "原样转告用户" in weigh.RELAY_INSTRUCTION and "不要因为这条消息调用 weigh" in weigh.RELAY_INSTRUCTION
         # 结果那一条里已经带着这次的重量
         assert pub.sent[-1]["sides"]["right"]["last"]["mass_g"] == res["mass_g"]
         time.sleep(1.5)
