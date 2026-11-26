@@ -55,6 +55,23 @@ sudo systemctl enable --now helios-depth-source@admin.service
 
 `camera_depth` 的 `info` 返回 `preview_topic`。应用 [Core 前端补丁](core-preview.patch) 后，画布的「查看数据流」优先打开 JPEG 预览，监控页也只订阅同一驱动成对发布的 JPEG 预览。原始毫米深度仍是卡片的第一输出，已有接线继续使用原话题。补丁已在 Helios 的 Core `release.261118.56edda4` 上验证，并可应用于 Phanthy Motus 源码 `d7dab1461`。
 
+#### JPEG 编码依赖与镜像体积
+
+- 核对 ARM64 `ros-base`（`sha256:82d45949e7c3…`）的文件系统后确认，预览复用镜像自带的 NumPy 完成下采样和着色。`sensor_msgs/CompressedImage` 用于传输已编码数据。基础镜像含原生 `libjpeg.so.8`，而 Python 层没有 Pillow、`cv2`、`cv_bridge` 或可调用的 `cjpeg`。直接复用 `libjpeg.so.8` 需要额外的绑定或编码程序。
+- 保留 `Pillow==12.3.0`，在进程内把 320×240 RGB 数组编码成 JPEG。原始毫米深度仅用 NumPy 和 zlib 编码。要保留 JPEG 预览并移除 Pillow，需要实现并维护原生编码绑定，或另行安装编码工具。本次 ARM64 构建安装的是固定版本的 Pillow wheel，关闭了 pip 缓存和依赖安装。
+- 在 PR 镜像 `release.261126.1b53f70` 上实测，Docker manifest 中 Pillow 安装层为 **6,833,602 字节（6.52 MiB 压缩）**。展开镜像后，`PIL`、`pillow.libs` 和 `pillow-12.3.0.dist-info` 的普通文件合计 **23,790,526 字节（22.69 MiB）**。压缩层用于估算额外拉取流量，展开文件用于估算安装内容大小。
+
+#### 基础设施文件
+
+| 文件 | 用途 |
+|---|---|
+| `Dockerfile` | 基于现有 ROS 镜像打包传感器代码、共享运行模块和部署模板，并在构建时验证导入。 |
+| `deploy/service.yml` | 声明主机网络、ROS 2 domain 42、只读 FastDDS 配置和有上限的容器日志轮转。 |
+| `driver.yaml` | 声明驱动标识、MCP 端口、两张传感器卡和共享模块的构建路径，供 Core 发现和构建流程使用。 |
+| `requirements.txt` | 固定 JPEG 编码依赖版本。Pillow 是新增的运行时软件包，体积见上文。 |
+
+同一镜像相对 `ros-base` 的其余压缩层合计 **27,027 字节（26.39 KiB）**，包含驱动源码、部署文件和构建层元数据。
+
 ## 验证
 
 在仓库根目录执行 `python -m pytest -q tests/test_helios_camera_sensors.py` 和 `python scripts/check_service_yml.py rokae/helios_sensors`。
