@@ -725,19 +725,51 @@ class ChassisGuardTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 remote.validate_frame(frame, 'n', 0)
 
+    def test_remote_receive_preserves_fragment_across_deadlines_and_following_frame(self):
+        reader, writer = os.pipe()
+        buffer = bytearray()
+        with os.fdopen(reader, 'rb', buffering=0) as stream:
+            try:
+                os.write(writer, b'{"nonce":"n","seq":')
+                with self.assertRaisesRegex(TimeoutError, 'keyboard_watchdog_expired'):
+                    remote.receive(stream, .02, buffer)
+                self.assertEqual(buffer, b'{"nonce":"n","seq":')
+                os.write(writer, b'1,"values":[0,0]}\n{"seq":2}\n')
+                self.assertEqual(remote.receive(stream,.1,buffer),
+                    {'nonce':'n','seq':1,'values':[0,0]})
+                os.close(writer); writer = None
+                self.assertEqual(remote.receive(stream,.1,buffer), {'seq':2})
+                with self.assertRaises(EOFError):remote.receive(stream,.1,buffer)
+            finally:
+                if writer is not None:os.close(writer)
+
+    def test_remote_receive_rejects_expired_buffer_and_oversized_fragment(self):
+        reader, writer = os.pipe()
+        with os.fdopen(reader, 'rb', buffering=0) as stream:
+            try:
+                buffer = bytearray(b'{"values":[.1,0]}\n')
+                with self.assertRaises(TimeoutError):remote.receive(stream,0.,buffer)
+                self.assertTrue(buffer)  # No expired command was consumed.
+                buffer[:] = b'x'*1025
+                with self.assertRaisesRegex(ValueError,'oversized_keyboard_frame'):
+                    remote.receive(stream,.1,buffer)
+            finally:
+                os.close(writer)
+
     def test_remote_watchdog_bounds_partial_json_and_disconnect(self):
         read_fd, write_fd = os.pipe()
+        receive_buffer = bytearray()
         with os.fdopen(read_fd, 'rb', buffering=0) as stream:
             try:
                 os.write(write_fd, b'{"seq":')
                 start = time.monotonic()
                 with self.assertRaises(TimeoutError):
-                    remote.receive(stream, .03)
+                    remote.receive(stream, .03, receive_buffer)
                 self.assertLess(time.monotonic()-start, .15)
                 os.close(write_fd)
                 write_fd = None
                 with self.assertRaises(EOFError):
-                    remote.receive(stream, .03)
+                    remote.receive(stream, .03, receive_buffer)
             finally:
                 if write_fd is not None:
                     os.close(write_fd)

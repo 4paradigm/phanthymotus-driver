@@ -141,20 +141,27 @@ def validate_frame(frame, nonce, last_seq):
     return values
 
 
-def receive(stream, timeout):
-    # Unbuffered fd reads: never wait indefinitely for a partial JSON line.
-    deadline, data = time.monotonic()+timeout, bytearray()
+def receive(stream, timeout, data):
+    # The caller owns this buffer for the entire connection. A parser timeout
+    # must not discard a fragmented line, nor extend the motion lease.
+    deadline = time.monotonic()+timeout
     while time.monotonic() < deadline:
-        if not select.select([stream], [], [], max(0., deadline-time.monotonic()))[0]:
-            break
-        part = os.read(stream.fileno(), 1)
-        if not part:
-            raise EOFError('keyboard_stream_closed')
-        if part == b'\n':
-            return json.loads(data)
-        data.extend(part)
+        newline = data.find(b'\n')
+        if newline >= 0:
+            if newline > 1024:
+                raise ValueError('oversized_keyboard_frame')
+            line = bytes(data[:newline])
+            del data[:newline+1]
+            return json.loads(line)
         if len(data) > 1024:
             raise ValueError('oversized_keyboard_frame')
+        if not select.select([stream], [], [], max(0., deadline-time.monotonic()))[0]:
+            break
+        # Bound one read while retaining any following complete frames.
+        part = os.read(stream.fileno(), 1025)
+        if not part:
+            raise EOFError('keyboard_stream_closed')
+        data.extend(part)
     raise TimeoutError('keyboard_watchdog_expired')
 
 
@@ -277,8 +284,9 @@ def run(request):
         emit({'state': 'held', 'nonce': nonce})
         # A new challenge per acknowledgement rejects queued/replayed frames.
         deadline = time.monotonic()+LEASE_S
+        receive_buffer = bytearray()
         while True:
-            frame = receive(sys.stdin, max(0., deadline-time.monotonic()))
+            frame = receive(sys.stdin, max(0., deadline-time.monotonic()), receive_buffer)
             vx, vw = validate_frame(frame, nonce, seq)
             seq = frame['seq']
             state = manual()
