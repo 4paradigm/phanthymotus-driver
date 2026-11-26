@@ -1299,6 +1299,71 @@ def test_stop_holds_the_arm_before_returning_and_only_once(hanging, tmp_path):
     assert hanging.pose == pytest.approx(stopped, abs=0.01)
 
 
+def _stop_like_the_card(engine, done):
+    """WeighPlugin.stop 对引擎做的事：置取消标志，再经 hold_if_moving 拿一次指令锁。"""
+    engine.cancel()
+    engine.hold_if_moving(timeout=5.0)
+    done.set()
+
+
+def test_stop_landing_between_cancel_check_and_hand_dispatch(hanging):
+    """bot 审查（2954e81）：stop 落在"查取消"和"发手指指令"之间。查取消和下发在同一把锁内，
+    stop 要等这条指令发完才能返回；返回之后再也发不出手指指令。"""
+    e = hanging.engine
+    e._hand_started = True
+    stopped, cancelled_seen = threading.Event(), []
+    real_guard = e._servo_guard
+
+    def guard_then_stop():                 # 查过取消、即将发手指指令时，stop 来了
+        if not cancelled_seen:
+            t = threading.Thread(target=_stop_like_the_card, args=(e, stopped), daemon=True)
+            t.start()
+            assert _wait_for(e._cancel.is_set)
+            cancelled_seen.append(stopped.wait(0.3))    # stop 拿不到锁，返回不了
+        return real_guard()
+    e._servo_guard = guard_then_stop
+    with pytest.raises(weigh.Cancelled):                # 指令发完，之后的等待发现已取消
+        e._set_hand("cup")
+    assert [c["action"] for c in hanging.hand_calls] == ["set_fingers_raw"]
+    assert cancelled_seen == [False]                    # 指令发出之前 stop 没有返回
+    assert stopped.wait(5)
+    n = len(hanging.hand_calls)
+    with pytest.raises(weigh.Cancelled):
+        e._set_hand("open")                             # stop 之后：不再下发
+    assert len(hanging.hand_calls) == n
+
+
+def test_stop_landing_right_before_a_message_suppresses_it(hanging):
+    """stop 落在测量结束、发结果消息之前：这条消息不发，动作以 cancelled 结束。"""
+    e = hanging.engine
+    e.pose({})
+    place_after_prompt(hanging, 0.59)
+    real_weigh = e.weigh
+
+    def weigh_then_stop(args):
+        res = real_weigh(args)
+        e.cancel()                                      # 结果出来了，stop 恰好落在这里
+        return res
+    e.weigh = weigh_then_stop
+    with pytest.raises(weigh.Cancelled):
+        e.auto_weigh({})
+    assert [m["kind"] for m in hanging.messages] == ["ready"]   # 没有 result / failed
+
+
+def test_message_waits_for_a_concurrent_stop_and_is_then_dropped(hanging):
+    """另一线程的 stop 正拿着指令锁时，消息等锁、再查取消，不会抢在 stop 之后发出。"""
+    e = hanging.engine
+    with e._cmd_lock:
+        t = threading.Thread(target=lambda: pytest.raises(weigh.Cancelled, e._tell, "ready", "right", "x"),
+                             daemon=True)
+        t.start()
+        time.sleep(0.1)
+        assert hanging.messages == []                   # 在等锁
+        e.cancel()
+    t.join(5)
+    assert not t.is_alive() and hanging.messages == []
+
+
 def test_cancel_outside_a_stage_sends_no_hold(hanging):
     hanging.engine.pose({})
     n = len(hanging.moves())

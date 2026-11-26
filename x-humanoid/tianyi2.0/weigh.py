@@ -280,8 +280,10 @@ class WeighEngine:
         self._log = log
         self._cancel = threading.Event()             # stop() 置位：不再下发任何手臂/手指指令
         # 本卡下发 move_pos 之后、到位/失败之前为 True：stop 时手臂可能还在朝目标走，要补一条
-        # "停在当前位置"。_cmd_lock 让"检查取消 + 下发指令"和 stop 的补发互斥，补发总在最后。
-        self._cmd_lock = threading.Lock()
+        # "停在当前位置"。_cmd_lock：每条手臂/手指指令和每条给用户的话都在锁内"先查取消再发"；
+        # stop 置位取消后要拿到这把锁（hold_if_moving）才返回，所以 stop 返回之后不会再有指令
+        # 或消息出去，补发的停住指令总在最后。可重入：一段运动在锁内调 _call_arm。
+        self._cmd_lock = threading.RLock()
         self._moving = False
         self._lock = threading.Lock()
         self._force = {s: deque() for s in SIDES}    # (t, fx, fy, fz, tx, ty, tz)
@@ -924,13 +926,15 @@ class WeighEngine:
         return f"servo {state}"
 
     def _call_arm(self, args: dict, *, on_cancel: bool = False):
-        if not on_cancel:            # 取消后只允许 hold_if_moving 补发的那条"停在当前位置"
-            self._check_cancel()
         if self._arm_call is None:
+            self._check_cancel()
             return {"state": "error", "code": "arm_card_unavailable",
                     "error": "arm 卡未启用，pose/retract 不可用"}
         try:
-            r = self._arm_call(dict(args))
+            with self._cmd_lock:
+                if not on_cancel:    # 取消后只允许 hold_if_moving 补发的那条"停在当前位置"
+                    self._check_cancel()
+                r = self._arm_call(dict(args))
         except Exception as exc:
             return {"state": "error", "code": "arm_call_failed", "error": str(exc)}
         if r is None:
@@ -1063,8 +1067,7 @@ class WeighEngine:
             return "hand_card_unavailable"
         try:
             if not self._hand_started:
-                self._check_cancel()
-                r = self._hand_call({"action": "start"})
+                r = self._call_hand({"action": "start"})
                 if not isinstance(r, dict) or r.get("state") == "error" or r.get("error"):
                     self._log(f"[weigh] hand start failed: {_brief(r)}")
                     return "hand_start_failed"
@@ -1072,11 +1075,12 @@ class WeighEngine:
                 self._sleep(self.cfg["arm_start_settle_s"])
             args = {"action": "set_fingers_raw", "side": side}
             args.update({k: max(0, min(100, int(v))) for k, v in fingers.items()})
-            self._check_cancel()
-            if self._servo_guard():
-                self._log(f"[weigh] hand {shape}: servo is streaming, fingers unchanged")
-                return "servo_active"
-            r = self._hand_call(args)
+            with self._cmd_lock:
+                self._check_cancel()
+                if self._servo_guard():
+                    self._log(f"[weigh] hand {shape}: servo is streaming, fingers unchanged")
+                    return "servo_active"
+                r = self._hand_call(args)
         except Exception as exc:
             self._log(f"[weigh] hand {shape} raised {exc}")
             return "hand_call_failed"
@@ -1086,6 +1090,11 @@ class WeighEngine:
         self._log(f"[weigh] hand {shape} ({side}): {fingers}")
         self._sleep(self.cfg["hand_settle_s"])
         return None
+
+    def _call_hand(self, args: dict):
+        with self._cmd_lock:
+            self._check_cancel()
+            return self._hand_call(args)
 
     def _ensure_arm_started(self):
         if self._arm_started:
@@ -1327,7 +1336,13 @@ class WeighEngine:
 
     def _tell(self, kind: str, side: str, text: str, seq=None) -> dict:
         """记下一条给用户的话，并通知 weigh_state 发布。不等、不出声，也不判断有没有人在听。
-        kind：preparing / ready / result / failed / reset_done / reset_confirm。"""
+        kind：preparing / ready / result / failed / reset_done / reset_confirm。
+        和指令一样在 _cmd_lock 内先查取消：stop 之后不再有话发出去（动作以 cancelled 结束）。"""
+        with self._cmd_lock:
+            self._check_cancel()
+            return self._tell_locked(kind, side, text, seq)
+
+    def _tell_locked(self, kind, side, text, seq):
         self._msg_id += 1
         msg = {"id": self._msg_id, "kind": kind, "side": side,
                "seq": self._seq if seq is None else seq, "text": text,
