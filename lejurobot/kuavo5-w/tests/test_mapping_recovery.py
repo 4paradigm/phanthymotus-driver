@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from test_controlled_spatial import Bundle, Client, wait
-from controlled_spatial import ControlledSpatialPlugin
+from controlled_spatial import ControlledSpatialPlugin, map_failure_code
 from spatial_client import NavigationStateUnavailable
 
 spec = importlib.util.spec_from_file_location('mapping_recovery_rpc',
@@ -325,6 +325,10 @@ class ReconciliationTests(unittest.TestCase):
 
 
 class PartialMapDeletionTests(unittest.TestCase):
+    def test_error_code_does_not_echo_untrusted_peer_content(self):
+        for error in ('https://user:password@peer/map','arbitrary_peer_failure','cannot_modify_active_map secret'):
+            self.assertIsNone(map_failure_code(ValueError(error)))
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -388,6 +392,41 @@ class PartialMapDeletionTests(unittest.TestCase):
         wait(lambda: bool(bundle.tracker.events))
         self.assertEqual(bundle.tracker.events[-1][0], 'completed')
         self.assertFalse(client.commands)
+
+    def test_active_map_deletion_rejects_before_executing_or_mutation(self):
+        bundle,client=Bundle(),Client()
+        plugin=ControlledSpatialPlugin(bundle,{'db_path':str(self.root/'state.db')},client)
+        bundle.spatial=plugin
+        self.addCleanup(plugin.close)
+        result=plugin.dispatch('delete_map',{'map_name':'factory','confirm_delete':True})
+        self.assertEqual(result,{'state':'error','error':'cannot_modify_active_map'})
+        self.assertFalse(client.calls)
+        self.assertFalse(client.commands)
+        self.assertFalse(bundle.tracker.events)
+        self.assertFalse(plugin.unresolved())
+
+    def test_active_map_changed_after_preflight_is_rechecked_and_explained(self):
+        bundle,client=Bundle(),Client()
+        plugin=ControlledSpatialPlugin(bundle,{'db_path':str(self.root/'state.db')},client)
+        bundle.spatial=plugin
+        self.addCleanup(plugin.close)
+        original=plugin._delete_map
+        def changed(name,cancelled):
+            client.identity=('other','grid-A:road-A')
+            return original(name,cancelled)
+        with patch.object(plugin,'_delete_map',side_effect=changed):
+            result=plugin.dispatch('delete_map',{'map_name':'other','confirm_delete':True})
+            self.assertEqual(result['state'],'executing')
+            wait(lambda:bool(bundle.tracker.events))
+        status,detail=bundle.tracker.events[-1]
+        self.assertEqual(status,'error')
+        self.assertEqual(detail['error_code'],'cannot_modify_active_map')
+        operation=plugin.store.state('last_map_operation')
+        self.assertEqual(operation['map_name'],'other')
+        self.assertEqual(operation['error_code'],'cannot_modify_active_map')
+        self.assertFalse(client.commands)
+        self.assertEqual([call[0] for call in client.calls],['stationary'])
+        self.assertFalse(plugin.unresolved())
 
 
 if __name__ == '__main__':

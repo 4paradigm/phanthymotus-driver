@@ -31,6 +31,16 @@ def number(value, field, low=None, high=None):
     return float(value)
 
 
+def map_failure_code(exc):
+    # Only image-owned validation codes; never echo arbitrary peer text.
+    code = str(exc)
+    return code if code in {'cannot_modify_active_map', 'grid_map_not_found',
+        'finish_factory_mapping_before_deleting', 'invalid_map_delete_manifest',
+        'invalid_map_delete_source', 'map_changed_during_delete_inspection',
+        'chassis_map_reappeared_during_delete', 'map_delete_interrupted',
+        'chassis_map_delete_not_confirmed', 'map_delete_not_confirmed'} else None
+
+
 class SpatialStore:
     def __init__(self, path):
         self.path, self._db = Path(path), None
@@ -1155,6 +1165,8 @@ class ControlledSpatialPlugin:
                 raise RuntimeError('finish_or_reconcile_mapping_before_deleting')
             if args.get('confirm_delete') is not True:
                 raise ValueError('confirm_delete_required')
+            if self.client.current_map()['mapId'] == args['map_name']:
+                raise ValueError('cannot_modify_active_map')
         elif action == 'load_map':
             text(args.get('map_name'), 'map_name')
             if mapping:
@@ -1218,6 +1230,8 @@ class ControlledSpatialPlugin:
         self._map_deadline = time.monotonic() + (1800 if restore_archive or action in ('stop_mapping', 'delete_map') else 150)
         started = time.monotonic()
         timing = {'operation': action, 'started_at': time.time(), 'stages': []}
+        if action in ('start_mapping', 'load_map', 'delete_map'):
+            timing['map_name'] = args['map_name']
         self._map_timing = timing
         def worker():
             try:
@@ -1248,8 +1262,11 @@ class ControlledSpatialPlugin:
                     self.archive.schedule()
                 self.bundle.tracker.finish('base', aid, self.PREFIX, 'completed', result)
             except Exception as exc:
+                error_code = map_failure_code(exc)
                 timing.update(state='error', elapsed_s=time.monotonic()-started,
                               error_type=type(exc).__name__)
+                if error_code:
+                    timing['error_code'] = error_code
                 self.store.state('last_map_operation', timing)
                 failed_stage = (self._map_pending or {}).get('stage')
                 # 8211 is the verified native precondition rejection, before
@@ -1264,7 +1281,8 @@ class ControlledSpatialPlugin:
                                else 'factory_map_command_rejected' if isinstance(exc, MapCommandRejected)
                                else 'map_transition_unconfirmed_inspect_info',
                      'failed_stage': failed_stage,
-                     'error_type': type(exc).__name__, 'map_state': self.store.state('mapping')})
+                     'error_type': type(exc).__name__, 'map_state': self.store.state('mapping'),
+                     **({'error_code': error_code} if error_code else {})})
             finally:
                 self._workers.discard(threading.current_thread())
         thread = threading.Thread(target=worker, daemon=True, name='kuavo-map-operation')
