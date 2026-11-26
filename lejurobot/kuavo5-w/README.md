@@ -1055,3 +1055,5 @@ audit for timing, geometry limitations and deployment status.
 `stop_mapping` 在 MANUAL 中用厂商 RobotMotion 零速和新鲜里程计静止完成保存预检，不要求调度软急停反馈；退出建图后用 AUTO 调度停车，不自动载入地图或按建图起点重定位。地图命令尚未发送时的预检失败会保留原建图会话并清除本次过渡记录，允许重试，不要求重启底盘。
 
 保存与载图分离：`stop_mapping` 返回 `map_loaded:false`，按保存文件的实际指纹绑定语义点并触发上位机同步；`spatial_map` 列表与底盘/本地地图并集一致，选择地图时校验同步预览副本，不改变底盘当前地图、模式或定位。文件同步失败明确报告 `map_preview_sync_failed`，不再将尚未同步的底盘地图误报为不存在。
+
+上位机底盘控制的模式切换：`base_drive/base_servo` 需要 AUTO；从已退出建图的 MANUAL 接管时，先确认无建图/键盘占用和新鲜静止，发送厂商 MANUAL 零速、关闭上位机速度输出，确认原生跟踪器已结束及上位机持续零输出，再切 AUTO 并等待实际反馈，之后才取消旧任务、核对速度源及解除调度停车并发送目标。`controlled_spatial` 建图键盘用 MANUAL，原生导航用 AUTO；卡片生命周期 start 不等于申请建图控制权。模式转换与运动共用停止世代和控制锁，停止可抢占，转换未确认不发目标。

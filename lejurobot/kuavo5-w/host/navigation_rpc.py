@@ -714,6 +714,26 @@ def main(request):
     if request['operation'] == 'stationary':
         confirm_stationary(rospy, Odometry)
         return {'success': True, 'stationary': True, 'completion_basis': 'fresh_distinct_odometry'}
+    if request['operation'] == 'manual_auto_guard':
+        from jaten_msgs.msg import RobotChassisState, MotionState
+        state = rospy.wait_for_message('/jaten_behavior_manager/robot_state', RobotChassisState, timeout=2.)
+        if (state.manual_mode is not True or state.mapping or state.estop
+                or state.bumper or state.driver_error or not state.driver_enable):
+            raise RuntimeError('chassis_manual_auto_guard_state_invalid')
+        motion = rospy.wait_for_message('/mpc_path_track/motion_state', MotionState, timeout=2.)
+        if not tracker_live_message(motion) or motion.motion_type != 2:
+            raise RuntimeError('native_tracker_must_finish_before_auto')
+        guard, close = remote_idle_guard(rospy, None, request.get('upper_master'), require_joy=False)
+        try:
+            guard()
+            confirm_stationary(rospy, Odometry, guard=guard)
+            motion = rospy.wait_for_message('/mpc_path_track/motion_state', MotionState, timeout=2.)
+            if not tracker_live_message(motion) or motion.motion_type != 2:
+                raise RuntimeError('native_tracker_must_finish_before_auto')
+            guard()
+            return {'success': True, 'stationary': True, 'native_tracker_idle': True, 'upper_zero': True}
+        finally:
+            close()
     names = {'navigate': '/move_base/move_to_target', 'check': '/move_base/check_arrived',
              'cancel': '/move_base/set_dispatch_mode'}
     types = {'navigate': MoveToTarget, 'check': CheckArrived, 'cancel': SetDispatchMode}

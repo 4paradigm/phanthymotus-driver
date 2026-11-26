@@ -99,6 +99,10 @@ class Bundle:
         if self._transition is not token or token['cancelled'].is_set():
             raise RuntimeError('superseded')
 
+    def confirm_control(self, token, name, kind, args, success, field, expected):
+        self._check_transition(token)
+        assert name == '/enable_vel_control' and args == {'data':False}
+
     def _end_control(self, token):
         with self.tracker.lock:
             if self._transition is token:
@@ -157,6 +161,8 @@ class Client:
             self.music_requests = getattr(self, 'music_requests', []) + [args]
             return {'state': 'disabled'}
         self.calls.append((operation, args))
+        if operation == 'manual_auto_guard':
+            return {'success':True,'stationary':True,'native_tracker_idle':True,'upper_zero':True}
         if operation == 'manual_stop':
             return {'success':True,'stationary':True,'manual_zero_sent':True}
         if operation == 'upper_handoff':
@@ -816,6 +822,55 @@ class SpatialTests(unittest.TestCase):
         self.assertFalse(self.plugin.unresolved())
         self.assertEqual(self.client.identity[0], 'factory')
 
+    def test_manual_lifecycle_preflight_defers_mode_and_release_until_execution(self):
+        self.client.feedback['agvState']['runningMode'] = 'MANUAL'
+        result = self.plugin.prepare_chassis()
+        self.assertTrue(result['auto_transition_deferred'])
+        self.assertFalse(self.client.commands)
+        self.assertEqual(self.client.calls, [('stationary', {})])
+        self.assertIsNone(self.plugin._preparation)
+        self.assertFalse(self.plugin.base_preparation_required)
+
+    def test_auto_transition_stops_manual_and_waits_for_actual_mode_without_loading_map(self):
+        self.client.feedback['agvState']['runningMode'] = 'MANUAL'
+        token, _, _ = self.bundle._begin_control('test_auto')
+        original = self.client.command
+        def command(method, params, timeout):
+            self.assertIn(('manual_stop', {}), self.client.calls)
+            self.assertEqual(self.plugin._preparation['delivery_uncertain'], True)
+            return original(method, params, timeout)
+        self.client.command = command
+        self.plugin.ensure_auto_for_motion(token)
+        self.assertEqual(self.client.commands, [('ChangeMode', {'mode':'AUTO'})])
+        self.assertEqual(self.plugin._preparation['delivery_uncertain'], False)
+        self.bundle._end_control(token)
+
+    def test_auto_transition_ack_without_mode_feedback_does_not_confirm_preparation(self):
+        self.client.feedback['agvState']['runningMode'] = 'MANUAL'
+        token, _, _ = self.bundle._begin_control('test_auto')
+        self.client.command = lambda *args, **kwargs: None
+        with self.assertRaisesRegex(RuntimeError, 'auto_mode_feedback_unconfirmed'):
+            self.plugin.ensure_auto_for_motion(token, timeout=.01)
+        self.assertTrue(self.plugin._preparation['delivery_uncertain'])
+        self.bundle._end_control(token)
+
+    def test_auto_transition_never_overrides_mapping_or_a_superseding_stop(self):
+        for cause in ('mapping', 'stop'):
+            with self.subTest(cause=cause):
+                self.bundle._transition = None
+                self.plugin.store.state('mapping', None)
+                token, _, _ = self.bundle._begin_control('test_auto')
+                if cause == 'mapping':
+                    self.plugin.store.state('mapping', {'name':'new','token':'active','phase':'mapping'})
+                else:
+                    token['cancelled'].set()
+                    self.bundle._transition = None
+                with self.assertRaises((RuntimeError, InterruptedError)):
+                    self.plugin.ensure_auto_for_motion(token)
+                self.assertFalse(self.client.commands)
+                self.assertFalse(self.client.calls)
+                self.bundle._end_control(token)
+
     def test_worker_preflight_failure_does_not_latch_map_busy(self):
         original = self.plugin._require_stationary
         calls = []
@@ -1329,6 +1384,22 @@ class NativePreparationTests(unittest.TestCase):
             self.assertTrue(response['ok'])
             self.assertFalse(response['result']['success'])
             self.assertIs(response['result']['delivery_uncertain'], uncertain)
+
+    def test_manual_auto_guard_reads_zero_sources_without_releasing_or_switching(self):
+        self.state.manual_mode, self.state.mapping, self.state.driver_enable = True, False, True
+        self.state.motion_type = 2
+        with patch.object(sys.modules['jaten_msgs.msg'], 'MotionState', object, create=True), \
+                patch.object(self.module, 'tracker_live_message', return_value=True), \
+                patch.object(self.module, 'remote_idle_guard', return_value=(lambda:None,lambda:self.events.append('closed'))):
+            result = self.call('manual_auto_guard')
+            self.assertTrue(result['upper_zero'])
+            self.assertTrue(result['native_tracker_idle'])
+            self.assertEqual(self.events, ['stationary','closed'])
+            self.state.motion_type = 8
+            self.events.clear()
+            with self.assertRaisesRegex(RuntimeError, 'native_tracker_must_finish_before_auto'):
+                self.call('manual_auto_guard')
+            self.assertFalse(self.events)
 
     def test_stationary_probe_reads_odom_without_cancel_or_release(self):
         result = self.call('stationary')

@@ -8,7 +8,15 @@ from test_driver import driver, wait_until
 
 
 class ControlOwnershipTests(unittest.TestCase):
-    setUp = fixtures.DriverContractTests.setUp
+    def setUp(self):
+        fixtures.DriverContractTests.setUp(self)
+        self.auto_mode_patch.stop()
+        self.auto_observation_patch = patch.object(self.bundle.spatial.client, 'observe', return_value={
+            'agvState': {'runningMode':'AUTO','isMapping':False,'estopButtonEvent':False,
+                         'bumperEvent':False,'driverError':False}, 'state':{'driving':False}})
+        self.auto_observation_patch.start()
+        self.addCleanup(self.auto_observation_patch.stop)
+
     tearDown = fixtures.DriverContractTests.tearDown
     call = fixtures.DriverContractTests.call
 
@@ -35,6 +43,33 @@ class ControlOwnershipTests(unittest.TestCase):
         self.release_all()
         with patch.object(self.bundle.spatial.client,'native',side_effect=AssertionError('already selected')):
             self.reserve('base_drive','base')
+        self.release_all()
+
+    def test_base_drive_changes_manual_to_auto_before_handoff_and_target(self):
+        self.bundle._upper_route_key = None
+        order, mode = [], ['MANUAL']
+        def observe(**kwargs):
+            return {'agvState':{'runningMode':mode[0], 'isMapping':False,
+                'estopButtonEvent':False,'bumperEvent':False,'driverError':False},
+                'state':{'driving':False}}
+        def command(method, params, timeout):
+            order.append(method)
+            self.assertEqual(params, {'mode':'AUTO'})
+            mode[0] = 'AUTO'
+        def native(operation, **args):
+            order.append(operation)
+            if operation == 'manual_auto_guard':
+                return {'success':True,'stationary':True,'native_tracker_idle':True,'upper_zero':True}
+            if operation == 'manual_stop':
+                return {'success':True,'stationary':True,'manual_zero_sent':True}
+            self.assertEqual(mode[0], 'AUTO')
+            return {'success':True,'stationary':True,'software_estop':False,
+                'velocity_source':'nav_mpc_move_base','delivery_uncertain':False}
+        with patch.object(self.bundle.spatial.client, 'observe', side_effect=observe), \
+                patch.object(self.bundle.spatial.client, 'command', side_effect=command), \
+                patch.object(self.bundle.spatial.client, 'native', side_effect=native):
+            self.bundle.start_motion('base','base_drive',(3,),lambda:order.append('target'))
+        self.assertEqual(order, ['manual_stop','manual_auto_guard','ChangeMode','upper_handoff','target'])
         self.release_all()
 
     def test_failed_chassis_handoff_does_not_publish_target(self):

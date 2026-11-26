@@ -1479,6 +1479,8 @@ class KuavoBundle:
                         self._check_transition(token)
                         self.spatial._preparation = {'delivery_uncertain': True}
                         self.spatial._persist()
+                    self.spatial.ensure_auto_for_motion(token)
+                    velocity, _ = self.state.read('upper_velocity_enabled')
                     handoff = self.spatial.client.native('upper_handoff')
                     with self.tracker.lock:
                         self._check_transition(token)
@@ -1488,7 +1490,12 @@ class KuavoBundle:
                         if (handoff.get('success') is not True or handoff.get('stationary') is not True
                                 or handoff.get('software_estop') is not False
                                 or handoff.get('velocity_source') != 'nav_mpc_move_base'):
-                            raise RuntimeError('upper_chassis_velocity_handoff_unconfirmed')
+                            stage = handoff.get('stage')
+                            detail = '_at_' + stage if stage in {
+                                'read_fault_state', 'hold_software_stop', 'cancel_old_task',
+                                'pause_old_tracker', 'confirm_cancel_stationary', 'release_software_stop',
+                                'confirm_release_state', 'confirm_release_stationary', 'validate_runtime'} else ''
+                            raise RuntimeError('upper_chassis_velocity_handoff_unconfirmed' + detail)
                         self.spatial._preparation = None
                         self.spatial._persist()
                         self._upper_route_key = upper_route_key

@@ -448,6 +448,55 @@ class ControlledSpatialPlugin:
                 if self._closed.wait(.5):
                     raise RuntimeError('driver_is_shutting_down')
 
+    def ensure_auto_for_motion(self, token, timeout=8., observation=None):
+        """Change only an idle, nonmapping MANUAL chassis to AUTO.
+
+        Caller owns the shared control transition and native-operation lock.
+        This never loads a map or releases a stop; upper/native handoff follows.
+        """
+        def check():
+            with self.bundle.tracker.lock:
+                self.bundle._check_transition(token)
+                if self.mapping_active() or self._keyboard_pending or self.keyboard.session is not None:
+                    raise RuntimeError('manual_mapping_owns_chassis_no_auto_transition')
+        def feedback(sample=None):
+            check()
+            observation = sample if sample is not None else self.client.observe(required=('agvState', 'state'))
+            check()
+            agv = observation['agvState']
+            if agv.get('isMapping') is not False or observation['state'].get('driving') is not False:
+                raise RuntimeError('chassis_must_be_idle_nonmapping_before_auto')
+            self._check_chassis_faults(observation)
+            return agv.get('runningMode')
+        mode = feedback(observation)
+        if mode == 'AUTO':
+            return
+        if mode != 'MANUAL':
+            raise RuntimeError('chassis_mode_unknown_before_auto')
+        stopped = self.client.native('manual_stop')
+        check()
+        if any(stopped.get(key) is not True for key in ('success', 'stationary', 'manual_zero_sent')):
+            raise RuntimeError('manual_zero_required_before_auto')
+        # AUTO can reactivate a different velocity route. Silence the upper
+        # MPC and prove the native tracker has finished before changing mode.
+        self.bundle.confirm_control(token, '/enable_vel_control', 'std_srvs/SetBool',
+                                    {'data': False}, 'success', 'upper_velocity_enabled', False)
+        guard = self.client.native('manual_auto_guard')
+        check()
+        if any(guard.get(key) is not True for key in ('success', 'stationary', 'native_tracker_idle', 'upper_zero')):
+            raise RuntimeError('manual_auto_velocity_routes_not_idle')
+        self._preparation = {'delivery_uncertain': True, 'stage': 'switch_chassis_auto'}
+        self._persist()
+        self.client.command('ChangeMode', {'mode': 'AUTO'}, timeout=timeout)
+        end = time.monotonic()+timeout
+        while time.monotonic() < end:
+            if feedback() == 'AUTO':
+                self._preparation = {'delivery_uncertain': False, 'stage': 'chassis_auto_confirmed'}
+                self._persist()
+                return
+            token['cancelled'].wait(.1)
+        raise RuntimeError('chassis_auto_mode_feedback_unconfirmed')
+
     def prepare_chassis(self, request_epoch=None):
         """Explicit card start: cancel old tasks, release soft stop, confirm rest.
 
@@ -467,7 +516,8 @@ class ControlledSpatialPlugin:
                 raise RuntimeError('previous_chassis_operation_unresolved_stop_first')
             if not self.bundle.ros1.connection[0]:
                 raise RuntimeError('control_connection_is_disconnected')
-            self._check_chassis_faults(self._startup_observation(epoch))
+            initial_observation = self._startup_observation(epoch)
+            self._check_chassis_faults(initial_observation)
             with self.bundle.tracker.lock:
                 if epoch != self.bundle._stop_epoch:
                     raise RuntimeError('chassis_start_superseded_by_stop')
@@ -478,6 +528,20 @@ class ControlledSpatialPlugin:
                     self.bundle._check_transition(token)
                     self._preparation = {'delivery_uncertain': True}
                     self._persist()
+                if initial_observation['agvState'].get('runningMode') == 'MANUAL':
+                    # A paused upper MPC may publish no idle velocity stream.
+                    # Lifecycle preflight must not enable it merely to change
+                    # modes. Actual base execution owns the guarded AUTO handoff.
+                    stopped = self.client.native('stationary')
+                    with self.bundle.tracker.lock:
+                        self.bundle._check_transition(token)
+                        if stopped.get('success') is not True or stopped.get('stationary') is not True:
+                            raise RuntimeError('manual_chassis_not_stationary')
+                        self._preparation = None
+                        self._persist()
+                        self.base_preparation_required = False
+                    return {'success': True, 'stationary': True, 'auto_transition_deferred': True,
+                            'completion_basis': 'manual_stationary_auto_handoff_deferred_to_base_execution'}
                 result = self.client.native('prepare')
                 if result.get('success') is False and result.get('delivery_uncertain') is False:
                     self._preparation = {'delivery_uncertain': False}

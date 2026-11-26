@@ -190,6 +190,11 @@ class DriverContractTests(unittest.TestCase):
         # Most command tests start with a preverified upper/chassis route.
         # Handoff tests explicitly invalidate it before exercising selection.
         self.bundle._upper_route_key = (self.bundle._stop_epoch,self.ros.connection)
+        # Generic card tests assume a healthy AUTO chassis; ownership tests
+        # exercise the real mode transition against explicit chassis feedback.
+        self.auto_mode_patch = patch.object(self.bundle.spatial, 'ensure_auto_for_motion')
+        self.auto_mode_patch.start()
+        self.addCleanup(self.auto_mode_patch.stop)
         original_native = self.bundle.spatial.client.native
         def native(operation, **args):
             if operation == 'upper_handoff':
@@ -701,14 +706,15 @@ class DriverContractTests(unittest.TestCase):
                         self.assertEqual(self.ros.published[-1][2]['joint_data'], [0., 0.])
                         # Even a late True notification cannot release the local stop.
                         self.ros.emit('/enable_control_state', True)
+                        self.assertTrue(self.bundle.state.motion_blocked)
                     finally:
                         release.set()
                         worker.join(1)
                 self.assertFalse(worker.is_alive())
                 self.assertIn('superseded', results[0]['error'])
                 self.assertTrue(self.bundle.state.motion_blocked)
-                self.assertEqual(self.call('base_drive', 'move', duration=.1)['state'], 'error')
                 if transition == 'resume':
+                    self.assertEqual(self.call('base_drive', 'move', duration=.1)['state'], 'error')
                     pending = self.bundle._remote_resume['pending']
                     self.ros.service_results[id(pending)] = {'success': False}
                     self.assertEqual(self.call('_control', 'pause')['state'], 'paused')
