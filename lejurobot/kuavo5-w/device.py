@@ -27,6 +27,7 @@ from controlled_spatial import ControlledSpatialPlugin
 from spatial_map import SpatialMap
 from base_servo import BaseServo
 from boot_remote import BootRemote
+from mapping_keyboard import UpperVelocityBridge
 from base_limits import LINEAR_LIMIT, ANGULAR_LIMIT, SPEED_FRACTIONS
 
 
@@ -1220,6 +1221,7 @@ class KuavoBundle:
                                       self.spatial.store, self.spatial.preview_pose_updates)
         self.base_servo = BaseServo(self, ros2_node)
         self.boot_remote = BootRemote(self, config.get('host_runtime', {}).get('remote_ready_on_first_boot', False))
+        self.upper_bridge = UpperVelocityBridge(self)
         if "plugins" in config:
             plugin_config = dict(config['plugins'])
             # Preserve old deployments, but an explicit new setting wins.
@@ -1381,6 +1383,9 @@ class KuavoBundle:
         joined = self._wait_for_chassis_start(request_epoch) if channel != 'base' or fresh_base_start else None
         self.state.require_motion_enabled()
         chassis_mode = self.spatial.motion_chassis_mode() if channel == 'base' else None
+        if channel == 'base' and tool != 'controlled_spatial':
+            self.sensors.require_profile()
+            self.upper_bridge.ensure()
         if not self.tracker.lock.acquire(timeout=DISPATCH_LOCK_TIMEOUT_S):
             raise RuntimeError('control transition is busy; query state before retrying')
         try:
@@ -1451,12 +1456,14 @@ class KuavoBundle:
         finally:
             self.tracker.lock.release()
         try:
-            if channel == 'base' and not upper_velocity and not velocity_ready:
+            if channel == 'base' and not velocity_ready:
                 # Resuming with upper velocity still enabled can publish to
                 # the competing chassis input before the native handoff.
                 self.confirm_control(token, '/enable_vel_control', 'std_srvs/SetBool',
                     {'data': False}, 'success', 'upper_velocity_enabled', False)
-                preparation['velocity_owner'] = 'native_navigation'
+                velocity = False
+                if not upper_velocity:
+                    preparation['velocity_owner'] = 'native_navigation'
             if enabled is not True:
                 resume_issued = time.monotonic()
                 self.confirm_control(token, '/enable_control', 'std_srvs/SetBool', {'data': True},
@@ -1572,6 +1579,9 @@ class KuavoBundle:
 
     def require_base_control(self, tool):
         self.state.require_motion((CARD_CONTROL_MODE,))
+        if tool != 'controlled_spatial' and self.upper_bridge.thread is not None and (
+                self.upper_bridge.error or not self.upper_bridge.thread.is_alive()):
+            raise RuntimeError('upper_velocity_bridge_failed_stop_and_retry')
         velocity, _ = self.state.read('upper_velocity_enabled')
         if velocity is not (tool != 'controlled_spatial'):
             raise RuntimeError('base velocity ownership changed; stop and prepare the requested base controller')
@@ -1606,6 +1616,7 @@ class KuavoBundle:
                     'boot_remote': self.boot_remote.info(),
                     'measured_mode': mode, 'control_enabled': enabled,
                     'motion_blocked': self.state.motion_blocked,
+                    'upper_velocity_bridge': self.upper_bridge.info(),
                     'base_velocity_route': ('factory_manual' if mapping and velocity is False else
                                             'upper_mpc' if velocity is True else
                                             'native_navigation' if velocity is False else 'unknown'),
@@ -1891,6 +1902,7 @@ class KuavoBundle:
                 print(f"[shutdown] {_safe_log(result.get('error'))}", flush=True)
         self.base_servo.close()
         self.boot_remote.close()
+        self.upper_bridge.close()
         self.state.close()
         self.spatial_map.close()
         self.spatial.close()

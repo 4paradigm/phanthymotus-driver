@@ -177,6 +177,9 @@ class DriverContractTests(unittest.TestCase):
         self.ros, self.node = FakeRos1(), FakeNode()
         self.bundle = driver.KuavoBundle({'sensors': {'joint_limits': fixture_joint_limits(self.ros)}},
                                          "test_robot", self.ros, self.node)
+        self.upper_bridge_patch = patch.object(self.bundle.upper_bridge, 'ensure')
+        self.upper_bridge_patch.start()
+        self.addCleanup(self.upper_bridge_patch.stop)
         self.spatial_temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.spatial_temp.cleanup)
         from controlled_spatial import SpatialStore

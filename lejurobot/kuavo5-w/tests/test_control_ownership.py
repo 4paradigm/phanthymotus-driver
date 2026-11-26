@@ -185,6 +185,26 @@ class ControlOwnershipTests(unittest.TestCase):
         self.assertIsNone(spatial.store.state('last_preparation_recovery'))
         spatial._preparation = None
 
+    def test_native_navigation_does_not_start_upper_bridge(self):
+        with patch.object(self.bundle.upper_bridge,'ensure',side_effect=AssertionError('native navigation must not start upper bridge')):
+            self.reserve('controlled_spatial','base')
+        self.release_all()
+
+    def test_upper_handoff_disables_old_velocity_before_resuming_body(self):
+        self.bundle._upper_route_key=None
+        self.ros.emit('/enable_control_state',False)
+        self.bundle.state.verify_enable()
+        self.bundle.state.motion_blocked=True
+        before=len(self.ros.sent_services)
+        self.reserve('base_drive','base')
+        services=[(name,args) for name,_,args in self.ros.sent_services[before:]]
+        disabled=services.index(('/enable_vel_control',{'data':False}))
+        resumed=services.index(('/enable_control',{'data':True}))
+        enabled=services.index(('/enable_vel_control',{'data':True}))
+        self.assertLess(disabled,resumed)
+        self.assertLess(resumed,enabled)
+        self.release_all()
+
     def test_failed_chassis_handoff_does_not_publish_target(self):
         self.bundle._upper_route_key=None
         sent=[]

@@ -37,16 +37,19 @@ def guard_error(reply):
 
 
 class FactoryKeyboardStream:
-    def __init__(self, client):
+    def __init__(self, client, bridge=False):
         self.stop_lock = threading.Lock()
         self._read_buffer = bytearray()
         manager = client.provisioner
         target = manager._target('chassis')
         source = ('NAVIGATION_SOURCE = ' + repr(client._source) + '\n' +
                   (Path(__file__).parent/'host/manual_keyboard.py').read_text())
+        if bridge:
+            source = source.split("if __name__ == '__main__':")[0] + '\n' + (Path(__file__).parent/'host/upper_velocity_bridge.py').read_text()
         self.process = manager.transport.open_stream('chassis', target,
             {'master': target.get('master', 'http://127.0.0.1:11311'),
-             'ros_ip': target['ros_ip']}, source,
+             'ros_ip': target['ros_ip'],
+             'upper_master': manager.settings.get('master', 'http://192.168.26.1:11311')}, source,
             load_secrets(os.environ.get('KUAVO_SSH_SECRETS', str(manager.state_dir/'ssh-secrets.json'))))
         os.set_blocking(self.process.stdin.fileno(), False)
 
@@ -289,3 +292,89 @@ class MappingKeyboard:
                     'cancelled' if stopped else 'error', {'reason': 'keyboard_closed', 'stop_confirmed': stopped})
                 if self.session is s:
                     self.session = None
+
+
+class UpperVelocityBridge:
+    """Driver heartbeat grants the chassis bridge only the current base lease."""
+    def __init__(self, bundle):
+        self.bundle = bundle
+        self.lock = threading.Lock()
+        self.thread = None
+        self.stop_event = threading.Event()
+        self.ready = threading.Event()
+        self.error = None
+        self.forwarded = 0
+
+    def ensure(self):
+        with self.lock:
+            if self.thread is None or not self.thread.is_alive():
+                self.stop_event = threading.Event()
+                self.ready = threading.Event()
+                self.error, self.forwarded = None, 0
+                self.thread = threading.Thread(target=self._run, daemon=True, name='upper-velocity-bridge')
+                self.thread.start()
+        if not self.ready.wait(15) or self.error:
+            raise RuntimeError('upper_velocity_bridge_not_ready')
+
+    def allowed(self):
+        with self.bundle.tracker.lock:
+            active = self.bundle.tracker._active.get('base')
+            return bool(active and active[1] in ('base_drive','base_servo')
+                and not self.bundle._closing and self.bundle._transition is None
+                and not self.bundle.state.motion_blocked
+                and self.bundle._upper_route_key == (self.bundle._stop_epoch,self.bundle.ros1.connection)
+                and self.bundle.state.read('upper_velocity_enabled')[0] is True
+                and not self.bundle.spatial.mapping_active())
+
+    def _run(self):
+        stream = None
+        try:
+            stream = FactoryKeyboardStream(self.bundle.spatial.client, bridge=True)
+            reply = stream.read(12)
+            if reply.get('state') != 'held':raise RuntimeError('upper_bridge_handshake_failed')
+            seq = 0
+            while not self.stop_event.is_set():
+                stream.send({'nonce':reply['nonce'],'seq':seq,'allow':self.allowed()})
+                reply = stream.read(1.)
+                if reply.get('state') != 'ready' or reply.get('seq') != seq:
+                    raise RuntimeError('upper_bridge_lease_failed')
+                if reply.get('forwarded_nonzero'):self.forwarded += 1
+                self.ready.set()
+                seq += 1
+                self.stop_event.wait(.04)
+        except Exception as exc:
+            self.error = str(exc) if str(exc).startswith(('upper_bridge_','factory_keyboard_')) else type(exc).__name__
+            self.ready.set()
+            # The chassis helper zeros independently. Prevent further driver
+            # publication once an established stream fails.
+            with self.bundle.tracker.lock:
+                self.bundle._upper_route_key = None
+        finally:
+            if stream is not None:
+                stop_confirmed = False
+                try:
+                    stream.stop()
+                    reply = stream.read(8.)
+                    stop_confirmed = (reply.get('state') == 'stopped' and reply.get('stationary') is True
+                                      and reply.get('bridge_zero_sent') is True)
+                    if not stop_confirmed:self.error = 'upper_bridge_stop_unconfirmed'
+                except Exception:
+                    self.error = self.error or 'upper_bridge_stop_unconfirmed'
+                finally:
+                    stream.close()
+                    if not stop_confirmed:
+                        with self.bundle.tracker.lock:
+                            self.bundle.state.motion_blocked = True
+                            if self.bundle.spatial._preparation is None:
+                                self.bundle.spatial._preparation = {'delivery_uncertain':False,
+                                    'stage':'upper_bridge_stop_unconfirmed'}
+                                self.bundle.spatial._persist()
+
+    def info(self):
+        return {'state':'error' if self.error else 'ready' if self.ready.is_set() else 'idle',
+                'error':self.error,'forwarded_nonzero_frames':self.forwarded,
+                'watchdog_ms':300}
+
+    def close(self):
+        self.stop_event.set()
+        if self.thread and self.thread is not threading.current_thread():self.thread.join(timeout=10)

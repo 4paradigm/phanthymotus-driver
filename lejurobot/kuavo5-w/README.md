@@ -1071,3 +1071,13 @@ audit for timing, geometry limitations and deployment status.
 准备记录按实际动作阶段持久化：初始状态读取和MANUAL静止检查均为delivery_uncertain:false；只有即将发送AUTO切换或原生prepare/upper_handoff时才标为true，并记录operation/stage；已收回的失败响应保留厂商stage/error_code及确定的投递状态。info.last_preparation_failure保留最初失败及当时记录，避免后续“需要先stop”覆盖根因。只读预检失败不会制造新的运动命令投递不确定性；真实未确认的模式/解除命令仍保留阻断。
 
 底盘键盘接收端按SSH连接持有JSON行缓冲，分片跨解析读取超时不会丢弃，合并到达的后续帧也保留；改为有界按块读取，单帧仍限制1024字节。解析缓冲不延长运动授权：守护的300ms租约一旦超时仍请求停车并退出，不重用迟到方向帧，不在旧会话中自动恢复运动。
+
+### 上位机速度到原生底盘的跨板连接
+
+`base_drive` 与main分支保持同一路径：`/cmd_vel`→厂商MPC/WBC→上位机`/move_base/base_cmd_vel`，不绕过MPC直接把卡片目标发给电机。现场发现控制器192.168.26.1与底盘192.168.26.22各自的ROS Master之间没有厂商wheel_bridge，导致接管和命令持续时间都能确认，但底盘收不到速度。驱动现在在首次上位机底盘动作前，经既有SSH通道创建底盘临时跨板连接；每个Master分别初始化真实ROS节点，转发MPC输出并反向转发厂商BaseCmdVelStatus，使用板子已有Noetic和生成消息，不安装依赖、不启动厂商控制进程、不修改原厂源码或launch。
+
+非零转发需要当前base任务为base_drive/base_servo、无控制转换、相同stop世代和连接、已验证upper mux、全身/速度使能为真、底盘AUTO且无建图/急停/软停/故障、速度输入不超过200ms且底盘反馈不超过300ms。速度仍受0.8m/s与1rad/s上限约束。驱动每40ms发送带随机nonce与递增seq的许可，底盘本地300ms超时发零速并确认静止；零速无法确认时请求独立ROS软停。观察子进程随父进程退出，底盘文件锁阻止重复桥接。
+
+切换为原生导航/建图或退出base任务时，撤销许可、发一次零速，然后停止向该底盘输入持续注入速度；原生导航仍选nav_mpc_path_track，键盘仍走MANUAL RobotMotion。交接前先关闭旧上位机速度输出再恢复全身，交接完成才为新任务开启速度。info.control_ownership.upper_velocity_bridge显示连接状态与非零转发帧数。定时move的completed仍是命令时长完成；实际位移须以底盘里程计确认。
+
+2026-11-27已授权现场验证：0.1m/s前向目标持续1秒，底盘输入、mux输入/输出均记录非零且峰值约0.1m/s，里程计约0.13米（含MPC减速尾段）；随后全身暂停、底盘软停与新鲜里程计静止均确认。另已验证零许可连接和断连停车。此次未重复真机导航或建图运动，跨卡片隔离由离线回归覆盖；不将此短程测试视为全部导航验收。
