@@ -1,5 +1,5 @@
 id: rokae-helios-sensors-driver
-name: 珞石 Helios-2.1 相机传感器
+name: ROKAE Helios-2.1 Camera Sensors
 category: driver
 hardware_provider: rokae
 hardware_model: helios-2.1

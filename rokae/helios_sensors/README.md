@@ -1,4 +1,4 @@
-# 珞石 Helios-2.1 相机传感器
+# ROKAE Helios-2.1 Camera Sensors
 
 使用机载 Orbbec SDK 2.9.3 和 GMSL2 Gemini 335Lg。已配置的传感器随驱动自动采集，Core 可独立管理两条流。驱动在 `127.0.0.1:15750` 注册 MCP，沿用官方 Core 的 ROS 2 domain 42 和本机 Fast DDS。可以和 Helios 的关节、电池、RGB 驱动并行部署。
 
@@ -41,7 +41,7 @@ python3 -B -m rokae.helios_sensors.depth_socket \
 
 在仓库根目录执行 `python -m pytest -q tests/test_helios_camera_sensors.py` 和 `python scripts/check_service_yml.py rokae/helios_sensors`。
 
-在机载 Core 的侧栏找到「珞石 Helios-2.1 相机传感器」，手动把两张卡拖入画布。直接打开「查看数据流」核对 IMU 数值和深度色图。移除后重新拖入并查看数据流时，可以恢复预览。正式验收使用 PR 触发的 bot 镜像，并记录镜像号和真机截图。
+在机载 Core 的侧栏找到「ROKAE Helios-2.1 Camera Sensors」，手动把两张卡拖入画布。直接打开「查看数据流」核对 IMU 数值和深度色图。移除后重新拖入并查看数据流时，可以恢复预览。正式验收使用 PR 触发的 bot 镜像，并记录镜像号和真机截图。
 
 2026-11-24 使用真机 ARM64 调试镜像验证了机载 Core 注册、两路自动采集、深度内参与浏览器数据流解码。现场 IMU 由容器直接采集，深度使用机载主机 socket。该记录对应开发调试镜像。
 
