@@ -157,6 +157,9 @@ class Client:
             self.music_requests = getattr(self, 'music_requests', []) + [args]
             return {'state': 'disabled'}
         self.calls.append((operation, args))
+        if operation == 'upper_handoff':
+            return {'success':True,'stationary':True,'software_estop':False,
+                    'velocity_source':'nav_mpc_move_base','delivery_uncertain':False}
         if operation == 'navigate':
             return self.navigate
         if operation == 'check':
@@ -1300,6 +1303,16 @@ class NativePreparationTests(unittest.TestCase):
         result = self.call('stationary')
         self.assertTrue(result['stationary'])
         self.assertEqual(self.events, ['stationary'])
+
+    def test_upper_handoff_selects_chassis_mux_before_release(self):
+        self.state.manual_mode,self.state.mapping,self.state.driver_enable=False,False,True
+        with patch.object(self.module,'remote_idle_guard',return_value=(lambda:None,lambda:None)) as guard, \
+                patch.object(self.module,'select_navigation_source',side_effect=lambda *args:self.events.append('upper_mux')):
+            result=self.module.main({'master':'http://chassis:11311','upper_master':'http://upper:11311',
+                                     'ros_ip':'127.0.0.1','operation':'upper_handoff'})
+        self.assertEqual(result['velocity_source'],'nav_mpc_move_base')
+        self.assertLess(self.events.index('upper_mux'),self.events.index(1))
+        self.assertFalse(guard.call_args.kwargs['require_joy'])
 
     def test_held_stationary_probe_is_read_only_and_requires_finished_tracker(self):
         message = types.SimpleNamespace(motion_type=2,

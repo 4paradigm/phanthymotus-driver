@@ -56,7 +56,7 @@ class JatenClient:
                    'master': target.get('master', 'http://127.0.0.1:11311'),
                    'upper_master': manager.settings.get('master', 'http://192.168.26.1:11311')}
         source = self._source
-        timeout = 45 if operation in ('prepare', 'remote_ready', 'soft_stop', 'navigate') else 25 if operation == 'cancel' else 15
+        timeout = 45 if operation in ('prepare', 'remote_ready', 'upper_handoff', 'soft_stop', 'navigate') else 25 if operation == 'cancel' else 15
         if operation == 'relocalize':
             helper = (Path(__file__).parent / 'host/map_relocalize.py').read_text()
             # Load the same ROS libraries as the factory Cartographer process.

@@ -177,12 +177,28 @@ class DriverContractTests(unittest.TestCase):
         self.ros, self.node = FakeRos1(), FakeNode()
         self.bundle = driver.KuavoBundle({'sensors': {'joint_limits': fixture_joint_limits(self.ros)}},
                                          "test_robot", self.ros, self.node)
+        self.spatial_temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.spatial_temp.cleanup)
+        from controlled_spatial import SpatialStore
+        self.bundle.spatial.store = SpatialStore(self.spatial_temp.name+'/state.db')
         self.bundle.sensors.discover()
         self.ros.raw()
         self.ros.emit("/enable_control_state", True)
         self.ros.emit("/mobile_manipulator/lb_mpc_control_mode", 3)
         self.bundle.state.verify_enable()
         self.ros.emit('/enable_vel_control_state', True)
+        # Most command tests start with a preverified upper/chassis route.
+        # Handoff tests explicitly invalidate it before exercising selection.
+        self.bundle._upper_route_key = (self.bundle._stop_epoch,self.ros.connection)
+        original_native = self.bundle.spatial.client.native
+        def native(operation, **args):
+            if operation == 'upper_handoff':
+                return {'success':True,'stationary':True,'software_estop':False,
+                        'velocity_source':'nav_mpc_move_base','delivery_uncertain':False}
+            return original_native(operation, **args)
+        self.upper_handoff_patch = patch.object(self.bundle.spatial.client,'native',side_effect=native)
+        self.upper_handoff_patch.start()
+        self.addCleanup(self.upper_handoff_patch.stop)
 
     def tearDown(self):
         self.bundle.close()

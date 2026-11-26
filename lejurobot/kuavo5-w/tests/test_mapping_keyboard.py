@@ -161,6 +161,19 @@ class MappingKeyboardTests(unittest.TestCase):
         self.assertEqual(self.spatial.dispatch('keyboard_release', {'session_id': 'old'})['state'], 'error')
         self.assertEqual(self.keyboard.info()['state'], 'ready')
 
+    def test_reopen_same_mapping_after_release_and_tag_preserves_mapping_identity(self):
+        self.open()
+        token=self.spatial.store.state('mapping')['token']
+        self.spatial.dispatch('keyboard_release',{'session_id':self.session})
+        self.assertTrue(wait_until(lambda:self.keyboard.session is None))
+        tagged=self.spatial.dispatch('tag_place',{'name':'P1'})
+        self.assertEqual(tagged['state'],'completed')
+        self.stream=Stream()
+        self.open()
+        self.assertEqual(self.spatial.store.state('mapping')['token'],token)
+        self.assertEqual(self.spatial.store.tags(('new',token))[0]['name'],'P1')
+        self.assertEqual(self.stream.sent[0]['values'],[0.,0.])
+
     def test_stop_mapping_releases_keyboard_before_saving_without_extra_confirmation(self):
         self.open()
         self.client.feedback['agvState'].update(isMapping=True, runningMode='MANUAL')

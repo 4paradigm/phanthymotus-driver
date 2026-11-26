@@ -20,6 +20,60 @@ class ControlOwnershipTests(unittest.TestCase):
         self.bundle.spatial._uncertain = False
         self.bundle.tracker.cancel_all('test_done')
 
+    def test_upper_card_verifies_chassis_route_before_first_target_even_when_upper_enabled(self):
+        self.bundle._upper_route_key=None
+        calls=[]
+        def handoff(operation,**args):
+            calls.append(operation)
+            self.assertFalse(any(p[0]=='/cmd_vel' and p[2]['linear']['x'] for p in self.ros.published))
+            return {'success':True,'stationary':True,'software_estop':False,
+                    'velocity_source':'nav_mpc_move_base','delivery_uncertain':False}
+        with patch.object(self.bundle.spatial.client,'native',side_effect=handoff):
+            lease=self.bundle.start_motion('base','base_drive',(3,),lambda:self.bundle.twist('/cmd_vel',.1))
+        self.assertEqual(calls,['upper_handoff'])
+        self.assertEqual(lease[-1]['chassis_velocity_source'],'nav_mpc_move_base')
+        self.release_all()
+        with patch.object(self.bundle.spatial.client,'native',side_effect=AssertionError('already selected')):
+            self.reserve('base_drive','base')
+        self.release_all()
+
+    def test_failed_chassis_handoff_does_not_publish_target(self):
+        self.bundle._upper_route_key=None
+        sent=[]
+        def native(operation,**args):
+            if operation=='upper_handoff':
+                return {'success':False,'delivery_uncertain':False}
+            return {'success':True,'stationary':True,'software_estop':True}
+        with patch.object(self.bundle.spatial.client,'native',side_effect=native):
+            with self.assertRaisesRegex(RuntimeError,'handoff_unconfirmed'):
+                self.bundle.start_motion('base','base_drive',(3,),lambda:sent.append(True))
+        self.assertFalse(sent)
+
+    def test_native_owner_invalidates_upper_route_for_the_next_upper_action(self):
+        self.reserve('base_drive','base');self.release_all()
+        self.reserve('controlled_spatial','base');self.release_all()
+        self.assertIsNone(self.bundle._upper_route_key)
+        with patch.object(self.bundle.spatial.client,'native',return_value={
+                'success':True,'stationary':True,'software_estop':False,
+                'velocity_source':'nav_mpc_move_base','delivery_uncertain':False}) as native:
+            self.reserve('base_drive','base')
+        native.assert_called_once_with('upper_handoff')
+        self.release_all()
+
+    def test_stop_during_chassis_handoff_cannot_publish_an_old_target(self):
+        self.bundle._upper_route_key=None
+        sent=[]
+        def native(operation,**args):
+            self.bundle._stop_epoch+=1
+            self.bundle._transition['cancelled'].set()
+            return {'success':True,'stationary':True,'software_estop':False,
+                    'velocity_source':'nav_mpc_move_base','delivery_uncertain':False}
+        with patch.object(self.bundle.spatial.client,'native',side_effect=native):
+            with self.assertRaises(InterruptedError):
+                self.bundle.start_motion('base','base_drive',(3,),lambda:sent.append(True))
+        self.assertFalse(sent)
+        self.assertIsNone(self.bundle._upper_route_key)
+
     def test_every_motion_card_normalizes_all_vendor_modes_to_shared_base_arm(self):
         for tool, channel in (('base_drive', 'base'), ('base_servo', 'base'),
                               ('controlled_spatial', 'base'), ('arm', 'arms'),

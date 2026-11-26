@@ -576,7 +576,7 @@ class UpperTopicObservation:
             self.thread.join(timeout=.2)
 
 
-def remote_idle_guard(rospy, owner, upper_master=None):
+def remote_idle_guard(rospy, owner, upper_master=None, require_joy=True):
     """Live guard retained through mux selection and software-stop release.
 
     Ignore initial latched upper velocity alone: require >=3 callbacks spanning
@@ -611,7 +611,7 @@ def remote_idle_guard(rospy, owner, upper_master=None):
     def check():
         now = time.monotonic()
         with lock:
-            if (sample.get('neutral') is not True or now-sample.get('joy_at', 0) > .3
+            if ((require_joy and (sample.get('neutral') is not True or now-sample.get('joy_at', 0) > .3))
                     or sample.get('quiet') is not True or now-sample.get('velocity_at', 0) > .3
                     or sample.get('count', 0) < 3 or now-sample.get('since', now) < .3
                     or any(getattr(s, 'failed', None) is not None and s.failed.is_set()
@@ -623,6 +623,8 @@ def remote_idle_guard(rospy, owner, upper_master=None):
     try:
         for topic, kind, callback, publisher in (('/joy', Joy, joy, owner),
                 ('/move_base/base_cmd_vel', Twist, velocity, '/nodelet_manager')):
+            if topic == '/joy' and not require_joy:
+                continue
             subscriptions.append(UpperTopicObservation(upper_master, topic, kind, publisher, callback)
                 if upper_master else rospy.Subscriber(topic, kind, callback, queue_size=1, tcp_nodelay=True))
         end = time.monotonic()+3.
@@ -722,7 +724,7 @@ def main(request):
             raise RuntimeError('native_navigation_service_abi_mismatch')
     if operation == 'probe':
         return {'owner': owners[0][0], 'services': names}
-    if operation in ('prepare', 'remote_ready', 'soft_stop', 'manual_hold'):
+    if operation in ('prepare', 'remote_ready', 'upper_handoff', 'soft_stop', 'manual_hold'):
         from jaten_msgs.msg import RobotChassisState
         proxy = rospy.ServiceProxy(names['cancel'], types['cancel'])
         def state():
@@ -766,10 +768,11 @@ def main(request):
         released = bool(current.soft_estop)
         guard, close_guard = None, None
         try:
-            if operation == 'remote_ready':
+            if operation in ('remote_ready', 'upper_handoff'):
                 if (current.manual_mode or current.mapping or not current.driver_enable):
                     raise RuntimeError('boot_remote_requires_healthy_auto_nonmapping')
-                guard, close_guard = remote_idle_guard(rospy, args.get('g12_owner'), request.get('upper_master'))
+                guard, close_guard = remote_idle_guard(rospy, args.get('g12_owner'), request.get('upper_master'),
+                                                       require_joy=operation == 'remote_ready')
                 select_navigation_source(rospy, 'nav_mpc_move_base')
                 guard()
                 current = state()
@@ -792,8 +795,11 @@ def main(request):
                 if not current.soft_estop:
                     request['_preparation_stage'] = 'confirm_release_stationary'
                     confirm_stationary(rospy, Odometry, guard=guard)
-                    return {'success': True, 'stationary': True, 'software_estop': False,
-                            'old_task_cancelled': True, 'released': released}
+                    result = {'success': True, 'stationary': True, 'software_estop': False,
+                              'old_task_cancelled': True, 'released': released}
+                    if operation == 'upper_handoff':
+                        result['velocity_source'] = 'nav_mpc_move_base'
+                    return result
             raise RuntimeError('chassis_release_feedback_unconfirmed')
         except Exception:
             try:
@@ -936,7 +942,7 @@ if __name__ == '__main__':
     except Exception as exc:
         # A completed rejection/feedback failure can be stopped and retried.
         # A ROS transport failure may leave the controller service executing.
-        if isinstance(request, dict) and request.get('operation') in ('prepare', 'remote_ready', 'navigate'):
+        if isinstance(request, dict) and request.get('operation') in ('prepare', 'remote_ready', 'upper_handoff', 'navigate'):
             stage_key = '_navigation_stage' if request['operation'] == 'navigate' else '_preparation_stage'
             result = {'success': False, 'stage': request.get(stage_key, 'validate_runtime'),
                       'error_code': rpc_error_code(exc),

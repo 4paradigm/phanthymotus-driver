@@ -462,6 +462,7 @@ class ControlledSpatialPlugin:
                 if epoch != self.bundle._stop_epoch:
                     raise RuntimeError('chassis_start_superseded_by_stop')
                 token, _, was_blocked = self.bundle._begin_control('prepare_chassis')
+                self.bundle._upper_route_key = None
             with self._native_lock:
                 with self.bundle.tracker.lock:
                     self.bundle._check_transition(token)

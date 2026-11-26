@@ -1212,6 +1212,7 @@ class KuavoBundle:
         self._remote_resume = None
         self._remote_mode = None
         self._stop_epoch = 0
+        self._upper_route_key = None
         self.plugins = [BaseDrivePlugin(self), ArmPlugin(self), LowerBodyPlugin(self),
                         HeadPlugin(self)]
         self.spatial = ControlledSpatialPlugin(self, config.get('controlled_spatial', {}))
@@ -1422,6 +1423,12 @@ class KuavoBundle:
             # heartbeat. read() invalidates it on a connection-generation change.
             velocity, _ = self.state.read('upper_velocity_enabled')
             velocity_ready = channel != 'base' or velocity is upper_velocity
+            upper_route_key = (self._stop_epoch, self.ros1.connection)
+            route_ready = (channel != 'base' or not upper_velocity
+                           or self._upper_route_key == upper_route_key)
+            velocity_ready = velocity_ready and route_ready
+            if channel == 'base' and not upper_velocity:
+                self._upper_route_key = None
             if mapping and not (enabled is True and not self.state.motion_blocked and compatible and fresh):
                 raise RuntimeError('manual_mapping_disallows_shared_enable_or_mode_changes; finish mapping first')
             if enabled is True and not self.state.motion_blocked and compatible and fresh and velocity_ready:
@@ -1460,7 +1467,33 @@ class KuavoBundle:
                     'kuavo_msgs/changeTorsoCtrlMode', {'control_mode': target_mode},
                     'result', 'mpc_mode', target_mode)
                 preparation['mode_changed'] = mode != target_mode
-            if channel == 'base' and upper_velocity and not velocity_ready:
+            if channel == 'base' and upper_velocity and not route_ready:
+                # The upper enable flag does not select the independent
+                # chassis mux. Hold/cancel old paths and verify that selection
+                # before publishing a nonzero target from this card.
+                with self.tracker.lock:
+                    self._check_transition(token)
+                    self.twist('/cmd_vel')
+                with self.spatial._native_lock:
+                    with self.tracker.lock:
+                        self._check_transition(token)
+                        self.spatial._preparation = {'delivery_uncertain': True}
+                        self.spatial._persist()
+                    handoff = self.spatial.client.native('upper_handoff')
+                    with self.tracker.lock:
+                        self._check_transition(token)
+                        if handoff.get('delivery_uncertain') is False:
+                            self.spatial._preparation = {'delivery_uncertain': False}
+                            self.spatial._persist()
+                        if (handoff.get('success') is not True or handoff.get('stationary') is not True
+                                or handoff.get('software_estop') is not False
+                                or handoff.get('velocity_source') != 'nav_mpc_move_base'):
+                            raise RuntimeError('upper_chassis_velocity_handoff_unconfirmed')
+                        self.spatial._preparation = None
+                        self.spatial._persist()
+                        self._upper_route_key = upper_route_key
+                        preparation['chassis_velocity_source'] = handoff['velocity_source']
+            if channel == 'base' and upper_velocity and velocity is not True:
                 self.confirm_control(token, '/enable_vel_control', 'std_srvs/SetBool',
                     {'data': True}, 'success', 'upper_velocity_enabled', True)
                 preparation['velocity_owner'] = 'upper_mpc'
