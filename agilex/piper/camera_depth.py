@@ -1,4 +1,4 @@
-"""PiPER's native RealSense depth stream, in the depth optical frame."""
+"""PiPER's RealSense depth stream with its calibrated optical frame."""
 from contextlib import ExitStack
 from functools import partial
 import math
@@ -21,10 +21,16 @@ def depth_settings(config):
     device = os.environ.get('PIPER_DEPTH_VIDEO_DEVICE', '').strip()
     source = os.environ.get('PIPER_DEPTH_ROS_SOURCE', '').strip()
     frame_id = os.environ.get('PIPER_DEPTH_ROS_FRAME_ID', '').strip()
+    alignment = os.environ.get('PIPER_DEPTH_ROS_ALIGNMENT', 'native').strip()
+    fps = config.get('camera', {}).get('depth', {}).get('fps', 15)
+    if type(fps) is not int or not 1 <= fps <= 30:
+        raise ValueError('camera.depth.fps must be an integer between 1 and 30')
     domain = None
     if source:
         if device or not frame_id or not re.fullmatch(r'(/[A-Za-z_][A-Za-z_0-9]*)+', source):
-            raise ValueError('Configure one native ROS depth source, its optical frame, and no V4L2 device')
+            raise ValueError('Configure one ROS depth source, its optical frame, and no V4L2 device')
+        if alignment not in ('native', 'color'):
+            raise ValueError('PIPER_DEPTH_ROS_ALIGNMENT must be native or color')
         try:
             domain = int(os.environ.get('PIPER_DEPTH_ROS_DOMAIN_ID', ''))
         except ValueError as exc:
@@ -32,8 +38,9 @@ def depth_settings(config):
         if not 0 <= domain <= 232:
             raise ValueError('ROS depth domain must be between 0 and 232')
     return dict(device=device, serial=serial, enabled=bool(serial or device or source),
-                width=WIDTH, height=HEIGHT, fps=settings['fps'], warmup_seconds=settings['warmup_seconds'],
+                width=WIDTH, height=HEIGHT, fps=fps, warmup_seconds=settings['warmup_seconds'],
                 ros_source=source, ros_domain=domain, ros_frame_id=frame_id,
+                ros_color_aligned=bool(source and alignment == 'color'),
                 ros_profile=os.environ.get('PIPER_DEPTH_ROS_DDS_PROFILE', '').strip())
 
 
@@ -44,9 +51,10 @@ def encode_depth(frame, scale):
         raise ValueError('RealSense depth requires a 640x480 Z16 frame')
     if not math.isfinite(scale) or scale <= 0:
         raise ValueError('RealSense reported an invalid depth scale')
-    mm = np.rint(frame.astype(np.float64) * scale * 1000)
-    mm[(mm < 1) | (mm > 65535)] = 0  # Zero is invalid depth in the renderer contract.
-    return zlib.compress(mm.astype('<u2').tobytes(), 1)
+    if scale != .001:
+        frame = np.rint(frame.astype(np.float64) * scale * 1000)
+        frame[(frame < 1) | (frame > 65535)] = 0
+    return zlib.compress(frame.astype('<u2', copy=False).tobytes(), 1)
 
 
 def _intrinsics(profile):
@@ -112,7 +120,7 @@ def depth_worker(settings, mailbox, stop):
 class PiperCameraDepth(PiperCameraLive):
     NAME = 'piper_camera_depth'
     TITLE = 'Depth camera'
-    DESCRIPTION = 'Live RealSense depth in millimetres on its native depth grid.'
+    DESCRIPTION = 'Live RealSense depth in millimetres with calibrated optical geometry.'
     TOPIC_SUFFIX = '/camera/depth'
     FORMAT = 'image/depth-zlib'
     ENCODING = '16UC1; compressedDepth zlib'
@@ -150,6 +158,8 @@ class PiperCameraDepth(PiperCameraLive):
             result = super().info()
             serial = self.settings['serial']
             camera_id = f'realsense/{serial}/depth' if serial else self.topic
+            if self.settings['ros_color_aligned']:
+                camera_id += '-aligned-color'
             result['camera_info'] = [build(
                 topic=self.topic, id=camera_id,
                 format=self.FORMAT, width=WIDTH, height=HEIGHT, **(self._metadata or {}))]

@@ -1,4 +1,4 @@
-"""Read native depth already published by a site's ROS camera driver."""
+"""Read calibrated depth already published by a site's ROS camera driver."""
 
 import math
 import os
@@ -27,12 +27,15 @@ def capture_ros_depth(settings, mailbox, stop, encode):
     import rclpy
     from rclpy.context import Context
     from rclpy.executors import SingleThreadedExecutor
-    from rclpy.qos import qos_profile_sensor_data
+    from rclpy.qos import QoSProfile, qos_profile_sensor_data
     from rclpy.signals import SignalHandlerOptions
     from sensor_msgs.msg import CameraInfo, Image
 
     width, height, frame_id = settings['width'], settings['height'], settings['ros_frame_id']
     source = settings['ros_source']
+    aligned = settings['ros_color_aligned']
+    image_name = 'image_raw' if aligned else 'image_rect_raw'
+    image_qos = QoSProfile(depth=1, reliability=qos_profile_sensor_data.reliability)
     latest = calibration = None
     stamp = 0.0
 
@@ -48,7 +51,9 @@ def capture_ros_depth(settings, mailbox, stop, encode):
         if k[0] <= 0 or k[4] <= 0 or not all(map(math.isfinite, (*k, *d))):
             raise ValueError('Invalid ROS depth intrinsics')
         metadata = dict(K=k, D=d, source='derived-from-K', distortion_model=(
-            'pinhole' if message.distortion_model == 'plumb_bob' and not any(d) else 'unknown'))
+            'pinhole' if message.distortion_model == 'plumb_bob' and not any(d) else 'unknown'),
+            pipeline=['align-depth-to-color'] if aligned else [],
+            vendor={'ros_frame_id': frame_id})
         if metadata != calibration:
             mailbox.set_metadata(metadata)
             calibration = metadata
@@ -58,8 +63,8 @@ def capture_ros_depth(settings, mailbox, stop, encode):
     executor = node = None
     try:
         executor = SingleThreadedExecutor(context=context)
-        node = rclpy.create_node('piper_native_depth_input', context=context)
-        node.create_subscription(Image, source + '/image_rect_raw', on_image, qos_profile_sensor_data)
+        node = rclpy.create_node('piper_ros_depth_input', context=context)
+        node.create_subscription(Image, f'{source}/{image_name}', on_image, image_qos)
         node.create_subscription(CameraInfo, source + '/camera_info', on_info, qos_profile_sensor_data)
         executor.add_node(node)
 

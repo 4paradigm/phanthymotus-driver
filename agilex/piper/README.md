@@ -50,9 +50,10 @@ On camera publishes the existing JPEG topic when its configured live stream and
 camera permission are enabled. Optional photo capture/import remains available.
 Depth camera publishes `image/depth-zlib` on the sibling `/camera/depth` topic.
 Its 640×480 little-endian `uint16` samples are millimetres, with zero for invalid
-depth. They use the native depth optical frame. The live `camera_info` reports
-the source intrinsics for that profile. RGB pixel coordinates require registration
-before sampling this stream.
+depth. The live `camera_info` reports the intrinsics for the configured
+optical frame. Register RGB pixel coordinates before sampling native depth.
+`camera.depth.fps` sets the target publication rate independently of color
+(default 15 Hz, range 1–30 Hz). The capture source can impose a lower rate.
 
 Long-running requests return a unique `action_id`; their real completed, error
 or cancelled result is POSTed to Core. Receipt timeout is 90 seconds, allowing
@@ -144,9 +145,13 @@ When a site camera service owns the RealSense, configure the PiPER container
 with `PIPER_DEPTH_ROS_SOURCE` (the source depth topic prefix),
 `PIPER_DEPTH_ROS_DOMAIN_ID`, and `PIPER_DEPTH_ROS_FRAME_ID` (the actual depth
 optical frame). Set `PIPER_DEPTH_SERIAL` to retain the camera's stable identity.
-The source publishes `image_rect_raw` (640×480 `16UC1` millimetres) and matching
-`camera_info` under that prefix. The worker preserves the frame and capture
-timestamp and the card retains its existing output topic and lifecycle.
+Under that prefix, native sources publish `image_rect_raw` and matching
+`camera_info`. To preview a source already aligned to its color image, set
+`PIPER_DEPTH_ROS_ALIGNMENT=color`, use the aligned topic prefix and set
+`PIPER_DEPTH_ROS_FRAME_ID` to the color optical frame. That source publishes
+`image_raw` with matching `camera_info`. Both modes require 640×480
+`16UC1` millimetres. The card preserves capture timestamps and reports the
+alignment and optical geometry in `camera_info`.
 
 For a custom source discovery profile, pass `PIPER_DEPTH_ROS_DDS_PROFILE` with
 the path to its read-only mount. A shared-memory source needs the matching

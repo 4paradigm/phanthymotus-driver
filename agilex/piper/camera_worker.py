@@ -85,6 +85,7 @@ def encode_frame(frame, stamp, quality):
 
 def capture_frames(settings, mailbox, stop, read, encode, *, frame_time=None):
     window = time.monotonic()
+    interval = 1 / settings['fps']
     next_frame = window + settings['warmup_seconds']
     frames = 0
     capture_fps = 0.
@@ -104,7 +105,8 @@ def capture_frames(settings, mailbox, stop, read, encode, *, frame_time=None):
         if stop.is_set():
             break
         mailbox.write(payload, stamp, frame.shape[1], frame.shape[0], capture_fps)
-        next_frame = now + 1 / settings['fps']
+        # Keep the original cadence even when a source frame arrives slightly late.
+        next_frame += (1 + int((now - next_frame) / interval)) * interval
 
 
 def capture_worker(settings, mailbox, stop):
