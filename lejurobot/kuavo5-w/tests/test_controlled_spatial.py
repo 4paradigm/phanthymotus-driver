@@ -641,6 +641,28 @@ class SpatialTests(unittest.TestCase):
         self.assertEqual(self.client.commands[-1], ('ChangeMode', {'mode': 'AUTO'}))
         self.assertFalse(self.plugin.unresolved())
 
+    def test_console_opened_during_start_is_authorized_only_for_that_completion(self):
+        entered,release=threading.Event(),threading.Event()
+        original=self.client.command
+        def command(method,params,timeout):
+            if method=='StartCartoMapping':
+                entered.set();release.wait(2)
+            return original(method,params,timeout)
+        self.client.command=command
+        started=self.call('start_mapping',map_name='new')
+        try:
+            self.assertTrue(entered.wait(1))
+            self.call('mapping_console')
+            self.assertEqual(self.call('keyboard_open')['mapping_state'],'starting')
+            self.assertEqual(self.call('keyboard_status')['mapping_state'],'starting')
+        finally:
+            release.set()
+        self.assertEqual(self.completed()[0],'completed')
+        status=self.call('keyboard_status')
+        self.assertEqual(status['mapping_state'],'mapping')
+        self.assertTrue(status['console_authorized'])
+        self.assertIsNone(self.plugin.keyboard.session)
+
     def test_mapping_requires_both_active_slam_and_manual_web_route(self):
         original = self.client.command
         def command(method, params, timeout):

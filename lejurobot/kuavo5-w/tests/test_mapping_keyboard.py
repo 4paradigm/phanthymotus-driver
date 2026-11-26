@@ -107,6 +107,20 @@ class MappingKeyboardTests(unittest.TestCase):
         self.assertEqual(self.spatial.dispatch('keyboard_open', {})['state'], 'error')
         self.assertFalse(self.stream.sent)
 
+    def test_early_console_waits_for_its_own_mapping_start_without_control_io(self):
+        self.spatial.store.state('mapping', {'name':'new','token':'mapping-id','phase':'starting'})
+        self.spatial._map_pending = {'operation':'start_mapping','action_id':'start-1'}
+        with patch.object(self.spatial,'_map_worker_active',return_value=True):
+            self.spatial.dispatch('mapping_console',{})
+            result=self.spatial.dispatch('keyboard_open',{})
+            self.assertEqual(result['state'],'loading')
+            self.assertEqual(result['mapping_state'],'starting')
+            self.assertTrue(self.spatial.dispatch('keyboard_status',{})['console_authorized'])
+            self.bundle._stop_epoch+=1
+            self.assertFalse(self.spatial.dispatch('keyboard_status',{})['console_authorized'])
+        self.assertFalse(self.stream.sent)
+        self.assertFalse(self.bundle.tracker._active)
+
     def test_zero_activation_and_browser_timeout_hold_and_release_resource(self):
         self.open()
         self.assertEqual(self.stream.sent[0]['values'], [0., 0.])

@@ -603,10 +603,14 @@ class ControlledSpatialPlugin:
                     self._mapping_console_grant = ((mapping.get('token'), self.bundle._stop_epoch,
                         self.bundle.ros1.connection) if mapping.get('phase') == 'mapping'
                         and not self._operations.locked() else None)
+                    pending = self._map_pending or {}
+                    if (pending.get('operation') == 'start_mapping' and self._map_worker_active()):
+                        self._mapping_console_grant = ('starting', pending['action_id'],
+                            self.bundle._stop_epoch, self.bundle.ros1.connection)
                 return {'protocol': 'motus.workbench/1',
                         'html': (Path(__file__).parent/'resource/mapping_keyboard.html').read_text()}
             if action == 'keyboard_status':
-                return self.keyboard.info()
+                return {**self.keyboard.info(), **self.mapping_console_status()}
             if action == 'keyboard_open':
                 return self.keyboard.open()
             if action == 'keyboard_command':
@@ -901,6 +905,19 @@ class ControlledSpatialPlugin:
 
     def _map_worker_active(self):
         return any(w.is_alive() and w.name == 'kuavo-map-operation' for w in self._workers.copy())
+
+    def mapping_console_status(self):
+        with self.bundle.tracker.lock:
+            pending = self._map_pending or {}
+            mapping = self.store.state('mapping') or {}
+            waiting = (pending.get('operation') == 'start_mapping' and self._map_worker_active()
+                and self._mapping_console_grant == ('starting', pending.get('action_id'),
+                    self.bundle._stop_epoch, self.bundle.ros1.connection))
+            authorized = (mapping.get('phase') == 'mapping' and self._map_pending is None
+                and self._mapping_console_grant == (mapping.get('token'), self.bundle._stop_epoch,
+                    self.bundle.ros1.connection))
+            return {'mapping_state': 'starting' if waiting else 'mapping' if authorized else 'unavailable',
+                    'console_authorized': bool(waiting or authorized)}
 
     def _settle_held_preparation(self):
         """Clear only a resolved preparation after passive held/idle evidence."""
@@ -1217,8 +1234,15 @@ class ControlledSpatialPlugin:
                 timing.update(state='completed', elapsed_s=time.monotonic()-started)
                 self.store.state('last_map_operation', timing)
                 result['timing'] = dict(timing)
-                self._map_pending = None
-                self._persist()
+                with self.bundle.tracker.lock:
+                    if (action == 'start_mapping' and not cancelled.is_set()
+                            and epoch == self.bundle._stop_epoch
+                            and self._mapping_console_grant == ('starting', aid, epoch, self.bundle.ros1.connection)):
+                        completed_mapping = self.store.state('mapping') or {}
+                        if completed_mapping.get('phase') == 'mapping':
+                            self._mapping_console_grant = (completed_mapping['token'], epoch, self.bundle.ros1.connection)
+                    self._map_pending = None
+                    self._persist()
                 if self.archive is not None:
                     self.archive.schedule()
                 self.bundle.tracker.finish('base', aid, self.PREFIX, 'completed', result)

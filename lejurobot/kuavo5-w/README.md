@@ -403,7 +403,7 @@ SSH RPC 辅助源码随镜像构建，每次在底盘执行固定操作，使用
 旧地图没有建图起点记录时，继续使用厂商原有的定位流程。
 `base_drive`和`controlled_spatial`可以同时start，共用底盘预检。已有建图会话时，两张卡的start只报告准备已延后，不取消任务、不切模式、不解除暂停；`base_servo.start`只连接输入并保持paused。厂商跟踪器队列为空且明确发布`FINISH_STOP`时可能不再发布速度；此时暂停确认使用底盘软停和新鲜静止里程计，不等待不存在的空闲零速流。已结清但遗留的`chassis_preparation.delivery_uncertain=false`记录，在无控制/地图/导航任务且两次新鲜网页反馈确认空闲时，可通过只读`held_stationary`再次确认软停、跟踪器结束和静止里程计后自动核销；不解除软停、不恢复运动。真正未确认的释放请求、导航提交和其他忙状态仍保留阻断。
 
-建图采用厂家网页的手动通路：`start_mapping`先关闭上位机速度输出、确认底盘软停并取消旧原生任务，在底盘MANUAL模式开始建图，之后保持MANUAL。无需G12遥控器，不再为遥控器恢复AUTO。全身BaseArm与底盘MANUAL是不同状态。
+建图采用厂家网页的手动通路：`start_mapping`先关闭上位机速度输出、确认底盘软停并取消旧原生任务，在底盘MANUAL模式开始建图，之后保持MANUAL。无需G12遥控器，不再为遥控器恢复AUTO。全身BaseArm与底盘MANUAL是不同状态。`executing`仅表示操作已开始，ACP完成才确认建图就绪；若此期间打开`mapping_console`，面板自动等待同一次建图完成后再准备键盘，不发送方向或解除软停。停止、保存、断线、失焦或该次建图失败会取消等待，旧面板不会接管新建图会话。
 
 `start_mapping`是本次建图遥控授权，返回及完成ACP都会用英文提示调用`mapping_console`、不要使用G12遥控器。在15678画布执行`controlled_spatial.mapping_console`打开内嵌面板（`motus.workbench/1`）后，面板取得焦点即自动准备键盘控制，无需额外启用确认。键盘准备异步检查/停止旧任务，确认MANUAL建图和驱动使能，并收到首帧零速后才释放底盘软停；不调用全身使能，也不解除硬件急停/碰撞/故障。准备期间的方向输入被丢弃，就绪后必须重新按键。`keyboard_open/command/release/status`保留为工作台内部租约接口，不作为独立的画布/LLM动作；操作者只使用`mapping_console`。停止或ROS重连使旧页面授权失效，必须重新打开面板才能重新取得控制。
 

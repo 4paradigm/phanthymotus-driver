@@ -74,11 +74,26 @@ async function arm(){
  if(!port||session||opening||releasing||suspended||!focused())return;
  opening=true;const attempt=++generation;pressed.clear();paint('Preparing keyboard control; no direction will be retained.');
  try{const r=await call('keyboard_open');
+  if(r.mapping_state==='starting'){
+   paint('Mapping is starting. Waiting for completion before preparing keyboard control.');
+   const deadline=Date.now()+150000;
+   while(attempt===generation&&focused()&&!suspended&&Date.now()<deadline){
+    await new Promise(resolve=>setTimeout(resolve,500));
+    if(attempt!==generation||!focused()||suspended)return;
+    const status=await call('keyboard_status');
+    if(!status.console_authorized)throw new Error('Mapping session changed or stopped. Reopen mapping_console after mapping is ready.');
+    if(status.mapping_state==='mapping'){
+     opening=false;return await arm();
+    }
+   }
+   if(attempt===generation&&focused()&&!suspended)throw new Error('Mapping has not completed. Check the start_mapping result.');
+   return;
+  }
   if(!r.session_id)throw new Error('No keyboard lease returned');
   session=r.session_id;seq=0;ready=false;
   if(attempt!==generation||!focused()||suspended){await disarm('Preparation cancelled; keyboard released.');return;}
   paint('Checking chassis and stopping old tasks in background. Please wait.');
- }catch(e){paint(e.message);}finally{opening=false;paint(state.textContent);}
+ }catch(e){if(attempt===generation)paint(e.message);}finally{opening=false;paint(state.textContent);}
 }
 release.onclick=()=>disarm();
 document.getElementById('stop').onclick=async()=>{

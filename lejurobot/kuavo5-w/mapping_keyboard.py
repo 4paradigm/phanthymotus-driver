@@ -85,6 +85,9 @@ class MappingKeyboard:
         with self.lock:
             self.spatial._restore()
             mapping = self.spatial.store.state('mapping') if self.spatial.mapping_active() else None
+            if self.spatial.mapping_console_status()['mapping_state'] == 'starting':
+                return {'state': 'loading', 'mapping_state': 'starting',
+                        'message': 'Mapping is starting. Waiting for completion before preparing keyboard control.'}
             if not mapping or mapping.get('phase') != 'mapping':
                 raise RuntimeError('confirmed_mapping_session_required')
             if (self.spatial._operations.locked() or self.spatial._mapping_console_grant !=

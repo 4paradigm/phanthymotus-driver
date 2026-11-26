@@ -17,14 +17,16 @@ function element(){return {disabled:false,textContent:'',dataset:{},classList:{t
 for(const id of ['state','release','stop'])elements[id]=element();
 const buttons=['KeyW','KeyS','KeyA','KeyD'].map(code=>({...element(),dataset:{code}}));
 const requests=[];
+let mappingStarting=true;
 const port={start(){},postMessage(m){requests.push(m.args);let result={state:'ready'};
- if(m.args.action==='keyboard_open')result={state:'loading',session_id:'lease'};
+ if(m.args.action==='keyboard_open')result=mappingStarting?{state:'loading',mapping_state:'starting'}:{state:'loading',session_id:'lease'};
+ if(m.args.action==='keyboard_status')result={state:'idle',mapping_state:mappingStarting?'starting':'mapping',console_authorized:true};
  if(m.args.action==='keyboard_command')result={state:ready?'ready':'loading'};
  if(m.args.action==='keyboard_release')result={state:'idle'};
  if(m.args.action==='keyboard_open'&&holdOpen){heldOpen=m;return;}
  queueMicrotask(()=>port.onmessage({data:{id:m.id,result}}));
 }};
-const parent={};const context={parent,setTimeout,clearTimeout,Promise,Map,Set,Number,Error,
+const parent={};const context={parent,setTimeout(fn,ms){if(ms===500){mappingStarting=false;queueMicrotask(fn);return 0;}return setTimeout(fn,ms);},clearTimeout,Promise,Map,Set,Number,Error,Date,
  setInterval(fn){tick=fn;},window:{focus(){focused=true;},addEventListener(k,f){listeners[k]=f;}},
  document:{hidden:false,hasFocus(){return focused;},getElementById(id){return elements[id];},querySelectorAll(){return buttons;},
  addEventListener(k,f){docListeners[k]=f;}}};
@@ -35,6 +37,8 @@ const values=()=>JSON.parse(JSON.stringify(requests.filter(x=>x.action==='keyboa
  listeners.message({source:parent,data:{protocol:'motus.workbench/1'},ports:[port]});
  await new Promise(resolve=>setImmediate(resolve));
  assert.equal(requests[0].action,'keyboard_open','Panel prepares automatically without an enable confirmation');
+ assert(requests.some(r=>r.action==='keyboard_status'),'Early opening must wait for mapping completion');
+ assert.equal(requests.filter(r=>r.action==='keyboard_open').length,2,'Prepare keyboard after mapping completes');
  listeners.keydown(key('KeyW'));await tick();assert.deepEqual(values(),[0,0]);
  ready=true;await tick();assert.deepEqual(values(),[0,0]);
  await tick();assert.deepEqual(values(),[0,0],'Preparation keys must not replay');
