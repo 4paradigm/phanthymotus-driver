@@ -519,7 +519,7 @@ class LocoPlugin:
                     },
                     "vx": {
                         "type": "number",
-                        "description": "Forward velocity [-1, 1] (>0 forward)",
+                        "description": "Forward input [-1, 1] (>0 forward, not metres or m/s); whole-body positive inputs below 0.8 use 0.8 to start walking",
                         "minimum": -1, "maximum": 1,
                     },
                     "vy": {
@@ -824,6 +824,11 @@ class LocoPlugin:
         vy = float(args.get("vy", 0))
         vyaw = float(args.get("vyaw", 0))
         duration = float(args.get("duration", 0))
+
+        # Match the measured whole-body forward startup input used by target
+        # moves. Zero, reverse, lateral and yaw commands keep their old values.
+        if self._walking_workmode == 3 and 0 < vx < 0.8:
+            vx = 0.8
 
         # Stop any existing move thread
         self._move_stop_event.set()
