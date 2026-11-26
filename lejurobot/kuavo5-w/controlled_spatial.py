@@ -493,6 +493,10 @@ class ControlledSpatialPlugin:
         # MPC and prove the native tracker has finished before changing mode.
         self.bundle.confirm_control(token, '/enable_vel_control', 'std_srvs/SetBool',
                                     {'data': False}, 'success', 'upper_velocity_enabled', False)
+        # Everything so far was a confirmed stop/disable. The following RPC
+        # only observes; its timeout cannot imply a lost mode/release command.
+        self._preparation = {'delivery_uncertain': False, 'stage': 'observe_manual_auto_guard'}
+        self._persist()
         guard = self.client.native('manual_auto_guard')
         check()
         if any(guard.get(key) is not True for key in ('success', 'stationary', 'native_tracker_idle', 'upper_zero')):

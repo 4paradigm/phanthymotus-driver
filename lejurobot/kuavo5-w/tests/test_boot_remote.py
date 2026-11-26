@@ -355,7 +355,8 @@ class G12GuardTests(fixtures.unittest.TestCase):
         rospy = types.SimpleNamespace(Subscriber=subscribe if not cross_master else None)
         master = 'http://upper:11311' if cross_master else None
         with patch.dict(sys.modules, {'sensor_msgs.msg': types.SimpleNamespace(Joy=object),
-                                     'geometry_msgs.msg': types.SimpleNamespace(Twist=object)}), \
+                                     'geometry_msgs.msg': types.SimpleNamespace(Twist=object),
+                                     'std_msgs.msg': types.SimpleNamespace(Bool=object)}), \
                 patch.object(native, 'UpperTopicObservation', side_effect=upper_subscribe), \
                 patch.object(native.time, 'monotonic', side_effect=lambda: clock[0]), \
                 patch.object(native.time, 'sleep', side_effect=sleep):
@@ -399,6 +400,69 @@ class G12GuardTests(fixtures.unittest.TestCase):
                 check()
             close()
             self.assertEqual(len(closed), 2)
+
+    def test_disabled_upper_accepts_one_zero_but_live_enable_nonzero_or_disconnect_revokes_it(self):
+        clock, callbacks, subscriptions = [10.], {}, []
+        def subscribe(master, topic, kind, owner, callback):
+            self.assertEqual(owner, '/nodelet_manager')
+            callbacks[topic] = callback
+            subscription = types.SimpleNamespace(failed=threading.Event(), unregister=lambda:None)
+            subscriptions.append(subscription)
+            return subscription
+        def zero(value=0.):
+            callbacks['/move_base/base_cmd_vel'](types.SimpleNamespace(
+                linear=types.SimpleNamespace(x=value,y=0.,z=0.),
+                angular=types.SimpleNamespace(x=0.,y=0.,z=0.),
+                _connection_header={'callerid':'/nodelet_manager','latching':'1'}))
+        def enable(value, owner='/nodelet_manager'):
+            callbacks['/enable_vel_control_state'](types.SimpleNamespace(data=value,
+                _connection_header={'callerid':owner,'latching':'1'}))
+        def sleep(_):
+            if clock[0] == 10.:
+                zero(); enable(False)
+            clock[0] += .05
+        with patch.dict(sys.modules, {'sensor_msgs.msg':types.SimpleNamespace(Joy=object),
+                'geometry_msgs.msg':types.SimpleNamespace(Twist=object),
+                'std_msgs.msg':types.SimpleNamespace(Bool=object)}), \
+                patch.object(native,'UpperTopicObservation',side_effect=subscribe), \
+                patch.object(native.time,'monotonic',side_effect=lambda:clock[0]), \
+                patch.object(native.time,'sleep',side_effect=sleep):
+            check, close = native.remote_idle_guard(object(), None, 'http://upper:11311',
+                require_joy=False, allow_disabled_output=True)
+            clock[0] += 3.
+            check()  # Disabled output is latched, not a heartbeat.
+            for cause in ('enabled','wrong_owner','nonzero','disconnect'):
+                with self.subTest(cause=cause):
+                    if cause == 'enabled':enable(True)
+                    elif cause == 'wrong_owner':enable(False,'/wrong')
+                    elif cause == 'nonzero':zero(.1)
+                    else:subscriptions[0].failed.set()
+                    with self.assertRaisesRegex(RuntimeError,'zero_output_unconfirmed'):check()
+                    subscriptions[0].failed.clear()
+                    enable(False);zero();clock[0]+=.31
+                    check()
+            close()
+
+    def test_missing_disable_feedback_cannot_accept_a_single_zero(self):
+        clock, callbacks = [10.], {}
+        def subscribe(topic, kind, callback, **kwargs):
+            callbacks[topic]=callback
+            return types.SimpleNamespace(unregister=lambda:None)
+        def sleep(_):
+            if clock[0] == 10.:
+                callbacks['/move_base/base_cmd_vel'](types.SimpleNamespace(
+                    linear=types.SimpleNamespace(x=0.,y=0.,z=0.),
+                    angular=types.SimpleNamespace(x=0.,y=0.,z=0.),
+                    _connection_header={'callerid':'/nodelet_manager'}))
+            clock[0]+=.05
+        with patch.dict(sys.modules, {'sensor_msgs.msg':types.SimpleNamespace(Joy=object),
+                'geometry_msgs.msg':types.SimpleNamespace(Twist=object),
+                'std_msgs.msg':types.SimpleNamespace(Bool=object)}), \
+                patch.object(native.time,'monotonic',side_effect=lambda:clock[0]), \
+                patch.object(native.time,'sleep',side_effect=sleep):
+            with self.assertRaisesRegex(RuntimeError,'zero_output_unconfirmed'):
+                native.remote_idle_guard(types.SimpleNamespace(Subscriber=subscribe),None,
+                    require_joy=False,allow_disabled_output=True)
 
     def test_final_guard_requires_continuous_zero_output_and_neutral_input(self):
         self.run_guard()

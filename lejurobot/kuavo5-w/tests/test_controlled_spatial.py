@@ -869,6 +869,21 @@ class SpatialTests(unittest.TestCase):
         self.assertEqual(self.plugin._preparation['delivery_uncertain'], False)
         self.bundle._end_control(token)
 
+    def test_read_only_auto_guard_failure_does_not_create_uncertain_mode_write(self):
+        self.client.feedback['agvState']['runningMode']='MANUAL'
+        token,_,_=self.bundle._begin_control('test_auto')
+        original=self.client.native
+        def native(operation,**args):
+            if operation=='manual_auto_guard':raise RuntimeError('boot_remote_fresh_neutral_or_zero_output_unconfirmed')
+            return original(operation,**args)
+        self.client.native=native
+        with self.assertRaisesRegex(RuntimeError,'zero_output_unconfirmed'):
+            self.plugin.ensure_auto_for_motion(token)
+        self.assertFalse(self.plugin._preparation['delivery_uncertain'])
+        self.assertEqual(self.plugin._preparation['stage'],'observe_manual_auto_guard')
+        self.assertFalse(self.client.commands)
+        self.bundle._end_control(token)
+
     def test_auto_transition_ack_without_mode_feedback_does_not_confirm_preparation(self):
         self.client.feedback['agvState']['runningMode'] = 'MANUAL'
         token, _, _ = self.bundle._begin_control('test_auto')

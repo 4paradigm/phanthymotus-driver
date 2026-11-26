@@ -576,7 +576,7 @@ class UpperTopicObservation:
             self.thread.join(timeout=.2)
 
 
-def remote_idle_guard(rospy, owner, upper_master=None, require_joy=True):
+def remote_idle_guard(rospy, owner, upper_master=None, require_joy=True, allow_disabled_output=False):
     """Live guard retained through mux selection and software-stop release.
 
     Ignore initial latched upper velocity alone: require >=3 callbacks spanning
@@ -585,6 +585,7 @@ def remote_idle_guard(rospy, owner, upper_master=None, require_joy=True):
     import threading
     from geometry_msgs.msg import Twist
     from sensor_msgs.msg import Joy
+    from std_msgs.msg import Bool
     lock, sample = threading.Lock(), {}
     def joy(message):
         with lock:
@@ -607,13 +608,29 @@ def remote_idle_guard(rospy, owner, upper_master=None, require_joy=True):
             else:
                 sample['count'] = sample.get('count', 0)+1
             sample.update(velocity_at=now, quiet=quiet)
+    def enabled(message):
+        header = getattr(message, '_connection_header', {}) or {}
+        with lock:
+            sample['disabled'] = (header.get('callerid') == '/nodelet_manager'
+                                  and getattr(message, 'data', None) is False)
+            if not sample['disabled']:
+                sample.pop('disabled_since', None)
+            elif 'disabled_since' not in sample:
+                sample['disabled_since'] = time.monotonic()
     subscriptions = []
     def check():
         now = time.monotonic()
         with lock:
+            # Disabled MPC publishes its final latched zero only once. Require
+            # a verified live disable-state connection and a quiet observation
+            # window; any nonzero output or enable callback revokes this path.
+            disabled_idle = (allow_disabled_output and not require_joy
+                and sample.get('disabled') is True and sample.get('quiet') is True
+                and now-max(sample.get('since', now), sample.get('disabled_since', now)) >= .3)
             if ((require_joy and (sample.get('neutral') is not True or now-sample.get('joy_at', 0) > .3))
-                    or sample.get('quiet') is not True or now-sample.get('velocity_at', 0) > .3
-                    or sample.get('count', 0) < 3 or now-sample.get('since', now) < .3
+                    or (not disabled_idle and (sample.get('quiet') is not True
+                        or now-sample.get('velocity_at', 0) > .3
+                        or sample.get('count', 0) < 3 or now-sample.get('since', now) < .3))
                     or any(getattr(s, 'failed', None) is not None and s.failed.is_set()
                            for s in subscriptions)):
                 raise RuntimeError('boot_remote_fresh_neutral_or_zero_output_unconfirmed')
@@ -622,8 +639,11 @@ def remote_idle_guard(rospy, owner, upper_master=None, require_joy=True):
             subscription.unregister()
     try:
         for topic, kind, callback, publisher in (('/joy', Joy, joy, owner),
-                ('/move_base/base_cmd_vel', Twist, velocity, '/nodelet_manager')):
+                ('/move_base/base_cmd_vel', Twist, velocity, '/nodelet_manager'),
+                ('/enable_vel_control_state', Bool, enabled, '/nodelet_manager')):
             if topic == '/joy' and not require_joy:
+                continue
+            if topic == '/enable_vel_control_state' and not allow_disabled_output:
                 continue
             subscriptions.append(UpperTopicObservation(upper_master, topic, kind, publisher, callback)
                 if upper_master else rospy.Subscriber(topic, kind, callback, queue_size=1, tcp_nodelay=True))
@@ -737,7 +757,8 @@ def main(request):
         motion = rospy.wait_for_message('/mpc_path_track/motion_state', MotionState, timeout=2.)
         if not tracker_live_message(motion) or motion.motion_type != 2:
             raise RuntimeError('native_tracker_must_finish_before_auto')
-        guard, close = remote_idle_guard(rospy, None, request.get('upper_master'), require_joy=False)
+        guard, close = remote_idle_guard(rospy, None, request.get('upper_master'), require_joy=False,
+                                         allow_disabled_output=True)
         try:
             guard()
             confirm_stationary(rospy, Odometry, guard=guard)
@@ -816,7 +837,8 @@ def main(request):
                 if (current.manual_mode or current.mapping or not current.driver_enable):
                     raise RuntimeError('boot_remote_requires_healthy_auto_nonmapping')
                 guard, close_guard = remote_idle_guard(rospy, args.get('g12_owner'), request.get('upper_master'),
-                                                       require_joy=operation == 'remote_ready')
+                                                       require_joy=operation == 'remote_ready',
+                                                       allow_disabled_output=operation == 'upper_handoff')
                 select_navigation_source(rospy, 'nav_mpc_move_base')
                 guard()
                 current = state()

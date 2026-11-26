@@ -1065,3 +1065,5 @@ audit for timing, geometry limitations and deployment status.
 键盘故障停车分两路：正常松键保留会话并发 RobotMotion 零速；释放/断连/看门狗退出先用同一厂商连接发零速并确认新鲜里程计静止。如果 WebSocket 已坏、零速写失败或静止不能确认，底盘本地守护改走独立 ROS SetDispatchMode(control_mode=0)，要求软停反馈为真、里程计静止、再核对软停仍为真，才返回已停车。故障兜底不解除软停、不切模式、不发非零目标。两条路径均未确认时返回 keyboard_fallback_stop_unconfirmed 并保留持久化阻断；不能以idle或进程已退出证明真机停住。MANUAL下厂商ROS软停曾有不确认记录，此兜底是否有效仍需真机故障场景验证，单元测试不替代该验证。
 
 已结束的MANUAL准备失败恢复：显式start的共享预检可处理仅有`chassis_preparation.delivery_uncertain:false`的残留记录。要求全身及上位机速度输出均已关闭、无活动任务/地图操作/键盘或未确认写入，随后请求厂商零速（失败时走独立ROS停车兜底）、确认原生跟踪器FINISH_STOP及新鲜里程计静止，再清理该准备记录。此过程不切AUTO、不使能、不解除停车，AUTO交接仍留到实际运动执行；恢复证据记录在`info.last_preparation_recovery`。info本身保持只读，不会为恢复而发停车或运动请求。
+
+上位机速度关闭时，实测 `/move_base/base_cmd_vel` 只保留一帧零速，不连续发布。仅对非G12的AUTO/上位机交接，检查同时订阅经过唯一发布者、类型和MD5核验的 `/enable_vel_control_state`：关闭反馈为false、最终速度为零、两条连接持续有效且观察窗口满300ms时，可确认关闭输出通路的静止；任何非零、使能回调或连接失败立即撤销。没有关闭反馈时仍要求至少三帧持续零速；G12仍要求持续新鲜零速和中立遥控输入。MANUAL→AUTO的只读预检前，已确认停车与关闭输出会记为`delivery_uncertain:false, stage:observe_manual_auto_guard`，只读检查失败不再伪装成模式命令投递未确认。
