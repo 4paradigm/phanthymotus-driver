@@ -91,22 +91,6 @@ def _settings(values):
     return out
 
 
-def _put_latest(target, value):
-    try:
-        target.put_nowait(value)
-        return True
-    except queue.Full:
-        try:
-            target.get_nowait()
-        except queue.Empty:
-            pass
-        try:
-            target.put_nowait(value)
-            return True
-        except queue.Full:
-            return False
-
-
 def _project_worker(jobs, results):
     from common import logsafe
     logsafe.install(check_fd=False)
@@ -145,9 +129,9 @@ def _project_worker(jobs, results):
             stats["measured_coverage"] = round(stats["valid_pixels"] / (640 * 480), 4)
             stats["filled_coverage"] = round(
                 (stats["valid_pixels"] + stats["filled_pixels"]) / (640 * 480), 4)
-            _put_latest(results, (context, fused_packet, stats, None))
+            results.put_nowait((context, fused_packet, stats, None))
         except Exception as exc:
-            _put_latest(results, (context, None, None, str(exc)[:300]))
+            results.put_nowait((context, None, None, str(exc)[:300]))
 
 
 class DepthWorker:
@@ -163,6 +147,9 @@ class DepthWorker:
         self._process = self._ctx.Process(target=_project_worker,
             args=(self._jobs, self._results), name="s10-front-depth", daemon=True)
         self._closed = threading.Event()
+        self._job_lock = threading.Lock()
+        self._in_flight = False
+        self._pending = None
         self._collector = threading.Thread(target=self._collect,
                                            name="s10-front-depth-results", daemon=True)
 
@@ -175,7 +162,17 @@ class DepthWorker:
                 and self._collector.is_alive())
 
     def submit(self, job):
-        return not self._closed.is_set() and _put_latest(self._jobs, job)
+        with self._job_lock:
+            if self._closed.is_set():
+                return False
+            if self._in_flight:
+                # Leave pending clouds in this process so a newer one can
+                # replace them even while an IPC transfer is in progress.
+                self._pending = job
+            else:
+                self._jobs.put_nowait(job)
+                self._in_flight = True
+            return True
 
     def _collect(self):
         while not self._closed.is_set():
@@ -185,6 +182,14 @@ class DepthWorker:
                 continue
             except (EOFError, OSError):
                 return
+            with self._job_lock:
+                if self._closed.is_set():
+                    return
+                if self._pending is None:
+                    self._in_flight = False
+                else:
+                    self._jobs.put_nowait(self._pending)
+                    self._pending = None
             try:
                 if error is not None:
                     self.on_error(context, error)
@@ -194,9 +199,11 @@ class DepthWorker:
                 self.on_error(context, str(exc)[:300])
 
     def close(self):
-        if self._closed.is_set():
-            return
-        self._closed.set()
+        with self._job_lock:
+            if self._closed.is_set():
+                return
+            self._closed.set()
+            self._pending = None
         if self._process.pid is not None:
             # Never read a partially transferred job to make room here.
             try:

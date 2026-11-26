@@ -1048,6 +1048,45 @@ def _wait_for(predicate):
     return False
 
 
+def _worker_with_blocked_first_job(jobs, results):
+    first = jobs.get()
+    Path(first["started"]).touch()
+    if not _wait_for(Path(first["release"]).exists):
+        return
+    results.put((first["frame"], b"", {}, None))
+    while (job := jobs.get()) is not None:
+        results.put((job["frame"], b"", {}, None))
+
+
+def test_busy_worker_keeps_latest_pending_frame_during_input_transfer(monkeypatch, tmp_path):
+    depth = module()
+    monkeypatch.setattr(depth, "_project_worker", _worker_with_blocked_first_job)
+    started, release = tmp_path / "started", tmp_path / "release"
+    release_pickle = threading.Event()
+    received = []
+
+    class DelayedFrame:
+        def __reduce__(self):
+            release_pickle.wait(5)
+            return dict, ({"frame": 2},)
+
+    worker = depth.DepthWorker(lambda frame, *_: received.append(frame), lambda *_: None)
+    try:
+        worker.start()
+        assert worker.submit({"frame": 1, "started": str(started), "release": str(release)})
+        assert _wait_for(started.exists)
+        assert worker.submit(DelayedFrame())
+        assert worker.submit({"frame": 3})
+        release_pickle.set()
+        release.touch()
+        assert _wait_for(lambda: len(received) >= 2)
+        assert received == [1, 3]
+    finally:
+        release_pickle.set()
+        release.touch()
+        worker.close()
+
+
 def _process_alive(worker):
     try:
         return worker._process.is_alive()
