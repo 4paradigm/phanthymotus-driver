@@ -118,13 +118,12 @@ are software operating settings, not new hardware measurements. Speed presets
 never scale up a requested velocity; restart navi after changing them so it
 reads the new descriptor. No minimum stable speed is invented.
 
-The servo descriptor estimates the static standing half-width at 0.23 m in
+The servo descriptor estimates the static standing half-width at 0.20 m in
 `base_link`. [DEEP Robotics lists a standing width of approximately 0.40 m](https://www.deeprobotics.cn/products/detail/2.html);
 the bundled `resource/S10_kinematic.urdf` collision geometry spans about
-0.3994 m in the nominal standing pose. The estimate rounds to 0.20 m per side
-and adds 0.03 m for geometry uncertainty. Navi adds its configured clearance
-on top. The dimensions of the robot during gait and with payloads require
-separate measurement.
+0.3994 m in the nominal standing pose, which rounds to 0.20 m per side. Navi
+adds its configured clearance on top. The dimensions of the robot during gait
+and with payloads require separate measurement.
 
 Configuration changes stop old real motion before applying settings, reset the
 confirmed output baseline to zero and require newly stamped commands. Pause and

@@ -18,8 +18,10 @@ from test_s10_pro_control import DRIVER as SOURCE, FakeNative, s10_ros
 
 
 @pytest.fixture
-def pro_bundle(s10_ros, monkeypatch):
+def pro_bundle(s10_ros, monkeypatch, tmp_path):
     device, ros2 = s10_ros
+    ros2.rclpy = SimpleNamespace(ok=lambda **_kwargs: True)
+    monkeypatch.setenv('S10_FRONT_DEPTH_CONFIG', str(tmp_path / 'front_depth.json'))
     config = yaml.safe_load((SOURCE / 'config.yaml').read_text())
     native = FakeNative(config)
     closed = []
@@ -112,14 +114,19 @@ def test_cloud_preserves_axes_and_limits_valid_points():
     assert info['frame_id'] == 'lidar_link'
 
 
-def test_pro_entrypoint_and_build_inputs_are_complete(pro_bundle, monkeypatch):
+@pytest.fixture
+def pro_entrypoint(pro_bundle, monkeypatch):
     monkeypatch.setitem(sys.modules, 'device', pro_bundle.device)
     from common import logsafe
     monkeypatch.setattr(logsafe, 'install', lambda: None)
     spec = importlib.util.spec_from_file_location('s10_pro_entrypoint', SOURCE / 'main.py')
     main = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(main)
-    assert main.build_plugins is pro_bundle.device.build_plugins
+    return main
+
+
+def test_pro_entrypoint_and_build_inputs_are_complete(pro_bundle, pro_entrypoint):
+    assert pro_entrypoint.build_plugins is pro_bundle.device.build_plugins
     manifest = yaml.safe_load((SOURCE / 'driver.yaml').read_text())
     cards = {c['name']: c['type'] for c in manifest['cards']}
     tools = {t['name']: t['type'] for t in pro_bundle.bundle.get_all_tools()}
@@ -140,8 +147,11 @@ def test_pro_entrypoint_and_build_inputs_are_complete(pro_bundle, monkeypatch):
                     assert kind in names
 
 
-def test_http_mcp_lists_pro_tools_and_starts_a_monitor(pro_bundle):
-    server = ThreadingHTTPServer(('127.0.0.1', 0), make_handler(lambda: pro_bundle.bundle, 's10-pro', 's10'))
+@pytest.fixture
+def pro_rpc(pro_bundle, pro_entrypoint):
+    handler = make_handler(lambda: pro_bundle.bundle, 's10-pro', 'deep-robotics-s10-pro-driver',
+                           config_error_tools=pro_entrypoint.CONFIG_ERROR_TOOLS)
+    server = ThreadingHTTPServer(('127.0.0.1', 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     def rpc(method, params):
@@ -151,13 +161,56 @@ def test_http_mcp_lists_pro_tools_and_starts_a_monitor(pro_bundle):
         with urllib.request.urlopen(request, timeout=2) as response:
             return json.load(response)
     try:
-        tools = rpc('tools/list', {})['result']['tools']
-        assert {'battery', 'joints', 'model', 'lidar_cloud', 'imu', 'odom',
-                'camera_front_depth', 'loco_servo'} <= {tool['name'] for tool in tools}
-        result = rpc('tools/call', {'name': 'battery', 'arguments': {'action': 'start'}})
-        state = json.loads(result['result']['content'][0]['text'])
-        assert state == {'state': 'running', 'topic_out': [{'topic': '/test/battery', 'format': 'data/json'}]}
+        yield rpc
     finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_http_mcp_lists_pro_tools_and_starts_a_monitor(pro_rpc):
+    tools = pro_rpc('tools/list', {})['result']['tools']
+    assert {'battery', 'joints', 'model', 'lidar_cloud', 'imu', 'odom',
+            'camera_front_depth', 'loco_servo'} <= {tool['name'] for tool in tools}
+    result = pro_rpc('tools/call', {'name': 'battery', 'arguments': {'action': 'start'}})
+    state = json.loads(result['result']['content'][0]['text'])
+    assert state == {'state': 'running', 'topic_out': [{'topic': '/test/battery', 'format': 'data/json'}]}
+
+
+@pytest.mark.parametrize('tool, config, message', [
+    ('loco_servo', {'speed_preset': 'invalid'}, 'speed_preset'),
+    ('loco_servo', {'dry_run': False}, 'S10_MOTION_ENABLED'),
+    ('camera_front_depth', {'camera_optical_from_cloud': [[1]]}, 'camera_optical_from_cloud'),
+])
+def test_http_mcp_rejects_invalid_saved_config(pro_rpc, monkeypatch, tool, config, message):
+    monkeypatch.setenv('S10_MOTION_ENABLED', '0')
+    response = pro_rpc('tools/call', {'name': tool, 'arguments': {'action': 'config', 'config': config}})
+    assert 'result' not in response, response
+    assert response['id'] == 1
+    assert response['error']['code'] == -32000
+    assert message in response['error']['message']
+
+
+def test_http_mcp_preserves_successful_config_payloads(pro_rpc):
+    result = pro_rpc('tools/call', {'name': 'loco_servo',
+                                    'arguments': {'action': 'config', 'speed_preset': 'slow'}})
+    config = json.loads(result['result']['content'][0]['text'])
+    assert config['ok'] is True and config['speed_preset'] == 'slow'
+    result = pro_rpc('tools/call', {'name': 'loco_servo', 'arguments': {'action': 'info'}})
+    info = json.loads(result['result']['content'][0]['text'])
+    assert info['control_interface']['limits']['upper'][0] == .3
+
+    result = pro_rpc('tools/call', {'name': 'camera_front_depth',
+                                    'arguments': {'action': 'config', 'rate_hz': 4}})
+    config = json.loads(result['result']['content'][0]['text'])
+    assert config['state'] == 'configured' and config['restart_required'] is True
+    assert config['config']['rate_hz'] == 4
+
+
+@pytest.mark.parametrize('tool, arguments', [
+    ('camera_front', {'action': 'config', 'undistort': 'invalid'}),
+    ('loco_servo', {'action': 'start'}),
+])
+def test_http_mcp_preserves_other_errors(pro_rpc, tool, arguments):
+    result = pro_rpc('tools/call', {'name': tool, 'arguments': arguments})
+    assert json.loads(result['result']['content'][0]['text'])['state'] == 'error'
