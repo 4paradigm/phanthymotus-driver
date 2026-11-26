@@ -53,11 +53,12 @@ def test_canvas_read_start_stop_without_vendor_runtime(monkeypatch, tmp_path):
     monkeypatch.setenv("HELIOS_SDK_PYTHON_DIR", str(tmp_path))
     plugin = HeliosSpatialMap({})  # Existing user configs predate the map SDK settings.
     bundle = DriverBundle([plugin])
-    definition, = bundle.get_all_tools()
+    definition, control = bundle.get_all_tools()
+    assert control["name"] == "controlled_spatial" and control["topic_out"][0]["format"] == "sensor/mapping"
     assert (definition["name"], definition["type"], definition["multiInstance"]) == ("spatial_map", "sensor", False)
-    assert definition["topic_out"] == [{"topic": "/rokae_helios/state/spatial_map", "format": "data/json"},
-                                       {"topic": "/rokae_helios/state/spatial_map/preview", "format": "image/jpeg"}]
-    assert bundle.dispatch("spatial_map", {"action": "info"})["preview_topic"] == definition["topic_out"][1]["topic"]
+    assert definition["topic_out"] == [{"topic": "/rokae_helios/state/spatial_map", "format": "sensor/mapping"},
+                                       {"topic": "/rokae_helios/state/spatial_map/status", "format": "data/json"}]
+    assert bundle.dispatch("spatial_map", {"action": "info"})["preview_topic"] == definition["topic_out"][0]["topic"]
     assert bundle.dispatch("spatial_map", {"action": "read"})["data"] == {
         "state": "idle", "stations": None, "map_name": None, "localization": None,
     }
@@ -79,6 +80,8 @@ def test_worker_logs_and_full_station_snapshot_use_separate_pipes(tmp_path, monk
         "def close_client(): pass\n")
     (tmp_path / "map_manager.py").write_text(
         "def has_map_manager(): return True\ndef get_current_map_name(): return 'lab'\n")
+    (tmp_path / "nav.py").touch()
+    (tmp_path / "point_cloud.py").touch()
     (tmp_path / "localization.py").write_text("def has_location_dev(): return False\n")
     (tmp_path / "map_reader.py").write_text(
         "from types import SimpleNamespace\n"
@@ -102,5 +105,50 @@ def test_worker_logs_and_full_station_snapshot_use_separate_pipes(tmp_path, monk
 
         wait_for(diagnostics_received)
         assert not any("工位" in line for line in logs)
+    finally:
+        sensor.stop()
+
+
+def test_vmr_command_cycle_reports_rejection_completion_and_cancel(tmp_path):
+    (tmp_path / "py_client_common.py").write_text(
+        "class ClientConfig: pass\ndef init_client(c): return True\ndef close_client(): pass\n")
+    (tmp_path / "localization.py").write_text(
+        "from types import SimpleNamespace\ndef has_location_dev(): return True\n"
+        "def loc_state(cb): cb(SimpleNamespace(status=0,confidence=1,x=0,y=0,theta=0,timestamp_ns=123))\n")
+    (tmp_path / "map_reader.py").write_text(
+        "def has_map_reader(): return True\ndef get_work_points(): return []\ndef get_charge_points(): return []\n")
+    (tmp_path / "point_cloud.py").write_text("def has_point_cloud_dev(): return False\n")
+    (tmp_path / "map_manager.py").write_text(
+        "class MapInfo: pass\nactive='lab'\nmaps=['lab']\n"
+        "def has_map_manager(): return True\ndef get_current_map_name(): return active\n"
+        "def get_map_list(): return maps\n"
+        "def start_mapping(info): maps.append(info.name); return ''\ndef stop_mapping(): return ''\n"
+        "def async_change_map(name):\n import asyncio\n from types import SimpleNamespace as NS\n"
+        " global active\n active=name\n f=asyncio.get_running_loop().create_future()\n"
+        " f.set_result(NS(err_code=0,data='',err_message='')); return NS(future=f)\n")
+    (tmp_path / "nav.py").write_text(
+        "import asyncio\nfrom types import SimpleNamespace as NS\n"
+        "class NavigateParams: pass\nclass Pose: pass\n"
+        "def async_NavigateTo(params):\n loop=asyncio.get_running_loop(); f=loop.create_future()\n"
+        " if params.target_position.x==1: loop.call_soon(f.set_result, NS(err_code=0,err_message=''))\n"
+        " return NS(id=4,future=f,cancel=lambda: f.set_result(NS(err_code=12,err_message='cancelled')))\n")
+    sensor = HeliosSpatialMap({"spatial_db": str(tmp_path / "tags.db")})
+    sensor._python, sensor._sdk = Path(sys.executable), tmp_path
+    try:
+        sensor._launch()
+        wait_for(lambda: sensor.payload()["state"] == "online")
+        with pytest.raises(ValueError, match="already in use"):
+            sensor.command("start_mapping", map_name="lab")
+        assert sensor.command("start_mapping", map_name="lab2")["state"] == "mapping"
+        assert sensor.command("stop_mapping", map_name="lab2")["state"] == "mapping_stopped"
+        assert sensor.command("list_maps")["maps"] == ["lab", "lab2"]
+        for x in (1, 2):
+            assert sensor.command("navigate", map_name="lab", x=x, y=0, yaw=0)["state"] == "navigating"
+            if x == 1:
+                wait_for(lambda: sensor.command("nav_status")["state"] == "completed")
+            else:
+                assert sensor.command("stop_nav")["state"] == "cancel_requested"
+                wait_for(lambda: sensor.command("nav_status")["message"] == "cancelled")
+        assert sensor.command("load_map", map_name="lab2")["state"] == "map_loaded"
     finally:
         sensor.stop()

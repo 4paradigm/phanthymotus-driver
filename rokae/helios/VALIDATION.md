@@ -1,16 +1,19 @@
 # 验证范围
 
-## spatial_map 真机验证（2026-11-26）
+## 三维地图与导航（2026-11-26）
 
-ARM64 真机使用仓库 Dockerfile 的默认 ROS 基础镜像构建。临时 Core（`release.261118.56edda4`）与测试 Driver 使用独立数据库和网络命名空间。Core 发现了 `joints`、`model`、`battery` 及 `spatial_map`。经 Core 调用地图卡，在画布使用的 `/ws/bus/rokae_helios/state/spatial_map` 收到连续两份定位源时间戳不同的数据。停止后收到空值和 `idle`，再次启动后恢复当前地图和新的定位反馈。
+在 Helios ARM64 主机使用本驱动 Dockerfile 构建镜像。正式 Core `release.261118.56edda4` 的原地图卡与新增控制卡均发布 `sensor/mapping`。通过正式 Core 的画布 WebSocket 解码了两条独立的数据流。
 
-机载 SDK 的 `get_current_map_name()` 返回 `helioslab`。`get_current_map_info()` 的 `goals` 和 `lines` 均为空，`get_work_points()` 和 `get_charge_points()` 均返回空列表。定位回调实测 `status=0`、`confidence=1.0`。工作点和充电点的非空序列化用 SDK 原生 `Goal.from_json()` 构造的样本验证，覆盖中文名称及 ID 为 0 的点位。未向现场地图添加点位。
+| 正式画布话题 | 地图 | XYZ 点数 | 高度范围（米） |
+| --- | --- | ---: | --- |
+| `/rokae_helios/state/spatial_map` | helioslab | 50,733 | −2.261 至 10.728 |
+| `/rokae_helios/controlled_spatial/map` | helioslab | 50,733 | −2.261 至 10.728 |
 
-**二维地图预览。** 正式 Core 的原卡片同时收到 JSON 状态和 620 × 622 JPEG 预览，`info.preview_topic` 指向 JPEG。底盘的 `getRunMapZip` 提供 310 × 284 的 PGM，分辨率为 0.05 m/像素，原点为 `[-3.64022, -5.07641, 0]`。单车监控的 `current_state.pose`、`robot_base.locate.current_state` 和 VMR 均返回约 `(0.0501, -0.3646, -0.0124)`。确认厂家定位标志为 1，正式画布图像流中箭头中心约为 `(148, 380)` 像素，指向图像右方。保留原卡片 ID、JSON 端口和已有连线。
+Edge 监控页为两路话题创建了带跟随视角切换的 MAPPING 面板，可见黑底、按高度着色的点云。两路点数及高度范围与现场地图包中的原厂 `lidmap/helioslab/map.pcd` 一致。正式画布保存了两张卡片和既有连线。通过控制卡查询，机载地图共 13 张，当前地图为 `helioslab`，导航状态为 `idle`。
 
 ## 自动验证
 
-2026-11-26，地图扫描叠加在正式 Core 的原卡片上收到两帧含双雷达点和机器人标记的 JPEG。现场预览的一帧显示左前雷达 590 点、右后雷达 588 点、深度平面检测 0 点；非空深度点的颜色及投影由构造样本验证。54 项 Helios 回归通过。[真机地图预览](evidence/spatial-map-preview.jpg)
+55 项 Helios 本地测试通过，覆盖 PCD 解包与二进制地图帧、保留扫描高度及定位时差、标签按图持久化、同名地图拒绝、建图和结束、加载地图、导航成功及取消反馈。控制动作使用模拟 VMR 接口。正式服务清单通过 `scripts/check_service_yml.py rokae/helios` 检查。
 
 2026-11-19，初版关节、电池、力矩回归共 37 项通过；本次另增加运行时模型发现、大小限制、同源检查及错误模型回归，`scripts/check_service_yml.py rokae/helios` 通过。执行命令见 README。测试使用本地模拟 WebSocket、固定协议样本和真实 Driver 代码，不需要连接或移动机器人。
 

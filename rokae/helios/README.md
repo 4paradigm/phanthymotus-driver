@@ -1,27 +1,28 @@
-# ROKAE Helios-2.1 状态卡片
+# ROKAE Helios-2.1 驱动
 
-通过 iNex 和底盘 WebSocket 读取 20 轴关节及双电池状态，通过 VMR SDK 读取地图、定位与站点。三张传感器卡可独立启停。
+通过 iNex 和底盘 WebSocket 读取 20 轴关节及双电池状态，通过 VMR SDK 获取定位与站点，并控制建图和导航。
 
 | 工具 | 类型 | 输出 |
 |---|---|---|
 | `joints` | sensor | 关节骨架和逐轴状态，默认 10 Hz |
 | `battery` | sensor | 两块电池状态，默认 1 Hz |
 | `model` | resource | 运行时读取本机 iNex 的 URDF，骨架渲染器自动调用 |
-| `spatial_map` | sensor | 读取当前地图名称、定位反馈以及工作点和充电点的 ID、名称和类型 |
+| `spatial_map` | sensor | 原厂 XYZ 点云地图、当前位置、地图状态和站点 |
+| `controlled_spatial` | actuator | 建图、保存和加载地图、按当前位置打点、到点导航 |
 
-### 地图、定位与站点
+### 三维地图与导航
 
-在识别 `info.preview_topic` 的 Core 上，点击卡片的「查看数据流」可打开二维地图。按首个输出展示详情的 Core 默认显示 JSON，地图可在监控页选择 `/rokae_helios/state/spatial_map/preview` 查看。蓝色箭头的中心表示当前位置，箭头尖端表示车头朝向。预览读取底盘监控使用的本机地图包，按 YAML 原点、分辨率和图像高度将厂家定位换算到栅格上。底图在启动和切换地图时加载；同名地图重新编辑后，停启卡片可重新加载底图。定位失效或过期时仍显示底图，并隐藏箭头。
+在 Motus 的「监控」页找到 `spatial_map` 或 `…/controlled_spatial/map` 的 MAPPING 面板，可旋转、平移、缩放地图，或用右上角的准星切换跟随视角。主输出 `/<namespace>/state/spatial_map` 使用 `sensor/mapping`，从底盘导出包的 `lidmap/<地图名>/map.pcd` 读取 XYZ。颜色由 Core 按点的高度生成。`controlled_spatial` 的地图输出为 `/<namespace>/controlled_spatial/map`，两张卡可独立开启显示。
 
-实时观测叠加在黑底白点的底图上。左前雷达（LF lidar）为青绿，右后雷达（RR lidar）为橙色，深度相机（Depth）为紫红。颜色对应这台底盘配置中的扫描源。驱动复用定位连接，从 `AGVInfo.laser_scan` 读取厂家用于二维地图的车体坐标点，随机器人位姿旋转和平移。每个来源独立更新；空扫描立即清除该来源的点，超过 1.5 秒的扫描不再绘制。图例显示最新报文的点数，`0` 表示已上报空扫描，`--` 表示没有可用的新鲜数据。三维原始点云仍可在 `lidar_pointcloud` 查看。
-
-原 JSON 输出保持在第一个端口。第二个端口 `/<namespace>/state/spatial_map/preview` 输出 `image/jpeg`，是 `info.preview_topic` 指定的默认预览。底图下载和状态查询独立运行。
+1. 运行 `controlled_spatial.start` 可查看当前点云。选择 `start_mapping(map_name)` 开始一张新地图，现场人员按厂家流程手动走一圈并回到起点，选择 `stop_mapping` 结束并由底盘保存地图。采集期间根据时间相近的 VMR 定位，将底盘实时三维点云变换到地图坐标。保存后控制卡显示该地图的原厂 PCD。
+2. `list_maps` 列出底盘地图，`load_map(map_name)` 加载指定地图。定位后用 `tag_place(name, description)` 保存当前位置和朝向；`list_tags` / `untag_place(name)` 可查看或移除本图标签。标签按地图保存在挂载目录内的 SQLite 数据库，点云上用立柱和朝向线标出。
+3. `navigate_to_tag(tag_name)` 导航到本图标签，或用 `navigate_to_pose(x, y, yaw)` 指定地图坐标（米、弧度）。`status` 查询 VMR 导航终态及错误信息，`stop_nav` 请求取消。打开或查看卡片只订阅地图。
 
 Dashboard 部署时从镜像读取 [deploy/service.yml](deploy/service.yml)，将机器人上 `/home/admin/helios-dev/native-odom-runtime/` 下的 `sdk-python` 和 `vmr-sdk` 分别只读挂载到 `/opt/sdk-python` 和 `/opt/vmr-sdk`。若安装位置不同，在主机的 Compose 项目 `.env` 中设置 `HELIOS_SDK_PYTHON_DIR`（含 `bin/python3.12` 的目录）和 `HELIOS_VMR_SDK_DIR`（含 `lib/` 的目录），然后重新部署驱动。
 
 画布启动地图卡后，SDK 才连接底盘，默认地址为 `192.168.0.100:9003`，可在 `config.yaml` 修改。
 
-每两秒查询当前地图和两类站点，通过 `/<namespace>/state/spatial_map` 发布 `data/json`。`map_name` 是 VMR 返回的地图标识。每个 `stations` 条目保留原始 `id`、`name`，`type` 由对应的 SDK 查询区分为 `work` 或 `charge`。成功读到零个点时返回 `[]`。无法提供当前地图快照时，地图和站点均为 `null`。
+每两秒查询当前地图和两类站点，通过 `/<namespace>/state/spatial_map/status` 发布 `data/json`。`map_name` 是 VMR 返回的地图标识。每个 `stations` 条目保留原始 `id`、`name`，`type` 由对应的 SDK 查询区分为 `work` 或 `charge`。成功读到零个点时返回 `[]`。无法提供当前地图快照时，地图和站点均为 `null`。
 
 `localization` 提供 VMR 回调中的 `status_code`、`confidence`、`x`、`y`、`theta` 及十进制字符串 `timestamp_ns`。保留厂商定位码；传输状态 `online` 表示同时收到地图及新鲜定位反馈。定位时间戳停止更新 3 秒后，定位字段在下一次采样置空，地图和站点仍可用，状态为 `partial`。停止卡片后释放 SDK 连接。
 
@@ -83,7 +84,7 @@ Dashboard 部署时从镜像读取 [deploy/service.yml](deploy/service.yml)，�
 
 默认读取上身 `ws://192.168.0.161:8888/ws` 及底盘 `ws://192.168.0.100/ws/AGVInfo`。可通过共享配置 `state_url` / `battery_state_url`，或环境变量 `HELIOS_STATE_URL` / `HELIOS_BATTERY_STATE_URL` 覆盖。地址字段声明为敏感配置，避免打包 Solution 时公开私有地址。
 
-`config.yaml` 控制发布、过期、连接和重连时间。MCP 仅监听 `127.0.0.1:15747`，ROS domain 42，复用 `common/vendor_runtime.py` 注册到 Core。WebSocket 只读订阅，不安装或运行厂家运动 SDK。
+`config.yaml` 控制发布、过期、连接和重连时间。MCP 仅监听 `127.0.0.1:15747`，ROS domain 42，复用 `common/vendor_runtime.py` 注册到 Core。底盘控制通过独立的 VMR SDK 进程运行。
 
 ## 本地验证
 

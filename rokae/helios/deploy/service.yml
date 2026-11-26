@@ -8,6 +8,7 @@ rokae-helios:
   tmpfs:
     - /tmp:rw,nosuid,nodev,size=16m
   volumes:
+    - /opt/phanthy-motus/data/helios-spatial:/var/lib/helios-spatial
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
     - ${HELIOS_SDK_PYTHON_DIR:-/home/admin/helios-dev/native-odom-runtime/sdk-python}:/opt/sdk-python:ro
     - ${HELIOS_VMR_SDK_DIR:-/home/admin/helios-dev/native-odom-runtime/vmr-sdk}:/opt/vmr-sdk:ro
