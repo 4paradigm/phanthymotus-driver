@@ -1,0 +1,14 @@
+# Apply after the Driver service Compose file to provide the installed VMR SDK.
+services:
+  rokae-helios:
+    volumes:
+      - type: bind
+        source: ${HELIOS_SDK_PYTHON_DIR:?Set the host directory of the SDK Python runtime}
+        target: /opt/sdk-python
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${HELIOS_VMR_SDK_DIR:?Set the host directory of the local VMR SDK}
+        target: /opt/vmr-sdk
+        read_only: true
+        bind: {create_host_path: false}

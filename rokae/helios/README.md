@@ -1,14 +1,32 @@
 # ROKAE Helios-2.1 状态卡片
 
-通过现有 iNex 和底盘 WebSocket 读取 20 轴关节及双电池状态。两张传感器卡可独立开始、停止，不提供运动、使能、模式切换或充放电控制。
+通过 iNex、底盘 WebSocket 和可选的原厂 SDK 读取 20 轴关节、双电池状态、里程计位姿和速度。
 
 | 工具 | 类型 | 输出 |
 |---|---|---|
 | `joints` | sensor | 关节骨架和逐轴状态，默认 10 Hz |
 | `battery` | sensor | 两块电池状态，默认 1 Hz |
+| `loco_state` | sensor | 原厂里程计位置和朝向、机体系速度，默认 10 Hz |
 | `model` | resource | 运行时读取本机 iNex 的 URDF，骨架渲染器自动调用 |
 
 ## 数据与单位
+
+### 里程计
+
+- `/{namespace}/loco/state`（`data/json`）显示原厂 `position=[x,y,null]`、
+  `rpy=[null,null,yaw]`、`velocity=[vx,vy,null]` 和 `yaw_speed`。位置采用米，
+  yaw 采用弧度。`position` 和 `rpy` 来自 VMR SDK 的 `odometry.odom_state`。
+- `/{namespace}/state/odom`（`state/odom`）提供 `motus.odom/1`。`pose` 采用同一原厂位姿，
+  参考系为 `/{namespace}` 命名空间下的 `odom → chassis_planar`。标准报文用平面模型
+  的 `z=0` 和 yaw 四元数表达。`twist=[vx,vy,null,null,null,wz]` 仍来自底盘 WebSocket。
+- 卡片持续采样。画布停卡或启动时保留原厂坐标，Driver 退出时关闭两路订阅。
+  断线、过期或 SDK 缺失时相应数据为空，两路反馈独立判断状态和接收时间。
+
+升级后，已有画布若仍显示旧的 `odometry` 卡片，刷新 Driver 工具列表并更新为 `loco_state`。
+Navi 继续订阅原来的 `state/odom` 话题。位姿部署与接口说明见
+[ODOMETRY_INTERFACE.md](ODOMETRY_INTERFACE.md)。
+
+### 关节与电池
 
 `joints` 只发布一条流 `/rokae_helios/state/joints`（`sensor/skeleton`）：每轴 `q`（rad）、`dq`（rad/s）、`motor_torque_nm`、`gravity_torque_nm`（Nm），按名称匹配 URDF；另含连接状态 `state` / `available`、`message`、数据年龄、接收时间和 `torque_status`。
 
@@ -52,7 +70,7 @@
 
 ## 画布与 Core 前端
 
-在卡片共享配置中保存状态地址，再将 `joints` 和 `battery` 加入画布并启动。`model` 无需单独运行；首次请求时读取同一 iNex 地址的 `/api/robot_3d_model` 及其同源 `urdf_url`，核对 20 轴名称后在进程内缓存。没有把厂家模型打入镜像。模型服务暂不可用时明确返回错误，不影响关节和电池订阅启动。监控页从 `joints` 自动生成骨架。
+在卡片共享配置中保存状态地址，再将需要的 `joints`、`battery` 或 `loco_state` 加入画布并启动。`model` 无需单独运行；首次请求时读取同一 iNex 地址的 `/api/robot_3d_model` 及其同源 `urdf_url`，核对 20 轴名称后在进程内缓存。没有把厂家模型打入镜像。模型服务暂不可用时明确返回错误，不影响传感器订阅启动。监控页从 `joints` 自动生成骨架。
 
 官方 Core 无需修改即可使用：监控页按真实 Driver ID 读取 URDF 显示骨架，电池在日志视图每字段一行、"最新"模式每字段一格。已知差异：
 
@@ -64,16 +82,16 @@
 
 ## 配置
 
-默认读取上身 `ws://192.168.0.161:8888/ws` 及底盘 `ws://192.168.0.100/ws/AGVInfo`。可通过共享配置 `state_url` / `battery_state_url`，或环境变量 `HELIOS_STATE_URL` / `HELIOS_BATTERY_STATE_URL` 覆盖。地址字段声明为敏感配置，避免打包 Solution 时公开私有地址。
+默认读取上身 `ws://192.168.0.161:8888/ws` 及底盘 `ws://192.168.0.100/ws/AGVInfo`。可通过共享配置 `state_url` / `battery_state_url` / `odometry_state_url`，或对应环境变量 `HELIOS_STATE_URL` / `HELIOS_BATTERY_STATE_URL` / `HELIOS_ODOMETRY_STATE_URL` 覆盖。地址字段声明为敏感配置，避免打包 Solution 时公开私有地址。
 
-`config.yaml` 控制发布、过期、连接和重连时间。MCP 仅监听 `127.0.0.1:15747`，ROS domain 42，复用 `common/vendor_runtime.py` 注册到 Core。WebSocket 只读订阅，不安装或运行厂家运动 SDK。
+`config.yaml` 控制发布、过期、连接和重连时间。MCP 仅监听 `127.0.0.1:15747`，ROS domain 42，复用 `common/vendor_runtime.py` 注册到 Core。WebSocket 使用只读订阅。里程计位姿可通过 [原厂 SDK 挂载配置](deploy/compose.native-odom.yml) 启用。
 
 ## 本地验证
 
 仓库根目录安装本 Driver 的 requirements 及 pytest 后执行：
 
 ```bash
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=. python -m pytest -q tests/test_helios_joints.py tests/test_helios_battery.py tests/test_helios_torque.py tests/test_helios_model.py
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=. python -m pytest -q tests/test_helios_joints.py tests/test_helios_battery.py tests/test_helios_torque.py tests/test_helios_model.py tests/test_helios_odometry.py tests/test_odom_format.py
 python scripts/check_service_yml.py rokae/helios
 ```
 
