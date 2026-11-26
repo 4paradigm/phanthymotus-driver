@@ -1323,17 +1323,41 @@ else:
     _NSENTER = ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--"]
 
     @classmethod
-    def _restart_orbbec_service(cls) -> str | None:
-        """无条件重启主机上的 orbbec_head。成功返回 None，失败返回原因。
+    def _orbbec_host_clock_step_ns(cls) -> int | None:
+        import subprocess
+        from clock_probe import sample_host_clocks
+
+        try:
+            result = subprocess.run(
+                cls._NSENTER + [
+                    "busctl", "--json=short", "call", "org.freedesktop.systemd1",
+                    "/org/freedesktop/systemd1/unit/orbbec_5fhead_2eservice",
+                    "org.freedesktop.DBus.Properties", "GetAll", "s",
+                    "org.freedesktop.systemd1.Service",
+                ], check=True, capture_output=True, text=True, timeout=2)
+            properties, = json.loads(result.stdout)["data"]
+            start_wall = properties["ExecMainStartTimestamp"]["data"]
+            start_mono = properties["ExecMainStartTimestampMonotonic"]["data"]
+            wall, mono = sample_host_clocks(time)
+            if start_wall > 0 and 0 < start_mono * 1000 <= mono:
+                return (wall - mono) - (start_wall - start_mono) * 1000
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+            print(f"[CameraPlugin] cannot check Orbbec host clock: {error}", flush=True)
+        return None
+
+    @classmethod
+    def _restart_orbbec_service(cls, *, startup_recovery=False) -> str | None:
+        """重启主机上的 orbbec_head。成功返回 None，失败返回原因。
 
         和 `_ensure_orbbec_service` 区别开：那个是「必要时才动」（active 且配置没变
         就不碰正在跑的流），看门狗要的恰恰是「它看着是 active 但其实死了，给我重启」。
         """
         import subprocess
         try:
+            action = "try-restart" if startup_recovery else "restart"
             subprocess.run(
-                cls._NSENTER + ["systemctl", "restart", "orbbec_head.service"],
-                check=True, capture_output=True, text=True, timeout=30)
+                cls._NSENTER + ["systemctl", action, "orbbec_head.service"],
+                check=True, capture_output=True, text=True, timeout=4 if startup_recovery else 30)
             return None
         except Exception as e:
             return str(e)

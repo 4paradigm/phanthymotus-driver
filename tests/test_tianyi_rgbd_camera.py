@@ -164,6 +164,103 @@ def test_image_ingress_rejects_invalid_capture_age_before_pairing(monkeypatch, a
     assert source.image_streams[kind]['received'] == 1
 
 
+@pytest.mark.parametrize(("ages_ms", "clock_steps_ms", "first_color", "restart"), [
+    ((704, 705), (-1792,), False, True),
+    ((704, 705), (-1792,), True, True),
+    ((-710, -710), (1792,), False, True),
+    ((704, 705), (None, -1792), False, True),
+    ((704, 705), (0,), False, False),
+    ((704, 425), (-1792,), False, False),
+])
+def test_startup_repairs_only_a_verified_clock_step_with_two_stale_streams(
+        monkeypatch, ages_ms, clock_steps_ms, first_color, restart):
+    import queue
+    import sys
+    import threading
+    from collections import deque
+
+    source = m.RgbdCameraPlugin.__new__(m.RgbdCameraPlugin)
+    source.lock = threading.RLock()
+    source.imu_lock = threading.RLock()
+    source.stop_event = threading.Event()
+    source.running = source.registered = True
+    source.managed = False
+    source.infos = {'color': info(), 'depth': info()}
+    source.geometry = source.signature = None
+    source.frames = {kind: deque(maxlen=3) for kind in source.infos}
+    source.pending = queue.Queue(maxsize=1)
+    source.last_emit = 0
+    source.frame_interval_ns = 100_000_000
+    source.image_streams = {kind: dict(received=0) for kind in source.infos}
+    source.imu_samples = {}
+    source._startup_clock_retry_at = 0.
+    source._startup_clock_restart_requested = False
+    source._startup_clock_restarting = False
+    source.count = 0
+    source.imu_publication_attempts = 0
+    source.body_mount = NS(retry_pending=lambda: None)
+    restarts = []
+    steps = iter(clock_steps_ms)
+
+    def measure_step():
+        ms = next(steps, clock_steps_ms[-1])
+        return None if ms is None else ms * 1_000_000
+
+    monkeypatch.setitem(sys.modules, 'device', NS(CameraPlugin=NS(
+        _orbbec_host_clock_step_ns=measure_step,
+        _restart_orbbec_service=lambda **kwargs: restarts.append(kwargs))))
+    monkeypatch.setitem(sys.modules, 'sensor_msgs.msg', NS(CompressedImage=object))
+    now = 2_000_000_000
+
+    def send(kind, stamp):
+        msg = NS(width=640, height=480, header=NS(frame_id='optical',
+                 stamp=NS(sec=stamp // 10**9, nanosec=stamp % 10**9)))
+        source._image(kind, msg)
+
+    monkeypatch.setattr(m.time, 'time_ns', lambda: now)
+    if first_color:
+        send('color', now - 30_000_000)
+        assert source.geometry is not None
+        # By the time both streams are stale, the lone pre-step frame expired.
+        now += 600_000_000
+    for _ in range(20):
+        for kind, age in zip(('color', 'depth'), ages_ms):
+            send(kind, now - age * 1_000_000)
+        now += 33_333_333
+
+    polls = iter((2., 4., 6., 8.))
+    monotonic = 0.
+    monkeypatch.setattr(m.time, 'monotonic', lambda: monotonic)
+    get = source.pending.get
+
+    def wait_for_pair(block=True, timeout=None):
+        nonlocal monotonic
+        if not block:
+            return get(block=False)
+        monotonic = next(polls)
+        if monotonic == 8.:
+            source.stop_event.set()
+        raise queue.Empty
+
+    with monkeypatch.context() as worker:
+        worker.setattr(source.pending, 'get', wait_for_pair)
+        source._work()
+    assert source.pending.empty()
+    assert len(restarts) == int(restart)
+
+    capture_ns = now - 30_000_000
+    if restart:
+        assert not source.registered and not source.infos
+        send('color', capture_ns)
+        assert not source.frames['color']
+        source.registered = True
+        for kind in ('color', 'depth'):
+            source._info(kind, info())
+    for kind in ('color', 'depth'):
+        send(kind, capture_ns)
+    assert tuple(map(m._stamp, source.pending.get_nowait())) == (capture_ns, capture_ns)
+
+
 @pytest.mark.parametrize('focal,distortion,offset', [
     (520., [0.]*5, (0., 0.)),
     (800., [.1, -.02, .001, -.001, 0.], (7., -5.)),

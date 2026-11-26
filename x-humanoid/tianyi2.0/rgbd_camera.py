@@ -117,9 +117,13 @@ class _MountNode:
         return self.output.destroy_publisher(publisher)
 
 
+_MIN_IMAGE_AGE_NS = -50_000_000
+_MAX_IMAGE_AGE_NS = 500_000_000
+
+
 def _fresh_images(*images, reserve_ns=0):
     now = time.time_ns()
-    return all(0 < _stamp(image) and -50_000_000 <= now - _stamp(image) <= 500_000_000 - reserve_ns
+    return all(0 < _stamp(image) and _MIN_IMAGE_AGE_NS <= now - _stamp(image) <= _MAX_IMAGE_AGE_NS - reserve_ns
                for image in images)
 
 
@@ -422,6 +426,9 @@ class RgbdCameraPlugin:
                 self.count = 0
                 self.image_streams = {kind: dict(received=0, last_capture_ns=None, last_arrival_ns=None)
                                       for kind in ('color', 'depth')}
+                self._startup_clock_retry_at = 0.
+                self._startup_clock_restart_requested = False
+                self._startup_clock_restarting = False
                 self.last_publish_ns = None
                 self.last_depth_timing = None
                 self.future = None
@@ -595,7 +602,8 @@ class RgbdCameraPlugin:
     def _parameters(self):
         from rcl_interfaces.srv import GetParameters
         with self.lock:
-            if not self.running or self.registered or self.future is not None:
+            if (not self.running or self.registered or self.future is not None
+                    or getattr(self, '_startup_clock_restarting', False)):
                 return
             if not self.client.service_is_ready():
                 self.parameter_stage = 'service'
@@ -678,6 +686,58 @@ class RgbdCameraPlugin:
                     self.running = False
                     self.stop_event.set()
 
+    def _startup_images_outside_capture_window(self):
+        if (not self.running or self.stop_event.is_set() or not self.registered
+                or self.count or self.imu_publication_attempts
+                or set(self.infos) != {'color', 'depth'}):
+            return False
+        now = time.time_ns()
+        ages = []
+        for stream in self.image_streams.values():
+            capture, arrival = stream['last_capture_ns'], stream['last_arrival_ns']
+            if stream['received'] < 15 or not capture or not 0 <= now - arrival <= 250_000_000:
+                return False
+            ages.append(arrival - capture)
+        return (all(age > _MAX_IMAGE_AGE_NS for age in ages)
+                or all(age < _MIN_IMAGE_AGE_NS for age in ages))
+
+    def _recover_startup_clock(self):
+        with self.lock, self.imu_lock:
+            now = time.monotonic()
+            if (self._startup_clock_restart_requested or now < self._startup_clock_retry_at
+                    or not self._startup_images_outside_capture_window()):
+                return
+            self._startup_clock_retry_at = now + 1.
+        from device import CameraPlugin
+        step = CameraPlugin._orbbec_host_clock_step_ns()
+        if step is None or abs(step) <= _MAX_IMAGE_AGE_NS:
+            return
+        with self.lock, self.imu_lock:
+            # A fresh frame or a stop can arrive while querying systemd.
+            if not self._startup_images_outside_capture_window():
+                return
+            self._startup_clock_restart_requested = self._startup_clock_restarting = True
+            self.registered = False
+            self.geometry = self.signature = None
+            self.last_emit = 0
+            for samples in (*self.frames.values(), *self.imu_samples.values()):
+                samples.clear()
+            try:
+                self.pending.get_nowait()
+            except queue.Empty:
+                pass
+        try:
+            if not self.stop_event.is_set():
+                error = CameraPlugin._restart_orbbec_service(startup_recovery=True)
+                print(f'[RGB-D] host clock shifted {step / 1e6:+.0f} ms since Orbbec startup: '
+                      + (f'camera restart failed: {error}' if error else 'restarted camera service'), flush=True)
+        finally:
+            with self.lock:
+                self.infos.clear()
+                self.parameter_stage = 'service'
+                self.parameter_values = {}
+                self._startup_clock_restarting = False
+
     def _work(self):
         import cv2
         from sensor_msgs.msg import CompressedImage
@@ -695,6 +755,7 @@ class RgbdCameraPlugin:
                 color, depth = item[:2]
                 epochs = item[2] if len(item) == 3 else None
             except queue.Empty:
+                self._recover_startup_clock()
                 continue
             try:
                 started_ns = time.time_ns()
