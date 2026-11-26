@@ -3222,17 +3222,17 @@ class HeadControlPlugin:
         if action not in ("look_left", "look_right", "look_up", "look_down", "center", "set_position", "send"):
             raise ValueError(f"head_control: unknown action {action!r}")
         presets = {
-            "look_left": {"yaw": 0.6}, "look_right": {"yaw": -0.6},
-            "look_up": {"pitch": 0.15}, "look_down": {"pitch": -0.3},
+            "look_left": {"yaw": 0.6, "pitch": 0.0}, "look_right": {"yaw": -0.6, "pitch": 0.0},
+            "look_up": {"yaw": 0.0, "pitch": 0.15}, "look_down": {"yaw": 0.0, "pitch": -0.3},
             "center": {"yaw": 0.0, "pitch": 0.0},
         }
-        if action in presets:
-            args = {**presets[action], **args}
+        # A canvas may retain set_position fields when switching actions.
+        target = presets.get(action, args)
         positions = {}
-        if args.get("yaw") is not None:
-            positions["head_yaw_joint"] = float(args["yaw"])
-        if args.get("pitch") is not None:
-            positions["head_pitch_joint"] = float(args["pitch"])
+        if target.get("yaw") is not None:
+            positions["head_yaw_joint"] = float(target["yaw"])
+        if target.get("pitch") is not None:
+            positions["head_pitch_joint"] = float(target["pitch"])
         _require(positions, "至少提供 yaw 或 pitch")
         rejected = _motion_gate(self.nodes.rpc, "head_control")
         if rejected:

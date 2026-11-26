@@ -1444,6 +1444,22 @@ class RpcDispatchTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             head.dispatch("send", {"yaw": 1.2})
 
+    def test_head_control_presets_ignore_retained_position_fields(self):
+        head = find_plugin(self.plugins, "head_control")
+        args = {"yaw": -1, "pitch": 0, "duration_ms": 0}
+        for action, expected in (
+            ("look_left", {"head_yaw_joint": 0.6, "head_pitch_joint": 0.0}),
+            ("look_right", {"head_yaw_joint": -0.6, "head_pitch_joint": 0.0}),
+            ("look_up", {"head_yaw_joint": 0.0, "head_pitch_joint": 0.15}),
+            ("look_down", {"head_yaw_joint": 0.0, "head_pitch_joint": -0.3}),
+            ("center", {"head_yaw_joint": 0.0, "head_pitch_joint": 0.0}),
+            ("set_position", {"head_yaw_joint": -1.0, "head_pitch_joint": 0.0}),
+        ):
+            with self.subTest(action=action):
+                self.assertEqual(head.dispatch(action, args)["joints"], expected)
+                msg = self.nodes.neck_command_pub.published[-1]
+                self.assertEqual(dict(zip(msg.name, msg.position)), expected)
+
     def test_hand_control_publishes_with_hand_type(self):
         hand = find_plugin(self.plugins, "hand_control")
         hand.dispatch("send", {"right": [100, 200], "hand_type": "O10Hand"})
