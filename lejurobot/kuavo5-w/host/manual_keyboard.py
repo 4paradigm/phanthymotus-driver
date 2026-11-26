@@ -157,14 +157,43 @@ def receive(stream, timeout):
     raise TimeoutError('keyboard_watchdog_expired')
 
 
+def manual_zero_stop(request):
+    """Factory MANUAL stop: zero RobotMotion plus fresh physical rest."""
+    namespace = {'__name__': 'motus_keyboard_navigation'}
+    exec(compile(NAVIGATION_SOURCE, 'navigation_rpc.py', 'exec'), namespace)
+    # A stop must reach RobotMotion even when the chassis is still moving.
+    os.environ['ROS_MASTER_URI'] = request['master']
+    os.environ['ROS_IP'] = request['ros_ip']
+    os.environ.pop('ROS_HOSTNAME', None)
+    for path in ('/opt/ros/noetic/lib/python3/dist-packages', '/opt/jaten/lib/python3/dist-packages'):
+        if path not in sys.path:
+            sys.path.insert(0, path)
+    import rospy
+    from jaten_msgs.msg import RobotChassisState
+    from nav_msgs.msg import Odometry
+    rospy.init_node('motus_manual_stop', anonymous=True, disable_signals=True,
+                    disable_rosout=True, log_level=rospy.ERROR)
+    state = rospy.wait_for_message('/jaten_behavior_manager/robot_state', RobotChassisState, timeout=2.)
+    if state.manual_mode is not True:
+        raise RuntimeError('keyboard_manual_stop_requires_manual_mode')
+    ws = FactorySocket()
+    try:
+        ws.send(json.dumps({'method':'RobotMotion','id':'1','params':{'vx':0.,'vy':0.,'vw':0.}}))
+        namespace['confirm_stationary'](rospy, Odometry)
+        return {'success':True,'stationary':True,'manual_zero_sent':True,
+                'completion_basis':'factory_manual_zero_and_fresh_stationary_odometry'}
+    finally:
+        ws.close()
+
+
 def run(request):
     import secrets
     namespace = {'__name__': 'motus_keyboard_navigation'}
     exec(compile(NAVIGATION_SOURCE, 'navigation_rpc.py', 'exec'), namespace)
-    # Hold, cancel the dispatcher and pause the old native tracker BEFORE any
-    # software-stop release. This may take seconds; no velocity is sent yet.
-    held = namespace['main'](dict(request, operation='soft_stop', args={}))
-    if held.get('software_estop') is not True or held.get('stationary') is not True:
+    # Mapping startup already cancelled native tasks and disabled upper output.
+    # MANUAL idle uses RobotMotion zero, not a latched dispatcher soft stop.
+    held = namespace['main'](dict(request, operation='stationary', args={}))
+    if held.get('stationary') is not True:
         raise RuntimeError('keyboard_initial_stop_unconfirmed')
     import rospy
     import rosgraph
@@ -203,6 +232,7 @@ def run(request):
             ws.send(json.dumps({'method': 'RobotMotion', 'id': '1',
                                 'params': {'vx': vx, 'vy': 0., 'vw': vw}}))
         motion()
+        namespace['confirm_stationary'](rospy, Odometry)
         nonce, seq = secrets.token_hex(16), -1
         emit({'state': 'held', 'nonce': nonce})
         # A new challenge per acknowledgement rejects queued/replayed frames.
@@ -221,10 +251,11 @@ def run(request):
                 # Another factory client may have released the held chassis
                 # while the lease/zero frame was in flight. Recheck fresh
                 # feedback at the release boundary; never adopt that release.
-                if manual().soft_estop is not True:
-                    raise RuntimeError('keyboard_initial_stop_ownership_lost')
-                if not dispatch(control_mode=1).success:
-                    raise RuntimeError('keyboard_release_rejected')
+                if state.soft_estop:
+                    if manual().soft_estop is not True:
+                        raise RuntimeError('keyboard_initial_stop_ownership_lost')
+                    if not dispatch(control_mode=1).success:
+                        raise RuntimeError('keyboard_release_rejected')
                 namespace['confirm_software_stop'](rospy, False)
                 namespace['confirm_stationary'](rospy, Odometry)
                 released = True
@@ -239,19 +270,25 @@ def run(request):
             deadline = time.monotonic()+LEASE_S
     finally:
         # Local loopback zero does not depend on the failed SSH/browser link.
-        if ws is not None:
-            try:
-                ws.send(json.dumps({'method': 'RobotMotion', 'id': '1',
-                                    'params': {'vx': 0., 'vy': 0., 'vw': 0.}}))
-            except Exception:
-                pass
-            ws.close()
-        if not dispatch(control_mode=0).success:
-            raise RuntimeError('keyboard_stop_rejected')
-        namespace['confirm_software_stop'](rospy, True)
-        namespace['confirm_stationary'](rospy, Odometry)
-        emit({'state': 'stopped', 'stationary': True, 'software_estop': True})
-        subscription.unregister()
+        try:
+            zero_sent = False
+            if ws is not None:
+                try:
+                    ws.send(json.dumps({'method': 'RobotMotion', 'id': '1',
+                                        'params': {'vx': 0., 'vy': 0., 'vw': 0.}}))
+                    zero_sent = True
+                except Exception:
+                    pass
+                try:
+                    if not zero_sent:
+                        raise RuntimeError('keyboard_zero_stop_send_unconfirmed')
+                    namespace['confirm_stationary'](rospy, Odometry)
+                    emit({'state': 'stopped', 'stationary': True, 'manual_zero_sent': True,
+                          'completion_basis':'factory_manual_zero_and_fresh_stationary_odometry'})
+                finally:
+                    ws.close()
+        finally:
+            subscription.unregister()
 
 
 def guard_error_code(exc):
@@ -261,6 +298,7 @@ def guard_error_code(exc):
         'keyboard_initial_stop_ownership_lost', 'keyboard_release_rejected',
         'keyboard_command_expired', 'keyboard_watchdog_expired',
         'keyboard_software_stop_is_active', 'keyboard_stop_rejected',
+        'keyboard_manual_stop_requires_manual_mode', 'keyboard_zero_stop_send_unconfirmed',
         'invalid_factory_websocket_handshake', 'factory_websocket_closed',
         'factory_websocket_api_error', 'factory_motion_rejected',
         'factory_websocket_disconnected', 'factory_websocket_write_busy'}

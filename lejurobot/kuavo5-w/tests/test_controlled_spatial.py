@@ -157,6 +157,8 @@ class Client:
             self.music_requests = getattr(self, 'music_requests', []) + [args]
             return {'state': 'disabled'}
         self.calls.append((operation, args))
+        if operation == 'manual_stop':
+            return {'success':True,'stationary':True,'manual_zero_sent':True}
         if operation == 'upper_handoff':
             return {'success':True,'stationary':True,'software_estop':False,
                     'velocity_source':'nav_mpc_move_base','delivery_uncertain':False}

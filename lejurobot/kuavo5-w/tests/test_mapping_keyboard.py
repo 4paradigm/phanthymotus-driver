@@ -258,7 +258,7 @@ class MappingKeyboardTests(unittest.TestCase):
         self.assertTrue(self.spatial.unresolved())
         self.assertTrue(self.spatial.store.state('pending')['keyboard_stop_unconfirmed'])
         self.spatial.cancel_remote()
-        self.assertEqual(self.client.calls[-1][0], 'soft_stop')
+        self.assertEqual(self.client.calls[-1][0], 'manual_stop')
         self.assertFalse(self.spatial.unresolved())
 
     def test_preparation_directions_are_discarded_and_disconnected_browser_never_activates(self):
@@ -457,12 +457,46 @@ class ChassisGuardTests(unittest.TestCase):
                 ws.close()
         self.assertTrue(wire.closed)
 
+    def test_manual_stop_sends_zero_before_confirming_rest_without_soft_estop(self):
+        for failure in (None, 'send', 'rest'):
+            with self.subTest(failure=failure):
+                events = []
+                state = types.SimpleNamespace(manual_mode=True, soft_estop=False)
+                def send(message):
+                    events.append(('zero', json.loads(message)['params']))
+                    if failure == 'send':
+                        raise ConnectionError('write failed')
+                def rest(*args):
+                    events.append(('rest',))
+                    if failure == 'rest':
+                        raise RuntimeError('still moving')
+                fixture = types.ModuleType('keyboard_stop_fixture')
+                fixture.confirm_stationary = rest
+                ros = types.SimpleNamespace(ERROR=40, init_node=lambda *a, **kw: None,
+                    wait_for_message=lambda *a, **kw: state)
+                modules = {'keyboard_stop_fixture': fixture, 'rospy': ros,
+                    'jaten_msgs.msg': types.SimpleNamespace(RobotChassisState=object),
+                    'nav_msgs.msg': types.SimpleNamespace(Odometry=object)}
+                ws = types.SimpleNamespace(send=send, close=lambda: events.append(('close',)))
+                with patch.dict(sys.modules, modules), patch.dict(os.environ), \
+                        patch.object(remote, 'NAVIGATION_SOURCE', 'from keyboard_stop_fixture import *', create=True), \
+                        patch.object(remote, 'FactorySocket', return_value=ws):
+                    if failure:
+                        with self.assertRaises((ConnectionError, RuntimeError)):
+                            remote.manual_zero_stop({'master':'unused', 'ros_ip':'unused'})
+                    else:
+                        reply = remote.manual_zero_stop({'master':'unused', 'ros_ip':'unused'})
+                        self.assertTrue(confirmed_stop(dict(reply, state='stopped')))
+                self.assertEqual(events[0], ('zero', {'vx':0., 'vy':0., 'vw':0.}))
+                self.assertEqual(events[-1], ('close',))
+                self.assertEqual(any(item[0] == 'rest' for item in events), failure != 'send')
+
     def test_full_remote_guard_orders_zero_release_and_stop_on_eof_or_mode_loss(self):
-        for cause in ('eof', 'mode', 'timeout', 'early_release', 'release_on_zero'):
+        for cause in ('eof', 'mode', 'timeout', 'zero_then_turn', 'held_release'):
             with self.subTest(cause=cause):
                 read_fd, write_fd = os.pipe()
                 state = types.SimpleNamespace(manual_mode=True, mapping=True, estop=False,
-                    bumper=False, driver_error=False, driver_enable=True, soft_estop=True)
+                    bumper=False, driver_error=False, driver_enable=True, soft_estop=cause == 'held_release')
                 commands, outputs, errors = [], [], []
                 def dispatch(**args):
                     commands.append(('dispatch', args['control_mode']))
@@ -508,22 +542,20 @@ class ChassisGuardTests(unittest.TestCase):
                         def send(seq, values):
                             os.write(write_fd, (json.dumps({'nonce': outputs[-1]['nonce'], 'seq': seq, 'values': values})+'\n').encode())
                         send(1, [0, 0])
-                        if cause in ('early_release', 'release_on_zero'):
-                            worker.join(1)
-                            self.assertFalse(worker.is_alive())
-                            self.assertEqual(outputs[-1]['state'], 'stopped')
-                            self.assertNotIn(('dispatch', 1), commands)
-                            self.assertEqual(commands[-1], ('dispatch', 0))
-                            self.assertTrue(state.soft_estop)
-                            self.assertTrue(errors)
-                            self.assertFalse(any(value.get('state') == 'ready' for value in outputs))
-                            continue
                         self.assertTrue(wait_until(lambda: outputs[-1]['state'] == 'ready'))
                         if cause == 'mode':
                             state.manual_mode = False
                         send(2, [.1, .2])
-                        if cause == 'eof':
+                        if cause == 'zero_then_turn':
                             self.assertTrue(wait_until(lambda: outputs[-1].get('seq') == 2))
+                            send(3, [0., 0.])
+                            self.assertTrue(wait_until(lambda: outputs[-1].get('seq') == 3))
+                            send(4, [0., -.2])
+                            self.assertTrue(wait_until(lambda: outputs[-1].get('seq') == 4))
+                            self.assertTrue(worker.is_alive())
+                        if cause in ('eof', 'zero_then_turn', 'held_release'):
+                            expected_seq = 4 if cause == 'zero_then_turn' else 2
+                            self.assertTrue(wait_until(lambda: outputs[-1].get('seq') == expected_seq))
                             os.close(write_fd)
                             write_fd = None
                         worker.join(1)
@@ -531,9 +563,12 @@ class ChassisGuardTests(unittest.TestCase):
                         self.assertEqual(outputs[-1]['state'], 'stopped')
                         self.assertEqual(commands[0], ('motion', {'vx': 0., 'vy': 0., 'vw': 0.}))
                         self.assertEqual(commands[1], ('motion', {'vx': 0., 'vy': 0., 'vw': 0.}))
-                        self.assertEqual(commands[2], ('dispatch', 1))
-                        self.assertEqual(commands[-2], ('motion', {'vx': 0., 'vy': 0., 'vw': 0.}))
-                        self.assertEqual(commands[-1], ('dispatch', 0))
+                        self.assertEqual(commands[-1], ('motion', {'vx': 0., 'vy': 0., 'vw': 0.}))
+                        self.assertTrue(outputs[-1]['manual_zero_sent'])
+                        if cause == 'held_release':
+                            self.assertEqual([item for item in commands if item[0] == 'dispatch'], [('dispatch', 1)])
+                        else:
+                            self.assertFalse(any(item[0]=='dispatch' for item in commands))
                         if cause == 'mode':
                             self.assertFalse(any(item[0] == 'motion' and item[1]['vx'] for item in commands))
                         self.assertTrue(errors)

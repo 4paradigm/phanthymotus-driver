@@ -879,10 +879,10 @@ class ControlledSpatialPlugin:
         self.keyboard.stop()
         if self._keyboard_pending:
             # An orphaned SSH helper never resumes after a lost heartbeat. Still
-            # require an ordered native stop before clearing its persisted fence.
-            response = self.client.native('soft_stop')
+            # require factory MANUAL zero and fresh rest before clearing its fence.
+            response = self.client.native('manual_stop')
             if (response.get('success') is not True or response.get('stationary') is not True
-                    or response.get('software_estop') is not True
+                    or response.get('manual_zero_sent') is not True
                     or (self.keyboard.thread and self.keyboard.thread.is_alive())):
                 raise RuntimeError('mapping_keyboard_stop_unconfirmed')
             self._keyboard_pending = False

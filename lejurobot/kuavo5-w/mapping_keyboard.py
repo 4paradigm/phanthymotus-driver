@@ -15,7 +15,8 @@ LINEAR_LIMIT, ANGULAR_LIMIT, LEASE_S = .15, .3, .3
 
 def confirmed_stop(reply):
     return (reply.get('state') == 'stopped' and reply.get('stationary') is True
-            and reply.get('software_estop') is True)
+            and (reply.get('software_estop') is True or (reply.get('manual_zero_sent') is True
+                and reply.get('completion_basis') == 'factory_manual_zero_and_fresh_stationary_odometry')))
 
 
 def guard_error(reply):
