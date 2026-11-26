@@ -141,7 +141,7 @@ ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 COPY resource/ /work/resource/
 COPY common/ /work/common/
 COPY main.py   /work/main.py
-COPY device.py /work/device.py
+COPY device.py bumi_av_recording.py /work/
 # Navi support modules are independent from device.py for ROS-free tests.
 COPY loco_servo.py /work/loco_servo.py
 COPY imu_distance_control.py /work/imu_distance_control.py
@@ -154,7 +154,8 @@ COPY visual_odometry_probe.py /work/visual_odometry_probe.py
 COPY odom_spec.py /work/odom_spec.py
 COPY sound_direction.py /work/sound_direction.py
 COPY direction_card.py /work/direction_card.py
-COPY patrol_baseline.py /work/patrol_baseline.py
+COPY live_stream.py /work/live_stream.py
+COPY patrol_baseline.py patrol_card.py /work/
 COPY examples/patrol-baseline-bumi-fixed.json /work/examples/patrol-baseline-bumi-fixed.json
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/

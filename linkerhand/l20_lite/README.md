@@ -158,7 +158,7 @@ torque limits 30, 85, and 160; `custom_grasp` accepts a raw 1–255 limit.
 The optional `speed_ratio` is 1.0x–3.0x, capped at 255. The three simple
 gestures and `number` release torque at completion unless `hold_torque=true`; grasp holds
 unless `hold_torque=false`. Contact detection is inferred from position
-stall only: there is no tactile sensor or verified force measurement, so
+stall only: the gesture controller does not use the tactile stream, so
 these options do **not** guarantee an object will not be squeezed or dropped.
 
 The new gesture implementation lives in `gesture_device.py` and shares the
@@ -167,3 +167,70 @@ existing driver's USB discovery and serial bus lock. The hand card's
 unchanged apart from loading this additional plugin. Run offline checks with
 `python3 -m pytest tests/test_linkerhand_l20_lite_gesture.py -q`; these checks
 do not move hardware.
+
+## `hand_tactile` sensor card
+
+The **L20 Lite 触觉感知** card reads the fingertip pressure arrays over the
+same USB-RS485 Modbus RTU link as the hand cards (115200 8N1, slave 0x27
+right / 0x28 left). No CAN interface is needed. The protocol matches the vendor's
+RS485 host app (`L10_hand_ui`, 2026-07-09 release):
+
+| Step | Frame | Meaning |
+|------|-------|---------|
+| Select finger | `0x10` write holding reg `0x0046` = N | N: 1 thumb, 2 index, 3 middle, 4 ring, 5 pinky |
+| Read matrix | `0x04` read 98 input regs from `0x003C` | reg 0 echoes N; reg 1 is unused; regs 2–97 are 96 raw 16-bit cells |
+
+For each finger, the card writes the selection, reads immediately, and
+checks that reg 0 equals the selected finger. The host app sleeps 30 ms
+between the two frames. On hardware the reply was correct without the
+delay (100/100 reads), and dropping it raises the rate from 3.4 Hz to
+about 6.5 Hz. `select_settle_s` restores the delay if a unit needs it.
+
+The card mirrors the L20 `hand_tactile` card: same lifecycle
+(`info/start/stop/config`), the same instance `bound_side` and
+shared `poll_hz` settings, and the same JSON fields. The differences:
+
+- `serial_port` replaces `can_channel`, and there is no CAN interface setting.
+- The Lite has no separate fingertip sensor: reg 1 is a constant `0xC6`
+  command echo and cells 72–95 stayed 0 while each fingertip was pressed.
+  `touch_scalar` (the card's "Tip") is the average of the first 72 raw
+  pressure readings, including zeros. The mean is rounded to the nearest
+  integer and capped at 255 for the renderer. Peak is the strongest cell in
+  the display matrix. The raw sum of all 96 cells is published as `touch_sum`,
+  and `model` is `l20_lite`.
+- `touch_matrix` is the first 72 cells, drawn as 12×6 row-major like the host
+  app. Each cell is clipped to 255 to match the L20 0–255 matrix schema, and
+  `matrix_sums` is the sum of these clipped values. It comes from the same
+  reply as the scalar, so `matrix_timeout_s` is accepted only for compatibility.
+- `touch_cells` carries all 96 raw 16-bit cells per finger (`cell_count: 96`),
+  including cells 72–95. The Core `sensor/tactile` renderer only draws a 12×6
+  matrix, so these extra cells are published for subscribers but not shown.
+  The field is `null` whenever the round is invalid or stale.
+- `contact_flags` follows L20: `touch_scalar >= contact_threshold` or a
+  positive matrix sum.
+- A partial round keeps fresh readings from the fingers that answered and
+  reports `state=degraded`. Missing or stale fingers are `null` and listed in
+  `errors.scalar`. A round with no valid readings reports `state=error`.
+
+| `plugins.hand_tactile` | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | Register the sensor card (shares the hand card's bus) |
+| `poll_hz` | `10.0` | Target rate, 1–10. One round is 5 × (4 ms select + 22 ms 201-byte read) plus port open, so it is about 6.5 Hz in practice at 115200 baud. |
+| `auto_start` | `true` | Poll the default `side` at startup; stopped when a card picks the other hand |
+| `matrix_enabled` | `true` | Publish the 12×6 matrix |
+| `matrix_request_interval_s` | `0.05` | Minimum interval between matrix refreshes |
+| `tactile_timeout_s` | `1.0` | Budget for one five-finger round, including waiting for the bus |
+| `matrix_timeout_s` | `0.25` | Compatibility only (matrix shares the scalar reply) |
+| `stale_after_s` | `1.0` | Age after which scalar/matrix readings are invalid |
+| `contact_threshold` | `8` | Average pressure (1–255) at or above which the scalar indicates contact |
+| `select_settle_s` | `0.0` | Delay between finger select and read (hidden; host app uses 0.03) |
+
+The card shares the hand cards' serial bus lock and takes it one finger at a
+time, so motion, gesture and teach frames interleave between fingers. A move
+holds the bus for its whole duration. Fingers that cannot get the bus within
+`tactile_timeout_s` fail the round instead of blocking the motion.
+
+Tactile data is published as `sensor/tactile` (JSON in `std_msgs/String`,
+BEST_EFFORT, KEEP_LAST, depth 1, VOLATILE). The topic is
+`/l20_lite/hand/<side>/tactile` under the configured ROS namespace, so it
+stays separate from an L20 driver on the same robot.

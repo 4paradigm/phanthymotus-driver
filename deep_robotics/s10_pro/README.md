@@ -137,16 +137,24 @@ RTSP-only: the robot ROS graph is scanned for point clouds, never image topics.
 The driver also reports each camera's body-frame mount position in
 `camera_info[].vendor.mounting.position_m`, based on the vendor Hardware
 Development Manual v1.0.2 sections 1.6 and 1.9. These values are converted
-from millimetres to metres. The manual provides no camera orientation, and the
-RTSP stream provides no intrinsics, so orientation and optical calibration
-remain unknown.
-The front camera currently carries a preliminary manual horizontal half-FOV
-estimate of `0.423 rad` (about 48.5 degrees full FOV), obtained with the rough
-`measure_fov.py wall` check on `/s10_pro/camera_front/visual_depth`. That check
-also indicates the depth values are ray range, so lateral projection should use
-`sin(theta) * range`. This estimate is intentionally marked `source=manual`
-and `confidence=rough`; it must be replaced after a precise per-camera
-calibration. The other camera FOVs remain unknown.
+from millimetres to metres. The manual provides no camera orientation, so
+orientation remains unknown.
+Each camera card has one setting, `undistort` (default `true`), saved per lane
+in `/opt/phanthy-motus/data/s10_pro/camera_undistort.json`. When it is on, the
+lane's FFmpeg command gains a `remap` stage at the 1024x576 source resolution
+and the published JPEG is already rectified; `camera_info` then declares
+`pinhole`, the calibrated K and zero D, with the half-FOV derived from that K
+(about 0.79 rad horizontal). When it is off the raw, barrel-distorted stream is
+published and its geometry is declared `unknown`: no pinhole angle fits it (the
+calibrated K's is about 10 degrees short at the edges). Changing the switch reconnects only that lane;
+restart downstream vision cards so they re-read the declaration, and do not
+chain a separate undistortion card behind a rectified camera.
+The per-camera K/D are the chessboard calibrations in `undistortion.py`
+(`CALIBRATIONS`, measured 2026-11-07/08, RMS 0.21-0.22 px). They are per model,
+not per unit, and are not editable from the card; re-measure with
+`tools/calibrate_chessboard.py` (a workstation tool needing numpy and OpenCV; it
+is not shipped in the image) and replace the row. These replace the earlier rough front-camera wall estimate of
+`0.423 rad`.
 A one-frame low-latency pipeline reconnects after stream interruption. The
 previous ROS image-topic receive path has been removed because the vendor camera service
 does not publish camera images over DDS. The final image includes the `ffmpeg`

@@ -19,6 +19,7 @@ from basic_server import BasicServerClient, _protocol_int
 from common.vendor_runtime import action_schema, tool
 from domain_bridge import CoreBridge
 from media_workers import MediaWorkers, encode_pointcloud
+from undistortion import CameraUndistortion
 from loco_servo import S10LocoServoPlugin
 from spatial import S10ControlledSpatialPlugin
 from common.odom import build_interface, build_sample
@@ -41,21 +42,6 @@ CAMERA_INTRINSICS_RANGE = {
     "distortion_abs_max": 10.0,
     "source": "vendor-spec",
     "note": "Range only; K/D remain null until per-camera calibration at the published resolution.",
-}
-# Preliminary wall-fit estimate for the front visual-depth stream only. It is
-# intentionally marked manual: the test used a rough indoor wall and the
-# visual-depth output, not a per-camera checkerboard calibration.
-CAMERA_FRONT_HALF_FOV_RAD = 0.423
-CAMERA_FRONT_FOV_NOTE = {
-    "half_fov_rad": CAMERA_FRONT_HALF_FOV_RAD,
-    "full_fov_deg": 48.5,
-    "source": "manual",
-    "confidence": "rough",
-    "measured_with": "measure_fov.py wall on /s10_pro/camera_front/visual_depth",
-    "sample_frames": 30,
-    "depth_semantics": "ray_range",
-    "lateral_projection": "sin(theta) * range; not tan(theta) * z_depth",
-    "note": "Preliminary estimate; replace after precise per-camera calibration.",
 }
 LIDAR_LANES = ("lidar_cloud", "lidar_map")
 PREFERRED_LIDAR_SOURCE = "/ALIGNED_POINTS"
@@ -180,8 +166,11 @@ class S10Nodes:
             for lane in CAMERA_LANES
         }
         self.media_workers = None
+        self.camera_undistortion = CameraUndistortion(CAMERA_LANES)
         if config.get("media_workers", False):
             self.media_workers = MediaWorkers(self._handle_media_result)
+            self.media_workers.camera_undistortion = self.camera_undistortion
+            self.camera_undistortion.on_change = self.media_workers.restart_rtsp_camera
             for lane in LIDAR_LANES:
                 self.media_workers.add_lidar(lane)
         topics = config.get("topics", {})
@@ -818,7 +807,29 @@ class S10ModelPlugin:
 
 
 class S10StatePlugin:
-    def __init__(self, native, nodes=None): self.native, self.nodes = native, nodes
+    def __init__(self, native, nodes=None):
+        self.native, self.nodes = native, nodes
+        self.camera_undistortion = getattr(nodes, "camera_undistortion", None)
+        if self.camera_undistortion is None:
+            self.camera_undistortion = CameraUndistortion(CAMERA_LANES)
+
+    def _camera_info(self, name):
+        optics = self.camera_undistortion.declaration(name)
+        details = optics.pop("undistortion", {})
+        return build_camera_info(
+            topic=self.nodes.topics[name]["topic"], id=f"deeprobotics/s10_pro/{name}",
+            format="image/jpeg", width=640, height=360,
+            vendor={"transport": "rtsp", "undistortion": details,
+                    "mounting": {"frame_id": "body", "position_m": list(CAMERA_MOUNTS[name]),
+                                 "orientation_xyzw": None, "source": "vendor-spec",
+                                 "intrinsics_range": CAMERA_INTRINSICS_RANGE,
+                                 "coordinate_convention": {"x": "forward", "y": "left", "z": "up",
+                                     "origin": "body geometric center shown in section 1.6"},
+                                 "reference": "DeepRobotics S10 Hardware Development Manual v1.0.2, sections 1.6 and 1.9",
+                                 "stream": {"width": 640, "height": 360, "fps_max": 15,
+                                     "codec": "mjpeg", "source": "driver_output",
+                                     "source_resolution": {"width": 1024, "height": 576, "fps": 30},
+                                     "source_codec": "h264"}}}, **optics)
     def get_tools(self):
         cards = {
             "imu": "山猫 S10 IMU 加速度和角速度（由原生运控状态报告提供，10Hz）",
@@ -838,23 +849,18 @@ class S10StatePlugin:
             outputs = [topics[name]] if name in topics else None
             definition = tool(name, "sensor", description, topic_out=outputs)
             if name in CAMERA_MOUNTS and outputs:
-                definition["camera_info"] = [build_camera_info(
-                    topic=topics[name]["topic"],
-                    id=f"deeprobotics/s10_pro/{name}",
-                    format="image/jpeg", width=640, height=360,
-                    half_fov_rad=CAMERA_FRONT_HALF_FOV_RAD if name == "camera_front" else None,
-                    source="manual" if name == "camera_front" else "unknown",
-                    vendor={"transport": "rtsp", "mounting": {
-                        "frame_id": "body", "position_m": list(CAMERA_MOUNTS[name]),
-                        "orientation_xyzw": None, "source": "vendor-spec",
-                        "intrinsics_range": CAMERA_INTRINSICS_RANGE,
-                        **({"fov_estimate": CAMERA_FRONT_FOV_NOTE} if name == "camera_front" else {}),
-                        "stream": {"width": 640, "height": 360, "fps_max": 15,
-                                   "codec": "mjpeg", "source": "driver_output",
-                                   "source_resolution": {"width": 1024, "height": 576, "fps": 30},
-                                   "source_codec": "h264"},
-                    }},
-                )]
+                definition["camera_info"] = [self._camera_info(name)]
+                definition["inputSchema"] = action_schema({
+                    "start": ([], "开始相机图像流"), "stop": ([], "停止卡片"),
+                    "info": ([], "相机参数和去畸变状态"),
+                    "config": (["undistort"], "修改本相机去畸变设置；修改后重启下游视觉卡"),
+                }, {"undistort": {"type": "boolean",
+                                  "description": "广角畸变校正：true 开启，false 关闭"}})
+                settings = self.camera_undistortion.settings(name)
+                definition["configSchema"] = {"type": "object", "properties": {
+                    "undistort": {"type": "boolean", "title": "广角畸变校正", "scope": "instance",
+                                  "default": settings["undistort"]},
+                }}
             definitions.append(definition)
         return definitions
 
@@ -870,6 +876,19 @@ class S10StatePlugin:
         self.native.close()
     def dispatch(self, action, args):
         name = args.get("_tool_name", "")
+        if name in CAMERA_MOUNTS and action == "config":
+            try:
+                values = dict(args.get("config") or {})
+                values.update({k: args[k] for k in ("undistort", "calibration") if k in args})
+                changed = self.camera_undistortion.configure(name, values)
+            except (ValueError, TypeError) as exc:
+                return {"state": "error", "message": str(exc)}
+            result = self._topic_result(name, "configured")
+            result.update(config=self.camera_undistortion.settings(name), changed=changed,
+                          undistortion=self.camera_undistortion.status(name))
+            if self.nodes:
+                result["camera_info"] = [self._camera_info(name)]
+            return result
         if action == "start":
             self.native.start()
             return self._topic_result(name, "running")
@@ -880,34 +899,9 @@ class S10StatePlugin:
         if action == "info":
             result = self._topic_result(name, "ready")
             if name in CAMERA_MOUNTS and self.nodes:
-                result["camera_info"] = [build_camera_info(
-                    topic=self.nodes.topics[name]["topic"],
-                    id=f"deeprobotics/s10_pro/{name}",
-                    format="image/jpeg",
-                    width=640,
-                    height=360,
-                    half_fov_rad=CAMERA_FRONT_HALF_FOV_RAD if name == "camera_front" else None,
-                    source="manual" if name == "camera_front" else "unknown",
-                    vendor={
-                        "mounting": {
-                            "frame_id": "body",
-                            "position_m": list(CAMERA_MOUNTS[name]),
-                            "orientation_xyzw": None,
-                            "source": "vendor-spec",
-                            "coordinate_convention": {
-                                "x": "forward", "y": "left", "z": "up",
-                                "origin": "body geometric center shown in section 1.6",
-                            },
-                            "reference": "DeepRobotics S10 Hardware Development Manual v1.0.2, sections 1.6 and 1.9",
-                            "intrinsics_range": CAMERA_INTRINSICS_RANGE,
-                            **({"fov_estimate": CAMERA_FRONT_FOV_NOTE} if name == "camera_front" else {}),
-                            "stream": {"width": 640, "height": 360, "fps_max": 15,
-                                       "codec": "mjpeg", "source": "driver_output",
-                                       "source_resolution": {"width": 1024, "height": 576, "fps": 30},
-                                       "source_codec": "h264"},
-                        },
-                    },
-                )]
+                result["camera_info"] = [self._camera_info(name)]
+                result["undistortion"] = self.camera_undistortion.status(name)
+                result["config"] = self.camera_undistortion.settings(name)
             if name == "loco_state":
                 result["odom_interface"] = build_interface(
                     provides=["vx", "vy", "wz"], frame="body", rate_hz=10,

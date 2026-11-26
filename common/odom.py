@@ -72,6 +72,7 @@ Spec for driver authors: README_dev.md § "Robot Odometry (motus.odom/1)".
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 
 SCHEMA = "motus.odom/1"
 
@@ -93,6 +94,7 @@ DRIFT_KINDS = ("none", "unbounded", "bounded")
 # `OdomInterface.usable_for_control`.
 BODY_FRAME = "body"
 FRAMES = (BODY_FRAME, "world")
+STAMP_SOURCES = ("robot", "received")
 
 DEFAULT_UNITS = {"linear": "m/s", "angular": "rad/s", "length": "m"}
 
@@ -114,6 +116,11 @@ class OdomInterface:
     provides: tuple[str, ...]
     rate_hz: float = 0.0
     pose_drift: str = "none"
+    # Optional declaration of how the sample stamp was obtained. Timing is a
+    # nested extension so older consumers can ignore it as one unit. Unknown
+    # measurement delay is omitted, never guessed from a request timeout (a
+    # failure bound is not an observed latency).
+    timing: dict = field(default_factory=dict)
     units: dict = field(default_factory=lambda: dict(DEFAULT_UNITS))
     raw: dict = field(default_factory=dict, repr=False)
 
@@ -173,18 +180,61 @@ def parse_interface(raw: dict) -> OdomInterface:
     if not isinstance(units, dict) or not units:
         raise OdomError("odom_interface.units must be a non-empty object")
 
+    if "timing" not in raw:
+        timing = {}
+    else:
+        timing = raw["timing"]
+        if not isinstance(timing, dict):
+            raise OdomError("odom_interface.timing must be an object")
+        unknown = set(timing) - {"stamp_source", "max_measurement_delay_ms"}
+        if unknown:
+            raise OdomError(
+                "odom_interface.timing has unknown fields "
+                + ", ".join(sorted(unknown))
+            )
+        stamp_source = timing.get("stamp_source")
+        if stamp_source not in STAMP_SOURCES:
+            raise OdomError(
+                "odom_interface.timing.stamp_source must be one of "
+                + ", ".join(STAMP_SOURCES)
+            )
+        delay = timing.get("max_measurement_delay_ms")
+        if delay is not None:
+            if isinstance(delay, bool) or not isinstance(delay, (int, float)):
+                raise OdomError(
+                    "odom_interface.timing.max_measurement_delay_ms must be a "
+                    "non-negative number"
+                )
+            try:
+                delay = float(delay)
+            except (OverflowError, ValueError):
+                raise OdomError(
+                    "odom_interface.timing.max_measurement_delay_ms must be a "
+                    "non-negative number"
+                ) from None
+            if not math.isfinite(delay) or delay < 0:
+                raise OdomError(
+                    "odom_interface.timing.max_measurement_delay_ms must be a "
+                    "non-negative number"
+                )
+        timing = {"stamp_source": stamp_source}
+        if delay is not None:
+            timing["max_measurement_delay_ms"] = delay
+
     return OdomInterface(
         frame=frame,
         provides=tuple(provides),
         rate_hz=float(rate_hz),
         pose_drift=drift,
+        timing=dict(timing),
         units=dict(units),
         raw=dict(raw),
     )
 
 
 def build_interface(*, provides, frame: str = BODY_FRAME, rate_hz: float = 0.0,
-                    pose_drift: str = "none", units: dict = None) -> dict:
+                    pose_drift: str = "none", units: dict = None,
+                    timing: dict = None) -> dict:
     """The declaration a driver's state card returns from `info()`.
 
     Goes through `parse_interface` before being returned, so a driver cannot
@@ -199,6 +249,8 @@ def build_interface(*, provides, frame: str = BODY_FRAME, rate_hz: float = 0.0,
         "pose_drift": pose_drift,
         "units": dict(units or DEFAULT_UNITS),
     }
+    if timing is not None:
+        raw["timing"] = dict(timing)
     parse_interface(raw)
     return raw
 

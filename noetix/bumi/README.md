@@ -1,5 +1,8 @@
 # Noetix Bumi driver
 
+The personal `patrol` experiment integrates readiness checks, fixed-point image
+capture and local reports. See [local inspection](PATROL_LOCAL.md).
+
 The bundle exposes Bumi sensor, locomotion, audio, camera, motion-state, and independent sound-direction cards. The direction card is implemented in `direction_card.py`; the other cards remain in `device.py`.
 
 The optional [`patrol_baseline` card](PATROL_BASELINE.md) reads an operator-defined
@@ -225,19 +228,28 @@ the new card. State scopes, JSON snapshots, labels and interval logging are no
 longer supported. Historical files under `/opt/phanthy-motus/data/bumi/state-records`
 are left untouched.
 
-- `start`: check whether the camera process is ready (does not take a photo).
+- `start`: immediately return the actuator lifecycle marker `ready`. Camera
+  readiness is checked by the photo/video actions, not canvas activation.
 - `capture_photo`: save one current RGB JPEG.
-- `record_video`: asynchronously save an RGB MP4/H.264 video; `duration_s` is
-  an integer from 1 to 30, default 5 seconds.
+- `record_video`: asynchronously save an MP4/H.264 video; `duration_s` is
+  an integer from 1 to 30, default 5 seconds. `include_audio: true` (default)
+  includes microphone AAC audio. Set `include_audio: false` for video only.
 - `info`: return storage directories, camera/frame freshness and active recording.
-- `stop`: cancel recording and remove the incomplete video. This is not
-  “finish early and save”. It does not stop the existing camera sensor card.
+- `stop`: immediately return lifecycle `idle` and request cancellation. If a
+  recording exists, `cancellation_pending=true` means cleanup is still running;
+  ACP/`info.last_recording` reports the terminal result. This does not stop the
+  camera/mic or “finish early and save”. Bundle shutdown separately waits for cleanup.
 
 Bumi reuses its existing 640x480 JPEG topic `/<namespace>/camera/color`.
 A recent cached frame is used for a photo; if none is available or it is older
 than 3 seconds, capture waits for a fresh frame (up to 5 seconds per wait).
-Recording requests a strictly later frame sequence for each encoded frame.
-No second RealSense pipeline, depth capture, audio or state JSON is added.
+Recording subscribes to the existing timestamped JPEG producer. It maps source
+timestamps onto the output frame clock, repeating missing frames instead of
+accelerating playback. A camera gap over one second fails the recording.
+Optional audio uses `/<namespace>/mic/audio_recording`, published by the existing
+mic process with host chunk-end stamps. No second SDK capture client is opened.
+The original mic topic keeps its SDK timestamp contract; SDK audio at a different
+sample rate is resampled to the declared 16 kHz instead of changing playback speed.
 
 Default persistent output:
 
@@ -258,13 +270,43 @@ Photo failure returns `CAPTURE_FAILED` without creating a JSON sidecar.
 Video requests return `state=queued` and an `action_id`; completion/failure/
 cancellation is sent to `AGENT_CORE_URL/api/acp/complete` (default Agent Core
 URL: `https://localhost:15678`), matching Q5's ACP contract. Only one video
-recording may run at a time. A callback delivery failure is logged; it does not
-delete a successfully saved video.
+recording may run at a time. `info.last_recording` retains its terminal result.
+A callback delivery failure is logged; it does not delete a successfully saved video.
 
 Configuration is under `plugins.vision_capture`: `output_dir`, `fps`
-(default/max 15), and `max_duration_s` (default/max 30). Rebuild the driver
-image to install the new FFmpeg dependency. All runtime implementation remains
-in `device.py`; no extra runtime Python file is required.
+(output fps, default/max 15), and `max_duration_s` (default/max 30). The existing
+Dockerfile installs FFmpeg and copies the recording module with the driver source.
+The recorder uses host timestamps for software synchronization and exposes the
+file path only after encoding.
+
+## `live_stream` card
+
+Pushes a camera and a microphone to any platform that gives out an RTMP push
+address (Huya, Xiaohongshu, Bilibili, ...). Implemented in `live_stream.py`.
+
+On the canvas, connect `camera` (`image/jpeg`) and `mic` (`audio/pcm-16k`)
+into `live_stream`, and enter the platform's full push address — server plus
+stream key, e.g. `rtmp://<server>/live/<key>` — in the card's settings
+(`rtmp_url`, a password field excluded from exported solutions).
+
+- `start`: subscribe to the connected inputs. Does **not** go live.
+- `go_live`: start one ffmpeg (H.264 + AAC, FLV) to the saved address. Returns
+  `live` once ffmpeg has stayed up for 3 seconds, or the redacted ffmpeg error
+  if the platform rejected the address or key.
+- `end_live` / `stop`: stop the stream (`stop` also drops the subscriptions).
+- `info`: `state` (`idle` / `live` / `error`), `duration_s`, and the age of
+  the last video frame and audio chunk.
+
+`go_live`, `end_live` and `info` are agent-callable, so the agent can start a
+broadcast when asked to. The address itself is only a card setting.
+
+Video runs at `plugins.live_stream.fps` (default 15) with the latest frame
+repeated when the camera is late; audio is padded with silence when the mic is
+late, so the two stay in sync. A camera silent for 10 seconds ends the stream.
+The address is on ffmpeg's command line, so it is visible to anyone who can
+list processes on the robot — the same people who can read the card settings.
+Confirm picture and sound from the platform's viewer side; `live` only means
+ffmpeg is sending.
 
 ## New cards
 

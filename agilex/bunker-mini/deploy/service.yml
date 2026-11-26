@@ -1,0 +1,39 @@
+agilex-bunker-mini:
+  container_name: embodied-agilex-bunker-mini
+  image: __IMAGE__
+  user: "0:0"
+  network_mode: host
+  cap_drop:
+    - ALL
+  cap_add:
+    - SYS_MODULE
+    - NET_ADMIN
+    - NET_RAW
+    - SETUID
+    - SETGID
+    - SETPCAP
+  security_opt:
+    - no-new-privileges:true
+  volumes:
+    - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+    - /lib/modules:/lib/modules:rw
+    - /usr/src:/usr/src:ro
+    - /etc/modules-load.d:/etc/modules-load.d:rw
+    - /etc/systemd/system:/etc/systemd/system:rw
+    - /usr/local/sbin:/usr/local/sbin:rw
+    - /sys:/sys:ro
+    - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
+  environment:
+    - ROS_DOMAIN_ID=42
+    - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    - FASTRTPS_DEFAULT_PROFILES_FILE=/opt/phanthy-motus/dds-local.xml
+    - ROS_LOCALHOST_ONLY=0
+    - PYTHONUNBUFFERED=1
+    - BUNKER_MOTION_ENABLED=${BUNKER_MOTION_ENABLED:-1}
+    - AGENT_CORE_URL=https://localhost:15678
+  logging:
+    driver: local
+    options:
+      max-size: "10m"
+      max-file: "3"
+  restart: always

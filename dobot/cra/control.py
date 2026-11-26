@@ -19,15 +19,21 @@ from dobot_sdk.core.connection import DobotConnection
 if __package__:
     from .feedback import disconnect, endpoint, positive_number
     from .model import JOINT_NAMES, resolve_model
+    from .ownership import ArmOwnership
 else:
     from feedback import disconnect, endpoint, positive_number
     from model import JOINT_NAMES, resolve_model
+    from ownership import ArmOwnership
 
 
 # CRA hardware manual V3.2, Appendix A, CR3A (degrees). The visualization
 # URDF rounds radians and is not used as a controller safety configuration.
 JOINT_LIMITS_DEG = ((-360, 360), (-360, 360), (-155, 155),
                     (-360, 360), (-360, 360), (-360, 360))
+# ServoJ follow parameters (SDK defaults). Field-tested on CR3A at a 20 ms period:
+# about 90 ms constant lag, 0.03 deg RMS tracking error after removing that lag.
+SERVO_AHEAD_TIME = 50.0
+SERVO_GAIN = 500.0
 
 
 class DashboardConnection(DobotConnection):
@@ -77,6 +83,7 @@ def parse_reply(reply, command):
 class RobotController:
     def __init__(self, feedback, config, connection_factory=DashboardConnection):
         self.feedback = feedback
+        self.ownership = ArmOwnership()
         settings = config.get("joint_move", {})
         self.connect_timeout = positive_number(settings.get("connect_timeout_s", 2), "joint_move.connect_timeout_s")
         self.receive_timeout = positive_number(settings.get("receive_timeout_s", 2), "joint_move.receive_timeout_s")
@@ -90,7 +97,7 @@ class RobotController:
         self._address = None
         self._status = {"dashboard_connected": False}
         self._requests = {card: {"last_request": None, "last_error": None}
-                          for card in ("joint_move",)}
+                          for card in ("joint_move", "teach")}
 
     def snapshot(self, card="joint_move"):
         import copy
@@ -123,6 +130,8 @@ class RobotController:
         address, port = endpoint(address, port)
         with self._command_lock:
             if (address, port) != (self.feedback.address, self.feedback.port):
+                if self.ownership.owner is not None:
+                    raise RuntimeError("stop the active arm operation before changing its address or feedback port")
                 self._close()
                 for card in self._requests:
                     self._update(card, last_request=None, last_error=None)
@@ -145,7 +154,9 @@ class RobotController:
         if (state["robot_mode"] not in allowed_modes or state["running_status"] or
                 state["jog_status"] or state["drag_status"] or any(state["brake_released"])):
             raise RuntimeError("robot must be stationary with locked brakes before preparing motion")
-        if action in ("move_j", "rel_joint_mov_j") and state["robot_mode"] not in (9, 11) and (
+        if action in ("move_j", "rel_joint_mov_j", "start_trajectory") and state["robot_mode"] == 10:
+            raise RuntimeError("stop the paused queue before preparing a new motion or recording")
+        if action in ("move_j", "rel_joint_mov_j", "start_trajectory") and state["robot_mode"] not in (9, 11) and (
                 state["pause_cmd_flag"] or (state["run_queued_cmd"] and not allow_own_queue)):
             raise RuntimeError("move_j requires an idle robot without a paused or running queue")
         return sample
@@ -197,7 +208,9 @@ class RobotController:
             raise RuntimeError("move_j requires an idle robot without a paused or running queue")
         return sample
 
-    def execute_motion(self, action, args, *, cancel=None):
+    def execute_motion(self, action, args, *, cancel=None, owner="joint_move", skin_applied=False):
+        if action not in ("stop_motion", "pause"):
+            self.ownership.check(owner)
         commands = {"move_j": "MovJ", "rel_joint_mov_j": "RelJointMovJ", "stop_motion": "Stop", "pause": "Pause", "resume": "Continue"}
         if action not in commands:
             raise ValueError(f"unsupported joint motion action: {action}")
@@ -209,6 +222,8 @@ class RobotController:
             if type(detect_collision) is not bool:
                 raise ValueError("detect_collision must be a boolean true or false")
             requested["detect_collision"] = detect_collision
+            # Only the teach card sets this: it has just applied the same skin setting in this play.
+            requested["skin_applied"] = bool(skin_applied)
         if action in ("move_j", "rel_joint_mov_j"):
             values = []
             provided = 0
@@ -246,6 +261,103 @@ class RobotController:
         return self._execute(action, commands[action], check_state, card="joint_move",
                              parameters=parameters, options=options, requested=requested)
 
+    def _connect(self, address):
+        if self._connection is None or self._address != address:
+            self._close()
+            self._address = address
+            self._connection = self._factory(address, 29999)
+            self._connection.set_timeout(self.connect_timeout, self.receive_timeout)
+            self._connection.connect()
+            self._api = RobotControl(self._connection)
+            self._motion_api = Motion(self._connection)
+            self._update(dashboard_connected=True)
+
+    def prepare_record(self, *, cancel=None):
+        """ClearError/EnableRobot and safe skin off (dragging the arm would trigger it);
+        start_drag follows once recording is subscribed."""
+        self.ownership.check("teach")
+
+        def check(current_action, *, allow_own_queue=False):
+            if cancel is not None and cancel.is_set():
+                raise RuntimeError("teaching interrupted")
+            return self._check_preparation_state(current_action, allow_own_queue=allow_own_queue)
+
+        return self._execute("start_trajectory", None, check, card="teach",
+                             requested={"detect_collision": False})
+
+    def _immediate(self, command, cancel=None, *, require_idle):
+        """One immediate Dashboard command, serialized with every other command.
+        A cancelled request is dropped under the command lock, so it cannot follow a later stop."""
+        self.ownership.check("teach")
+        with self._command_lock:
+            if cancel is not None and cancel.is_set():
+                raise RuntimeError("teaching interrupted")
+            if not self.feedback.address:
+                raise RuntimeError("configure the controller IP before sending commands")
+            if require_idle:
+                address = self._check_motion_state("move_j")["controller_ip"]
+            else:
+                address = self.feedback.address
+            request = {"action": command, "timestamp_ms": int(time.time() * 1000), "controller_ip": address,
+                       "read_only": False, "effect_verified": False}
+            try:
+                self._connect(address)
+                reply = getattr(self._api, command)()
+                parse_response(reply, command)
+                self._update("teach", last_request={**request, "state": "accepted", "response": reply},
+                             last_error=None)
+            except Exception as exc:
+                exc.dobot_command_attempted = command
+                self._update("teach", last_request={**request, "state": "failed_or_outcome_unknown",
+                                                    "error": str(exc)}, last_error=str(exc))
+                self._close()
+                raise
+
+    def start_drag(self, cancel):
+        """Enter drag from rest (enabled, mode 5, no alarm); the effect is read from feedback."""
+        self._immediate("StartDrag", cancel, require_idle=True)
+
+    def stop_drag(self):
+        """Leave drag; callers send this only while fresh feedback shows the drag we started."""
+        self._immediate("StopDrag", require_idle=False)
+
+    def prepare_playback(self, start_joints, args, *, cancel=None, skin_applied=False):
+        """Same preparation as move_j (ClearError, enable, skin, ClearError), then
+        confirm the arm is at the trajectory start. Sends no motion."""
+        self.ownership.check("teach")
+        if args.get("confirm_move") is not True:
+            raise ValueError("confirm_move=true is required")
+        skin = args.get("detect_collision", False)
+        if type(skin) is not bool:
+            raise ValueError("detect_collision must be a boolean")
+
+        def check(action, *, allow_own_queue=False):
+            if cancel is not None and cancel.is_set():
+                raise RuntimeError("teaching interrupted")
+            return self._check_preparation_state(action, allow_own_queue=allow_own_queue)
+
+        return self._execute("move_j", "ServoJ", check, card="teach",
+                             requested={"detect_collision": skin, "expected_start": list(start_joints),
+                                        "start_tolerance_deg": args.get("start_tolerance_deg", 0.5),
+                                        "skin_applied": skin_applied})
+
+    def servo_j(self, joints, period_s, cancel):
+        """One ServoJ follow target. Checked against cancel under the command lock,
+        so no target can be transmitted after a Stop that follows the cancellation."""
+        self.ownership.check("teach")
+        with self._command_lock:
+            if cancel.is_set():
+                raise RuntimeError("teaching interrupted")
+            try:
+                self._connect(self.feedback.address)
+                reply = self._motion_api.ServoJ(list(joints), t=period_s, aheadtime=SERVO_AHEAD_TIME, gain=SERVO_GAIN)
+                return parse_reply(reply, "ServoJ")
+            except Exception as exc:
+                exc.dobot_command_attempted = "ServoJ"
+                self._update("teach", last_error=str(exc))
+                self._close()
+                raise
+
     @staticmethod
     def _absolute_target(sample, requested):
         current = sample["data"]["joint_state"]["q_actual"]
@@ -279,18 +391,10 @@ class RobotController:
                        "controller_ip": sample["controller_ip"], "read_only": False, "effect_verified": False}
             self._update(card, last_request={**request, "state": "sending"}, last_error=None)
             try:
-                if self._connection is None or self._address != sample["controller_ip"]:
-                    self._close()
-                    self._address = sample["controller_ip"]
-                    self._connection = self._factory(self._address, 29999)
-                    self._connection.set_timeout(self.connect_timeout, self.receive_timeout)
-                    self._connection.connect()
-                    self._api = RobotControl(self._connection)
-                    self._motion_api = Motion(self._connection)
-                    self._update(dashboard_connected=True)
+                self._connect(sample["controller_ip"])
                 # Connecting can take long enough for feedback/state to change.
                 check_state(action)
-                if action in ("move_j", "rel_joint_mov_j"):
+                if action in ("move_j", "rel_joint_mov_j", "start_trajectory"):
                     pre_enable_clear = self._api.ClearError()
                     parse_response(pre_enable_clear, "ClearError")
                     request["pre_enable_clear_error_response"] = pre_enable_clear
@@ -307,7 +411,8 @@ class RobotController:
                             if time.monotonic() >= deadline:
                                 raise TimeoutError("EnableRobot acknowledged but enabled feedback was not confirmed")
                             time.sleep(0.02)
-                if card == "joint_move" and action in ("move_j", "rel_joint_mov_j"):
+                skin_queue_id = None
+                if action in ("move_j", "rel_joint_mov_j", "start_trajectory") and not request.get("skin_applied"):
                     baseline = check_state(action).get("packets_received")
                     detect_collision = request["detect_collision"]
                     skin_reply = self._api.EnableSafeSkin(int(detect_collision))
@@ -323,7 +428,7 @@ class RobotController:
                             skin_queue_id = parse_reply(sensitivity_reply, "SetSafeSkin")
                             request["safe_skin_sensitivity_responses"].append(sensitivity_reply)
                             self._wait_preparation_queue(action, check_state, skin_queue_id, baseline)
-                if command in ("MovJ", "RelJointMovJ"):
+                if command in ("MovJ", "RelJointMovJ", "ServoJ"):
                     # Keep clear + state recheck + move serialized as one request.
                     # A failed/uncertain clear must never be followed by motion.
                     baseline = check_state(action).get("packets_received")
@@ -331,19 +436,23 @@ class RobotController:
                     parse_response(clear_reply, "ClearError")
                     request["clear_error_response"] = clear_reply
                     self._wait_preparation_queue(action, check_state, skin_queue_id, baseline)
-                if action in ("move_j", "rel_joint_mov_j"):
+                if action in ("move_j", "rel_joint_mov_j", "start_trajectory"):
                     # ACKs can precede the feedback packet reporting the effect.
                     # Wait for final motion conditions only after all preparation.
                     deadline = time.monotonic() + self.enable_timeout
                     while True:
                         check_state(action)
                         try:
-                            self._check_motion_state(action)
+                            self._check_motion_state("move_j" if action == "start_trajectory" else action)
                             break
                         except RuntimeError:
                             if time.monotonic() >= deadline:
                                 raise
                             time.sleep(0.02)
+                if command is None:
+                    request["state"] = "prepared"
+                    self._update(card, last_request=request)
+                    return request
                 if command in ("MovJ", "RelJointMovJ"):
                     final_sample = self._check_motion_state(action)
                     request["start_joint_angles_deg"] = list(final_sample["data"]["joint_state"]["q_actual"])
@@ -356,7 +465,17 @@ class RobotController:
                 if action == "resume":
                     paused_sample = self._check_motion_state(action)
                     request["resumed_command_id"] = paused_sample["data"].get("current_command_id")
+                if command == "ServoJ":
+                    current = self._check_motion_state("move_j")["data"]["joint_state"]["q_actual"]
+                    if max(abs(a - b) for a, b in zip(current, request["expected_start"])) > request["start_tolerance_deg"]:
+                        raise RuntimeError("robot is not at the trajectory start; play moves to the start first")
+                    # The ServoJ stream itself is sent by the teach card, target by target.
+                    request["state"] = "prepared"
+                    self._update(card, last_request=request)
+                    return request
+                request["submission_baseline"] = self.feedback.snapshot().get("packets_received")
                 api = self._motion_api if command in ("MovJ", "RelJointMovJ") else self._api
+                request["command_attempted"] = command
                 reply = getattr(api, command)(*parameters, **(options or {}))
                 queue_id = parse_reply(reply, command)
                 request.update(state="submitted" if queue_id is not None else "accepted_unverified",
@@ -364,6 +483,7 @@ class RobotController:
                 self._update(card, last_request=request)
                 return request
             except Exception as exc:
+                exc.dobot_command_attempted = request.get("command_attempted")
                 # A timeout may happen after transmission; never replay the write.
                 request.update(state="rejected" if isinstance(exc, CommandRejected) else "failed_or_outcome_unknown", error=str(exc))
                 self._update(card, last_request=request, last_error=str(exc))

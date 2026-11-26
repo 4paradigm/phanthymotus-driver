@@ -1,0 +1,4 @@
+Upstream: https://github.com/gregkh/linux/blob/v5.15.148/drivers/net/can/usb/gs_usb.c
+Revision: v5.15.148
+SHA256: d1ee028fd35e29f1c120577f62d1c3d670731b3b5104f4107278d061a7e5ac06
+License: GPL-2.0-only (the module is kept separate from the Apache-2.0 driver code)

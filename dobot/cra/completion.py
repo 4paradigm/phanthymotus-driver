@@ -16,8 +16,9 @@ else:
 
 
 class MotionCompletion:
-    def __init__(self, control, config, notify=None):
+    def __init__(self, control, config, notify=None, tool_name="joint_move"):
         self.control = control
+        self.tool_name = tool_name
         settings = config.get("joint_move", {})
         self.timeout = positive_number(settings.get("motion_timeout_s", 300), "joint_move.motion_timeout_s")
         self.tolerance = positive_number(settings.get("target_tolerance_deg", 0.5), "joint_move.target_tolerance_deg")
@@ -38,7 +39,7 @@ class MotionCompletion:
             raise RuntimeError("AGENT_CORE_CA_CERT is required for motion completion callbacks")
         return ssl.create_default_context(cafile=ca)
 
-    def start(self, action, args):
+    def start(self, action, args, *, tool_name=None):
         if args.get("confirm_move") is not True:
             raise ValueError("confirm_move=true is required for each motion request")
         # Fail before transmitting motion when callback TLS is not configured.
@@ -52,13 +53,15 @@ class MotionCompletion:
             # Explicit Stop must remain available even with broken callback TLS.
             context = None
         with self._lock:
+            if self._active is not None and action not in ("pause", "stop_motion"):
+                raise RuntimeError("another joint_move action is active")
+            lease = self.control.ownership.acquire(self.tool_name)
             interrupting = self._active is not None
             if self._active is not None:
-                if action not in ("pause", "stop_motion"):
-                    raise RuntimeError("another joint_move action is active")
                 self._active["cancel"].set()
             action_id = f"dobot_cra_{action}_{uuid4().hex}"
-            active = {"action_id": action_id, "cancel": threading.Event(), "interrupting": interrupting}
+            active = {"action_id": action_id, "cancel": threading.Event(), "interrupting": interrupting,
+                      "lease": lease, "tool": tool_name or self.tool_name}
             self._active = active
             self._jobs[action_id] = active
             thread = threading.Thread(target=self._run, args=(active, action, dict(args), context), daemon=True)
@@ -68,6 +71,7 @@ class MotionCompletion:
             except Exception:
                 self._active = None
                 self._jobs.pop(action_id, None)
+                self.control.ownership.release(lease)
                 raise
         return {"state": "running", "action_id": action_id}
 
@@ -91,7 +95,7 @@ class MotionCompletion:
             response = self.control.execute_motion(action, args, cancel=active["cancel"])
             submitted = True
             sample = self.control.feedback.snapshot()
-            baseline = sample.get("packets_received")
+            baseline = response.get("submission_baseline", sample.get("packets_received"))
             target = response["target_joint_angles_deg"] if action in ("move_j", "rel_joint_mov_j") else self._last_target
             if action in ("move_j", "rel_joint_mov_j"):
                 self._last_target = target
@@ -122,6 +126,8 @@ class MotionCompletion:
                     status, result = "cancelled", {"reason": "motion interrupted"}
                 if self._active is active:
                     self._active = None
+                if not (action == "pause" and status == "completed"):
+                    self.control.ownership.release(active["lease"])
             try:
                 self._complete(active["action_id"], status, result, context)
             finally:
@@ -210,7 +216,7 @@ class MotionCompletion:
         if context is None:
             raise RuntimeError("AGENT_CORE_CA_CERT is required for completion callbacks")
         payload = {"action_id": action_id, "status": status, "result": result,
-                   "tool": "joint_move", "ts": time.time()}
+                   "tool": self._jobs.get(action_id, {}).get("tool", self.tool_name), "ts": time.time()}
         url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
         request = Request(url + "/api/acp/complete", data=json.dumps(payload).encode(),
                           headers={"Content-Type": "application/json"}, method="POST")

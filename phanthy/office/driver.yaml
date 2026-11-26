@@ -1,0 +1,13 @@
+id: phanthy-office-driver
+name: Phanthy Office
+category: driver
+hardware_provider: phanthy
+hardware_model: "office"
+image_name: phanthy-office
+port: 15750
+mcp_url: "http://localhost:15750/mcp"
+description: "办公室场景：前台访客贴打印 — 通过 SSH 操作前台 Windows 电脑：查询当天未入场访客，并用访客系统网页打印访客贴"
+build_context_extras:
+  - ../../common
+cards:
+  - { name: visitor_badge, type: actuator }

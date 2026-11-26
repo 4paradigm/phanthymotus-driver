@@ -1,0 +1,29 @@
+#!/bin/sh
+# The service already supplies RT priority and memlock to the unprivileged client.
+set -eu
+port=${FR3_VENDOR_ARM_PORT:-}
+case "$port" in 50051|50052) ;; *) exit 1 ;; esac
+if [ "$#" -eq 3 ] && [ "$1" = lsof ] && [ "$2" = -t ] && [ "$3" = "-i:$port" ]; then
+    exec lsof -t "-i:$port"
+fi
+if [ "$#" -eq 4 ] && [ "$1" = env ] &&
+   [ "$2" = '"PATH=$PATH"' ] && [ "$3" = "$FR3_VENDOR_CLIENT" ]; then
+    exec "$3" "$4"
+fi
+if [ "$#" -eq 2 ] && [ "$1" = echo ] && [ "$2" = '"Acquired sudo."' ]; then
+    echo 'Using realtime permissions inherited from systemd.'
+    exit 0
+fi
+if [ "$#" -eq 9 ] && [ "$1" = -s ] && [ "$2" = env ] &&
+   [ "$3" = '"PATH=$PATH"' ] && [ "$4" = "$FR3_VENDOR_SERVER" ] &&
+   [ "$5" = -s ] && [ "$6" = 0.0.0.0 ] && [ "$7" = -p ] &&
+   [ "$8" = "$port" ] && [ "$9" = -r ]; then
+    exec "$4" -s 127.0.0.1 -p "$port" -r
+fi
+if [ "$#" -eq 3 ] && [ "$1" = bash ] && [ "$2" = -c ] &&
+   [ "$3" = "lsof -t -i:$port | xargs -r kill -9" ]; then
+    # systemd owns cleanup and signals the entire dedicated cgroup.
+    exit 0
+fi
+printf '%s\n' 'Unexpected privileged vendor request; stopping' >&2
+exit 1

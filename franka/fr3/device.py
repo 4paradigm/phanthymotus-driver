@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 import json
 import logging
 import math
@@ -42,15 +43,15 @@ def _core_tls_context(url):
 
 
 class RosPublisher:
-    """One independently stoppable DDS publisher per canvas card."""
+    """Publish joint state without adding transient nodes to a ROS executor."""
 
     def __init__(self, ros2, topic, hz, callback):
         from rclpy.node import Node
         from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
         from std_msgs.msg import String
 
-        self._ros2 = ros2
         self._message = String
+        self._stop = threading.Event()
         qos = QoSProfile(
             depth=1, reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST, durability=DurabilityPolicy.VOLATILE,
@@ -58,12 +59,17 @@ class RosPublisher:
         self._node = Node("franka_" + topic.strip("/").replace("/", "_"), context=ros2.ctx_core)
         try:
             self._publisher = self._node.create_publisher(String, topic, qos)
-            self._node.create_timer(1.0 / hz, callback)
-            ros2.executor_core.add_node(self._node)
+            self._thread = threading.Thread(target=self._run, args=(1.0 / hz, callback),
+                                            name="fr3-joint-publish", daemon=True)
+            self._thread.start()
         except Exception:
             self._node.destroy_node()
             self._node = None
             raise
+
+    def _run(self, period, callback):
+        while not self._stop.wait(period):
+            callback()
 
     def publish(self, payload):
         message = self._message()
@@ -71,12 +77,11 @@ class RosPublisher:
         self._publisher.publish(message)
 
     def close(self):
+        self._stop.set()
+        self._thread.join()
         node, self._node = self._node, None
         if node is not None:
-            try:
-                self._ros2.executor_core.remove_node(node)
-            finally:
-                node.destroy_node()
+            node.destroy_node()
 
 
 class _Instance:
@@ -247,7 +252,7 @@ class FrankaPlugin:
         return cfg
 
     def _info(self, instance_id, instance):
-        snapshot = instance.session.snapshot() if instance.session is not None else {}
+        snapshot = self._state_sample(instance.session) if instance.session is not None else {}
         connected = snapshot.get("connected", False)
         active = instance.publisher is not None
         state = "idle"
@@ -284,7 +289,7 @@ class FrankaPlugin:
                 return  # A queued timer from before stop/restart owns no stream.
             if instance.publisher is None or instance.session is None:
                 return
-            snapshot = instance.session.snapshot()
+            snapshot = self._state_sample(instance.session)
             if not snapshot.get("connected"):
                 return  # Never republish an old pose with a fresh timestamp.
             positions = snapshot.get("q", [])
@@ -299,18 +304,31 @@ class FrankaPlugin:
                     for i, position in enumerate(positions)
                 ],
             }
+            self._display_frame(instance, payload)
             instance.publisher.publish(payload)
             instance.publish_error = None
         except Exception as exc:
-            # Timer exceptions escape spin_once and stop the shared DDS
-            # executor. Keep a failed publisher local to its card and retry on
-            # the next tick; only log the outage transition, not every frame.
+            # Retry on the next tick. Log the outage transition once.
             error = f"State publication failed: {type(exc).__name__}: {str(exc)[:200]}"
             if instance.publish_error is None:
                 log.warning("%s", error.encode("unicode_escape").decode("ascii"))
             instance.publish_error = error
         finally:
             instance.lock.release()
+
+    def _state_sample(self, session):
+        return session.snapshot()
+
+    def _display_frame(self, instance, payload):
+        pass
+
+    def _open_state_session(self, cfg, instance_id):
+        if not cfg.get("robot_ip"):
+            raise ValueError("robot_ip is required; configure this card before starting")
+        return self._manager.acquire(cfg["robot_ip"], self._owner_key(instance_id))
+
+    def _close_state_session(self, key, instance, session):
+        self._manager.release(instance.config["robot_ip"], self._owner_key(key))
 
     def _stop_instance(self, key, instance):
         publisher, instance.publisher = instance.publisher, None
@@ -321,7 +339,7 @@ class FrankaPlugin:
                 publisher.close()
         finally:
             if session is not None:
-                self._manager.release(instance.config["robot_ip"], self._owner_key(key))
+                self._close_state_session(key, instance, session)
 
     def _start_cancelled(self, instance, epoch):
         with self._lock:
@@ -379,9 +397,7 @@ class FrankaPlugin:
                 instance.selection = {**selection, **{k: v for k, v in cfg.items() if k != "robot_ip"}}
                 instance.config = cfg
                 if action == "start" and instance.session is None:
-                    if not cfg.get("robot_ip"):
-                        raise ValueError("robot_ip is required; configure this card before starting")
-                    instance.session = self._manager.acquire(cfg["robot_ip"], self._owner_key(instance_id))
+                    instance.session = self._open_state_session(cfg, instance_id)
                     try:
                         if self._start_cancelled(instance, epoch):
                             self._stop_instance(instance_id, instance)
@@ -406,6 +422,83 @@ class FrankaPlugin:
         return None
 
 
+class PnpJointStatesPlugin(FrankaPlugin):
+    CONFIG_FIELDS = ("arm",)
+
+    def __init__(self, config, namespace, ros2, controller_configuration):
+        from franka.fr3.joint_monitor import JointStreams, display_quaternion
+
+        self.joint_streams = JointStreams()
+        super().__init__(config, namespace, ros2, manager=SessionManager(joint_streams=self.joint_streams))
+
+        self._controller_configuration = controller_configuration
+        self._orientation = {side: display_quaternion(up) for side, up in
+                             config.get("joint_states", {}).get("display_up_base", {}).items()}
+
+    def get_tools(self):
+        definition = tool(self.PREFIX, "sensor", "Read actual FR3 joint state from the PNP controller.",
+                          topic_out=[{"format": JOINT_FORMAT}])
+        definition["multiInstance"] = True
+        definition["configSchema"] = {
+            "type": "object", "required": ["arm"], "properties": {
+                "arm": {"type": "string", "title": "Arm", "scope": "instance",
+                        "enum": ["left", "right"], "enumNames": ["Left", "Right"]},
+            },
+        }
+        return [definition, tool("model", "resource", "Franka FR3 seven-joint URDF")]
+
+    @staticmethod
+    def _validate(cfg):
+        arm = cfg.get("arm")
+        if arm is not None and arm not in ("left", "right"):
+            raise ValueError("Select left or right arm")
+        return {"arm": arm, "publish_hz": 10.}
+
+    def _open_state_session(self, cfg, instance_id):
+        side = cfg.get("arm")
+        if side is None:
+            raise ValueError("Select left or right arm before starting")
+        host, addresses, username, password = self._controller_configuration.snapshot()
+        return self.joint_streams.open(host, username, password, side, addresses[side])
+
+    def _close_state_session(self, key, instance, session):
+        self.joint_streams.close(session)
+
+    def _state_sample(self, session):
+        local = self._manager.read_active_state(session.address)
+        return local if local.get("connected") else session.snapshot()
+
+    def dispatch(self, action, args):
+        if (action == "config" and args.get("_tool_name") == self.PREFIX
+                and args.get("instance_id") and args.get("arm") in ("left", "right")):
+            existing = self._get_instance(args["instance_id"])
+            with existing.lock:
+                if existing.session is not None and existing.config.get("arm") != args["arm"]:
+                    super().dispatch("stop", args)
+            result = super().dispatch(action, args)
+            if result.get("state") == "idle":
+                try:
+                    self._controller_configuration.snapshot()
+                except RuntimeError:
+                    return result
+                return super().dispatch("start", args)
+            return result
+        return super().dispatch(action, args)
+
+    def _display_frame(self, instance, payload):
+        orientation = self._orientation.get(instance.config["arm"])
+        if orientation is not None:
+            payload["imu_quat"] = orientation
+
+    def _info(self, instance_id, instance):
+        state = super()._info(instance_id, instance)
+        state.pop("robot_ip")
+        state["arm"] = instance.config.get("arm")
+        if instance.publisher is None:
+            state["message"] = "Select an arm and start this card"
+        return state
+
+
 class JointControlPlugin(FrankaPlugin):
     """Discrete joint targets; the shared session owns hardware arbitration."""
 
@@ -416,7 +509,7 @@ class JointControlPlugin(FrankaPlugin):
     READY_TIMEOUT = 5.0
     CONFIG_FIELDS = FrankaPlugin.CONFIG_FIELDS + ("speed_deg_s",)
 
-    def __init__(self, *args, acp_callback=None, **kwargs):
+    def __init__(self, *args, acp_callback=None, controller_configuration=None, **kwargs):
         super().__init__(*args, **kwargs)
         self._acp_callback = acp_callback or self._post_completion
         config = args[0] if args else kwargs.get("config", {})
@@ -426,6 +519,45 @@ class JointControlPlugin(FrankaPlugin):
         self._enabled = True
         self._execution_epoch = 0
         self._stopping = False
+        self._endpoint_lock = threading.RLock()
+        self._controller_configuration = controller_configuration
+        self._arm_ip_peer = None
+
+    def _apply_arm_ip_mapping(self, addresses):
+        from franka.fr3.arm_ips import mapping
+        addresses = mapping(addresses)
+        if addresses == self._arm_ips:
+            return
+        if not self._endpoint_lock.acquire(blocking=False):
+            raise RuntimeError("Card is busy; retry the arm IP update")
+        try:
+            if addresses == self._arm_ips:
+                return
+            with ExitStack() as stack:
+                if not self._lock.acquire(blocking=False):
+                    raise RuntimeError("Card state is busy; retry the arm IP update")
+                stack.callback(self._lock.release)
+                plugins = [self] + ([self._arm_ip_peer] if self._arm_ip_peer is not None else [])
+                for plugin in plugins:
+                    with plugin._manager._lock:
+                        sessions = [entry[0] for entry in plugin._manager._sessions.values()]
+                    for session in sessions:
+                        if session.motion().get("status") in ("submitted", "accepted", "queued", "running", "stopping"):
+                            raise RuntimeError("An arm or gripper action is active; arm IP update rejected")
+                        if session.snapshot().get("is_grasped"):
+                            raise RuntimeError("The gripper is holding an object; arm IP update rejected")
+                instances = list(self._instances.items())
+                for key, instance in instances:
+                    if not instance.lock.acquire(blocking=False):
+                        raise RuntimeError("A robot connection is busy; retry the arm IP update")
+                    stack.callback(instance.lock.release)
+                for key, instance in instances:
+                    self._stop_instance(key, instance)
+                self._arm_ips = dict(addresses)
+                # IP-keyed instances are recreated lazily on the next action.
+                self._instances.clear()
+        finally:
+            self._endpoint_lock.release()
 
     def start(self):
         # Motion connections are acquired lazily by explicit action requests.
@@ -496,6 +628,10 @@ class JointControlPlugin(FrankaPlugin):
                 self._stopping = False
 
     def dispatch(self, action, args):
+        with self._endpoint_lock:
+            return self._dispatch_card(action, args)
+
+    def _dispatch_card(self, action, args):
         if args.get("_tool_name", action) != self.PREFIX:
             return None
         if action == "Stop":
@@ -534,6 +670,12 @@ class JointControlPlugin(FrankaPlugin):
             self._number(args.get(speed_key), speed_key, 0.1, high)
         if action == "grasp":
             self._grasp_options(args)
+        if action in self.MOTION_ACTIONS and self._controller_configuration is not None:
+            try:
+                _, addresses, _, _ = self._controller_configuration.snapshot()
+                self._apply_arm_ip_mapping(addresses)
+            except RuntimeError as error:
+                return {"state": "error", "code": "CONTROLLER_CONFIGURATION_NOT_READY", "message": str(error)}
         address = self._target_ip(args)
         key = "robot_" + address.encode("ascii").hex()
         forwarded = {k: v for k, v in args.items()
@@ -830,12 +972,45 @@ class JointControlPlugin(FrankaPlugin):
             return {**self._info(instance_id, instance), "motion": motion}
 
 
-def build_plugins(config, namespace, ros2):
+def build_plugins(config, namespace, ros2, access_configured=None):
+    from franka.fr3.arm_ip_sync import ControllerConfiguration
     from franka.fr3.camera import ExtCameraPlugin
     from franka.fr3.gripper import GripperPlugin
-    sensor = FrankaPlugin(config, namespace, ros2)
+    from franka.fr3.pnp_remote_teleop import PnpRemoteTeleopPlugin
+    if access_configured is None:
+        from franka.fr3.arm_ip_sync import access_configured
+    if not access_configured():
+        # Without a trusted PNP controller nothing can verify which address is
+        # which arm, and every motion card would refuse to move. Run the cards
+        # addressed by an explicit robot IP instead — the setup before the
+        # shared controller configuration — rather than trusting the left/right
+        # IPs in config.yaml, which describe one installation. Visual
+        # pick-and-place plans on the controller, so it is not offered.
+        print("[fr3] no PNP controller host key in "
+              "/opt/phanthy-motus/franka-controller-access; joint cards take a robot IP, "
+              "visual pick-and-place and controller configuration are unavailable", flush=True)
+        standalone = {key: value for key, value in config.items() if key != "motion_arm_ips"}
+        sensor = FrankaPlugin(standalone, namespace, ros2)
+        controller = JointControlPlugin(standalone, namespace, ros2,
+            manager=sensor._manager, discovery=sensor._discovery)
+        gripper = GripperPlugin(standalone, namespace, ros2, discovery=sensor._discovery)
+        return [sensor, controller, gripper,
+                ExtCameraPlugin(config.get("ext_camera", {}), namespace, ros2),
+                PnpRemoteTeleopPlugin()]
+    from franka.fr3.pick_place import PickPlacePlugin
+    controller_configuration = ControllerConfiguration(config.get("motion_arm_ips", {}))
+    controller_configuration.start()
+    sensor = PnpJointStatesPlugin(config, namespace, ros2, controller_configuration)
     controller = JointControlPlugin(config, namespace, ros2,
-        manager=sensor._manager, discovery=sensor._discovery)
-    gripper = GripperPlugin(config, namespace, ros2, discovery=sensor._discovery)
-    return [sensor, controller, gripper,
-            ExtCameraPlugin(config.get("ext_camera", {}), namespace, ros2)]
+        manager=sensor._manager, discovery=sensor._discovery, controller_configuration=controller_configuration)
+    gripper = GripperPlugin(config, namespace, ros2, discovery=sensor._discovery,
+                           controller_configuration=controller_configuration)
+    controller._arm_ip_peer = gripper
+    gripper._arm_ip_peer = controller
+    camera = ExtCameraPlugin(config.get("ext_camera", {}), namespace, ros2)
+    pick = PickPlacePlugin(config, sensor._manager, camera, ros2, gripper_manager=gripper._manager,
+                           controller_configuration=controller_configuration, acquire_gripper=gripper.acquire_for_vision)
+
+    return [controller_configuration, sensor, controller, gripper, camera, pick,
+            PnpRemoteTeleopPlugin(controller_configuration=controller_configuration,
+                                 joint_streams=sensor.joint_streams)]

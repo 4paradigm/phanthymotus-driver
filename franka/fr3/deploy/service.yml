@@ -3,16 +3,24 @@ franka-fr3:
   image: __IMAGE__
   # FCI connects directly to the configured robot IPs; local DDS reaches Core.
   network_mode: host
+  extra_hosts:
+    - phanthy-motus:127.0.0.1
   volumes:
+    - /opt/phanthy-motus/franka-ip-sync:/opt/phanthy-motus/franka-ip-sync
+    - /opt/phanthy-motus/franka-controller-access:/opt/phanthy-motus/franka-controller-access:ro
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
     - /opt/phanthy-motus/data/certs/cert.pem:/opt/phanthy-motus/data/certs/cert.pem:ro
     - /dev:/dev:ro
+    - ${FRANKA_PNP_SSH_DIR:-/home/nvidia/.ssh/fr3-pnp}:/run/fr3-pnp-ssh:ro
+    - ${FRANKA_PNP_STATE_DIR:-/home/nvidia/fr3-pnp-state}:/var/lib/fr3-pnp:rw
   device_cgroup_rules:
     - "c 81:* rw"
     - "c 189:* rw"
   # FIFO permission is required in both enforce and explicit standard-kernel modes.
   cap_add:
     - SYS_NICE
+    - NET_ADMIN
+    - NET_RAW
   ulimits:
     rtprio: 99
     memlock: -1
@@ -21,6 +29,7 @@ franka-fr3:
   tmpfs:
     - /dev/shm:rw,nosuid,nodev,size=128m
   environment:
+    - FRANKA_ROBOT_INTERFACE=${FRANKA_ROBOT_INTERFACE:-}
     - FRANKA_REALTIME_POLICY=${FRANKA_REALTIME_POLICY:-standard}
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
@@ -28,7 +37,9 @@ franka-fr3:
     - ROS_LOCALHOST_ONLY=0
     - PYTHONUNBUFFERED=1
     - RCUTILS_COLORIZED_OUTPUT=0
-    - AGENT_CORE_URL=${FRANKA_AGENT_CORE_URL:-https://127.0.0.1:15678}
+    - AGENT_CORE_URL=${FRANKA_AGENT_CORE_URL:-https://phanthy-motus:15678}
+    - FRANKA_PNP_SSH_HOST=${FRANKA_PNP_SSH_HOST:-pnp@172.16.0.200}
+    - FRANKA_PNP_LEFT_SSH_HOST=${FRANKA_PNP_LEFT_SSH_HOST:-}
     - AGENT_CORE_CA_CERT=/opt/phanthy-motus/data/certs/cert.pem
   logging:
     driver: local

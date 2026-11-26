@@ -14,11 +14,13 @@ if __package__:
     from .model import JOINT_NAMES, model_resource, resolve_model
     from .control import JOINT_LIMITS_DEG, RobotController
     from .completion import MotionCompletion
+    from .teaching import Teaching
 else:
     from feedback import FeedbackClient, positive_number
     from model import JOINT_NAMES, model_resource, resolve_model
     from control import JOINT_LIMITS_DEG, RobotController
     from completion import MotionCompletion
+    from teaching import Teaching
 
 
 CARD_DESCRIPTIONS = {
@@ -33,6 +35,7 @@ class DobotSensors:
         self.client = client if client is not None else FeedbackClient(config)
         self.control = controller if controller is not None else RobotController(self.client, config)
         self.completion = MotionCompletion(self.control, config)
+        self.teach = Teaching(self.control, config)
         self._hz = positive_number(config.get("publish_hz", 30), "publish_hz")
         if self._hz > 125:
             raise ValueError("publish_hz must not exceed the 125 Hz feedback rate")
@@ -97,6 +100,7 @@ class DobotSensors:
         motion_tool = tool("joint_move", "actuator", "CR3A 绝对/相对关节角度运动、停止、暂停与继续；角度单位为度", motion_schema)
         motion_tool["configSchema"] = definitions[0]["configSchema"]
         definitions.append(motion_tool)
+        definitions.append(self.teach.definition(definitions[0]["configSchema"]))
         definitions.append(tool("model", "resource", "六轴 CR3A 直角连杆骨架 URDF，附加连接全部为固定关节"))
         return definitions
 
@@ -131,6 +135,7 @@ class DobotSensors:
             self.client.start()
 
     def stop(self):
+        self.teach.shutdown()
         self.completion.shutdown()
         with self._lifecycle:
             node, self._node = self._node, None
@@ -190,16 +195,28 @@ class DobotSensors:
             # Core calls info for descriptions and topic discovery. Keep live
             # state exclusively in ROS outputs.
             return next((definition for definition in self.get_tools() if definition["name"] == name), None)
-        if name == "joint_move":
+        if name in ("joint_move", "teach"):
             if action in ("config", "start") and any(key in args for key in ("controller_ip", "feedback_port")):
                 self.control.reconfigure(args.get("controller_ip", self.client.address),
                                          args.get("feedback_port", self.client.port))
             if action in ("start", "stop", "config"):
                 if action == "stop":
+                    if name == "teach":
+                        self.teach.shutdown()
+                    if self.control.ownership.owner is not None:
+                        raise RuntimeError("stop the active arm operation before closing the shared command connection")
                     self.control.close()
                 elif action == "start":
                     self.client.start()
                 return {"state": {"start": "ready", "stop": "idle", "config": "configured"}[action]}
+            if action in ("pause", "resume", "stop_motion"):
+                # A Stop from either card reaches the current owner; it must not
+                # leave the other worker running or capable of submitting later.
+                owner = self.control.ownership.owner
+                worker = self.teach if owner == "teach" or (owner is None and name == "teach") else self.completion
+                return worker.start(action, args, tool_name=name)
+            if name == "teach":
+                return self.teach.dispatch(action, args)
             if action in ("move_j", "rel_joint_mov_j", "resume", "pause", "stop_motion"):
                 return self.completion.start(action, args)
             return self.control.execute_motion(action, args)

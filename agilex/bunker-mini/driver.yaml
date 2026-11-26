@@ -1,0 +1,18 @@
+id: agilex-bunker-mini-driver
+name: AgileX Bunker Mini Driver
+category: driver
+hardware_provider: agilex
+hardware_model: bunker-mini
+image_name: agilex-bunker-mini
+port: 15744
+mcp_url: "http://localhost:15744/mcp"
+description: "AgileX Bunker Mini v2 differential mobile base over USB SocketCAN."
+build_context_extras:
+  - ../../common
+cards:
+  - { name: motor_state, type: sensor }
+  - { name: battery, type: sensor }
+  - { name: remote_controller, type: sensor }
+  - { name: odom, type: sensor }
+  - { name: base_drive, type: actuator }
+  - { name: bunker_servo, type: actuator }

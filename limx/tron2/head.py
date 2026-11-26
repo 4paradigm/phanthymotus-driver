@@ -37,12 +37,12 @@ def arguments(args):
 
 def tool():
     return {'name':'move_head','type':'actuator','multiInstance':False,
-        'description':'转到指定头部角度（相对零位），到位后通知完成。',
+        'description':'Move the head to angles relative to its neutral position and report completion on arrival.',
         'inputSchema':{'type':'object','additionalProperties':False,
             'properties':{
-                'pitch_deg':{'type':'number','minimum':CARD_DEG_LIMITS[0][0],'maximum':CARD_DEG_LIMITS[0][1],'title':'俯仰角度（°）','description':'上正下负；-60～45°'},
-                'yaw_deg':{'type':'number','minimum':CARD_DEG_LIMITS[1][0],'maximum':CARD_DEG_LIMITS[1][1],'title':'左右角度（°）','description':'自身左正右负；-88～88°'},
-                'time':{'type':'number','minimum':0.1,'maximum':60,'default':5,'title':'运动时间（秒）'}},
+                'pitch_deg':{'type':'number','minimum':CARD_DEG_LIMITS[0][0],'maximum':CARD_DEG_LIMITS[0][1],'title':'Pitch (deg)','description':'Positive is up. Range: -60 to 45 degrees.'},
+                'yaw_deg':{'type':'number','minimum':CARD_DEG_LIMITS[1][0],'maximum':CARD_DEG_LIMITS[1][1],'title':'Yaw (deg)','description':'Positive is to the robot left. Range: -88 to 88 degrees.'},
+                'time':{'type':'number','minimum':0.1,'maximum':60,'default':5,'title':'Duration (s)'}},
             'required':['pitch_deg','yaw_deg'],
             'x-resource':['head','arm_l','arm_r'],
             # No action filter: calls without an action still register ACP.
