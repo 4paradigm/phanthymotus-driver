@@ -15,20 +15,22 @@ from urllib.request import Request, urlopen
 from common.vendor_runtime import tool
 
 PARAMS = {"info": [], "start": [], "stop": [], "status": [], "list_maps": [],
-          "load_map": ["map_name"], "start_mapping": ["map_name"], "stop_mapping": [],
+          "load_map": ["map_name", "confirm"], "start_mapping": ["map_name", "confirm"], "stop_mapping": ["confirm"],
           "tag_place": ["name", "description"], "list_tags": [], "untag_place": ["name"],
-          "navigate_to_tag": ["tag_name"], "navigate_to_pose": ["x", "y", "yaw"], "stop_nav": []}
+          "navigate_to_tag": ["tag_name", "confirm"], "navigate_to_pose": ["x", "y", "yaw", "confirm"], "stop_nav": []}
 
 
 def definition(topic):
     props = {k: {"type": "string"} for k in ("map_name", "name", "description", "tag_name")}
     props.update({k: {"type": "number"} for k in ("x", "y", "yaw")})
+    props["confirm"] = {"type": "boolean", "enum": [False, True], "default": False,
+                        "description": "确认本次建图、切换地图或底盘导航操作"}
     props["action"] = {"type": "string", "enum": list(PARAMS)}
     schema = {"type": "object", "properties": props, "required": ["action"],
               "x-action-params": {k: {"params": p, "required": [i for i in p if i != "description"]}
                                   for k, p in PARAMS.items()},
               "x-completion": {"actions": ["navigate_to_tag", "navigate_to_pose"], "timeout": 300},
-              "x-resource": "base", "x-hooks": {"on_interrupt_motion": {"action": "stop_nav"},
+              "x-is-dangerous": True, "x-resource": "base", "x-hooks": {"on_interrupt_motion": {"action": "stop_nav"},
                                                 "on_interrupt_all": {"action": "stop_nav"}}}
     return tool("controlled_spatial", "actuator", "手动建图、加载地图、记录当前位置，按标签或地图坐标导航。"
                 "status 查询导航结果，stop_nav 取消当前导航。", schema, topic_out=[topic])
@@ -88,6 +90,8 @@ class ControlledSpatial:
             "SELECT name, description, x, y, yaw FROM tags WHERE map=? ORDER BY name", (name,))]
 
     def execute(self, action, args, sensor):
+        if "confirm" in PARAMS.get(action, ()) and args.get("confirm") is not True:
+            raise ValueError(f"{action} requires confirm=true")
         current = sensor.payload()
         active = current["map_name"]
         if action == "list_maps":

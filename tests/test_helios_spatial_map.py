@@ -174,16 +174,36 @@ def vmr_sensor(tmp_path):
         sensor.stop()
 
 
-def test_vmr_map_commands(vmr_sensor):
-    sensor = vmr_sensor
-    sensor._launch()
-    wait_for(lambda: sensor.payload()["state"] == "online")
+def test_controlled_map_commands(vmr_sensor):
+    bundle = DriverBundle([vmr_sensor])
+
+    def control(action, **args):
+        return bundle.dispatch("controlled_spatial", {"action": action, **args})
+
+    control("start")
+    wait_for(lambda: vmr_sensor.payload()["state"] == "online")
     with pytest.raises(ValueError, match="already in use"):
-        sensor.command("start_mapping", map_name="lab")
-    assert sensor.command("start_mapping", map_name="lab2")["state"] == "mapping"
-    assert sensor.command("stop_mapping", map_name="lab2")["state"] == "mapping_stopped"
-    assert sensor.command("list_maps")["maps"] == ["lab", "lab2"]
-    assert sensor.command("load_map", map_name="lab2")["state"] == "map_loaded"
+        control("start_mapping", map_name="lab", confirm=True)
+    assert control("start_mapping", map_name="lab2", confirm=True)["state"] == "mapping"
+    assert control("stop_mapping", confirm=True)["state"] == "mapping_stopped"
+    assert control("list_maps")["maps"] == ["lab", "lab2"]
+    assert control("load_map", map_name="lab2", confirm=True)["state"] == "map_loaded"
+
+
+def test_chassis_mode_changes_and_navigation_require_explicit_confirmation(vmr_sensor):
+    bundle = DriverBundle([vmr_sensor])
+    schema = bundle.dispatch("controlled_spatial", {"action": "info"})["inputSchema"]
+    assert schema["x-is-dangerous"] is True
+    assert schema["properties"]["confirm"]["type"] == "boolean"
+    vmr_sensor.command = Mock()
+    for action in ("start_mapping", "stop_mapping", "load_map", "navigate_to_tag", "navigate_to_pose"):
+        assert "confirm" in schema["x-action-params"][action]["required"]
+        for args in ({}, {"confirm": False}, {"confirm": "true"}, {"confirm": 1}):
+            with pytest.raises(ValueError, match="requires confirm=true"):
+                bundle.dispatch("controlled_spatial", {"action": action, **args})
+    vmr_sensor.command.assert_not_called()
+    bundle.dispatch("controlled_spatial", {"action": "stop_nav"})
+    vmr_sensor.command.assert_called_once_with("stop_nav")
 
 
 def test_canvas_navigation_reports_acp_outcome(vmr_sensor, acp_posts):
@@ -208,19 +228,19 @@ def test_canvas_navigation_reports_acp_outcome(vmr_sensor, acp_posts):
     bundle.dispatch("spatial_map", {"action": "stop"})
     wait_for(lambda: sensor.payload()["state"] == "online")
     control("tag_place", name="取件")
-    tag = control("navigate_to_tag", tag_name="取件")
+    tag = control("navigate_to_tag", confirm=True, tag_name="取件")
     assert tag["state"] == "navigating"
     with pytest.raises(ValueError, match="Navigation active"):
-        control("navigate_to_pose", x=1, y=0, yaw=0)
+        control("navigate_to_pose", confirm=True, x=1, y=0, yaw=0)
     assert control("stop_nav")["state"] == "cancel_requested"
     assert completion(tag, "cancelled")["code"] == 12
-    goal = control("navigate_to_pose", x=1, y=0, yaw=0)
+    goal = control("navigate_to_pose", confirm=True, x=1, y=0, yaw=0)
     assert goal["action_id"] != tag["action_id"]  # VMR reused id=4.
     assert completion(goal, "completed")["code"] == 0
-    failed = control("navigate_to_pose", x=3, y=0, yaw=0)
+    failed = control("navigate_to_pose", confirm=True, x=3, y=0, yaw=0)
     assert completion(failed, "error")["message"] == "no route"
     assert control("status")["navigation"]["action_id"] == failed["action_id"]
-    delayed = control("navigate_to_pose", x=4, y=0, yaw=0)
+    delayed = control("navigate_to_pose", confirm=True, x=4, y=0, yaw=0)
     assert control("stop")["state"] == "idle"
     completion(delayed, "cancelled")
     sensor._tick()
@@ -234,7 +254,7 @@ def test_stop_after_worker_exit_releases_card_and_reports_unknown_navigation(vmr
     bundle = DriverBundle([sensor])
     bundle.dispatch("controlled_spatial", {"action": "start"})
     wait_for(lambda: sensor.payload()["state"] == "online")
-    accepted = bundle.dispatch("controlled_spatial", {"action": "navigate_to_pose", "x": 2, "y": 0, "yaw": 0})
+    accepted = bundle.dispatch("controlled_spatial", {"action": "navigate_to_pose", "confirm": True, "x": 2, "y": 0, "yaw": 0})
     sensor._process.kill()
     sensor._process.wait(timeout=3)
     if tick_before_stop:

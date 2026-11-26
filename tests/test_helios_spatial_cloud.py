@@ -50,9 +50,9 @@ def test_tags_persist_in_map_frame_and_navigation_uses_current_map(tmp_path):
     controller.close()
     controller.open()
     assert not controller.tags("other")
-    controller.execute("navigate_to_tag", {"tag_name": "取件"}, sensor)
+    controller.execute("navigate_to_tag", {"tag_name": "取件", "confirm": True}, sensor)
     sensor.command.assert_called_once_with("navigate", map_name="lab", x=1., y=-2., yaw=.7)
     controller.selected = "other"
     with pytest.raises(ValueError, match="localization"):
-        controller.execute("navigate_to_tag", {"tag_name": "取件"}, sensor)
+        controller.execute("navigate_to_tag", {"tag_name": "取件", "confirm": True}, sensor)
     controller.close()
