@@ -48,7 +48,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Keep Pink/Pinocchio wheels isolated from system ROS/OpenCV NumPy.
 RUN python3 -m venv /opt/panther-pink && \
-    /opt/panther-pink/bin/pip install --no-cache-dir 'pin-pink==4.0.0' 'daqp'
+    /opt/panther-pink/bin/pip install --no-cache-dir --quiet \
+        --index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/simple/ --trusted-host mirrors.tuna.tsinghua.edu.cn \
+        'pin-pink==4.0.0' 'daqp'
 
 # ROS runtime dependencies deliberately come from Ubuntu/ROS apt packages.
 # nav-msgs is required for the /odom Odometry subscription; removing the
