@@ -31,6 +31,16 @@ agibot-a3:
     # and publishes converted media back to robot domain 232. The A3 process
     # then forwards those small samples to domain 42 through its child bridge.
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    # The A3 body link runs a FastDDS discovery server on the HDU and the MDU
+    # (fixed 10.42.10.10 / 10.42.10.12 on the robot subnet, dev guide §7).
+    # main.py's constrained profile disables the builtin transports (see
+    # _select_profile), so multicast discovery is unavailable by design and this
+    # unicast server is the only way to see the robot's nodes. Without it the
+    # driver registers over HTTP and looks healthy while every robot-domain topic
+    # stays silent — measured 2026-11-26 on the A3 Ultra: no camera, microphone
+    # or live joint samples until it was added. The deployed container on that
+    # robot carried the variable by hand; this fragment makes a fresh deploy match.
+    - ROS_DISCOVERY_SERVER=10.42.10.10:11811;10.42.10.12:11811
     - A3_JAZZY_RELAY=1
     # Subscribe all configured camera inputs at startup. The relay still bounds
     # memory/CPU with resize, JPEG quality and newest-frame replacement; relying

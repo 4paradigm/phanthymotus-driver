@@ -330,6 +330,19 @@ class ToolInventoryTests(unittest.TestCase):
         for module in sorted(path.name for path in DEVICE_DIR.glob("*.py")):
             self.assertIn(module, copies, f"{module} must be COPYed into the image")
 
+    def test_service_fragment_declares_discovery_server(self):
+        # Measured 2026-11-26: without ROS_DISCOVERY_SERVER the driver registers
+        # over HTTP and looks healthy while every robot-domain topic stays silent
+        # (no camera frames, no microphone, no live joints). The deployed
+        # container carried it by hand; the fragment must carry it for every A3.
+        fragment = yaml.safe_load(
+            (DEVICE_DIR / "deploy" / "service.yml").read_text(encoding="utf-8"))
+        env = fragment["agibot-a3"]["environment"]
+        entry = next((item for item in env
+                      if str(item).startswith("ROS_DISCOVERY_SERVER=")), None)
+        self.assertEqual(entry,
+                         "ROS_DISCOVERY_SERVER=10.42.10.10:11811;10.42.10.12:11811")
+
     def test_host_relay_uses_materialized_constrained_profile(self):
         script = (DEVICE_DIR / "jazzy_relay.sh").read_text(encoding="utf-8")
         self.assertIn("HOST_PROFILE=$ROOT/dds-profile.xml", script)
