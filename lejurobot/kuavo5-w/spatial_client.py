@@ -119,6 +119,15 @@ print(result.stdout, end='')
             raise RuntimeError('map_changed_during_identity_read')
         return before['mapId'], fingerprint + ':' + before['mapMd5']
 
+    def saved_map_identity(self, name):
+        value = self.native('map_identity', map_name=name, include_road_md5=True)
+        grid, road = value.get('sha256'), value.get('road_md5')
+        if any(not isinstance(v, str) or len(v) != size or
+               any(c not in '0123456789abcdef' for c in v)
+               for v, size in ((grid, 64), (road, 32))):
+            raise RuntimeError('saved_map_identity_unavailable')
+        return name, grid + ':' + road
+
     @staticmethod
     def _frame(raw):
         if not isinstance(raw, str) or len(raw) > 2_000_000:

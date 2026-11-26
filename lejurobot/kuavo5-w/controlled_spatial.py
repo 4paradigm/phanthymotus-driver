@@ -1440,13 +1440,15 @@ class ControlledSpatialPlugin:
             hold = self.client.native('soft_stop')
             if hold.get('software_estop') is not True or hold.get('stationary') is not True:
                 raise RuntimeError('post_restart_software_stop_unconfirmed')
-            self._load(mapping['name'], cancelled)
-            new_identity = self._identity()
+            # Saving a map never assumes the robot is at its starting anchor.
+            # Bind POIs to the saved files without loading or relocalizing.
+            new_identity = self.client.saved_map_identity(mapping['name'])
             self.store.bind_mapping((mapping['name'], mapping['token']), new_identity,
                                     mapping.get('start_pose'))
             self.store.state('mapping', None)
             return {'state': 'completed', 'map_name': new_identity[0], 'map_fingerprint': new_identity[1],
-                    'mapping_start_pose': mapping.get('start_pose')}
+                    'mapping_start_pose': mapping.get('start_pose'), 'map_loaded': False,
+                    'message': 'Map saved. Preview it with spatial_map. Use load_map separately when ready to localize.'}
         if action == 'load_map':
             if mapping:
                 raise RuntimeError('finish_or_reconcile_mapping_before_loading')

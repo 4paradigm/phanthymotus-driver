@@ -191,6 +191,9 @@ class Client:
     def map_identity(self):
         return self.identity
 
+    def saved_map_identity(self, name):
+        return name, 'grid-new:road-new'
+
     def maps(self):
         return self.grid_maps
 
@@ -639,11 +642,13 @@ class SpatialTests(unittest.TestCase):
         self.assertEqual(self.call('stop_mapping')['state'], 'executing')
         self.assertEqual(self.completed()[0], 'completed')
         self.assertIsNone(self.plugin.store.state('mapping'))
-        identity = self.client.identity
+        identity = ('new', 'grid-new:road-new')
         self.assertEqual(self.plugin.store.state(self.plugin.store.anchor_key(identity)),
                          {'x': 1., 'y': 2., 'yaw': .3})
-        self.assertEqual(self.call('list_tags')['tags'][0]['name'], 'entry')
-        self.assertEqual(self.client.commands[-1], ('ChangeMode', {'mode': 'AUTO'}))
+        self.assertEqual(self.plugin.store.tags(identity)[0]['name'], 'entry')
+        self.assertEqual(self.client.commands[-1], ('AgvSystemRestart', {}))
+        self.assertFalse(any(method in ('ChangeCartoMap','ChangeRoadMap') for method, _ in self.client.commands))
+        self.assertEqual(self.client.identity[0], 'factory')
         self.assertFalse(self.plugin.unresolved())
 
     def test_console_opened_during_start_is_authorized_only_for_that_completion(self):
@@ -894,7 +899,7 @@ class SpatialTests(unittest.TestCase):
         wait(lambda: bool(self.bundle.tracker.events), timeout=5)
         self.assertEqual(self.completed()[0], 'completed')
         self.assertFalse(any(m == 'SaveCartoMap' for m, _ in self.client.commands))
-        self.assertEqual(self.call('list_tags')['tags'][0]['name'], 'P1')
+        self.assertEqual(self.plugin.store.tags(('new', 'grid-new:road-new'))[0]['name'], 'P1')
         self.assertFalse(self.plugin.unresolved())
 
     def test_save_recovery_does_not_restart_on_partial_grid_files(self):

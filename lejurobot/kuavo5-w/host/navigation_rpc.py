@@ -675,7 +675,17 @@ def main(request):
                     if not chunk:
                         break
                     digest.update(chunk)
-        return {'sha256': digest.hexdigest()}
+        result = {'sha256': digest.hexdigest()}
+        if request.get('args', {}).get('include_road_md5') is True:
+            road = (root / (name + '.path')).resolve()
+            if road.parent != root or not 0 < road.stat().st_size <= 32_000_000:
+                raise RuntimeError('invalid_road_map_file')
+            road_digest = hashlib.md5(usedforsecurity=False)
+            with road.open('rb') as stream:
+                for chunk in iter(lambda: stream.read(65536), b''):
+                    road_digest.update(chunk)
+            result['road_md5'] = road_digest.hexdigest()
+        return result
     os.environ['ROS_MASTER_URI'] = request['master']
     os.environ['ROS_IP'] = request['ros_ip']
     os.environ.pop('ROS_HOSTNAME', None)
