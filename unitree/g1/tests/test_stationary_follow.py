@@ -107,7 +107,8 @@ class TestMotusFollow(unittest.TestCase):
         time.sleep(.15)
         plugin._shutdown.set()
         worker.join(1)
-        self.assertTrue(any(c[0] == "stop" for c in commands))
+        self.assertEqual(plugin.dispatch("info", {})["last_decision"]["reason"], "pose_timeout")
+        self.assertFalse(any(c[0] == "stop" for c in commands))
 
     def test_busy_base_never_receives_turn(self):
         calls = []

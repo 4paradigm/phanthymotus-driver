@@ -131,6 +131,7 @@ class StationaryFollowPlugin:
         self._publisher = None
         self._message_type = None
         self._worker = None
+        self._cleanup_in_progress = False
         self._shutdown = threading.Event()
         self._owned = False
         self._last_received = None
@@ -174,8 +175,9 @@ class StationaryFollowPlugin:
             if not topic:
                 return {"state": "error", "error": "请在画布连接 sensor/pose2d 输入"}
             with self._lock:
-                if self._node is not None:
-                    return {"state": "error", "error": "卡片已经启动"}
+                if (self._node is not None or self._cleanup_in_progress or
+                        self._worker is not None and self._worker.is_alive()):
+                    return {"state": "error", "error": "卡片已经启动或正在收尾"}
                 try:
                     from rclpy.node import Node
                     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
@@ -266,29 +268,42 @@ class StationaryFollowPlugin:
                             self._last_decision = self._controller.stop("motion_error")
                         decision = dict(self._last_decision)
                 elif self._owned:
-                    try:
-                        result = self._motion.stop(reason=decision.get("reason", "follow_stop"))
-                    except Exception as exc:
-                        result = {"error": str(exc)}
+                    # Every command has a 0.12 s deadline in TimedMotion. A second
+                    # synchronous stop RPC can block the safety process well past
+                    # Core's 5 s project-stop deadline after that command expires.
+                    # Suppress new commands; the existing one expires on its timer.
+                    result = {"status": "bounded_motion_expiry", "max_remaining_s": .12}
                     self._owned = False
             self._publish(decision, result)
 
     def _stop(self):
         with self._lock:
+            if self._cleanup_in_progress:
+                return {"state": "idle"}
+            self._cleanup_in_progress = True
             node, self._node = self._node, None
             self._shutdown.set()
             self._topic = ""
             self._last_decision = self._controller.stop()
-        worker, self._worker = self._worker, None
+            worker = self._worker
         if worker is not None and worker is not threading.current_thread():
-            worker.join(timeout=16)
-        with self._base_lock:
-            if self._owned and self._motion is not None:
-                self._motion.stop(reason="follow_stop")
+            worker.join(timeout=1)
+        def cleanup():
+            if worker is not None and worker.is_alive():
+                worker.join()
+            if node is not None:
+                self._executor.remove_node(node)
+                node.destroy_node()
+            with self._lock:
                 self._owned = False
-        if node is not None:
-            self._executor.remove_node(node)
-            node.destroy_node()
-        self._publisher = None
-        self._message_type = None
+                self._publisher = None
+                self._message_type = None
+                if self._worker is worker:
+                    self._worker = None
+                self._cleanup_in_progress = False
+        if worker is not None and worker.is_alive():
+            threading.Thread(target=cleanup, daemon=True,
+                             name="g1_stationary_follow_cleanup").start()
+        else:
+            cleanup()
         return {"state": "idle"}
