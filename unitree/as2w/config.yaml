@@ -1,6 +1,7 @@
 mcp_port: 15709
 robot_interface: auto
 ros_namespace: ""
+towing: {enabled: false, loop_hz: 20, publish_hz: 5, max_speed_mps: 0.5, min_speed_mps: 0.05, drag_warn_ratio: 0.25, drag_stop_ratio: 0.6, stuck_speed_eps_mps: 0.02, stuck_hold_ms: 800, detach_drop_ratio: 0.5, detach_accel_mps2: 0.8, slope_warn_deg: 8.0, freshness_timeout_ms: 300, loop_timeout_ms: 500, zero_frame_count: 5}
 plugins:
   loco: {enabled: true}
   # Continuous motus.control/1 twist input used by ActuCore navigation.

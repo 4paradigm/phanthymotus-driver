@@ -689,6 +689,7 @@ class LocoPlugin:
         self._controlled_spatial = None
         self._moving = False
         self._moving_owner = None
+        self._chassis_workers = 0
         self._state_override = None
         self._state_override_until = 0.0
         # Some AS2 firmware keeps reporting AI_FREE_WALK after both StopMove
@@ -707,6 +708,9 @@ class LocoPlugin:
         self._controlled_spatial = plugin
 
     def _other_chassis_owner(self):
+        channel = getattr(self, "_towing_channel", None)
+        if channel is not None and channel.owner:
+            return channel.owner
         if (self._special_motion is not None
                 and self._special_motion.is_running()):
             return "special_motion"
@@ -720,6 +724,29 @@ class LocoPlugin:
         with self._lock:
             return (self._moving or self._stop is not None
                     or self._transition_stop is not None)
+
+    def owns_speed_channel(self):
+        return bool(self._chassis_workers) or self.is_moving()
+
+    def _start_chassis_worker(self, target, args, name):
+        channel = getattr(self, "_towing_channel", None)
+        if channel is not None:
+            self._chassis_workers += 1
+
+        def run():
+            try:
+                target(*args)
+            finally:
+                if channel is not None:
+                    with self.motion_lock:
+                        self._chassis_workers -= 1
+
+        try:
+            threading.Thread(target=run, daemon=True, name=name).start()
+        except Exception:
+            if channel is not None:
+                self._chassis_workers -= 1
+            raise
 
     def _preempt_servo(self, reason):
         if self._servo is None:
@@ -1076,6 +1103,11 @@ class LocoPlugin:
     def _dispatch(self, action, args):
         if action in ("start", "info"): return {"state": "ready"}
         if action == "stop":
+            channel = getattr(self, "_towing_channel", None)
+            if channel is not None and channel.owner:
+                return {"ret": -1, "accepted": False, "action": action,
+                        "error": "Chassis is owned by another controller",
+                        "reason": f"{channel.owner} 正在占用底盘"}
             self._preempt_servo("loco.stop")
             self._cancel_transition()
             self._stop_continuous()
@@ -1208,9 +1240,8 @@ class LocoPlugin:
             action_id = f"as2w_loco_{uuid4().hex[:8]}"
             self._moving = True
             self._moving_owner = action_id
-            threading.Thread(target=self._stop_move_worker,
-                             args=(action_id, action_id), daemon=True,
-                             name="as2w-loco-stop-move").start()
+            self._start_chassis_worker(
+                self._stop_move_worker, (action_id, action_id), "as2w-loco-stop-move")
             return {"ret": 0, "accepted": True, "status": "stopping",
                     "action": action, "action_id": action_id,
                     **({"preempted_loco_servo": True}
@@ -1232,12 +1263,11 @@ class LocoPlugin:
             if action == "stand_down" and self._is_moving(state_name):
                 action_id = f"as2w_loco_{uuid4().hex[:8]}"
                 method, expected_name = methods[action]
-                threading.Thread(
-                    target=self._stop_then_posture,
-                    args=(action_id, action, method, expected_name, state_name),
-                    daemon=True,
-                    name="as2w-loco-stop-then-stand-down",
-                ).start()
+                self._start_chassis_worker(
+                    self._stop_then_posture,
+                    (action_id, action, method, expected_name, state_name),
+                    "as2w-loco-stop-then-stand-down",
+                )
                 return {"ret": 0, "accepted": True, "status": "running",
                         "action": action, "action_id": action_id,
                         "current_state": state_name,
@@ -1267,7 +1297,8 @@ class LocoPlugin:
                     "SportClient rejected the posture transition",
                     ["get_state", "stop_move", "stand_up", "recovery_stand"])
             action_id = f"as2w_loco_{uuid4().hex[:8]}"
-            threading.Thread(target=self._await_posture, args=(action_id, action, expected_name), daemon=True).start()
+            self._start_chassis_worker(
+                self._await_posture, (action_id, action, expected_name), "as2w-loco-await-posture")
             return {"ret": 0, "accepted": True, "status": "running", "action": action, "action_id": action_id}
         if action == "speed_level":
             preset = args.get("speed_preset", "normal")
@@ -1528,6 +1559,9 @@ class SpecialMotionPlugin:
         return self._motion_lock.locked() or active_posture
 
     def _other_chassis_owner(self):
+        channel = getattr(self, "_towing_channel", None)
+        if channel is not None and channel.owner:
+            return channel.owner
         if self._loco is not None and self._loco.is_moving():
             return "loco"
         if (self._controlled_spatial is not None
@@ -1728,8 +1762,16 @@ class SpecialMotionPlugin:
                 "error": "special motion requires boolean confirm=true",
             }
         if action in motions:
-            state_error = self._validate_motion_state(
-                action, bool(args.get("enter", True)))
+            channel = getattr(self, "_towing_channel", None)
+            if channel is not None:
+                with channel.lock:
+                    if channel.owner:
+                        return {"ret": -1, "accepted": False, "action": action,
+                                "error": "Chassis is owned by another controller",
+                                "reason": f"{channel.owner} 正在占用底盘"}
+                    state_error = self._validate_motion_state(action, bool(args.get("enter", True)))
+            else:
+                state_error = self._validate_motion_state(action, bool(args.get("enter", True)))
             if state_error is not None:
                 return state_error
             with self._chassis_lock:

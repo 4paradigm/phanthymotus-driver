@@ -7,6 +7,7 @@ import json
 import multiprocessing
 import threading
 import time
+from contextlib import nullcontext
 from uuid import uuid4
 
 def _install_logsafe():
@@ -140,6 +141,9 @@ class ControlledSpatialPlugin:
         self._special_motion = plugin
 
     def _other_chassis_owner(self):
+        channel = getattr(self, "_towing_channel", None)
+        if channel is not None and channel.owner:
+            return channel.owner
         loco = getattr(self, "_loco", None)
         special_motion = getattr(self, "_special_motion", None)
         if loco is not None and loco.is_moving():
@@ -183,18 +187,30 @@ class ControlledSpatialPlugin:
 
     def start(self): pass
     def stop(self):
-        with self._nav_lock:
-            action_id, self._nav_action_id = self._nav_action_id, None
-            self._navigation_active = False
-        if action_id:
-            self._client.call("pause_navigation", {})
-            _acp_notify(action_id, "cancelled", {"reason": "card stopped"})
+        channel = getattr(self, "_towing_channel", None)
+        with (channel.lock if channel is not None else nullcontext()):
+            self._stop_navigation(require_ack=channel is not None)
         if self._nav_sub is not None:
             try:
                 self._nav_sub.Close()
             except Exception:
                 pass
         self._client.stop()
+
+    def _stop_navigation(self, require_ack):
+        with self._nav_lock:
+            action_id, self._nav_action_id = self._nav_action_id, None
+            was_active = require_ack and self._navigation_active
+            if not require_ack:
+                self._navigation_active = False
+        needs_pause = was_active if require_ack else action_id is not None
+        if needs_pause:
+            pause = self._client.call("pause_navigation", {})
+            if require_ack and pause["code"] == 0:
+                with self._nav_lock:
+                    self._navigation_active = False
+        if action_id:
+            _acp_notify(action_id, "cancelled", {"reason": "card stopped"})
 
     def _on_slam_key_info(self, message):
         try:
@@ -210,18 +226,31 @@ class ControlledSpatialPlugin:
         with self._nav_lock:
             if self._nav_action_id != action_id:
                 return
+        channel = getattr(self, "_towing_channel", None)
+        settled = True
         if completed:
             result = self._nav_result or {}
             arrived = bool(result.get("data", {}).get("is_arrived", False))
             status = "completed" if arrived and result.get("errorCode", 0) == 0 else "error"
+            if channel is not None:
+                settled = status == "completed"
             _acp_notify(action_id, status, {"target": target, "response": result})
         else:
-            self._client.call("pause_navigation", {})
+            with (channel.lock if channel is not None else nullcontext()):
+                with self._nav_lock:
+                    if self._nav_action_id != action_id:
+                        return
+                    needs_pause = channel is None or self._navigation_active
+                if needs_pause:
+                    pause = self._client.call("pause_navigation", {})
+                    if channel is not None:
+                        settled = pause["code"] == 0
             _acp_notify(action_id, "error", {"target": target, "error": "navigation timed out after 180 seconds"})
         with self._nav_lock:
             if self._nav_action_id == action_id:
                 self._nav_action_id = None
-                self._navigation_active = False
+                if settled:
+                    self._navigation_active = False
 
     @staticmethod
     def _pose(args):
@@ -229,6 +258,19 @@ class ControlledSpatialPlugin:
             "x": 0, "y": 0, "z": 0, "q_x": 0, "q_y": 0, "q_z": 0, "q_w": 1}.items()}
 
     def dispatch(self, action, args):
+        channel = getattr(self, "_towing_channel", None)
+        if channel is not None and action in (
+                "navigate_to", "resume_navigation", "pause_navigation", "shutdown", "stop"):
+            # Keep admission and the vendor RPC serialized against a towing
+            # acquire, including the window before navigation is acknowledged.
+            with channel.lock:
+                if channel.owner and action in ("pause_navigation", "shutdown", "stop"):
+                    return {"ret": -1, "error": "Chassis is owned by another controller",
+                            "reason": f"{channel.owner} 正在占用底盘"}
+                return self._dispatch(action, args)
+        return self._dispatch(action, args)
+
+    def _dispatch(self, action, args):
         if action in ("start", "info"): return {"state": "ready"}
         if action == "stop":
             self.stop()
@@ -244,6 +286,8 @@ class ControlledSpatialPlugin:
         else: data = {}
         action_id = None
         previous = None
+        was_active = False
+        shared_chassis = getattr(self, "_towing_channel", None) is not None
         if action in ("navigate_to", "resume_navigation"):
             chassis_lock = getattr(self, "_chassis_lock", None)
             if chassis_lock is None:
@@ -257,6 +301,7 @@ class ControlledSpatialPlugin:
                 # Reserve vendor navigation before releasing the shared lock,
                 # so another controller cannot enter during the service RPC.
                 with self._nav_lock:
+                    was_active = shared_chassis and self._navigation_active
                     self._navigation_active = True
                     if action == "navigate_to":
                         previous = self._nav_action_id
@@ -274,16 +319,18 @@ class ControlledSpatialPlugin:
         try: response = json.loads(response) if isinstance(response, str) else response
         except json.JSONDecodeError: pass
         if result["code"] != 0:
-            if action in ("navigate_to", "resume_navigation"):
+            # The vendor can still be moving after a missing acknowledgement.
+            uncertain = shared_chassis and result["code"] == 3104
+            if action in ("navigate_to", "resume_navigation") and not uncertain:
                 with self._nav_lock:
                     if action == "resume_navigation":
-                        self._navigation_active = False
+                        self._navigation_active = was_active and shared_chassis
                     elif self._nav_action_id == action_id:
                         self._nav_action_id = None
-                        self._navigation_active = False
+                        self._navigation_active = was_active and shared_chassis
                         self._nav_done.clear()
             return {"ret": result["code"], "response": response}
-        if action == "pause_navigation" and result["code"] == 0:
+        if action == "pause_navigation" or (action == "shutdown" and shared_chassis):
             with self._nav_lock:
                 self._navigation_active = False
         elif action == "resume_navigation" and result["code"] == 0:

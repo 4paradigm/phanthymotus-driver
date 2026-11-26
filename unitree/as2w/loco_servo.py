@@ -385,6 +385,10 @@ class LocoServoPlugin:
                         "message": f"{name} must be a boolean"}
         with self._lock:
             enabling_live = args.get("dry_run") is False and self._dry_run
+            channel = getattr(self, "_towing_channel", None)
+            if enabling_live and channel is not None and channel.owner:
+                return {"ok": False, "code": "CHANNEL_BUSY",
+                        "message": f"{channel.owner} 正在占用底盘"}
             effective_gate = bool(args.get(
                 "require_standing", self._require_standing))
             if (enabling_live and self._running and not self._paused
@@ -413,6 +417,9 @@ class LocoServoPlugin:
                 "require_standing": self._require_standing}
 
     def _other_owner(self):
+        channel = getattr(self, "_towing_channel", None)
+        if channel is not None and channel.owner:
+            return channel.owner
         if (self._special_motion is not None
                 and self._special_motion.is_running()):
             return "special_motion"
@@ -420,6 +427,9 @@ class LocoServoPlugin:
                 and self._controlled_spatial.is_navigating()):
             return "controlled_spatial"
         return ""
+
+    def owns_speed_channel(self):
+        return self._running and not self._paused and not self._dry_run
 
     def _info(self):
         with self._lock:
@@ -518,6 +528,9 @@ class LocoServoPlugin:
         with self._lock:
             if not self._running or self._paused:
                 return
+            channel = getattr(self, "_towing_channel", None)
+            if channel is not None and channel.owner:
+                return
             vx, vy, wz = float(values[0]), float(values[1]), float(values[5])
             if self._rotate_only:
                 vx = vy = 0.0
@@ -549,6 +562,9 @@ class LocoServoPlugin:
 
     def _hold(self, *_args):
         with self._lock:
+            channel = getattr(self, "_towing_channel", None)
+            if channel is not None and channel.owner:
+                return
             # A paused policy no longer owns the chassis. Its watchdog or
             # shutdown must not stop a subsequent explicit loco movement.
             if self._loco is not None and self._loco.is_moving():

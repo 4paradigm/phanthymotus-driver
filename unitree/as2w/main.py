@@ -128,6 +128,7 @@ class Bundle:
         loco = None
         loco_servo = None
         special_motion = None
+        controlled_spatial = None
         if p.get("loco", {}).get("enabled", True):
             loco = LocoPlugin(p.get("loco", {}), namespace, executor, proxy)
             self.plugins.append(loco)
@@ -170,6 +171,10 @@ class Bundle:
                 controlled_spatial.attach_servo(loco_servo)
                 loco_servo.attach_controlled_spatial(controlled_spatial)
         if dds_ready and p.get("slam_mapping", {}).get("enabled", True): self.plugins.append(SlamMappingPlugin(p.get("slam_mapping", {}), namespace, executor))
+        if "towing" in cfg:
+            from towing import TowingPlugin
+            self.plugins.insert(0, TowingPlugin(
+                cfg, namespace, proxy, dds_ready, loco, loco_servo, special_motion, controlled_spatial))
     def start_all(self):
         for plugin in self.plugins: plugin.start()
     def stop_all(self):

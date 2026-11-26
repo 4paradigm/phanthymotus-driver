@@ -13,6 +13,7 @@ cards:
   - { name: model, type: resource }
   - { name: loco, type: actuator }
   - { name: loco_servo, type: actuator }
+  - { name: towing, type: actuator }
   - { name: special_motion, type: actuator }
   - { name: mic, type: sensor }
   - { name: speaker, type: actuator }
