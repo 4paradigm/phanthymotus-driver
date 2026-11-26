@@ -315,8 +315,8 @@ arrives for 1000ms, the action is cancelled and its heartbeat stops.
 IPC, local queue and SDK reply time consume the original receive budgets,
 never renew them. A detection older than 1200ms is never admitted, however
 many new packets reuse it. `control_interface.rate.watchdog_ms` reports 500 and
-`max_obs_age_ms` reports 1200 (admission). `max_feedback_gap_ms` declares a
-350ms maximum gap in received velocity feedback for Navi. Deploy Python and the native
+`max_obs_age_ms` reports 1200 (admission). Navi sets its velocity-feedback gap
+from its own configuration, which defaults to 300ms. Deploy Python and the native
 worker together; staged stopping requires the worker's advertised capability.
 Python uses the original monotonic receipt time for its silence watchdog; the
 native layer receives the remaining bounded execution deadline and independently

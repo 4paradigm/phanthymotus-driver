@@ -739,7 +739,7 @@ def test_tianyi_navigation_enforces_observation_age_limit(setup, age_ms, accepte
     assert bool(plugin._counts["accepted"]) is accepted
     rate = plugin._info()["control_interface"]["rate"]
     assert rate["max_obs_age_ms"] == 1200
-    assert rate["max_feedback_gap_ms"] == 350
+    assert "max_feedback_gap_ms" not in rate
 
 
 def test_zero_is_prioritized_and_cannot_be_overwritten_by_a_later_motion(setup):

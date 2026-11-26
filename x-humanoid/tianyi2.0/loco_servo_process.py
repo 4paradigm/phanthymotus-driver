@@ -500,8 +500,9 @@ class LocoServoPlugin:
             return
         if state.get("raw") is not True:
             raise RuntimeError(f"cannot read map localization: {state}")
-        status = self._slamtec.get_nav_status()
-        if status.get("action_state") not in (-1, 4):
+        status = self._slamtec.get_nav_status(strict=True)
+        action_state = status.get("action_state")
+        if status.get("error") or type(action_state) is not int or action_state not in (-1, 4):
             raise RuntimeError(f"cannot exit map localization while chassis is busy or unknown: {status}")
         result = self._slamtec.set_localization_enabled(False)
         if result.get("error") or result.get("raw") is False:

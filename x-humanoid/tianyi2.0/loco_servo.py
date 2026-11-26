@@ -19,7 +19,6 @@ from slamtec_velocity import (ChassisBusy, CommandLeaseExpired,
 INPUT_TOPIC = "/actucore/navi/cmd"
 WATCHDOG_MS = 500
 MAX_OBS_AGE_MS = 1200
-MAX_FEEDBACK_GAP_MS = 350
 CANCEL_AFTER_MS = 1000
 FOLLOW_KEYS = ("wz_limit",)
 SPEED_PRESETS = {"slow": 0.15, "normal": 0.30, "fast": 0.50}
@@ -215,7 +214,6 @@ def build_descriptor(hz=10.0, max_vx=0.3, max_wz=1.0, min_vx=0.0,
                     "unit": "m/s", "resource": "base"}],
         "rate": {"max_hz": 20, "expected_hz": hz,
                  "watchdog_ms": WATCHDOG_MS, "max_obs_age_ms": MAX_OBS_AGE_MS,
-                 "max_feedback_gap_ms": MAX_FEEDBACK_GAP_MS,
                  "cancel_after_ms": CANCEL_AFTER_MS},
         "force_torque": None,
         # Conservative width in the normal navigation posture. Navi adds clearance.

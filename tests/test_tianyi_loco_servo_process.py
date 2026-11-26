@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import types
+import urllib.error
 
 import pytest
 
@@ -161,9 +162,15 @@ def test_process_start_is_inert_and_parent_keeps_ros_subscription(process_setup)
     assert info["counts"]["accepted"] == 0
 
 
-@pytest.mark.parametrize("opening", ["start", "config", "resume"])
+@pytest.mark.parametrize(("opening", "action_reply"), [
+    ("start", b'{"state":{"status":4}}'),
+    ("start", b""),
+    ("start", None),  # HTTP 404, the documented no-current-action response.
+    ("config", b'{"state":{"status":4}}'),
+    ("resume", b'{"state":{"status":4}}'),
+])
 def test_bundle_exits_map_localization_before_enabling_velocity(
-        process_setup, native_worker, monkeypatch, opening):
+        process_setup, native_worker, monkeypatch, opening, action_reply):
     from nav_client import SlamtecClient
 
     calls = []
@@ -173,6 +180,7 @@ def test_bundle_exits_map_localization_before_enabling_velocity(
 
     def open_url(request, *, timeout):
         nonlocal localization_enabled
+        calls.append((request.method, request.full_url.removeprefix("http://chassis")))
         if request.method == "PUT":
             assert not bundle._loco_servo.reserves_chassis() or opening == "config"
             assert json.loads(request.data) == {"enable": False}
@@ -182,8 +190,9 @@ def test_bundle_exits_map_localization_before_enabling_velocity(
             reply = localization_enabled
         else:
             assert request.full_url.endswith(action_path)
-            reply = {"state": {"status": 4}}
-        calls.append((request.method, request.full_url.removeprefix("http://chassis")))
+            if action_reply is None:
+                raise urllib.error.HTTPError(request.full_url, 404, "Action Not Found", {}, None)
+            return io.BytesIO(action_reply)
         return io.BytesIO(json.dumps(reply).encode())
 
     monkeypatch.setattr("urllib.request.urlopen", open_url)
@@ -224,13 +233,46 @@ def test_bundle_exits_map_localization_before_enabling_velocity(
         bundle.stop_all()
 
 
+@pytest.mark.parametrize("action_reply", [
+    b"<html>Temporary proxy error</html>",
+    b"null",
+    b"[]",
+    b'{"state":{"status":4.0}}',
+    b'{"action_state":-1,"error":"unknown action"}',
+])
+def test_malformed_current_action_does_not_disable_localization(
+        process_setup, native_worker, monkeypatch, action_reply):
+    from nav_client import SlamtecClient
+
+    calls = []
+    localization_path = "/api/core/slam/v1/localization/:enable"
+    action_path = "/api/core/motion/v1/actions/:current"
+
+    def open_url(request, *, timeout):
+        path = request.full_url.removeprefix("http://chassis")
+        calls.append((request.method, path))
+        return io.BytesIO(action_reply if path == action_path else b"true")
+
+    monkeypatch.setattr("urllib.request.urlopen", open_url)
+    config = {"dry_run": False, "sdk_binary": str(native_worker), "sdk_host": "ok"}
+    card = process_setup.module.LocoServoPlugin(
+        config, "ubuntu", process_setup.ros, slamtec_client=SlamtecClient("http://chassis"))
+    try:
+        result = card.dispatch("start", {})
+        assert calls == [("GET", localization_path), ("GET", action_path)]
+        assert result["state"] == "error" and "busy or unknown" in result["error"], result
+        assert not card.reserves_chassis()
+    finally:
+        card.stop()
+
+
 @pytest.mark.parametrize("blocked", ["active_navigation", "readback"])
 def test_process_does_not_arm_if_map_localization_cannot_be_disabled(
         process_setup, native_worker, blocked):
     writes = []
     client = types.SimpleNamespace(
         get_localization_enabled=lambda: {"raw": True},
-        get_nav_status=lambda: {"action_state": 1 if blocked == "active_navigation" else -1},
+        get_nav_status=lambda *, strict: {"action_state": 1 if blocked == "active_navigation" else -1},
         set_localization_enabled=lambda enable: writes.append(enable) or {"raw": True},
     )
     config = {"dry_run": False, "sdk_binary": str(native_worker), "sdk_host": "ok"}
