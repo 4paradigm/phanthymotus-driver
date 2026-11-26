@@ -41,6 +41,25 @@ def test_primary_registration_lists_and_routes_virtual_cards_without_hardware():
             assert body["params"] == {"name": target, "arguments": {"action": "info", "instance_id": "my-card"}}
 
 
+def test_registered_player_declares_per_action_inputs():
+    config = {"plugins": {"l20_mujoco": {"worker_port": 15769}}}
+    tool, = PreviewCards(config).get_tools()
+    schema = tool["inputSchema"]
+    actions = schema["x-action-params"]
+    props = schema["properties"]
+    assert {name: action["params"] for name, action in actions.items()} == {
+        "view": [], "info": [], "start": ["input_topic", "input_topics"], "stop": [],
+        "config": ["bound_side"], "inspect": ["run_id", "offset", "count"],
+    }
+    assert all(key in props for action in actions.values() for key in action["params"])
+    assert actions["inspect"]["required"] == ["run_id"]
+    assert props["bound_side"] == tool["configSchema"]["properties"]["bound_side"]
+    assert props["input_topics"]["items"]["pattern"] == props["input_topic"]["pattern"]
+    assert props["count"]["maximum"] == 32
+    assert set(props["action"]["enum"]) - actions.keys() == {"geometry", "live"}
+    assert {"geometry", "live", "inspect"} <= set(schema["x-workbench"]["actions"])
+
+
 @pytest.mark.parametrize("side", ["left", "right"])
 def test_external_trajectory_plays_unmodified_without_motion_sources(side):
     config = {"plugins": {"l20_mujoco": {"worker_port": 15769}}}
@@ -60,7 +79,8 @@ def test_external_trajectory_plays_unmodified_without_motion_sources(side):
         args = {"instance_id": "player"}
         card.dispatch("config", {**args, "bound_side": side})
         route = "/custom/joint_sequence"
-        assert card.dispatch("start", {**args, "input_topics": [route]})["state"] == "running"
+        wiring = {"input_topic": route} if side == "left" else {"input_topics": [route]}
+        assert card.dispatch("start", {**args, **wiring})["state"] == "running"
         receive = bus.bind.call_args.args[2]
         frames = [[(j * 11 + k) % 256 for j in range(20)] for k in (23, 181, 5, 137)]
         packet = dict(schema=VERSION, id="motion-42", side=side, action="calibration_sweep",
@@ -77,6 +97,8 @@ def test_external_trajectory_plays_unmodified_without_motion_sources(side):
                     assert card.dispatch("live", args)["pose"] == frame
             assert sample["last_id"] == packet["id"]
             assert card.dispatch("inspect", {**args, "run_id": packet["id"]})["frames"] == frames
+            page = card.dispatch("inspect", {**args, "run_id": sample["last_id"], "offset": 1, "count": 2})
+            assert page["frames"] == frames[1:3]
         assert card.dispatch("stop", args)["state"] == "idle"
 
 

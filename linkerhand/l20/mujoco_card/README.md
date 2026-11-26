@@ -4,6 +4,8 @@
 
 执行 `view` 可在三维工作台旋转视角、以原速或 0.5×、0.25× 回放、逐帧查看最近一次完整动作。固定的五种颜色标示各指的指腹位置；实际压力需由触觉传感器测量。
 
+其他调用方可从 `info.last_id` 取得最近一次完整动作的标识，传给 `inspect.run_id` 读取各帧的网格变换。`offset` 从 0 计数，`count` 默认 24，每次最多取 32 帧。
+
 `hand_gesture_sim` 与 `hand_grasp_sim` 是可选的上游轨迹源。也可只接自定义发布者。在 `config.yaml` 中分别通过 `plugins.hand_gesture_sim.enabled` 和 `plugins.hand_grasp_sim.enabled` 配置这两个来源；均关闭时，模拟卡仍可独立接收轨迹、出图和回放。
 
 ## 接入其他轨迹来源
@@ -30,4 +32,4 @@
 
 同一 ARM64 环境使用 `docker image inspect --format '{{.Size}}'` 测得 ROS 基础镜像约 261.6 MB，原实手镜像约 262.8 MB，统一镜像约 296.3 MB，较原实手镜像增加约 33.5 MB（十进制）。MuJoCo 3.2.7 用于运动学，Pillow 11.3.0 用于实时 JPEG；两个进程共享基础镜像中已有的 NumPy、PyYAML 和 ROS 2。
 
-左右手网格、URDF 和标定表来自灵心巧手官方 URDF 目录中的 `linkerhand_L20_0910`（v10.1）。[厂家原包 L20.zip 直链](https://urdf-view.linkerbot.cn/api/v1/urdf-models/10/download）。压缩包为 16,328,324 字节，构建时和加载时均校验 SHA-256。归档路径、完整哈希和许可见[模型来源说明](../resource/SOURCE.md)。取得项目 COS 上经过校验的同一文件地址后，可将 `L20_MODEL_URL` 指向该地址。
+左右手网格、URDF 和标定表来自灵心巧手官方 URDF 目录中的 `linkerhand_L20_0910`（v10.1）。[厂家原包 L20.zip 直链](https://urdf-view.linkerbot.cn/api/v1/urdf-models/10/download)。压缩包为 16,328,324 字节，构建时和加载时均校验 SHA-256。归档路径、完整哈希和许可见[模型来源说明](../resource/SOURCE.md)。取得项目 COS 上经过校验的同一文件地址后，可将 `L20_MODEL_URL` 指向该地址。

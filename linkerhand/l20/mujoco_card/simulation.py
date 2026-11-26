@@ -21,13 +21,35 @@ class Simulation:
         self.runtime=runtime
 
     def get_tool(self):
-        actions={'view':([], '打开虚拟手三维工作台'),'info':([], '虚拟手状态'),'stop':([], '停止模拟'),
-                 'start':([], '绑定画布输入轨迹'),'config':([], '绑定模拟侧别'),'geometry':([], '已校准网格'),
-                 'live':([], '当前姿态和最近完整动作'),'inspect':([], '最近完整动作的帧')}
-        schema=action_schema(actions,{})
-        schema['x-workbench']={'protocol':PROTOCOL,'kind':'simulation','title':'L20 · 轨迹仿真',
-                               'entry':'view','actions':['info','stop','geometry','live','inspect']}
-        schema['x-action-params']={'view':schema['x-action-params']['view']}
+        actions = {
+            "view": ([], "打开虚拟手三维工作台"),
+            "info": ([], "读取模拟手状态及最近完整动作的 last_id"),
+            "start": (["input_topic", "input_topics"], "绑定画布连入的轨迹话题"),
+            "stop": ([], "停止模拟"),
+            "config": (["bound_side"], "设置实例的模拟侧别"),
+            "inspect": (["run_id", "offset", "count"], "读取最近完整轨迹的指定帧"),
+        }
+        topic = {"type": "string", "pattern": r"^/[A-Za-z0-9_]+(?:/[A-Za-z0-9_]+)*$"}
+        properties = {
+            "input_topic": {**topic, "description": "画布连入的单个 ROS 话题"},
+            "input_topics": {"type": "array", "items": topic, "maxItems": 16,
+                             "description": "画布连入的 ROS 话题列表，提供时优先使用"},
+            "bound_side": SIDE_CONFIG["properties"]["bound_side"],
+            "run_id": {"type": "string", "minLength": 1, "maxLength": 100,
+                       "description": "info 返回的最近完整动作 last_id"},
+            "offset": {"type": "integer", "minimum": 0, "maximum": 599, "default": 0,
+                       "description": "起始帧，从 0 计数"},
+            "count": {"type": "integer", "minimum": 1, "maximum": 32, "default": 24,
+                      "description": "本次最多读取的帧数"},
+        }
+        schema = action_schema(actions, properties)
+        schema["x-action-params"]["inspect"]["required"] = ["run_id"]
+        # Meshes and per-frame transforms are workbench payloads, not model-facing actions.
+        schema["properties"]["action"]["enum"].extend(["geometry", "live"])
+        schema["x-workbench"] = {
+            "protocol": PROTOCOL, "kind": "simulation", "title": "L20 · 轨迹仿真",
+            "entry": "view", "actions": ["info", "stop", "geometry", "live", "inspect"],
+        }
         result=tool(CARD,'processor','仅仿真 · 播放连入的 L20 关节轨迹，输出实时虚拟手画面',schema,
                     topic_in=[{'format':FORMAT}],topic_out=[{'format':'image/jpeg'}])
         result.update(title='L20 轨迹仿真',multiInstance=True,configSchema=SIDE_CONFIG)
