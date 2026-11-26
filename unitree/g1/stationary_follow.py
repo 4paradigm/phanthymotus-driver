@@ -1,10 +1,4 @@
-"""Experimental G1 in-place follower decision layer for pose-like messages.
-
-Dry-run by default. This module does not connect to the robot or send commands.
-The input shape and coordinate sign are hypotheses until checked against the
-live perception card. A future adapter must implement the commands returned
-by ``ingest`` and arbitrate ownership of the base before issuing motion.
-"""
+"""G1 in-place visual follower. Translation is never commanded."""
 import math
 import time
 import json
@@ -118,24 +112,34 @@ class FollowCard:
 
 
 class StationaryFollowPlugin:
-    """Canvas card for pose2d wiring and decision preview; never sends motion."""
+    """Canvas card with bounded turns, a pose watchdog and visible decisions."""
 
     PREFIX = "g1_stationary_follow"
 
-    def __init__(self, config, namespace, executor, clock=time.monotonic):
+    def __init__(self, config, namespace, executor, motion=None,
+                 admission=None, base_lock=None, clock=time.monotonic):
         self._executor = executor
         self._clock = clock
         self._lock = threading.RLock()
         self._controller = FollowCard(clock=clock)
+        self._motion = motion
+        self._admission = admission
+        self._base_lock = base_lock or threading.RLock()
         self._node = None
         self._topic = ""
+        self._output = f"/{namespace}/stationary_follow/decision"
+        self._publisher = None
+        self._message_type = None
+        self._worker = None
+        self._shutdown = threading.Event()
+        self._owned = False
         self._last_received = None
         self._last_decision = {"command": "none", "reason": "idle"}
 
     def get_tool(self):
         return {
             "name": self.PREFIX, "type": "actuator", "multiInstance": False,
-            "description": "G1 原地小跟班预览：连接人物姿态流，显示转向/停止判断；当前版本不向机器人发送运动指令。",
+            "description": "G1 原地小跟班：根据单人姿态低速原地转向，丢失目标或超时停止。",
             "inputSchema": {
                 "type": "object", "required": ["action"],
                 "properties": {
@@ -146,11 +150,17 @@ class StationaryFollowPlugin:
                 "x-resource": "base",
             },
             "topic_in": [{"format": "sensor/pose2d", "desc": "COCO-17 人物姿态流"}],
+            "topic_out": [{"topic": self._output, "format": "data/json"}],
         }
 
     def start(self):
         # Bundle start does not arm a Canvas-controlled card.
         pass
+
+    @property
+    def active(self):
+        with self._lock:
+            return self._node is not None
 
     def stop(self):
         self._stop()
@@ -174,26 +184,31 @@ class StationaryFollowPlugin:
                     qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                                      history=HistoryPolicy.KEEP_LAST, depth=1)
                     node.create_subscription(String, topic, self._on_message, qos)
+                    publisher = node.create_publisher(String, self._output, qos)
                     self._executor.add_node(node)
                 except Exception as exc:
                     if "node" in locals():
                         node.destroy_node()
                     return {"state": "error", "error": f"无法订阅人物姿态流: {exc}"}
                 self._node = node
+                self._publisher = publisher
+                self._message_type = String
                 self._topic = topic
                 self._last_received = None
                 self._last_decision = self._controller.start()
-            return {"state": "running", "mode": "preview", "input": topic}
+                self._shutdown.clear()
+                self._worker = threading.Thread(target=self._control_loop, daemon=True,
+                                                name="g1_stationary_follow")
+                self._worker.start()
+            return {"state": "running", "input": topic,
+                    "topic_out": [{"topic": self._output, "format": "data/json"}]}
         if action == "stop":
             return self._stop()
         if action == "info":
             with self._lock:
-                if self._last_received is not None:
-                    watchdog = self._controller.tick(self._clock() - self._last_received)
-                    if watchdog["command"] != "none":
-                        self._last_decision = watchdog
                 return {"state": "running" if self._node is not None else "idle",
-                        "mode": "preview", "input": self._topic,
+                        "input": self._topic,
+                        "topic_out": [{"topic": self._output, "format": "data/json"}],
                         "last_decision": dict(self._last_decision)}
         return None
 
@@ -209,12 +224,71 @@ class StationaryFollowPlugin:
                 self._last_decision = self._controller.stop("invalid_pose2d")
             self._last_received = received_at
 
+    def _publish(self, decision, result=None):
+        if self._publisher is None:
+            return
+        payload = {"timestamp": time.time(), "decision": decision,
+                   "motion_result": result, "motion_enabled": self._motion is not None}
+        self._publisher.publish(self._message_type(data=json.dumps(payload, ensure_ascii=False)))
+
+    def _control_loop(self):
+        while not self._shutdown.wait(.1):
+            with self._lock:
+                if self._node is None:
+                    return
+                if self._last_received is None:
+                    decision = {"command": "none", "reason": "waiting_for_pose"}
+                else:
+                    watchdog = self._controller.tick(self._clock() - self._last_received)
+                    if watchdog["command"] != "none":
+                        self._last_decision = watchdog
+                    decision = dict(self._last_decision)
+            result = None
+            with self._base_lock:
+                if self._shutdown.is_set():
+                    break
+                if decision.get("command") == "move" and self._motion is not None:
+                    state = {}
+                    try:
+                        ready = self._admission() if self._admission else {"admitted": False}
+                        state = self._motion.get_state()
+                        if self._shutdown.is_set():
+                            break
+                        if ready.get("admitted") is not True or state.get("base_available") is not True:
+                            result = {"error": "base_not_available_or_locomotion_not_ready"}
+                        else:
+                            result = self._motion.move(0.0, 0.0, decision["vyaw"], .12)
+                            self._owned = result.get("ret") == 0
+                    except Exception as exc:
+                        result = {"error": str(exc)}
+                    if (result.get("error") or result.get("ret", 0) != 0) and state.get("base_available") is True:
+                        with self._lock:
+                            self._last_decision = self._controller.stop("motion_error")
+                        decision = dict(self._last_decision)
+                elif self._owned:
+                    try:
+                        result = self._motion.stop(reason=decision.get("reason", "follow_stop"))
+                    except Exception as exc:
+                        result = {"error": str(exc)}
+                    self._owned = False
+            self._publish(decision, result)
+
     def _stop(self):
         with self._lock:
             node, self._node = self._node, None
+            self._shutdown.set()
             self._topic = ""
             self._last_decision = self._controller.stop()
+        worker, self._worker = self._worker, None
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(timeout=16)
+        with self._base_lock:
+            if self._owned and self._motion is not None:
+                self._motion.stop(reason="follow_stop")
+                self._owned = False
         if node is not None:
             self._executor.remove_node(node)
             node.destroy_node()
-        return {"state": "idle", "mode": "preview"}
+        self._publisher = None
+        self._message_type = None
+        return {"state": "idle"}

@@ -1,6 +1,7 @@
 import unittest
 import sys
 import json
+import time
 from types import ModuleType, SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
@@ -24,23 +25,27 @@ class TestMotusFollow(unittest.TestCase):
         with self.assertRaises(ValueError):
             pose2d_to_follow_frame({"persons": [{}]}, 1.0)
 
-    def test_registered_card_preview_does_not_call_motion(self):
+    def test_registered_card_requires_pose_input(self):
         plugin = StationaryFollowPlugin({}, "g1", object())
         tool = plugin.get_tool()
         self.assertEqual(tool["name"], "g1_stationary_follow")
         self.assertEqual(tool["topic_in"][0]["format"], "sensor/pose2d")
         self.assertEqual(plugin.dispatch("start", {})["state"], "error")
-        self.assertEqual(plugin.dispatch("info", {})["mode"], "preview")
+        self.assertEqual(tool["topic_out"][0]["format"], "data/json")
+        self.assertEqual(plugin.dispatch("info", {})["state"], "idle")
 
     def test_canvas_start_pose_input_and_stop(self):
         clock = [10.0]
         subscriptions = []
+        published = []
         class FakeNode:
             def __init__(self, name):
                 self.name = name
                 self.destroyed = False
             def create_subscription(self, msg_type, topic, callback, qos):
                 subscriptions.append((topic, callback))
+            def create_publisher(self, msg_type, topic, qos):
+                return SimpleNamespace(publish=lambda msg: published.append(msg.data))
             def destroy_node(self):
                 self.destroyed = True
         class Executor:
@@ -55,7 +60,7 @@ class TestMotusFollow(unittest.TestCase):
         qos_mod.HistoryPolicy = SimpleNamespace(KEEP_LAST=1)
         std_mod = ModuleType("std_msgs")
         std_msg_mod = ModuleType("std_msgs.msg")
-        std_msg_mod.String = str
+        std_msg_mod.String = lambda data="": SimpleNamespace(data=data)
         with patch.dict(sys.modules, {"rclpy": ModuleType("rclpy"),
                                       "rclpy.node": node_mod, "rclpy.qos": qos_mod,
                                       "std_msgs": std_mod, "std_msgs.msg": std_msg_mod}):
@@ -67,11 +72,60 @@ class TestMotusFollow(unittest.TestCase):
                 "persons": [{"bbox": [65, 0, 85, 90]}]})))
             info = plugin.dispatch("info", {})
             self.assertEqual(info["last_decision"]["command"], "move")
-            self.assertEqual(info["mode"], "preview")
+            self.assertEqual(info["topic_out"][0]["format"], "data/json")
             clock[0] = 10.31
+            time.sleep(.15)
             self.assertEqual(plugin.dispatch("info", {})["last_decision"]["reason"], "pose_timeout")
             self.assertEqual(plugin.dispatch("stop", {})["state"], "idle")
             self.assertEqual(executor.nodes, [])
+
+    def test_turn_command_is_bounded_and_timeout_stops(self):
+        clock = [10.0]
+        commands = []
+        class Motion:
+            def get_state(self): return {"base_available": True}
+            def move(self, vx, vy, vyaw, duration):
+                commands.append(("move", vx, vy, vyaw, duration))
+                return {"ret": 0}
+            def stop(self, reason="command"):
+                commands.append(("stop", reason))
+                return {"ret": 0}
+        plugin = StationaryFollowPlugin({}, "g1", object(), motion=Motion(),
+                                        admission=lambda: {"admitted": True},
+                                        clock=lambda: clock[0])
+        plugin._node = object()
+        plugin._controller.start()
+        plugin._last_decision = plugin._controller.ingest(frame(10.0, [{"id": 1, "position": [.5, 0]}]))
+        plugin._last_received = clock[0]
+        plugin._shutdown.clear()
+        worker = __import__('threading').Thread(target=plugin._control_loop, daemon=True)
+        worker.start()
+        time.sleep(.15)
+        self.assertTrue(any(c[0] == "move" and c[1:3] == (0.0, 0.0)
+                            and c[4] == .12 for c in commands))
+        clock[0] = 10.4
+        time.sleep(.15)
+        plugin._shutdown.set()
+        worker.join(1)
+        self.assertTrue(any(c[0] == "stop" for c in commands))
+
+    def test_busy_base_never_receives_turn(self):
+        calls = []
+        class Motion:
+            def get_state(self): return {"base_available": False}
+            def move(self, *args): calls.append(args)
+        plugin = StationaryFollowPlugin({}, "g1", object(), motion=Motion(),
+                                        admission=lambda: {"admitted": True})
+        plugin._node = object()
+        plugin._controller.start()
+        plugin._last_decision = plugin._controller.ingest(frame(1.0, [{"id": 1, "position": [.5, 0]}]))
+        plugin._last_received = plugin._clock()
+        worker = __import__('threading').Thread(target=plugin._control_loop, daemon=True)
+        worker.start()
+        time.sleep(.15)
+        plugin._shutdown.set()
+        worker.join(1)
+        self.assertEqual(calls, [])
 
     def test_left_right_and_center(self):
         c = FollowCard()

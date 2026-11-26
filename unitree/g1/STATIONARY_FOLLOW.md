@@ -1,6 +1,6 @@
 # G1 原地小跟班：决策原型
 
-`stationary_follow.py` 包含跟随决策层和 `g1_stationary_follow` Motus 卡片。卡片在 G1 Driver 中注册，画布可连接 `sensor/pose2d` 人物姿态输入。它将 `image_size` 与人物 `bbox`（或可见关键点）换算为画面横向位置，并在 `info` 中显示转向或停止判断。当前是**预览模式**，不调用 G1 运动接口，不能作为真机跟随功能验收。
+`stationary_follow.py` 包含跟随决策层和 `g1_stationary_follow` Motus 卡片。画布连接 `camera_rgb` → `pose` → `g1_stationary_follow`，第二条线必须使用 `pose` 的 `sensor/pose2d`（`poses/skeleton`）输出。卡片把判断与运动接口结果发布为 `data/json`，也可通过 `info` 查看。
 
 运行离线检查：
 
@@ -8,9 +8,9 @@
 python -m unittest discover -s unitree/g1/tests -p test_stationary_follow.py -v
 ```
 
-接入前需要完成：
+控制边界与真机验收：
 
 1. 在画布连接真实 `sensor/pose2d` 输出，核对 `image_size`、`bbox`/`keypoints`、人物 ID 稳定性与相机横坐标方向。只有标准姿态格式才会得到有效判断。
-2. 明确 G1 底座控制权与停止接口，保证与现有 `loco`、`loco_relative_move` 和 SmartMotion 不会同时写入运动指令。
-3. 在预览模式确认丢失目标、数据超时均产生停止判断，再实现受保护的真机运动适配。
-4. 真机测试需机器人负责人在安全场地监督；原地转向也可能产生脚步位移。
+2. 卡片只发送 `vx=0, vy=0` 的短时低速转向，经 SmartMotion 执行。只有平衡运动模式、底座空闲、没有相对运动任务时才发送；其他底座卡片的运动命令在小跟班运行时被拒绝。
+3. 人物居中、目标丢失、姿态超过 0.3 秒未更新或停止卡片时发送停止指令。单次转向 0.12 秒，速度上限 0.2 rad/s。
+4. 真机测试需机器人负责人在安全场地监督，先验证相机画面、姿态输出与转向方向；原地转向也可能产生脚步位移。单元测试不能代替真机验收。

@@ -177,11 +177,21 @@ class G1DeviceBundle:
             self._plugins.append(self._point_card)
             print("[bundle] LocoRelativeMovePlugin loaded (direct SDK)")
 
+        self._follow_base_lock = threading.RLock()
+        self._follow_card = None
         if plugins_cfg.get("stationary_follow", {}).get("enabled", False):
             from stationary_follow import StationaryFollowPlugin
-            self._plugins.append(StationaryFollowPlugin(
-                plugins_cfg["stationary_follow"], namespace, executor))
-            print("[bundle] StationaryFollowPlugin loaded (preview, no motion)")
+            def follow_admission():
+                point = getattr(self, "_point_card", None)
+                if point is not None and (point.busy or point.faulted):
+                    return {"admitted": False, "reason": "relative_motion_active"}
+                return relative_locomotion_admission() if point is not None else {"admitted": False}
+            self._follow_card = StationaryFollowPlugin(
+                plugins_cfg["stationary_follow"], namespace, executor,
+                motion=smart_motion, admission=follow_admission,
+                base_lock=self._follow_base_lock)
+            self._plugins.append(self._follow_card)
+            print("[bundle] StationaryFollowPlugin loaded")
 
         if plugins_cfg.get("arm", {}).get("enabled", False):
             from device import ArmActionPlugin
@@ -363,6 +373,13 @@ class G1DeviceBundle:
                     resource = tool_def.get("inputSchema", {}).get("x-resource")
                     is_base = (resource == "base" or isinstance(resource, list) and "base" in resource
                                or tool_name in ("loco", "switch_mode", "switch_mode_expert", "spatial"))
+                    follow = getattr(self, "_follow_card", None)
+                    if is_base and tool_name != "g1_stationary_follow" and follow is not None:
+                        stopping = action in ("stop", "stop_move", "emergency_stop", "interrupt_motion")
+                        if stopping:
+                            follow.dispatch("stop", {})
+                        elif follow.active:
+                            return {"error": "g1_stationary_follow is active; stop it before another base action"}
                     interrupts_motion = tool_name == "smart_motion" and action == "interrupt_motion"
                     if point and tool_name != "loco_relative_move" and (is_base or interrupts_motion) and tool_def["type"] == "actuator":
                         result = point.dispatch_base(p, action, args)
