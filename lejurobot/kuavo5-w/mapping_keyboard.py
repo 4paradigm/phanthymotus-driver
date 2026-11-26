@@ -45,7 +45,9 @@ class FactoryKeyboardStream:
         source = ('NAVIGATION_SOURCE = ' + repr(client._source) + '\n' +
                   (Path(__file__).parent/'host/manual_keyboard.py').read_text())
         if bridge:
-            source = source.split("if __name__ == '__main__':")[0] + '\n' + (Path(__file__).parent/'host/upper_velocity_bridge.py').read_text()
+            source = (source.split("if __name__ == '__main__':")[0] + '\n'
+                      + (Path(__file__).parent/'host/upper_input_gate.py').read_text() + '\n'
+                      + (Path(__file__).parent/'host/upper_velocity_bridge.py').read_text())
         self.process = manager.transport.open_stream('chassis', target,
             {'master': target.get('master', 'http://127.0.0.1:11311'),
              'ros_ip': target['ros_ip'],
@@ -304,9 +306,73 @@ class UpperVelocityBridge:
         self.ready = threading.Event()
         self.error = None
         self.forwarded = 0
+        self.remote_state = 'unavailable'
+        self.return_requested = False
+        self.return_thread = None
+        self.monitor_thread = None
+        self.closed = threading.Event()
+        self.remote_error = None
+        self.last_control = None
+        self.last_epoch = getattr(bundle, '_stop_epoch', 0)
+        self.external_resume = False
+
+    def request_return(self, tool):
+        if tool in ('base_drive','base_servo','controlled_spatial'):
+            self.return_requested = True
+
+    def start_monitor(self):
+        if self.monitor_thread is not None:return
+        def monitor():
+            while not self.closed.wait(.1):
+                try:self.consider_return()
+                except Exception:self.remote_error='remote_return_state_unavailable'
+        self.monitor_thread=threading.Thread(target=monitor,daemon=True,name='remote-control-return')
+        self.monitor_thread.start()
+
+    def consider_return(self):
+        b=self.bundle
+        with b.tracker.lock:
+            try:enabled=b.state.confirmed_enable()
+            except RuntimeError:return
+            if self.last_epoch!=b._stop_epoch:
+                self.last_epoch=b._stop_epoch
+                self.return_requested=self.external_resume=False
+                self.last_control=enabled
+                return
+            if self.last_control is False and enabled is True:
+                # An operator's explicit controller re-enable is a new action;
+                # this monitor never issues enable_control itself.
+                self.return_requested=self.external_resume=True
+            self.last_control=enabled
+            if (not self.return_requested or enabled is not True or b._closing
+                    or b._transition is not None or 'base' in b.tracker._active
+                    or b.spatial.unresolved() or b.spatial.mapping_active()
+                    or (b.state.motion_blocked and not self.external_resume)
+                    or (self.return_thread and self.return_thread.is_alive())):
+                return
+            if (b._upper_route_key==(b._stop_epoch,b.ros1.connection)
+                    and b.state.read('upper_velocity_enabled')[0] is True):
+                self.return_requested=self.external_resume=False
+                return  # The existing upper route can hand back after neutral.
+            epoch=b._stop_epoch
+            self.return_requested=self.external_resume=False
+        def restore():
+            def validate():
+                if b.state.confirmed_enable() is not True:
+                    raise RuntimeError('remote_return_requires_existing_enable')
+            try:
+                lease=b.start_motion('base','remote_control',(3,),lambda:None,validate,
+                                     request_epoch=epoch,notify=False)
+                b.tracker.finish('base',lease[0],'remote_control','cancelled',{'reason':'remote_handoff_ready'})
+                self.remote_error=None
+            except Exception:
+                self.remote_error='remote_return_preparation_unconfirmed'
+        self.return_thread=threading.Thread(target=restore,daemon=True,name='remote-control-handoff')
+        self.return_thread.start()
 
     def ensure(self):
         with self.lock:
+            self.ready.clear()
             if self.thread is None or not self.thread.is_alive():
                 self.stop_event = threading.Event()
                 self.ready = threading.Event()
@@ -326,20 +392,45 @@ class UpperVelocityBridge:
                 and self.bundle.state.read('upper_velocity_enabled')[0] is True
                 and not self.bundle.spatial.mapping_active())
 
+    def owner(self):
+        with self.bundle.tracker.lock:
+            b=self.bundle
+            active=b.tracker._active.get('base')
+            transition=b._transition
+            if transition is not None:
+                return 'card' if transition.get('tool') in ('base_drive','base_servo','remote_control') else 'hold'
+            if active:
+                return 'card' if active[1] in ('base_drive','base_servo') else 'hold'
+            try:enabled=b.state.confirmed_enable()
+            except RuntimeError:enabled=False
+            if (not b._closing and not b.state.motion_blocked and not b.spatial.unresolved()
+                    and not b.spatial.mapping_active() and enabled is True
+                    and b.state.read('upper_velocity_enabled')[0] is True
+                    and b._upper_route_key==(b._stop_epoch,b.ros1.connection)):
+                return 'remote'
+            return 'hold'
+
     def _run(self):
-        stream = None
+        stream, stop_confirmed = None, False
         try:
             stream = FactoryKeyboardStream(self.bundle.spatial.client, bridge=True)
             reply = stream.read(12)
             if reply.get('state') != 'held':raise RuntimeError('upper_bridge_handshake_failed')
             seq = 0
             while not self.stop_event.is_set():
-                stream.send({'nonce':reply['nonce'],'seq':seq,'allow':self.allowed()})
+                owner=self.owner()
+                stream.send({'nonce':reply['nonce'],'seq':seq,'allow':self.allowed() or owner=='remote','owner':owner})
                 reply = stream.read(1.)
+                if (reply.get('state')=='stopped' and reply.get('stationary') is True
+                        and reply.get('bridge_zero_sent') is True):
+                    stop_confirmed=True
+                    raise RuntimeError('upper_bridge_remote_stopped')
                 if reply.get('state') != 'ready' or reply.get('seq') != seq:
                     raise RuntimeError('upper_bridge_lease_failed')
                 if reply.get('forwarded_nonzero'):self.forwarded += 1
-                self.ready.set()
+                self.remote_state=reply.get('remote_state','unavailable')
+                if reply.get('input_owner')==owner:
+                    self.ready.set()
                 seq += 1
                 self.stop_event.wait(.04)
         except Exception as exc:
@@ -351,12 +442,12 @@ class UpperVelocityBridge:
                 self.bundle._upper_route_key = None
         finally:
             if stream is not None:
-                stop_confirmed = False
                 try:
                     stream.stop()
-                    reply = stream.read(8.)
-                    stop_confirmed = (reply.get('state') == 'stopped' and reply.get('stationary') is True
-                                      and reply.get('bridge_zero_sent') is True)
+                    if not stop_confirmed:
+                        reply = stream.read(8.)
+                        stop_confirmed = (reply.get('state') == 'stopped' and reply.get('stationary') is True
+                                          and reply.get('bridge_zero_sent') is True)
                     if not stop_confirmed:self.error = 'upper_bridge_stop_unconfirmed'
                 except Exception:
                     self.error = self.error or 'upper_bridge_stop_unconfirmed'
@@ -373,8 +464,13 @@ class UpperVelocityBridge:
     def info(self):
         return {'state':'error' if self.error else 'ready' if self.ready.is_set() else 'idle',
                 'error':self.error,'forwarded_nonzero_frames':self.forwarded,
+                'remote_state':self.remote_state,
+                'remote_return_error':self.remote_error,
                 'watchdog_ms':300}
 
     def close(self):
+        self.closed.set()
         self.stop_event.set()
         if self.thread and self.thread is not threading.current_thread():self.thread.join(timeout=10)
+        if self.monitor_thread:self.monitor_thread.join(timeout=1)
+        if self.return_thread:self.return_thread.join(timeout=1)

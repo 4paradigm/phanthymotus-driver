@@ -83,7 +83,7 @@ class BridgeGateTests(unittest.TestCase):
                     return reply
                 stream=types.SimpleNamespace(read=read,send=lambda value:None,stop=lambda:None,close=lambda:None)
                 with patch('mapping_keyboard.FactoryKeyboardStream',return_value=stream), \
-                        patch.object(bridge,'allowed',return_value=False):
+                        patch.object(bridge,'allowed',return_value=False), patch.object(bridge,'owner',return_value='hold'):
                     bridge._run()
                 if confirmed:
                     self.assertIsNone(bundle.spatial._preparation)
@@ -92,3 +92,59 @@ class BridgeGateTests(unittest.TestCase):
                     self.assertTrue(bundle.state.motion_blocked)
                     self.assertEqual(bundle.spatial._preparation['stage'],'upper_bridge_stop_unconfirmed')
                     bundle.spatial._persist.assert_called_once()
+
+    def remote_bundle(self):
+        enabled=[True]
+        spatial=types.SimpleNamespace(mapping_active=lambda:False,unresolved=lambda:False)
+        tracker=types.SimpleNamespace(lock=threading.RLock(),_active={},finish=lambda *args:None)
+        bundle=types.SimpleNamespace(tracker=tracker,_closing=False,_transition=None,
+            state=types.SimpleNamespace(motion_blocked=False,confirmed_enable=lambda:enabled[0],
+                read=lambda key:(True,10.)),_stop_epoch=3,ros1=types.SimpleNamespace(connection=(True,1)),
+            _upper_route_key=(3,(True,1)),spatial=spatial)
+        return bundle,enabled
+
+    def test_idle_upper_route_returns_remote_but_all_base_owners_and_stops_block_it(self):
+        bundle,enabled=self.remote_bundle();bridge=UpperVelocityBridge(bundle)
+        self.assertEqual(bridge.owner(),'remote')
+        for tool in ('base_drive','base_servo','controlled_spatial','mapping_keyboard'):
+            bundle.tracker._active={'base':('id',tool,None)}
+            self.assertEqual(bridge.owner(),'card' if tool in ('base_drive','base_servo') else 'hold')
+        bundle.tracker._active={}
+        bundle.state.motion_blocked=True;self.assertEqual(bridge.owner(),'hold')
+        bundle.state.motion_blocked=False;enabled[0]=False;self.assertEqual(bridge.owner(),'hold')
+        enabled[0]=True;bundle.spatial.mapping_active=lambda:True;self.assertEqual(bridge.owner(),'hold')
+
+    def test_completed_native_navigation_requests_handoff_without_resuming_a_paused_body(self):
+        bundle,enabled=self.remote_bundle();bridge=UpperVelocityBridge(bundle)
+        bundle.start_motion=Mock(return_value=('id',None))
+        bundle.tracker.finish=Mock()
+        bundle._upper_route_key=None
+        enabled[0]=False
+        bridge.request_return('controlled_spatial')
+        bridge.consider_return()
+        bundle.start_motion.assert_not_called()
+        # A later explicit operator enable permits a guarded handoff.
+        enabled[0]=True
+        bridge.consider_return()
+        bridge.return_thread.join(1)
+        self.assertEqual(bundle.start_motion.call_args.args[:2],('base','remote_control'))
+        self.assertEqual(bundle.start_motion.call_args.kwargs['request_epoch'],3)
+        bundle.tracker.finish.assert_called_once()
+
+    def test_stop_epoch_revokes_a_pending_automatic_remote_return(self):
+        bundle,_=self.remote_bundle();bridge=UpperVelocityBridge(bundle)
+        bundle.start_motion=Mock()
+        bridge.request_return('controlled_spatial')
+        bundle._stop_epoch+=1
+        bridge.consider_return()
+        self.assertFalse(bridge.return_requested)
+        bundle.start_motion.assert_not_called()
+
+    def test_normal_upper_completion_uses_existing_route_instead_of_repreparing(self):
+        bundle,_=self.remote_bundle();bridge=UpperVelocityBridge(bundle)
+        bundle.start_motion=Mock()
+        bridge.request_return('base_drive')
+        bridge.consider_return()
+        bundle.start_motion.assert_not_called()
+        self.assertEqual(bridge.owner(),'remote')
+        self.assertFalse(bridge.return_requested)

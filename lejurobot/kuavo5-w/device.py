@@ -377,6 +377,7 @@ class ActionTracker:
         self._no_completion = set()
         self._closed = False
         self._callbacks = queue.Queue()
+        self.on_completed = None
         self._worker = threading.Thread(target=self._deliver, daemon=True, name="acp-callbacks")
         self._worker.start()
 
@@ -411,6 +412,8 @@ class ActionTracker:
             if self.current(channel, action_id):
                 active = self._active.pop(channel)
                 active[2].set()
+                if channel=='base' and status=='completed' and self.on_completed is not None:
+                    self.on_completed(tool)
                 if action_id in self._no_completion:
                     self._no_completion.discard(action_id)
                 else:
@@ -1222,6 +1225,7 @@ class KuavoBundle:
         self.base_servo = BaseServo(self, ros2_node)
         self.boot_remote = BootRemote(self, config.get('host_runtime', {}).get('remote_ready_on_first_boot', False))
         self.upper_bridge = UpperVelocityBridge(self)
+        self.tracker.on_completed = self.upper_bridge.request_return
         if "plugins" in config:
             plugin_config = dict(config['plugins'])
             # Preserve old deployments, but an explicit new setting wins.
@@ -1383,9 +1387,6 @@ class KuavoBundle:
         joined = self._wait_for_chassis_start(request_epoch) if channel != 'base' or fresh_base_start else None
         self.state.require_motion_enabled()
         chassis_mode = self.spatial.motion_chassis_mode() if channel == 'base' else None
-        if channel == 'base' and tool != 'controlled_spatial':
-            self.sensors.require_profile()
-            self.upper_bridge.ensure()
         if not self.tracker.lock.acquire(timeout=DISPATCH_LOCK_TIMEOUT_S):
             raise RuntimeError('control transition is busy; query state before retrying')
         try:
@@ -1442,10 +1443,11 @@ class KuavoBundle:
                 self._upper_route_key = None
             if mapping and not (enabled is True and not self.state.motion_blocked and compatible and fresh):
                 raise RuntimeError('manual_mapping_disallows_shared_enable_or_mode_changes; finish mapping first')
-            if enabled is True and not self.state.motion_blocked and compatible and fresh and velocity_ready:
+            if (enabled is True and not self.state.motion_blocked and compatible and fresh and velocity_ready
+                    and not (channel=='base' and upper_velocity)):
                 return self._publish_motion_locked(channel, tool, modes, publish, validate, preparation, notify=notify)
             base_handoff_only = (channel == 'base' and enabled is True and not self.state.motion_blocked
-                                 and compatible and fresh and not velocity_ready)
+                                 and compatible and fresh and (upper_velocity or not velocity_ready))
             if self.tracker._active and not base_handoff_only:
                 raise RuntimeError('control preparation needs an idle robot; another action is still running')
             target_mode = CARD_CONTROL_MODE
@@ -1456,6 +1458,8 @@ class KuavoBundle:
         finally:
             self.tracker.lock.release()
         try:
+            if channel=='base' and upper_velocity:
+                self.upper_bridge.ensure()
             if channel == 'base' and not velocity_ready:
                 # Resuming with upper velocity still enabled can publish to
                 # the competing chassis input before the native handoff.
@@ -1838,6 +1842,7 @@ class KuavoBundle:
     def start_background(self):
         self.startup_checks.start()
         self.spatial.start_background()
+        self.upper_bridge.start_monitor()
         self.peripherals.start()
         if self._enabled.intersection({'mic', 'ext_mic'}):
             self.microphones.start_background()

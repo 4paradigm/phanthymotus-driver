@@ -1081,3 +1081,11 @@ audit for timing, geometry limitations and deployment status.
 切换为原生导航/建图或退出base任务时，撤销许可、发一次零速，然后停止向该底盘输入持续注入速度；原生导航仍选nav_mpc_path_track，键盘仍走MANUAL RobotMotion。交接前先关闭旧上位机速度输出再恢复全身，交接完成才为新任务开启速度。info.control_ownership.upper_velocity_bridge显示连接状态与非零转发帧数。定时move的completed仍是命令时长完成；实际位移须以底盘里程计确认。
 
 2026-11-27已授权现场验证：0.1m/s前向目标持续1秒，底盘输入、mux输入/输出均记录非零且峰值约0.1m/s，里程计约0.13米（含MPC减速尾段）；随后全身暂停、底盘软停与新鲜里程计静止均确认。另已验证零许可连接和断连停车。此次未重复真机导航或建图运动，跨卡片隔离由离线回归覆盖；不将此短程测试视为全部导航验收。
+
+### 执行卡与G12遥控的交接
+
+底盘空闲且已使能时交给G12；base_drive/base_servo实际执行期间切到卡片来源，controlled_spatial导航、建图和地图转换期间阻断遥控底盘输入。卡片仅start不永久占用底盘。使用ROS subscriber的publisherUpdate接口临时选择MPC两处消费者的/cmd_vel和/cmd_vel_world来源：卡片只允许/rosbridge_websocket，遥控只允许原厂两个joy command节点，hold不接收这两条速度输入。核对旧TCPROS连接已退出后才确认交接。遥控节点和/joy、/stop_robot通路不被停止或重映射，原厂文件和launch不改。断开驱动时恢复Master中当前注册的原输入连接。
+
+base_drive正常完成或base_servo释放数据租约后，先等经核验的G12输入连续回中300ms，再接回遥控来源并重新等待MPC零输出300ms，才允许底盘速度；杆未回中不会沿用旧方向。原生导航完成后，在现有全身使能仍为true、无活动任务/未确认操作时自动准备上位机速度通路，再执行同样的遥控交还。显式全身stop、故障、未知写入、建图未结束时不自动使能或解除阻断；之后若操作员明确重新使能控制器，则可在新停止世代内重新准备遥控，仍需回中。info.control_ownership.upper_velocity_bridge.remote_state显示blocked/waiting_for_neutral/ready，remote_return_error显示交还失败。
+
+2026-11-27已在全身关闭状态下真机核对hold/card/remote三种MPC输入连接均生效且能恢复原连接；随后在旁站授权下恢复遥控，操作员确认能正常移动、回中停止。另执行1秒全零base_drive任务，期间remote_state=blocked、完成后无额外恢复调用即回到ready；测试期间非零转发计数不变。未执行额外原生导航或建图运动，相关隔离和导航完成交还由离线回归覆盖。

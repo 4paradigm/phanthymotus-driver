@@ -28,12 +28,13 @@ def latest_put(channel, value):
             pass
 
 
-def upper_observer(request, velocities, statuses, stopping):
+def upper_observer(request, velocities, statuses, stopping, ownership, acknowledged, remote_ready):
     # SSH process loss must not leave the observer child orphaned.
     import ctypes
     import signal
     parent = os.getppid()
     ctypes.CDLL(None).prctl(1, signal.SIGTERM)
+    signal.signal(signal.SIGTERM,lambda *args:stopping.set())
     if os.getppid() != parent:
         return
     os.environ['ROS_MASTER_URI'] = request['upper_master']
@@ -42,6 +43,7 @@ def upper_observer(request, velocities, statuses, stopping):
     import rospy
     from geometry_msgs.msg import Twist
     from std_msgs.msg import Bool
+    from sensor_msgs.msg import Joy
     from leju_mobile_base_msgs.msg import BaseCmdVelStatus
     import rosgraph
     rospy.init_node('motus_upper_velocity_bridge_observer', anonymous=True, disable_signals=True,
@@ -51,6 +53,12 @@ def upper_observer(request, velocities, statuses, stopping):
            ('/enable_control_state','/enable_vel_control_state','/move_base/base_cmd_vel')):
         stopping.set()
         return
+    if publishers.get('/joy') != ['/joy_node']:
+        stopping.set()
+        return
+    gate = UpperInputGate(request['upper_master'])
+    navigation = {'__name__':'remote_neutral_check'}
+    exec(compile(NAVIGATION_SOURCE,'navigation_rpc.py','exec'),navigation)
     lock, state = threading.Lock(), {}
     def enable(field, message):
         if (message._connection_header or {}).get('callerid') == '/nodelet_manager':
@@ -60,18 +68,57 @@ def upper_observer(request, velocities, statuses, stopping):
         if (message._connection_header or {}).get('callerid') != '/nodelet_manager':
             stopping.set()
             return
-        with lock:
-            allowed = state.get('control') is True and state.get('velocity') is True
         values = [message.linear.x, message.linear.y, message.linear.z,
                   message.angular.x, message.angular.y, message.angular.z]
-        latest_put(velocities, (time.monotonic(), allowed, values))
+        now = time.monotonic()
+        with lock:
+            quiet = all(math.isfinite(v) and abs(v)<=1e-6 for v in values)
+            if not quiet:state.pop('quiet_since',None)
+            elif 'quiet_since' not in state:state['quiet_since']=now
+            state['velocity_at']=now
+            allowed = (state.get('control') is True and state.get('velocity') is True
+                and acknowledged.value==ownership.value
+                and (ownership.value!=2 or remote_ready.value==1))
+        latest_put(velocities, (now, allowed, values, ownership.value))
+    def joy(message):
+        now=time.monotonic()
+        neutral=navigation['remote_joy_neutral'](message,'/joy_node')
+        with lock:
+            state.update(joy_at=now,neutral=neutral)
+            if not neutral:state.pop('neutral_since',None)
+            elif 'neutral_since' not in state:state['neutral_since']=now
     subscribers = [
         rospy.Subscriber('/enable_control_state', Bool, lambda m:enable('control', m), queue_size=1),
         rospy.Subscriber('/enable_vel_control_state', Bool, lambda m:enable('velocity', m), queue_size=1),
-        rospy.Subscriber('/move_base/base_cmd_vel', Twist, velocity, queue_size=1, tcp_nodelay=True)]
+        rospy.Subscriber('/move_base/base_cmd_vel', Twist, velocity, queue_size=1, tcp_nodelay=True),
+        rospy.Subscriber('/joy',Joy,joy,queue_size=1,tcp_nodelay=True)]
     publisher = rospy.Publisher('/move_base/base_cmd_vel_status', BaseCmdVelStatus, queue_size=1, latch=False)
     try:
         while not stopping.wait(.02) and not rospy.is_shutdown():
+            desired={0:'hold',1:'card',2:'remote'}[ownership.value]
+            now=time.monotonic()
+            with lock:
+                neutral=(state.get('neutral') is True and now-state.get('joy_at',0.)<=.3
+                    and now-state.get('neutral_since',now)>=.3)
+                joy_fresh=now-state.get('joy_at',0.)<=.3
+                quiet=(now-state.get('velocity_at',0.)<=.3
+                    and now-state.get('quiet_since',now)>=.3)
+            if desired=='remote' and remote_ready.value!=1 and not neutral:
+                desired='hold'
+            if desired=='remote' and not joy_fresh:
+                desired='hold'
+            if gate.owner!=desired or now-gate.checked_at>=.1:
+                changed=gate.owner!=desired
+                if changed:
+                    acknowledged.value=-1
+                    remote_ready.value=0
+                    with lock:state.pop('quiet_since',None)
+                    quiet=False
+                gate.select(desired)
+                acknowledged.value={'hold':0,'card':1,'remote':2}[desired]
+            if desired=='remote' and neutral and quiet:
+                remote_ready.value=1
+            if desired!='remote':remote_ready.value=0
             try:
                 stamp, message = statuses.get_nowait()
             except queue.Empty:
@@ -83,6 +130,8 @@ def upper_observer(request, velocities, statuses, stopping):
         for sub in subscribers:
             sub.unregister()
         publisher.unregister()
+        try:gate.restore()
+        except Exception:pass
 
 
 def bridge_values(sample, chassis, allowed, now):
@@ -114,7 +163,9 @@ def run_bridge(request):
     # Fork BEFORE either process initializes rospy: one node per real master.
     context = multiprocessing.get_context('fork')
     velocities, statuses, stopping = context.Queue(1), context.Queue(1), context.Event()
-    observer = context.Process(target=upper_observer, args=(request, velocities, statuses, stopping))
+    ownership,acknowledged,remote_ready=context.Value('i',0),context.Value('i',-1),context.Value('i',0)
+    observer = context.Process(target=upper_observer, args=(request, velocities, statuses, stopping,
+                                                          ownership,acknowledged,remote_ready))
     observer.start()
     os.environ['ROS_MASTER_URI'] = request['master']
     os.environ['ROS_IP'] = request['ros_ip']
@@ -163,14 +214,18 @@ def run_bridge(request):
         while not stopping.is_set() and observer.is_alive():
             frame = receive(sys.stdin, .3, buffer)
             if (frame.get('nonce') != nonce or type(frame.get('seq')) is not int
-                    or frame['seq'] <= seq or type(frame.get('allow')) is not bool):
+                    or frame['seq'] <= seq or type(frame.get('allow')) is not bool
+                    or frame.get('owner') not in ('hold','card','remote')):
                 raise RuntimeError('upper_bridge_invalid_lease')
             seq = frame['seq']
+            ownership.value={'hold':0,'card':1,'remote':2}[frame['owner']]
             while True:
                 try:sample = velocities.get_nowait()
                 except queue.Empty:break
             with lock:
-                values = bridge_values(sample, latest[0], frame['allow'], time.monotonic())
+                matching=sample is not None and sample[3]==ownership.value and acknowledged.value==ownership.value
+                permit=frame['allow'] and matching and (ownership.value!=2 or remote_ready.value==1)
+                values = bridge_values(sample[:3] if sample else None, latest[0], permit, time.monotonic())
             # Do not continuously inject even zeros into a native navigation
             # task. Send one zero when relinquishing upper control, then keep
             # the data path silent until another upper lease owns the base.
@@ -178,7 +233,9 @@ def run_bridge(request):
                 publish(values)
             was_allowed = frame['allow']
             nonce = secrets.token_hex(16)
-            print(json.dumps({'state':'ready','nonce':nonce,'seq':seq,'forwarded_nonzero':any(values)}),flush=True)
+            print(json.dumps({'state':'ready','nonce':nonce,'seq':seq,'forwarded_nonzero':any(values),
+                'input_owner':{0:'hold',1:'card',2:'remote'}.get(acknowledged.value),
+                'remote_state':'ready' if remote_ready.value==1 else 'waiting_for_neutral' if ownership.value==2 else 'blocked'}),flush=True)
         raise RuntimeError('upper_bridge_observer_stopped')
     finally:
         try:
@@ -196,6 +253,7 @@ def run_bridge(request):
             stopping.set()
             observer.join(timeout=1.)
             if observer.is_alive():observer.terminate();observer.join(timeout=1.)
+            if observer.is_alive():observer.kill();observer.join(timeout=1.)
             for sub in subscribers:sub.unregister()
             publisher.unregister()
 
