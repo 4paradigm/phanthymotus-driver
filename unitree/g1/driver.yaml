@@ -25,6 +25,7 @@ cards:
   - { name: motion_events,          type: sensor }
   - { name: loco,                   type: actuator }
   - { name: loco_relative_move,     type: actuator }
+  - { name: g1_stationary_follow,   type: actuator }
   - { name: switch_mode,            type: actuator }
   - { name: switch_mode_expert,     type: actuator }
   - { name: arm,                    type: actuator }

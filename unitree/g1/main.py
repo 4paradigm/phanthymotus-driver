@@ -177,6 +177,12 @@ class G1DeviceBundle:
             self._plugins.append(self._point_card)
             print("[bundle] LocoRelativeMovePlugin loaded (direct SDK)")
 
+        if plugins_cfg.get("stationary_follow", {}).get("enabled", False):
+            from stationary_follow import StationaryFollowPlugin
+            self._plugins.append(StationaryFollowPlugin(
+                plugins_cfg["stationary_follow"], namespace, executor))
+            print("[bundle] StationaryFollowPlugin loaded (preview, no motion)")
+
         if plugins_cfg.get("arm", {}).get("enabled", False):
             from device import ArmActionPlugin
             self._plugins.append(ArmActionPlugin(plugins_cfg["arm"], namespace, executor, arm_client))

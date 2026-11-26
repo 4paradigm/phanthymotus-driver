@@ -1,6 +1,6 @@
 # G1 原地小跟班：决策原型
 
-`stationary_follow.py` 是电脑仿真中使用的纯 Python 决策层。输入单人位置后，它只计算原地转向或停止的请求；前进和横移始终为零。它**没有**订阅真实感知数据、调用 G1 SDK、注册 Motus 卡片或加入 Docker 镜像，因此当前 PR 不能作为真机功能验收。
+`stationary_follow.py` 包含跟随决策层和 `g1_stationary_follow` Motus 卡片。卡片在 G1 Driver 中注册，画布可连接 `sensor/pose2d` 人物姿态输入。它将 `image_size` 与人物 `bbox`（或可见关键点）换算为画面横向位置，并在 `info` 中显示转向或停止判断。当前是**预览模式**，不调用 G1 运动接口，不能作为真机跟随功能验收。
 
 运行离线检查：
 
@@ -10,7 +10,7 @@ python -m unittest discover -s unitree/g1/tests -p test_stationary_follow.py -v
 
 接入前需要完成：
 
-1. 核对 Motus `pose` 卡片真实消息字段、时间戳语义、人物 ID 稳定性与横坐标方向；现有 `persons[].position[0]` 格式只是仿真假设。
+1. 在画布连接真实 `sensor/pose2d` 输出，核对 `image_size`、`bbox`/`keypoints`、人物 ID 稳定性与相机横坐标方向。只有标准姿态格式才会得到有效判断。
 2. 明确 G1 底座控制权与停止接口，保证与现有 `loco`、`loco_relative_move` 和 SmartMotion 不会同时写入运动指令。
-3. 实现超时与目标丢失的实际停机路径，并以默认关闭的插件接入 `main.py`、`config.yaml`、`driver.yaml` 和 `Dockerfile`。
-4. 完成无运动的消息链路测试，再由机器人负责人在安全场地监督真机测试；原地转向也可能产生脚步位移。
+3. 在预览模式确认丢失目标、数据超时均产生停止判断，再实现受保护的真机运动适配。
+4. 真机测试需机器人负责人在安全场地监督；原地转向也可能产生脚步位移。
