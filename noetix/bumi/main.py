@@ -123,6 +123,7 @@ class BumiDeviceBundle:
         plugins_cfg = cfg.get("plugins", {})
         camera_plugin = None
         loco_plugin = None
+        loco_servo_plugin = None
         # The camera subprocess reads this env var; set it before any plugin can
         # start that subprocess, so the raw RGB-D branch is published only when
         # the visual odometry card is enabled.
@@ -151,12 +152,13 @@ class BumiDeviceBundle:
         if (plugins_cfg.get("loco_servo", {}).get("enabled", False)
                 and high_ctrl is not None):
             from loco_servo import LocoServoPlugin
-            self._plugins.append(LocoServoPlugin(
+            loco_servo_plugin = LocoServoPlugin(
                 plugins_cfg["loco_servo"], namespace, executor, high_ctrl,
                 # When the call-shaped card is enabled, both paths share its
                 # lock/rate limiter and explicit actions preempt the stream.
                 loco_plugin=loco_plugin,
-            ))
+            )
+            self._plugins.append(loco_servo_plugin)
             print("[bundle] LocoServoPlugin loaded")
 
         if plugins_cfg.get("mic", {}).get("enabled", False) and media_ctrl is not None:
@@ -212,7 +214,12 @@ class BumiDeviceBundle:
             else:
                 from upper_body_mimic_card import UpperBodyMimicPlugin
                 self._plugins.append(UpperBodyMimicPlugin(
-                    plugins_cfg["upper_body_mimic"], namespace, executor, high_ctrl))
+                    plugins_cfg["upper_body_mimic"], namespace, executor, high_ctrl,
+                    # Both chassis writers are built before this card. Wiring
+                    # them in gives all three the same mutual-exclusion graph:
+                    # a motion or a velocity stream blocks start, and an
+                    # explicit motion preempts this loop.
+                    loco_plugin=loco_plugin, loco_servo=loco_servo_plugin))
                 print("[bundle] UpperBodyMimicPlugin loaded")
 
         if plugins_cfg.get("motion_state", {}).get("enabled", False) and high_ctrl is not None:

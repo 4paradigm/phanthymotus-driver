@@ -92,12 +92,12 @@ class FakeLoco:
         self.published.append((round(x, 6), round(y, 6), round(z, 6)))
 
 
-def _card(high_ctrl=None, loco=None, **config):
+def _card(high_ctrl=None, loco=None, mimic=None, **config):
     config.setdefault("dry_run", False)
     return loco_servo.LocoServoPlugin(
         config, "bumi", executor=None,
         high_ctrl=high_ctrl if high_ctrl is not None else FakeHighCtrl(),
-        loco_plugin=loco)
+        loco_plugin=loco, mimic_plugin=mimic)
 
 
 def _command(values, seq=1, stamp_ms=None, ttl_ms=200):
@@ -528,6 +528,41 @@ def test_starting_is_refused_while_loco_is_driving():
     result = card.dispatch("start", {"input_topic": "/nav/cmd"})
     assert result["state"] == "error"
     assert "stop_move" in result["message"]
+
+
+class FakeMimic:
+    """Stands in for upper_body_mimic holding all 21 motors."""
+
+    def __init__(self, driving=False):
+        self.driving = driving
+        self.attached_servo = None
+
+    def is_driving(self):
+        return self.driving
+
+    def attach_mimic(self, servo):
+        self.attached_servo = servo
+
+
+def test_starting_is_refused_while_the_mimic_owns_all_motors():
+    """The reverse start order: mimic first, then this stream tries to start."""
+    card = _card(mimic=FakeMimic(driving=True))
+    result = card.dispatch("start", {"input_topic": "/nav/cmd"})
+    assert result["state"] == "error"
+    assert "upper_body_mimic" in result["message"]
+
+
+def test_the_mimic_reference_is_wired_both_ways():
+    mimic = FakeMimic()
+    card = _card(mimic=mimic)
+    assert card._mimic is mimic
+    assert mimic.attached_servo is card
+
+
+def test_releasing_the_motors_allows_the_stream_to_start():
+    mimic = FakeMimic(driving=False)
+    card = _card(mimic=mimic, dry_run=True)
+    assert card._chassis_conflict() == ""
 
 
 def test_the_card_registers_itself_with_loco_so_it_can_be_preempted():

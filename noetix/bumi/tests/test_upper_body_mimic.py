@@ -391,7 +391,8 @@ class _FakeLowCtrl:
         self.calls.append(commands)
 
 
-def _plugin(monkeypatch, *, mode=2, pose=None, config=None):
+def _plugin(monkeypatch, *, mode=2, pose=None, config=None,
+            loco=None, servo=None):
     card = _load_card_module(monkeypatch)
     high = _FakeHighCtrl(mode=mode, pose=pose)
     low = _FakeLowCtrl()
@@ -400,7 +401,7 @@ def _plugin(monkeypatch, *, mode=2, pose=None, config=None):
     settings = {"dds_contention_verified": True, **(config or {})}
     plugin = card.UpperBodyMimicPlugin(
         settings, "bumi", types.SimpleNamespace(add_node=lambda *_: None),
-        high_ctrl=high)
+        high_ctrl=high, loco_plugin=loco, loco_servo=servo)
     # The SDK probe would try to import the ARM64 bindings; the fake replaces
     # both halves of `_ensure_low_level`.
     card._load_low_level = lambda: (lambda: low, _FakeMotorCmd)
@@ -436,7 +437,11 @@ def test_the_tool_is_an_actuator_that_declares_the_motors_it_takes(monkeypatch):
     assert tool["name"] == "upper_body_mimic"
     assert tool["type"] == "actuator"
     assert tool["topic_out"] == []
-    assert tool["inputSchema"]["x-resource"] == ["base", "arm_l", "arm_r"]
+    # set_joint writes all 21 motors: six arms follow, thirteen leg/waist joints
+    # hold. Every occupied channel must be declared or a leg/waist action could
+    # run concurrently (README_dev.md: wrongly-declared is the unsafe case).
+    assert tool["inputSchema"]["x-resource"] == [
+        "base", "arm_l", "arm_r", "leg", "waist"]
     assert set(tool["inputSchema"]["x-action-params"]) == {"start", "stop", "info"}
     assert tool["inputSchema"]["required"] == ["action"]
 
@@ -995,3 +1000,123 @@ def test_a_stop_during_a_blocked_joint_read_cannot_be_followed_by_a_command(monk
     finally:
         release.set()
         plugin.dispatch("stop", {})
+
+
+# ── chassis arbitration (review High) ────────────────────────────────────────
+
+class _FakeLoco:
+    def __init__(self, moving=False):
+        self.moving = moving
+        self.attached_mimic = None
+
+    def is_moving(self):
+        return self.moving
+
+    def attach_mimic(self, mimic):
+        self.attached_mimic = mimic
+
+
+class _FakeServo:
+    def __init__(self, running=False):
+        self.running = running
+        self.attached_mimic = None
+
+    def is_running(self):
+        return self.running
+
+    def attach_mimic(self, mimic):
+        self.attached_mimic = mimic
+
+
+def _conflict_message(result):
+    return result.get("error", "")
+
+
+def test_construction_wires_both_chassis_writers_back_to_mimic(monkeypatch):
+    loco, servo = _FakeLoco(), _FakeServo()
+    _card, plugin, _high, _low = _plugin(monkeypatch, loco=loco, servo=servo)
+    assert loco.attached_mimic is plugin
+    assert servo.attached_mimic is plugin
+
+
+def test_mimic_refuses_start_while_loco_has_a_motion_in_flight(monkeypatch):
+    loco = _FakeLoco(moving=True)
+    _card, plugin, _high, low = _plugin(monkeypatch, loco=loco)
+    result = plugin.dispatch("start", {"confirm": True})
+    assert result["state"] == "error"
+    assert "loco" in _conflict_message(result)
+    assert low.calls == []
+    assert plugin._worker is None
+
+
+def test_mimic_refuses_start_while_the_velocity_stream_is_running(monkeypatch):
+    servo = _FakeServo(running=True)
+    _card, plugin, _high, low = _plugin(monkeypatch, servo=servo)
+    result = plugin.dispatch("start", {"confirm": True})
+    assert result["state"] == "error"
+    assert "loco_servo" in _conflict_message(result)
+    assert low.calls == []
+    assert plugin._worker is None
+
+
+def test_a_chassis_writer_started_mid_run_stops_the_mimic(monkeypatch):
+    """The reverse start order: servo comes up after the mimic was armed."""
+    import time
+
+    servo = _FakeServo(running=False)
+    _card, plugin, _high, low = _plugin(monkeypatch, servo=servo)
+    assert plugin.dispatch("start", {"confirm": True})["state"] == "ready"
+    try:
+        time.sleep(0.1)
+        assert low.calls, "control loop never ran"
+        servo.running = True
+        deadline = time.monotonic() + 2.0
+        while plugin.is_driving() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not plugin.is_driving(), "kept writing after the chassis stream started"
+        settled = len(low.calls)
+        time.sleep(0.1)
+        assert len(low.calls) == settled, "sent more commands after yielding"
+        info = plugin.dispatch("info", {})
+        assert "loco_servo" in info["chassis_conflict"]
+    finally:
+        plugin.dispatch("stop", {})
+
+
+def test_an_explicit_command_preempts_a_running_mimic(monkeypatch):
+    """LocoPlugin._preempt_servo must also stop this all-motor writer."""
+    import time
+
+    _card, plugin, _high, low = _plugin(monkeypatch)
+    assert plugin.dispatch("start", {"confirm": True})["state"] == "ready"
+    try:
+        time.sleep(0.1)
+        assert low.calls
+        assert plugin.pause_for_explicit_command("loco.move") is True
+        assert not plugin.is_driving()
+        assert plugin.dispatch("info", {})["state"] == "idle"
+        assert "preempted" in plugin._last_error
+        settled = len(low.calls)
+        time.sleep(0.1)
+        assert len(low.calls) == settled, "wrote motors after preemption"
+        # No implicit resume: a dangerous card needs a fresh confirm.
+        assert plugin.pause_for_explicit_command("again") is False
+    finally:
+        plugin.dispatch("stop", {})
+
+
+def test_info_reports_the_arbitration_state(monkeypatch):
+    _card, plugin, _high, _low = _plugin(monkeypatch)
+    info = plugin.dispatch("info", {})
+    assert info["driving"] is False
+    assert info["chassis_conflict"] == ""
+
+
+def test_the_tool_declares_interrupts_and_all_occupied_channels(monkeypatch):
+    card = _load_card_module(monkeypatch)
+    plugin = card.UpperBodyMimicPlugin(
+        {}, "bumi", types.SimpleNamespace(add_node=lambda *_: None))
+    schema = plugin.get_tool()["inputSchema"]
+    assert schema["x-hooks"]["on_interrupt_motion"] == {"action": "stop"}
+    assert schema["x-hooks"]["on_interrupt_all"] == {"action": "stop"}
+    assert set(schema["x-resource"]) == {"base", "arm_l", "arm_r", "leg", "waist"}

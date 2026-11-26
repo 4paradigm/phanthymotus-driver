@@ -111,12 +111,25 @@ class UpperBodyMimicPlugin:
     PREFIX = "upper_body_mimic"
 
     def __init__(self, plugin_config: dict, namespace: str,
-                 executor, high_ctrl=None):
+                 executor, high_ctrl=None, loco_plugin=None, loco_servo=None):
         cfg = plugin_config or {}
         self._namespace = namespace
         self._default_angles_topic = f"/{namespace}/upper_body_track/angles"
         self._angles_topic = self._default_angles_topic
         self._high_ctrl = high_ctrl
+        # set_joint takes the whole robot, not just the arms. A running chassis
+        # writer (`loco` motion or `loco_servo` stream) must not coexist with
+        # this loop. These are the same two references the servo card uses for
+        # its own arbitration; the bundle wires them in registration order.
+        self._loco = loco_plugin
+        self._servo = loco_servo
+        # Both cards are constructed before this one. Attach from this side the
+        # same way LocoServoPlugin attaches itself to `loco`: each now knows it
+        # must yield when the other owns the robot.
+        if self._loco is not None and hasattr(self._loco, "attach_mimic"):
+            self._loco.attach_mimic(self)
+        if self._servo is not None and hasattr(self._servo, "attach_mimic"):
+            self._servo.attach_mimic(self)
 
         self._control_hz = float(cfg.get("control_hz", 50.0))
         # PR #485 preview bounds, in rad/s and rad/s²; the spec converts them.
@@ -243,6 +256,10 @@ class UpperBodyMimicPlugin:
                 },
                 "required": ["action"],
                 "x-is-dangerous": True,
+                # An interrupt must stop this card too: a running 21-motor loop
+                # is exactly what on_interrupt_motion has to silence.
+                "x-hooks": {"on_interrupt_motion": {"action": "stop"},
+                            "on_interrupt_all": {"action": "stop"}},
                 "x-action-params": {
                     "start": {
                         "params": ["angles_topic", "confirm"],
@@ -257,7 +274,14 @@ class UpperBodyMimicPlugin:
                         "description": "当前目标角度、实测角度、是否失联与 workmode",
                     },
                 },
-                "x-resource": ["base", "arm_l", "arm_r"],
+                # set_joint takes exactly 21 commands, so this card commands the
+                # whole robot: the six observable arm joints follow the operator
+                # and the other fifteen — both legs and the waist included —
+                # hold their measured pose. Declaring only the arm channels
+                # would let a correctly-declared leg/waist action run alongside
+                # this all-motor takeover. Use the canonical names from
+                # README_dev.md's resource table.
+                "x-resource": ["base", "arm_l", "arm_r", "leg", "waist"],
             },
             "topic_in": [{
                 "topic": self._default_angles_topic,
@@ -292,6 +316,49 @@ class UpperBodyMimicPlugin:
             return self._info()
         return None
 
+    # ── arbitration with the call-shaped and stream-shaped chassis cards ────
+
+    def is_driving(self) -> bool:
+        """Whether the 21-motor loop is really writing (for other cards)."""
+        worker = self._worker
+        return bool(worker is not None and worker.is_alive()
+                    and not self._stop_event.is_set())
+
+    def pause_for_explicit_command(self, reason: str = "") -> bool:
+        """Give up the motors to an explicit loco/posture action.
+
+        The same protocol `loco_servo` implements: a person's or the LLM's
+        action outranks this loop. Return True only if a live loop was stopped,
+        so callers can report the preemption. Unlike a servo pause there is no
+        resume — the operator must confirm `start` again before this dangerous
+        card may write all 21 motors.
+        """
+        if not self.is_driving():
+            return False
+        self._last_error = f"preempted by explicit command: {reason}" if reason \
+            else "preempted by explicit command"
+        # _teardown reports whether the worker really exited. Do not claim idle
+        # while a mid-tick send may still complete after a join timeout.
+        self._teardown()
+        return True
+
+    def _chassis_conflict(self) -> str:
+        """Why this card must not own the motors right now, or "".
+
+        `x-resource` is scheduling metadata, not a lock: a `loco` motion or a
+        `loco_servo` stream can already be publishing through `HighController`
+        when this card arms. Both write the same robot; only one may own it.
+        """
+        if self._loco is not None and getattr(self._loco, "is_moving", None):
+            if self._loco.is_moving():
+                return ("loco 卡片正在驱动底盘（move 未 stop_move）——"
+                        "请先调用 loco 的 stop_move 再启动 upper_body_mimic。")
+        if self._servo is not None and getattr(self._servo, "is_running", None):
+            if self._servo.is_running():
+                return ("loco_servo 正在发布底盘速度流 —— 请先 stop 该卡片"
+                        "再启动 upper_body_mimic。")
+        return ""
+
     # ── actions ──────────────────────────────────────────────────────────────
 
     def _start(self, args: dict) -> dict:
@@ -316,6 +383,12 @@ class UpperBodyMimicPlugin:
                     "error": ("DDS contention not verified: confirm on the real "
                               "robot that LowController and HighController do "
                               "not fight, then set dds_contention_verified: true")}
+
+        # A chassis writer may already be publishing. x-resource only orders
+        # Agent Core's own actions; it cannot stop a topic-driven loop.
+        conflict = self._chassis_conflict()
+        if conflict:
+            return {"state": "error", "error": conflict}
 
         mode = self._read_workmode()
         if mode is None:
@@ -419,6 +492,8 @@ class UpperBodyMimicPlugin:
             "workmode": mode,
             "walking_mode_ok": mode == _WALKING_WORKMODE,
             "dds_contention_verified": self._dds_verified,
+            "chassis_conflict": self._chassis_conflict(),
+            "driving": self.is_driving(),
             "urdf_limits_loaded": spec.URDF_LIMITS_LOADED,
             "ticks": self._ticks,
             "control_hz": self._control_hz,
@@ -523,6 +598,17 @@ class UpperBodyMimicPlugin:
                 self._status = "error"
                 self._stop_event.set()
                 log.error(f"upper_body_mimic stopped: {self._last_error}")
+                break
+
+            # A chassis card can be started after this one. Re-check ownership
+            # every tick, not only at start, so a newly running loco stream
+            # cannot end up writing HighController while we write LowController.
+            conflict = self._chassis_conflict()
+            if conflict:
+                self._last_error = conflict
+                self._status = "error"
+                self._stop_event.set()
+                log.error(f"upper_body_mimic stopped: {conflict}")
                 break
 
             now = time.monotonic()

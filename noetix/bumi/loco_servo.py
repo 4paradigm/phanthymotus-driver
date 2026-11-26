@@ -332,11 +332,12 @@ class LocoServoPlugin:
     PREFIX = "locoservo"      # no underscore — dispatch routes on partition("_")
 
     def __init__(self, plugin_config: dict, namespace: str, executor,
-                 high_ctrl, loco_plugin=None):
+                 high_ctrl, loco_plugin=None, mimic_plugin=None):
         self._ns = namespace
         self._executor = executor
         self._high_ctrl = high_ctrl
         self._loco = loco_plugin
+        self._mimic = mimic_plugin
         config = plugin_config or {}
 
         self._expected_hz = float(config.get("expected_hz", DEFAULT_EXPECTED_HZ))
@@ -404,6 +405,12 @@ class LocoServoPlugin:
         if loco_plugin is not None and hasattr(loco_plugin, "attach_servo"):
             # Lets every call-shaped card pause this one before it acts.
             loco_plugin.attach_servo(self)
+        if mimic_plugin is not None and hasattr(mimic_plugin, "attach_mimic"):
+            mimic_plugin.attach_mimic(self)
+
+    def attach_mimic(self, mimic) -> None:
+        """Let the 21-motor card be checked before this stream starts."""
+        self._mimic = mimic
 
     def distance_full_scale(self) -> dict:
         """Normalised command -> m/s for the pure-IMU distance cross-check.
@@ -758,18 +765,30 @@ class LocoServoPlugin:
 
     # ── arbitration with the call-shaped cards ───────────────────────────────
 
-    def _chassis_conflict(self) -> str:
-        """Refuse to start while `loco` is driving the same chassis.
+    def is_running(self) -> bool:
+        """Whether a velocity stream currently owns the chassis (for arbitration)."""
+        with self._lock:
+            return bool(self._running)
 
-        Starting anyway produces two threads publishing velocities at different
-        rates into one SDK, which reads on the robot as a stutter and in the
-        logs as nothing at all.
+    def _chassis_conflict(self) -> str:
+        """Refuse to start while `loco` or `upper_body_mimic` owns the motors.
+
+        Starting anyway produces two threads writing the same robot at
+        different rates through different controllers, which reads as a stutter
+        on the robot and shows up in no log at all. The mimic card takes all 21
+        motors with `LowController.set_joint`; this stream uses
+        `HighController.publish_cmd` — mutually exclusive by hardware, not by
+        `x-resource` scheduling.
         """
-        if self._loco is None or not getattr(self._loco, "is_moving", None):
-            return ""
-        if self._loco.is_moving():
-            return ("loco 卡片正在驱动底盘（move 未 stop_move）—— 两张卡片同时"
-                    "写同一个底盘会互相打架。请先调用 loco 的 stop_move。")
+        if self._loco is not None and getattr(self._loco, "is_moving", None):
+            if self._loco.is_moving():
+                return ("loco 卡片正在驱动底盘（move 未 stop_move）—— 两张卡片同时"
+                        "写同一个底盘会互相打架。请先调用 loco 的 stop_move。")
+        if (self._mimic is not None
+                and getattr(self._mimic, "is_driving", None)
+                and self._mimic.is_driving()):
+            return ("upper_body_mimic 正在接管全部 21 个电机 —— 请先 stop 该卡片"
+                    "再启动 loco_servo。")
         return ""
 
     def _posture_problem(self) -> str:

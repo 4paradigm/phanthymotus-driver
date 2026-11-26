@@ -604,6 +604,16 @@ What it does to stay inside that envelope:
   `confirm: true` — a missing, false or non-boolean value is refused before
   any motor is touched, so neither a stray call nor an unattended agent can
   arm the loop;
+- it shares the same in-process arbitration as `loco` and `loco_servo`: `start`
+  is refused while a `loco` motion or a `loco_servo` velocity stream owns the
+  chassis, the ownership check repeats every tick so a card started later also
+  stops this loop, and any explicit action on `loco` preempts it through the
+  same `_preempt_servo` path. `x-resource` alone cannot do this — it orders
+  Agent Core's scheduling, not two writers reaching the DDS bus by different
+  routes. The card declares every channel it occupies (`base`, `arm_l`,
+  `arm_r`, `leg`, `waist`), not just the arms;
+- `x-hooks` map `on_interrupt_motion` and `on_interrupt_all` to `stop`, so an
+  interrupt cannot leave a 21-motor loop writing;
 - a missing controller and an SDK failure refuse to command rather than
   retrying into a robot that has said no.
 

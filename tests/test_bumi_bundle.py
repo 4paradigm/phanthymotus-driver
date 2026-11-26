@@ -228,11 +228,14 @@ def test_upper_body_track_is_skipped_when_disabled(bundle_module, monkeypatch):
 
 
 class FakeUpperBodyMimicPlugin:
-    def __init__(self, plugin_config, namespace, executor, high_ctrl):
+    def __init__(self, plugin_config, namespace, executor, high_ctrl,
+                 loco_plugin=None, loco_servo=None):
         self.plugin_config = plugin_config
         self.namespace = namespace
         self.executor = executor
         self.high_ctrl = high_ctrl
+        self.loco_plugin = loco_plugin
+        self.loco_servo = loco_servo
 
     def get_tool(self):
         return {"name": "upper_body_mimic", "type": "actuator"}
@@ -267,6 +270,29 @@ def test_upper_body_mimic_registers_when_a_controller_exists(bundle_module, monk
 
     assert [tool["name"] for tool in bundle.get_all_tools()] == ["upper_body_mimic"]
     assert bundle._plugins[0].namespace == "bumi_test"
+
+
+def test_all_three_motor_writers_are_wired_for_arbitration(bundle_module, monkeypatch):
+    """loco/loco_servo/upper_body_mimic must know each other when all are on.
+
+    x-resource only orders Agent Core's own actions; a topic stream or a
+    21-motor loop can still reach the hardware by another route. The bundle
+    must build the mutual-exclusion graph explicitly.
+    """
+    fake = types.ModuleType("upper_body_mimic_card")
+    fake.UpperBodyMimicPlugin = FakeUpperBodyMimicPlugin
+    monkeypatch.setitem(sys.modules, "upper_body_mimic_card", fake)
+
+    config = _config(servo_config={"dry_run": True, "expected_hz": 10})
+    config["plugins"]["upper_body_mimic"] = {"enabled": True}
+
+    bundle = bundle_module.BumiDeviceBundle(
+        config, "bumi_test", object(), high_ctrl=FakeHighCtrl(), media_ctrl=None)
+    loco, servo, mimic = bundle._plugins
+
+    assert mimic.loco_plugin is loco
+    assert mimic.loco_servo is servo
+    assert servo._loco is loco
 
 
 def test_upper_body_mimic_is_skipped_without_a_controller(bundle_module, monkeypatch):
