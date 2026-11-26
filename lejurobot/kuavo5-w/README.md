@@ -1051,3 +1051,5 @@ root, then recovered by a camera-only device soft reboot. See the spatial input
 audit for timing, geometry limitations and deployment status.
 
 键盘SSH确认等待与运动租约分开：运行中允许最多1秒接收回复，底盘本地300ms失联零速保护不变，不重发旧方向。帧按80ms起点间隔发送，通信耗时计入周期，不在回复后额外等待80ms；`info.keyboard.last_roundtrip_ms/max_roundtrip_ms` 显示当前会话通信耗时，供定位抖动。该修改需部署后再进行现场持续操作验证。
+
+`stop_mapping` 在 MANUAL 中用厂商 RobotMotion 零速和新鲜里程计静止完成保存预检，不要求调度软急停反馈；退出建图后再用 AUTO 调度停车保护载图。地图命令尚未发送时的预检失败会保留原建图会话并清除本次过渡记录，允许重试，不要求重启底盘。

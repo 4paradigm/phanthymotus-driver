@@ -827,6 +827,30 @@ class SpatialTests(unittest.TestCase):
         self.assertFalse(self.plugin.unresolved())
         self.assertFalse(self.client.commands)
 
+    def test_stop_mapping_preflight_failure_preserves_session_and_allows_retry(self):
+        self.call('start_mapping', map_name='new')
+        self.completed()
+        self.bundle.tracker.events.clear()
+        original = self.client.native
+        def native(operation, **args):
+            if operation == 'manual_stop':
+                raise RuntimeError('temporary_manual_stop_feedback_loss')
+            return original(operation, **args)
+        self.client.native = native
+        self.call('stop_mapping')
+        status, result = self.completed()
+        self.assertEqual(status, 'error')
+        self.assertEqual(result['failed_stage'], None)
+        self.assertFalse(self.plugin.unresolved())
+        self.assertEqual(self.plugin.store.state('mapping')['phase'], 'mapping')
+        self.client.native = original
+        self.bundle.tracker.events.clear()
+        self.call('stop_mapping')
+        status, result = self.completed()
+        self.assertEqual(status, 'completed', result)
+        self.assertIsNone(self.plugin.store.state('mapping'))
+        self.assertIn('manual_stop', [op for op, args in self.client.calls])
+
     def test_save_waits_for_factory_optimization_without_short_rpc_timeout(self):
         self.call('start_mapping', map_name='new')
         self.completed()

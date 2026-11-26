@@ -1271,7 +1271,9 @@ class ControlledSpatialPlugin:
                 failed_stage = (self._map_pending or {}).get('stage')
                 # 8211 is the verified native precondition rejection, before
                 # ChangeCartoMap touches the map. No mutation is still running.
-                if ((failed_stage is None and self.store.state('mapping') is None) or
+                if ((failed_stage is None and (self.store.state('mapping') is None or
+                        (action == 'stop_mapping' and
+                         (self.store.state('mapping') or {}).get('phase') == 'mapping'))) or
                         (action == 'load_map' and isinstance(exc, MapCommandRejected)
                          and exc.method == 'ChangeCartoMap' and exc.code == 8211)):
                     self._map_pending = None
@@ -1371,10 +1373,12 @@ class ControlledSpatialPlugin:
         recovering_save = action == 'stop_mapping' and mapping and mapping['phase'] == 'saving'
         if not recovering_save:
             self._require_stationary()
-        hold = self.client.native('soft_stop' if action in ('start_mapping', 'load_map') else 'manual_hold')
-        if (hold.get('success') is not True or hold.get('software_estop') is not True
-                or hold.get('stationary') is not True):
-            raise RuntimeError('map_operation_requires_confirmed_software_stop')
+        manual_save = action == 'stop_mapping'
+        hold = self.client.native('manual_stop' if manual_save else 'soft_stop')
+        if (hold.get('success') is not True or hold.get('stationary') is not True
+                or hold.get('manual_zero_sent' if manual_save else 'software_estop') is not True):
+            raise RuntimeError('map_operation_requires_confirmed_manual_stop' if manual_save
+                               else 'map_operation_requires_confirmed_software_stop')
         if cancelled.is_set():
             raise RuntimeError('map_operation_interrupted')
         if action == 'start_mapping':
@@ -1433,7 +1437,7 @@ class ControlledSpatialPlugin:
                                                    for m in self.client.maps()], cancelled, 1500)
             self._command('AgvSystemRestart', {}, cancelled)
             self._wait(lambda: self.client.observe()['agvState'].get('isMapping') is False, cancelled, 60)
-            hold = self.client.native('manual_hold')
+            hold = self.client.native('soft_stop')
             if hold.get('software_estop') is not True or hold.get('stationary') is not True:
                 raise RuntimeError('post_restart_software_stop_unconfirmed')
             self._load(mapping['name'], cancelled)
