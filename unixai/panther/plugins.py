@@ -291,6 +291,9 @@ def build_plugins(config, namespace, device):
         plugins.append(CameraPlugin(
             device, "camera_depth", "depth", "Panther Gemini 2 depth stream (zlib 16UC1)"
         ))
+    if on("vision_pick_and_drop"):
+        from vision_pick_and_drop import VisionPickAndDrop
+        pick = VisionPickAndDrop(device, enabled["vision_pick_and_drop"])
     for eye in ("left", "right"):
         if on(f"camera_{eye}"):
             plugins.append(StereoCameraPlugin(device, eye))
@@ -475,5 +478,6 @@ def build_plugins(config, namespace, device):
             {"actions": ["look", "home"], "timeout": 30}, True,
         )
         plugins.append(ActuatorPlugin(device, "head", "Panther head pan/tilt control using live URDF limits", schema, device.head))
+    if on("vision_pick_and_drop"):
+        plugins.append(pick)  # stop before shutting down its camera and arm dependencies
     return plugins
-

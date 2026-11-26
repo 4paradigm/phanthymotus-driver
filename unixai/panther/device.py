@@ -175,6 +175,7 @@ class PantherDevice:
         self._controller_query_lock = threading.Lock()
         self._arm_lock = threading.RLock()
         self._arm_active = None
+        self._pick_owner = None
         self._head_lock = threading.RLock()
         self._head_active = None
         self._closed = False
@@ -1218,7 +1219,7 @@ class PantherDevice:
         if not response.ok:
             raise RuntimeError("controller manager rejected arm mode switch")
 
-    def arm(self, args: dict) -> dict:
+    def arm(self, args: dict, *, owner=None, completion=None) -> dict:
         action = args.get("action", "move")
         if action in ("start", "info"):
             with self._arm_lock:
@@ -1240,7 +1241,7 @@ class PantherDevice:
                     "joint_state_fresh": fresh(self._get("joints")[1]),
                     "limits_loaded": bool(self._joint_limits)}
         if action in ("stop", "cancel"):
-            return self._stop_arm("cancelled_by_request", wait_s=10.0)
+            return self._stop_arm("cancelled_by_request", wait_s=10.0, owner=owner)
         if action not in ("move", "move_separate", "home"):
             raise ValueError(f"unsupported arm_control action: {action}")
         self._ensure_motion_ready()
@@ -1346,12 +1347,14 @@ class PantherDevice:
             raise ValueError(f"duration_s must be in [1.0, {max_duration}]")
 
         with self._arm_lock:
+            if self._pick_owner is not owner:
+                raise RuntimeError("arm reserved by vision_pick_and_drop")
             if self._arm_active:
                 raise RuntimeError("an arm move is already active; call stop first")
             action_id = str(args.get("action_id") or f"panther_arm_{uuid4().hex[:12]}")
             active = {"action_id": action_id, "action": action, "side": side,
                       "duration_s": duration, "stop": threading.Event(), "handles": {},
-                      "thread": None}
+                       "thread": None, "completion": completion}
             self._arm_active = active
             thread = threading.Thread(
                 target=self._run_arm,
@@ -1414,7 +1417,7 @@ class PantherDevice:
                 results[arm_side] = {"status": int(wrapped.status),
                                      "error_code": int(wrapped.result.error_code),
                                      "error_string": wrapped.result.error_string}
-                if wrapped.result.error_code != 0 and not active["stop"].is_set():
+                if (wrapped.status != 4 or wrapped.result.error_code != 0) and not active["stop"].is_set():
                     raise RuntimeError(f"{arm_side} trajectory failed: {wrapped.result.error_string}")
             result["result"] = results
             status = "cancelled" if active["stop"].is_set() else "completed"
@@ -1433,12 +1436,17 @@ class PantherDevice:
             with self._arm_lock:
                 if self._arm_active is active:
                     self._arm_active = None
-            _notify_completion(action_id, status, result, "arm_control")
+            if active.get("completion") is not None:
+                active["completion"](status, result)
+            else:
+                _notify_completion(action_id, status, result, "arm_control")
 
-    def _stop_arm(self, reason: str, wait_s: float) -> dict:
+    def _stop_arm(self, reason: str, wait_s: float, owner=None) -> dict:
         with self._arm_lock:
             active = self._arm_active
             if not active:
+                return {"state": "idle", "stopped": False}
+            if owner is not None and self._pick_owner is not owner:
                 return {"state": "idle", "stopped": False}
             active["stop"].set()
             handles = list(active["handles"].values())
@@ -1454,7 +1462,24 @@ class PantherDevice:
         return {"state": "idle" if not thread or not thread.is_alive() else "stopping",
                 "stopped": True, "reason": reason, "action_id": action_id}
 
-    def gripper(self, args: dict) -> dict:
+    def reserve_pick(self, owner):
+        with self._arm_lock:
+            if self._pick_owner is not None or self._arm_active is not None:
+                raise RuntimeError("Panther arm is busy")
+            self._pick_owner = owner
+
+    def release_pick(self, owner):
+        with self._arm_lock:
+            if self._pick_owner is owner and self._arm_active is None:
+                self._pick_owner = None
+
+    def gripper(self, args: dict, *, owner=None) -> dict:
+        with self._arm_lock:
+            if args.get("action") not in ("info", "start", "stop") and self._pick_owner is not owner:
+                raise RuntimeError("gripper reserved by vision_pick_and_drop")
+            return self._gripper_command(args)
+
+    def _gripper_command(self, args: dict) -> dict:
         action = args.get("action", "set")
         if action == "stop":
             return {
@@ -1691,4 +1716,3 @@ class PantherDevice:
         if action == "info":
             return self._camera.info(kind)
         raise ValueError(f"unsupported camera action: {action}")
-
