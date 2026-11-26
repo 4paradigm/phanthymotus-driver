@@ -772,14 +772,18 @@ class A3Nodes:
                     # cadence. Never build an unbounded executor backlog: one
                     # frame per camera is in flight, newer frames replace the
                     # next sample naturally at the ROS callback.
-                    if key not in self._encoding_keys:
-                        with self._encode_lock:
-                            if key not in self._encoding_keys:
-                                self._encoding_keys.add(key)
-                                future = self._media_executor.submit(
-                                    self._encode_and_publish, re_encode, msg, pub, robot_topic)
-                                future.add_done_callback(
-                                    lambda _future, stream_key=key: self._clear_encoding(stream_key))
+                    with self._encode_lock:
+                        if key in self._encoding_keys:
+                            return
+                        self._encoding_keys.add(key)
+                    try:
+                        future = self._media_executor.submit(
+                            self._encode_and_publish, re_encode, msg, pub, robot_topic)
+                    except RuntimeError:
+                        self._clear_encoding(key)
+                        raise
+                    # Completed futures invoke this callback immediately, on this thread.
+                    future.add_done_callback(lambda _future: self._clear_encoding(key))
                     return
                 if as_json:
                     try:
@@ -1714,7 +1718,8 @@ class A3Rpc:
                    "command": {k: v for k, v in command.items() if not str(k).startswith("_")}}
         response = self._unit(self.mdu_port, 56322).call("MotionControlActionService", "SetAction", payload)
         state = response.get("state")
-        if state is not None and str(state) not in ("1", "CommonState_SUCCESS"):
+        # CommonResponse.state defaults to UNKNOWN (0) when protobuf JSON omits it.
+        if str(state) not in ("1", "CommonState_SUCCESS"):
             raise RpcError(f"MotionControlActionService/SetAction 拒绝请求: state={state!r} "
                            f"msg={(response.get('header') or {}).get('msg', '')!r}")
         return response
@@ -2331,9 +2336,13 @@ def _mc_failed(info: dict) -> bool:
 def _mc_next(rpc) -> dict:
     """GetNextActions → {short action name: command entry to send verbatim}."""
     out = {}
-    for item in rpc.get_next_actions().get("commands") or ():
-        if isinstance(item, dict) and item.get("action"):
-            out[_mc_name(item["action"])] = item
+    commands = rpc.get_next_actions().get("commands", [])  # empty repeated fields may be omitted
+    if not isinstance(commands, list):
+        raise ValueError("GetNextActions: commands must be a list")
+    for item in commands:
+        if not isinstance(item, dict) or not isinstance(item.get("action"), str) or not item["action"].strip():
+            raise ValueError(f"GetNextActions: invalid command entry {item!r}")
+        out[_mc_name(item["action"])] = item
     return out
 
 
@@ -2359,7 +2368,7 @@ def _motion_gate(rpc, card: str):
     except Exception as exc:
         return _rejected("NOT_READY", f"无法读取运动控制状态: {exc}",
                          "检查 MDU 连接后重试", current="UNKNOWN")
-    if info["action"] != "MOTION" or info["status"] == "PREPARE":
+    if not _mc_settled(info, "MOTION"):
         return _rejected("NOT_READY",
                          f"{card} 需要 MOTION 状态，当前 {info['action']}/{info['status']}",
                          "先调用 mc_mode stand，等待其完成后重试", current=info["action"])
@@ -2486,9 +2495,9 @@ class McModePlugin:
         """End the posture switch ``action_id``: clear the BUSY slot and let loco walk again."""
         with self._lock:
             if self._active and self._active[0] == action_id:
+                if self.loco is not None:
+                    self.loco.unblock()
                 self._active = None
-        if self.loco is not None:
-            self.loco.unblock()
 
     # -- planning ---------------------------------------------------------------
 
@@ -2549,22 +2558,25 @@ class McModePlugin:
             return _rejected("NOT_ALLOWED", f"当前 {info['action']} 下固件不允许 DAMPING",
                              current=info["action"], next_actions=sorted(nxt))
         if self.loco is not None:
-            self.loco.halt("superseded_by_damping", wait=False)
+            self.loco.block("mc_mode damping", wait=False)
         try:
             self.nodes.rpc.set_action(command)
+            deadline = time.monotonic() + self.DAMPING_TIMEOUT_S
+            last = info
+            while time.monotonic() < deadline:
+                try:
+                    last = _mc_info(self.nodes.rpc)
+                except Exception:
+                    pass
+                if _mc_settled(last, "DAMPING"):
+                    return {"state": "done", "current": "DAMPING", "changed": True}
+                time.sleep(self.POLL_S)
+            return _rejected("TIMEOUT", "已发送 DAMPING，但未在时限内确认进入", current=last["action"])
         except RpcError as exc:
             return _rejected("ROBOT_REJECTED", str(exc), current=info["action"])
-        deadline = time.monotonic() + self.DAMPING_TIMEOUT_S
-        last = info
-        while time.monotonic() < deadline:
-            try:
-                last = _mc_info(self.nodes.rpc)
-            except Exception:
-                pass
-            if _mc_settled(last, "DAMPING"):
-                return {"state": "done", "current": "DAMPING", "changed": True}
-            time.sleep(self.POLL_S)
-        return _rejected("TIMEOUT", "已发送 DAMPING，但未在时限内确认进入", current=last["action"])
+        finally:
+            if self.loco is not None:
+                self.loco.unblock()
 
     # -- worker -----------------------------------------------------------------
 
@@ -2608,8 +2620,9 @@ class McModePlugin:
                 if fails >= self.STATE_FAILS:
                     raise _McAbort("STATE_UNAVAILABLE", f"确认站稳期间连续读取 GetAction 失败: {exc}", info)
                 continue
-            if latest["action"] != info["action"]:
-                raise _McAbort("INTERRUPTED", f"到位后状态变为 {latest['action']}", latest)
+            if not _mc_settled(latest, info["action"]):
+                raise _McAbort("INTERRUPTED", f"到位后状态变为 {latest['action']}/{latest['status']}", latest)
+            info = latest
         return info
 
     def _wait(self, targets, allowed, deadline, start=None):
@@ -2704,7 +2717,7 @@ class LocoPlugin:
         self._task = None          # {"id", "target", "deadline", "ending": None | (status, result)}
         self._velocity = dict.fromkeys(self.AXES, 0.0)
         self._thread = None
-        self._fault = None         # set by the MOTION monitor
+        self._motion_revision = 0  # invalidates admission checks that span a posture change
         self._state_at = 0.0       # monotonic time of the last good GetAction
         self._publish_error = None # why the current/last stream died, None if it stopped cleanly
         self._blocked = None       # reason walks are refused (mc_mode transition)
@@ -2770,19 +2783,26 @@ class LocoPlugin:
             thread.join(timeout=3.0)
         return task["id"] if task else None
 
-    def block(self, reason) -> bool:
+    def block(self, reason, wait=True) -> bool:
         """Refuse new walks (BUSY) until unblock(), and stop the current stream.
 
         True once the stream that was running has exited after delivering its
         zero frames (or none was running); False if it is still running after
-        BLOCK_STOP_TIMEOUT_S or died on a publish error. The block stays either way.
+        BLOCK_STOP_TIMEOUT_S or died on a publish error. Damping uses wait=False
+        to start braking without delaying the explicit damping command.
         """
         with self._lock:
+            self._motion_revision += 1
             self._blocked = reason
-            running = self._thread is not None
-        if not running:
-            return True
+            if self._thread is None:
+                if not wait or self._publish_error is None:
+                    return self._publish_error is None
+                # A previous stream died without confirming a stop. Retry its zero
+                # frames while walks are blocked before allowing SkillPilot to move.
+                self._start_stream()
         self.halt(reason)
+        if not wait:
+            return False
         deadline = time.monotonic() + self.BLOCK_STOP_TIMEOUT_S
         while True:
             with self._lock:
@@ -2811,8 +2831,10 @@ class LocoPlugin:
             return _rejected("INVALID_ARG", "forward/lateral/angular/duration 必须是数字")
         if not 0.0 < duration <= self.MAX_DURATION_S:
             return _rejected("INVALID_ARG", f"duration={duration:g} 超出 (0, {self.MAX_DURATION_S:g}]")
-        if self._blocked is not None:
-            return self._busy()
+        with self._lock:
+            if self._blocked is not None:
+                return self._busy()
+            motion_revision = self._motion_revision
         try:
             limits = self._effective_limits()
         except Exception as exc:
@@ -2835,18 +2857,22 @@ class LocoPlugin:
             if self._blocked is not None:
                 return self._busy()
             old = self._task
+            if self._motion_revision != motion_revision:
+                return _rejected("NOT_READY", "行走校验期间运动控制状态已变化，请重试")
+            if old and old["ending"] and old["ending"][0] == "error":
+                return _rejected("NOT_READY", "上一行走任务因异常正在减速，请等停稳后重试")
             self._task = {"id": action_id, "target": target, "duration": duration,
                           "deadline": time.monotonic() + duration, "ending": None}
-            self._fault = None
             if self._thread is None:
                 self._state_at = time.monotonic()    # the MOTION gate just read it
-                self._publish_error = None
-                self._thread = threading.Thread(target=self._stream, daemon=True,
-                                                name="a3_loco_stream")
-                self._thread.start()
+                self._start_stream()
         if old is not None:
-            status, result = old["ending"] or ("cancelled", {"reason": "superseded", "by": action_id})
-            _notify_async(old["id"], status, result, "loco")
+            # If the old walk is still here, its zero frame hasn't been confirmed.
+            # An expired walk taken over during braking cannot report completion.
+            ending = old["ending"]
+            result = (ending[1] if ending and ending[0] == "cancelled"
+                      else {"reason": "superseded", "by": action_id})
+            _notify_async(old["id"], "cancelled", result, "loco")
         return {"state": "accepted", "action_id": action_id, "target": target,
                 "duration": duration, "superseded": old["id"] if old else None}
 
@@ -2875,6 +2901,12 @@ class LocoPlugin:
         return limits
 
     # -- streaming --------------------------------------------------------------
+
+    def _start_stream(self):
+        """Called with the loco lock held, for a walk or to retry unconfirmed stop frames."""
+        self._publish_error = None
+        self._thread = threading.Thread(target=self._stream, daemon=True, name="a3_loco_stream")
+        self._thread.start()
 
     def _frame(self, velocity):
         now = time.time()
@@ -2905,7 +2937,7 @@ class LocoPlugin:
         zero frames with no task left."""
         dt = 1.0 / self.RATE_HZ
         monitor_stop = threading.Event()
-        threading.Thread(target=self._monitor, args=(monitor_stop,), daemon=True,
+        threading.Thread(target=self._monitor, args=(monitor_stop, threading.current_thread()), daemon=True,
                          name="a3_loco_monitor").start()
         zero_frames = 0
         next_tick = time.monotonic()
@@ -2914,13 +2946,10 @@ class LocoPlugin:
                 with self._lock:
                     task = self._task
                     if task is not None and task["ending"] is None:
-                        fault = self._fault
                         stale = time.monotonic() - self._state_at
-                        if fault is None and stale >= self.MONITOR_STALE_S:
-                            fault = {"code": "STATE_UNAVAILABLE",
-                                     "reason": f"{stale:.1f} 秒未读到 GetAction"}
-                        if fault is not None:
-                            task["ending"] = ("error", dict(fault))
+                        if stale >= self.MONITOR_STALE_S:
+                            task["ending"] = ("error", {"code": "STATE_UNAVAILABLE",
+                                                        "reason": f"{stale:.1f} 秒未读到 GetAction"})
                             task["target"] = dict.fromkeys(self.AXES, 0.0)
                         elif time.monotonic() >= task["deadline"]:
                             task["ending"] = ("completed", {"duration": task["duration"],
@@ -2961,18 +2990,25 @@ class LocoPlugin:
         if task is not None:
             _notify_async(task["id"], "error", {"code": "PUBLISH_FAILED", "reason": str(exc)}, "loco")
 
-    def _monitor(self, stop_event):
-        """Refresh ``_state_at`` on every good GetAction; the stream judges staleness."""
+    def _monitor(self, stop_event, stream_thread):
+        """Refresh feedback in MOTION and brake the current walk on a transition."""
         while not stop_event.wait(self.MONITOR_S):
             try:
                 info = _mc_info(self.nodes.rpc, timeout=self.MONITOR_RPC_TIMEOUT_S)
             except Exception:
                 continue
             with self._lock:
-                self._state_at = time.monotonic()
-            if info["action"] != "MOTION":
-                self._fault = {"code": "LEFT_MOTION",
-                               "reason": f"行走中运动控制状态变为 {info['action']}/{info['status']}"}
+                if self._thread is not stream_thread:
+                    return  # a delayed RPC from a previous stream
+                if _mc_settled(info, "MOTION"):
+                    self._state_at = time.monotonic()
+                    continue
+                self._motion_revision += 1
+                task = self._task
+                if task and (task["ending"] is None or task["ending"][0] == "completed"):
+                    task["target"] = dict.fromkeys(self.AXES, 0.0)
+                    task["ending"] = ("error", {"code": "LEFT_MOTION",
+                                                "reason": f"行走中运动控制状态变为 {info['action']}/{info['status']}"})
 
     def _status(self):
         with self._lock:
