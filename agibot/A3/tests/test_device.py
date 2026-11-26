@@ -120,6 +120,17 @@ class FakeExecutor:
         pass
 
 
+class FakeSingleThreadedExecutor(FakeExecutor):
+    def spin_once(self, timeout_sec):
+        time.sleep(min(timeout_sec, 0.01))
+
+    def wake(self):
+        pass
+
+    def shutdown(self):
+        pass
+
+
 class FakeROS2:
     def __init__(self):
         self.ctx_robot = object()
@@ -144,6 +155,7 @@ def _install_ros_stubs():
     module("rclpy.qos", QoSProfile=FakeQoSProfile, QoSReliabilityPolicy=FakeQoSReliabilityPolicy)
     rclpy.node = sys.modules["rclpy.node"]
     rclpy.qos = sys.modules["rclpy.qos"]
+    rclpy.executors = module("rclpy.executors", SingleThreadedExecutor=FakeSingleThreadedExecutor)
 
     module("sensor_msgs")
     module("sensor_msgs.msg", Image=FakeMsg, CompressedImage=FakeMsg, Imu=FakeMsg,
@@ -321,31 +333,39 @@ class HandTactileTests(unittest.TestCase):
         values = [0.0] * TAXEL_COUNT
         values[0], values[267], values[284], values[433] = 13, 17, 29, 255
         reader = TactileReader()
-        reading = reader.read(self.feedback(1, values), 0)
+        reading = reader.read(self.feedback(1, values), 0, 0)
         left, right = (reading["hands"][side] for side in ("left", "right"))
         self.assertEqual(left["thumb"]["raw"][0], 13)
         self.assertEqual(left["back"]["raw"][-1], 17)
         self.assertEqual(right["index"]["peak_raw"], 29)
         self.assertEqual(right["palm"]["raw"][-1], 255)
         self.assertEqual(right["palm"]["nonzero_points"], 1)
-        released = reader.read(self.feedback(2), 0.1)
+        released = reader.read(self.feedback(2), 0.1, 0.1)
         self.assertEqual(released["state"], "fresh")
         self.assertEqual(released["hands"]["right"]["palm"]["peak_raw"], 0)
 
     def test_cached_or_invalid_source_is_not_fresh_zero_pressure(self):
-        reader = TactileReader(cached_stamp=(42, 1))
+        reader = TactileReader()
         self.assertEqual(reader.read({}, 0)["state"], "waiting")
         self.assertEqual(reader.read(self.feedback(1), 0)["state"], "waiting")
-        self.assertEqual(reader.read(self.feedback(2), 0.1)["state"], "fresh")
-        stale = reader.read(self.feedback(2), 1.2)
+        self.assertEqual(reader.read(self.feedback(2), 0.1, 0.1)["state"], "fresh")
+        stale = reader.read(self.feedback(2), 1.2, 0.1)
         self.assertEqual(stale["state"], "stale")
         self.assertIsNone(stale["hands"])
-        self.assertEqual(reader.read(self.feedback(3, [0.0] * 260), 1.3)["state"], "unsupported_layout")
+        self.assertEqual(reader.read(self.feedback(3, [0.0] * 260), 1.3, 1.3)["state"], "unsupported_layout")
         bad = self.feedback(4, [0.0] * 535 + [float("nan")])
-        self.assertEqual(reader.read(bad, 1.4)["state"], "invalid_readings")
-        self.assertEqual(reader.read(self.feedback(5), 1.5)["state"], "fresh")
+        self.assertEqual(reader.read(bad, 1.4, 1.4)["state"], "invalid_readings")
+        self.assertEqual(reader.read(self.feedback(5), 1.5, 1.5)["state"], "fresh")
 
-    def test_sensor_lifecycle_reuses_mirror_and_keeps_existing_interfaces(self):
+    def test_new_arrivals_with_repeated_header_remain_fresh_until_receiving_stops(self):
+        reader = TactileReader()
+        feedback = self.feedback(1)
+        self.assertEqual(reader.read(feedback, 0, 0)["state"], "fresh")
+        self.assertEqual(reader.read(feedback, 4, 4)["state"], "fresh")
+        self.assertEqual(reader.read(feedback, 4.9, 4)["state"], "fresh")
+        self.assertEqual(reader.read(feedback, 5.1, 4)["state"], "stale")
+
+    def test_sensor_lifecycle_isolates_receiver_and_keeps_existing_interfaces(self):
         from PIL import Image
 
         config = json.loads(json.dumps(BASE_CONFIG))
@@ -380,19 +400,32 @@ class HandTactileTests(unittest.TestCase):
                 frame_ready.set()
 
         preview_pub.publish = capture_preview
-        callback = next(cb for topic, cb in nodes.robot.subscriptions if topic == "/motion/control/hand_joint_state")
+        source = sensor._source
+        self.assertIsNot(source._node, nodes.robot)
+        self.assertEqual(source._node.context, nodes.robot.context)
+        callback = next(cb for topic, cb in source._node.subscriptions if topic == "/motion/control/hand_joint_state")
+        # The aggregate mirror is deliberately frozen. Only the dedicated
+        # subscription receives the new pressure sample in this regression.
+        nodes.values["hand_state"] = self.feedback(1)
         feedback = FakeMsg()
         feedback.header = types.SimpleNamespace(frame_id="O10Hand", stamp=types.SimpleNamespace(sec=42, nanosec=1))
         feedback.name, feedback.position, feedback.velocity = [], [], []
         feedback.effort = array.array("d", [0.0] * TAXEL_COUNT)
         feedback.effort[284] = 29
         callback(feedback)
-        self.assertTrue(frame_ready.wait(3), "tactile preview never received a fresh mirrored sample")
+        self.assertTrue(frame_ready.wait(3), "tactile preview never received its independent sample")
         self.assertEqual(bundle.dispatch("hand_tactile", {"action": "stop"})["state"], "idle")
         self.assertEqual(json.loads(data_pub.published[-1].data)["hands"]["right"]["index"]["peak_raw"], 29)
         with Image.open(io.BytesIO(preview_pub.published[-1].data)) as rendered:
             self.assertEqual(rendered.format, "JPEG")
+            self.assertEqual(rendered.size, (800, 600))
             rendered.verify()
+        self.assertFalse(source._thread.is_alive())
+        self.assertIsNone(source._node)
+        bundle.dispatch("hand_tactile", {"action": "start"})
+        self.assertIsNot(sensor._source, source)
+        self.assertEqual(sensor._source.snapshot(), (None, None))
+        bundle.dispatch("hand_tactile", {"action": "stop"})
         self.assertEqual(len(nodes.robot.subscriptions), existing_subscriptions)
         self.assertEqual(transport.calls, [])
 
