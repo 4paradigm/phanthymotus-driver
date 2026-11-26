@@ -74,7 +74,7 @@ def diagnose(endpoint, photos=0):
     check("server", lambda: rpc(endpoint,"initialize"))
     def check_cards():
         cards = [t["name"] for t in rpc(endpoint,"tools/list")["tools"]]
-        expected = {"arm_control", "joints", "model", "piper_photo", "piper_camera_live"}
+        expected = {"arm_control", "joints", "model", "piper_photo", "piper_camera_live", "piper_camera_depth"}
         if set(cards) != expected:
             raise RuntimeError(f"Production tools mismatch: expected {sorted(expected)}, received {sorted(cards)}")
         return cards
@@ -106,6 +106,7 @@ def diagnose(endpoint, photos=0):
                 report["can"] = host_check(["ip","-details","link","show",interface])
         check("model", check_model)
         check("camera", lambda: call(endpoint, "piper_camera_live", "info"))
+        check("depth", lambda: call(endpoint, "piper_camera_depth", "info"))
         for index in range(photos):
             photo = check(f"photo_{index+1}", lambda: finish_photo(endpoint,
                          call(endpoint,"piper_photo","capture", capture_confirmed=True)))

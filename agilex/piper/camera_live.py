@@ -1,5 +1,6 @@
 """Passive live-color sensor/resource; lifecycle is independent of arm control."""
 import math
+from functools import partial
 from pathlib import Path
 import threading
 import time
@@ -46,11 +47,12 @@ def offline_image(width, height):
 
 
 class ImageTransport:
-    def __init__(self, ros2, topic):
+    def __init__(self, ros2, topic, *, encoding='jpeg', frame_id='piper_camera_color_optical_frame'):
         from rclpy.node import Node
         from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
         from sensor_msgs.msg import CompressedImage
         self.ros2, self.message_type = ros2, CompressedImage
+        self.encoding, self.frame_id = encoding, frame_id
         self.node = Node('piper_live_' + topic.strip('/').replace('/', '_'), context=ros2.ctx_core)
         self.attached = False
         try:
@@ -63,12 +65,12 @@ class ImageTransport:
             self.close()
             raise
 
-    def publish(self, jpeg, stamp):
+    def publish(self, payload, stamp):
         msg = self.message_type()
         msg.header.stamp.sec = int(stamp)
         msg.header.stamp.nanosec = int((stamp - int(stamp)) * 1e9)
-        msg.header.frame_id = 'piper_camera_color_optical_frame'
-        msg.format, msg.data = 'jpeg', jpeg
+        msg.header.frame_id = self.frame_id
+        msg.format, msg.data = self.encoding, payload
         self.publisher.publish(msg)
 
     def close(self):
@@ -84,12 +86,24 @@ class ImageTransport:
 class PiperCameraLive:
     STALE_SECONDS = 2.
     RETRY_SECONDS = 2.
+    NAME = 'piper_camera_live'
+    TITLE = 'On camera'
+    DESCRIPTION = 'Live bound color camera. Independent of Arm control and Joints; no robot commands.'
+    TOPIC_SUFFIX = '/camera/live'
+    FORMAT = 'image/jpeg'
+    ENCODING = 'jpeg'
+    FRAME_ID = 'piper_camera_color_optical_frame'
+    sensor_card = False
+    settings_from_config = staticmethod(camera_settings)
+    offline_frame = staticmethod(offline_image)
 
     def __init__(self, runtime, ros2=None, *, session_factory=CameraSession,
-                 publisher_factory=ImageTransport, owner_factory=CameraOwner):
+                 publisher_factory=None, owner_factory=CameraOwner):
         self.runtime, self.ros2 = runtime, ros2
-        self.settings = camera_settings(runtime.config)
-        self.topic = runtime.topic.rsplit('/', 1)[0] + '/camera/live'
+        self.settings = self.settings_from_config(runtime.config)
+        self.topic = runtime.topic.rsplit('/', 1)[0] + self.TOPIC_SUFFIX
+        if publisher_factory is None:
+            publisher_factory = partial(ImageTransport, encoding=self.ENCODING, frame_id=self.FRAME_ID)
         self.session_factory, self.publisher_factory, self.owner_factory = session_factory, publisher_factory, owner_factory
         self._lock = threading.RLock()
         self._stop = threading.Event()
@@ -101,21 +115,24 @@ class PiperCameraLive:
         self._width = self._height = None
         self._capture_fps = self._publish_fps = 0.
         self._publisher = None
+        self._metadata = None
+
+    def _outputs(self):
+        return [{'topic': self.topic, 'format': self.FORMAT}]
 
     def get_tools(self):
-        if getattr(self, 'sensor_card', False):
-            definition = tool('piper_camera_live', 'sensor',
-                'Live bound color camera. Independent of Arm control and Joints; no robot commands.',
+        if self.sensor_card:
+            definition = tool(self.NAME, 'sensor', self.DESCRIPTION,
                 {'type': 'object', 'properties': {}, 'additionalProperties': False},
-                topic_out=[{'topic': self.topic, 'format': 'image/jpeg'}])
-            definition['title'] = 'On camera'
+                topic_out=self._outputs())
+            definition['title'] = self.TITLE
             return [definition]
         schema = action_schema({'start': ([], '自动开始实时监控'), 'stop': ([], '停止采集并释放相机'),
                                 'info': ([], '查看相机状态')}, {})
         schema['additionalProperties'] = False
-        definition = tool('piper_camera_live', 'resource',
+        definition = tool(self.NAME, 'resource',
                           '自动显示绑定彩色相机的当前画面；在顶部「监控」查看，不控制机械臂。', schema,
-                          topic_out=[{'topic': self.topic, 'format': 'image/jpeg'}])
+                          topic_out=self._outputs())
         definition['title'] = '实时相机画面'
         if getattr(self.runtime, 'interface_language', None) == 'en':
             definition['title'] = 'Live camera'
@@ -134,7 +151,7 @@ class PiperCameraLive:
                         采集帧率=round(self._capture_fps, 2), 发布帧率=round(self._publish_fps, 2),
                         目标帧率=self.settings['fps'], 有效帧数=self._frames, 最后有效时间=self._last_time,
                         错误原因=self._error, publishing=self._publisher is not None,
-                        topic_out=[{'topic': self.topic, 'format': 'image/jpeg'}])
+                        topic_out=self._outputs())
             if getattr(self.runtime, 'interface_language', None) == 'en':
                 from agilex.piper.intent_control import public_error
                 keys = {'状态': 'status', '设备名称': 'device', '实际分辨率': 'resolution', '采集帧率': 'capture_fps',
@@ -146,18 +163,21 @@ class PiperCameraLive:
                 result['error'] = public_error(result['error']) if result['error'] else None
             return result
 
+    def _enabled(self):
+        return self.settings['enabled'] and self.runtime.camera_enabled
+
     def start(self):
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 if self._stop.is_set():
                     raise RuntimeError('相机采集进程仍在停止，请稍后再启动')
                 return self.info()
-            if not self.settings['enabled'] or not self.runtime.camera_enabled:
+            if not self._enabled():
                 self._state = 'disabled'
                 return self.info()
             self._stop = threading.Event()  # A new generation never clears the old cancellation token.
-            self._state, self._error = 'starting', None
-            self._thread = threading.Thread(target=self._run, args=(self._stop,), daemon=True, name='piper-live-supervisor')
+            self._state, self._error, self._metadata = 'starting', None, None
+            self._thread = threading.Thread(target=self._run, args=(self._stop,), daemon=True, name=self.NAME)
             self._thread.start()
             return self.info()
 
@@ -177,11 +197,11 @@ class PiperCameraLive:
     def dispatch(self, action, args):
         english = getattr(self.runtime, 'interface_language', None) == 'en'
         allowed = {'action', 'instance_id', '_tool_name'}
-        if getattr(self, 'sensor_card', False) and args.get('input_topic') == '':
+        if self.sensor_card and args.get('input_topic') == '':
             allowed.add('input_topic')
         if set(args) - allowed:
             raise ValueError('Live camera accepts lifecycle arguments only.' if english else '实时相机卡不接受控制或拍照参数')
-        action = args.get('action', 'info' if action == 'piper_camera_live' else action)
+        action = args.get('action', 'info' if action == self.NAME else action)
         if action not in ('start', 'stop', 'info'):
             raise ValueError('Live camera supports start, stop and info only.' if english else '实时相机只支持启动、停止和状态查询')
         try:
@@ -192,12 +212,12 @@ class PiperCameraLive:
                 raise RuntimeError(public_error(exc)) from exc
             raise
 
-    def _publish(self, stop, jpeg, stamp):
+    def _publish(self, stop, payload, stamp):
         # Serialize with cancellation: no frame can be published after stop wins.
         with self._lock:
             if stop.is_set():
                 return False
-            self._publisher.publish(jpeg, stamp)
+            self._publisher.publish(payload, stamp)
             return True
 
     def _offline(self, stop, error):
@@ -206,8 +226,11 @@ class PiperCameraLive:
                 return
             self._state, self._error = 'offline', str(error).replace('\n', ' ')[:300]
             self._capture_fps = self._publish_fps = 0.
+            self._metadata = None
+        if self.offline_frame is None:
+            return
         try:
-            self._publish(stop, offline_image(self.settings['width'], self.settings['height']), time.time())
+            self._publish(stop, self.offline_frame(self.settings['width'], self.settings['height']), time.time())
         except Exception as exc:
             with self._lock:
                 self._error += '; 发布异常: ' + str(exc).replace('\n', ' ')[:150]
@@ -221,6 +244,14 @@ class PiperCameraLive:
             time.sleep(.1)
         session.dispose()
 
+    def _check_device(self):
+        if not Path(self.settings['device']).exists():
+            raise RuntimeError('绑定的彩色相机不存在，请检查 USB 连接')
+
+    def _acquire_source(self):
+        self._check_device()
+        return self.owner_factory(self.runtime.data_dir, self.settings['device'])
+
     def _run(self, stop):
         publisher = None
         try:
@@ -232,11 +263,9 @@ class PiperCameraLive:
             while not stop.is_set():
                 owner = session = None
                 try:
-                    owner = self.owner_factory(self.runtime.data_dir, self.settings['device'])
+                    owner = self._acquire_source()
                     if stop.is_set():
                         break
-                    if not Path(self.settings['device']).exists():
-                        raise RuntimeError('绑定的彩色相机不存在，请检查 USB 连接')
                     session = self.session_factory(self.settings)
                     began = window = time.monotonic()
                     last_sequence = count = 0
@@ -250,12 +279,13 @@ class PiperCameraLive:
                             stamp = frame['timestamp']
                             if not math.isfinite(stamp) or not 0 <= time.time() - stamp <= self.STALE_SECONDS:
                                 raise RuntimeError('相机画面时间无效或已过期')
-                            if not self._publish(stop, frame['jpeg'], stamp):
+                            if not self._publish(stop, frame['payload'], stamp):
                                 break
                             last_sequence, last_frame = frame['sequence'], now
                             count += 1
                             with self._lock:
                                 self._state, self._error = 'running', None
+                                self._metadata = frame.get('metadata')
                                 self._width, self._height = frame['width'], frame['height']
                                 self._capture_fps = frame['capture_fps']
                                 self._frames += 1
@@ -286,6 +316,7 @@ class PiperCameraLive:
                 with self._lock:
                     self._publisher = None
                     self._capture_fps = self._publish_fps = 0.
+                    self._metadata = None
                     if stop.is_set():
                         self._state = 'idle'
 

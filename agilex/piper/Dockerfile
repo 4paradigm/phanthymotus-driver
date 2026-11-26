@@ -8,7 +8,7 @@ ARG PIPER_SDK_SHA256=89dfa296331abc04b8d7ca5ebbc4dbe21bed44e521e85e8c4716a81e413
 # The project base already contains these packages. Only an explicit alternate
 # base (for example amd64) needs to install missing packages.
 RUN missing=""; \
-    for package in python3-pip ros-humble-rmw-fastrtps-cpp ros-humble-sensor-msgs; do \
+    for package in python3-pip libusb-1.0-0 ros-humble-rmw-fastrtps-cpp ros-humble-sensor-msgs; do \
         dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -qx 'install ok installed' \
             || missing="$missing $package"; \
     done; \
@@ -23,7 +23,7 @@ COPY requirements.txt /work/agilex/piper/requirements.txt
 # pip verifies its hash before installation and removes its temporary download;
 # --no-cache-dir prevents the ZIP/wheel cache from becoming an image layer.
 RUN sed '/^piper-sdk @ /d' /work/agilex/piper/requirements.txt > /tmp/piper-dependencies.txt \
-    && pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r /tmp/piper-dependencies.txt \
+    && pip3 install --no-cache-dir --only-binary=pyrealsense2 -i ${PYPI_MIRROR} -r /tmp/piper-dependencies.txt \
        "${PIPER_SDK_URL}#sha256=${PIPER_SDK_SHA256}" \
     && rm /tmp/piper-dependencies.txt
 COPY common/ /work/common/
@@ -33,7 +33,7 @@ COPY status_card.py direct_control.py /work/agilex/piper/
 COPY intent_control.py intent_motion.py intent_monitor.py intent_teaching.py /work/agilex/piper/
 COPY unified_control.py user_motion.py path_capability.py preset.py /work/agilex/piper/
 COPY completion.py /work/agilex/piper/
-COPY camera_live.py camera_worker.py camera_owner.py /work/agilex/piper/
+COPY camera_live.py camera_worker.py camera_owner.py camera_depth.py camera_depth_ros.py /work/agilex/piper/
 COPY resource/ /work/agilex/piper/resource/
 COPY deploy/ /deploy/
 ENV PYTHONPATH=/work PYTHONUNBUFFERED=1 RCUTILS_COLORIZED_OUTPUT=0 \

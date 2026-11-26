@@ -1,0 +1,9 @@
+services:
+  agilex-piper:
+    devices:
+      - "${PIPER_DEPTH_VIDEO_DEVICE:?Set the RealSense depth V4L2 node}:${PIPER_DEPTH_VIDEO_DEVICE:?Set the RealSense depth V4L2 node}:rw"
+      - "${PIPER_DEPTH_METADATA_DEVICE:?Set its V4L2 metadata node}:${PIPER_DEPTH_METADATA_DEVICE:?Set its V4L2 metadata node}:rw"
+      - "${PIPER_DEPTH_USB_DEVICE:?Set its USB device node}:${PIPER_DEPTH_USB_DEVICE:?Set its USB device node}:rw"
+    environment:
+      - PIPER_DEPTH_SERIAL=${PIPER_DEPTH_SERIAL:?Set the RealSense serial number}
+      - PIPER_DEPTH_VIDEO_DEVICE=${PIPER_DEPTH_VIDEO_DEVICE:?Set the RealSense depth V4L2 node}
