@@ -329,7 +329,7 @@ class G12GuardTests(fixtures.unittest.TestCase):
                             self.message(axes=[float('nan')]*8)):
                 self.assertFalse(check(message, '/sdk'))
 
-    def run_guard(self, repeats=True, output=.0):
+    def run_guard(self, repeats=True, output=.0, interruption=None):
         clock, callbacks, closed = [10.], {}, []
         def subscribe(topic, _, callback, **kwargs):
             callbacks[topic] = callback
@@ -356,6 +356,25 @@ class G12GuardTests(fixtures.unittest.TestCase):
                 return
             check, close = native.remote_idle_guard(rospy, '/sdk')
             check()
+            if interruption:
+                if interruption == 'motion':
+                    output = .01
+                    emit()
+                    with self.assertRaises(RuntimeError):
+                        check()
+                    output = 0.
+                # A previous zero period or the last nonzero timestamp must
+                # not qualify three new callbacks as 0.3s of quiet output.
+                clock[0] += .4
+                for _ in range(3):
+                    clock[0] += .01
+                    emit()
+                with self.assertRaisesRegex(RuntimeError, 'neutral_or_zero_output_unconfirmed'):
+                    check()
+                for _ in range(7):
+                    clock[0] += .05
+                    emit()
+                check()
             callbacks['/joy'](self.message(owner='/wrong'))
             with self.assertRaises(RuntimeError):
                 check()
@@ -374,6 +393,12 @@ class G12GuardTests(fixtures.unittest.TestCase):
 
     def test_nonzero_upper_output_is_never_released(self):
         self.run_guard(output=.01)
+
+    def test_nonzero_then_rapid_zeros_require_a_new_continuous_quiet_period(self):
+        self.run_guard(interruption='motion')
+
+    def test_stale_zero_stream_cannot_reuse_its_previous_quiet_period(self):
+        self.run_guard(interruption='gap')
 
     def test_g12_owner_is_verified_against_local_sdk_process_not_node_name(self):
         master = types.SimpleNamespace(lookupNode=lambda *a: (1, '', 'http://localhost:1'))

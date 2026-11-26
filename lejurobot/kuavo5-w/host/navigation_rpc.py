@@ -521,8 +521,15 @@ def remote_idle_guard(rospy, owner):
                  and all(math.isfinite(v) and abs(v) <= 1e-6 for v in values))
         now = time.monotonic()
         with lock:
-            sample['since'] = sample.get('since', now) if quiet else now
-            sample['count'] = sample.get('count', 0)+1 if quiet else 0
+            if not quiet:
+                sample.pop('since', None)
+                sample['count'] = 0
+            elif sample.get('quiet') is not True or now-sample.get('velocity_at', now) > .3:
+                # Measure only from the first fresh zero after motion or a
+                # stream gap, never from the last nonzero callback.
+                sample.update(since=now, count=1)
+            else:
+                sample['count'] = sample.get('count', 0)+1
             sample.update(velocity_at=now, quiet=quiet)
     subscriptions = [rospy.Subscriber('/joy', Joy, joy, queue_size=1, tcp_nodelay=True),
                      rospy.Subscriber('/move_base/base_cmd_vel', Twist, velocity, queue_size=1, tcp_nodelay=True)]
