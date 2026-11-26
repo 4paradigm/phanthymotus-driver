@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from test_controlled_spatial import Bundle, Client, wait
 from controlled_spatial import ControlledSpatialPlugin
+from spatial_client import NavigationStateUnavailable
 
 spec = importlib.util.spec_from_file_location('mapping_recovery_rpc',
     Path(__file__).resolve().parents[1] / 'host/navigation_rpc.py')
@@ -174,6 +175,48 @@ class ReconciliationTests(unittest.TestCase):
         self.assertEqual(result['state'], 'recovery_required')
         self.assertEqual(result['recovery']['map_name'], 'failed')
         self.assertIn('no longer running', result['message'])
+        self.assert_kept()
+
+    def test_blocked_map_actions_identify_the_same_orphan_and_recovery(self):
+        actions = [('start_mapping', {'map_name': 'new'}),
+                   ('stop_mapping', {}),
+                   ('delete_map', {'map_name': 'failed', 'confirm_delete': True}),
+                   ('load_map', {'map_name': 'factory'})]
+        for action, args in actions:
+            with self.subTest(action=action):
+                result = self.plugin.dispatch(action, args)
+                self.assertEqual(result['state'], 'error')
+                self.assertTrue(result.get('recovery_required'), result)
+                self.assertEqual(result['recovery']['action'], 'reconcile_mapping')
+                self.assertEqual(result['recovery']['map_name'], 'failed')
+                self.assertEqual(result['recovery']['stage'], 'ChangeCartoMap')
+                self.assertTrue(result['recovery']['confirm_abandon_required'])
+                self.assert_kept()
+        self.assertFalse(self.client.calls)
+        self.assertFalse(self.client.commands)
+
+    def test_list_maps_exposes_orphan_without_claiming_maps_are_missing(self):
+        result = self.plugin.dispatch('list_maps', {})
+        self.assertEqual(result['state'], 'ready')
+        self.assertTrue(result['maps'])
+        self.assertTrue(result.get('recovery_required'), result)
+        self.assertEqual(result['recovery']['map_name'], 'failed')
+        self.assert_kept()
+
+    def test_feedback_timeout_does_not_hide_mapping_recovery(self):
+        with patch.object(self.client, 'observe', side_effect=NavigationStateUnavailable(('agvState',), 'timeout')):
+            result = self.plugin.dispatch('info', {})
+        self.assertEqual(result['state'], 'recovery_required')
+        self.assertEqual(result['feedback_status']['state'], 'loading')
+        self.assertIn('no longer running', result['message'])
+        self.assertEqual(result['recovery']['map_name'], 'failed')
+        self.assert_kept()
+
+    def test_live_map_worker_does_not_advertise_abandonment(self):
+        with patch.object(self.plugin, '_map_worker_active', return_value=True):
+            result = self.plugin.dispatch('start_mapping', {'map_name': 'new'})
+        self.assertEqual(result['state'], 'error')
+        self.assertNotIn('recovery', result)
         self.assert_kept()
 
     def test_chassis_reboot_between_commands_never_sends_the_next_command(self):
