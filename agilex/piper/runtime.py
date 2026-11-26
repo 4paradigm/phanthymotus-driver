@@ -23,7 +23,7 @@ from uuid import uuid4
 import urllib.request
 
 from common.vendor_runtime import action_schema, tool
-from agilex.piper.arm import PiperDriver
+from agilex.piper.arm import MotorTelemetry, PiperDriver
 from agilex.piper.control import Previews, healthy, mode_name, mode_plan, ready_to_move, signature, summary, teaching_stopped
 
 
@@ -285,6 +285,17 @@ class PiperRuntime:
             if self.owner_file is not None:
                 self.owner_file.close()
                 self.owner_file = None
+
+    def read_motor_telemetry(self) -> tuple[MotorTelemetry | None, ...]:
+        """Sample only the existing CAN receiver, without waiting for reconnect."""
+        if not self.connection_lock.acquire(blocking=False):
+            return ()
+        try:
+            if self.closed or self.driver is None:
+                return ()
+            return self.driver.get_motor_telemetry()
+        finally:
+            self.connection_lock.release()
 
     def read_state(self, monitor=False):
         with self.connection_lock:

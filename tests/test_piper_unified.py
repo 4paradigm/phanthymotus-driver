@@ -67,10 +67,11 @@ class UnifiedTests(unittest.TestCase):
     def targets(self, kind='end_pose'):
         return [call[1] for call in self.sdk.calls if call[0] == kind]
 
-    def test_three_card_schema_topics_and_legacy_request_rejection(self):
+    def test_production_card_schema_topics_and_legacy_request_rejection(self):
         self.config['camera'] = {'live': {'enabled': True}}
         tools = {t['name']: t for t in self.bundle.get_all_tools()}
-        self.assertEqual(set(tools), {'arm_control', 'joints', 'model', 'piper_photo', 'piper_camera_live'})
+        self.assertEqual(set(tools), {'arm_control', 'joints', 'model', 'piper_photo',
+                                      'piper_camera_live', 'piper_joint_motor_telemetry'})
         arm = tools['arm_control']
         self.assertEqual(arm['title'], 'Arm control')
         schema = arm['inputSchema']
@@ -84,7 +85,9 @@ class UnifiedTests(unittest.TestCase):
         self.assertEqual(tools['joints']['topic_out'][0]['format'], 'sensor/skeleton')
         self.assertEqual(tools['joints']['title'], 'Joints')
         self.assertEqual(tools['joints']['type'], 'sensor')
-        self.assertFalse(any(t['format'] == 'data/json' for tool in tools.values() for t in tool.get('topic_out', [])))
+        self.assertEqual([t['topic'] for tool in tools.values() for t in tool.get('topic_out', [])
+                          if t['format'] == 'data/json'],
+                         ['/piper_arm1/piper/state/joint_motor_telemetry'])
         self.assertIn('tip-relative', arm['description'])
         self.assertIn('Every control action first exits', arm['description'])
         for old in ('move_forward', 'exit_teaching_and_hold', 'enable', 'switch', 'move_joint', 'set_position', 'open_gripper', 'close_gripper'):

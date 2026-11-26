@@ -231,6 +231,28 @@ def build_plugins(config, namespace, ros2):
     from agilex.piper.unified_control import UnifiedControlPlugin
     from agilex.piper.intent_monitor import add_intent_monitor
     from agilex.piper.camera_live import add_camera_live
+    from agilex.piper.motor_telemetry import JointMotorTelemetryPlugin
 
-    plugins = add_intent_monitor([UnifiedControlPlugin(config, namespace, ros2)], config, ros2, joints_card=True)
-    return add_camera_live(plugins, config, ros2, sensor_card=True)
+    telemetry_config = config.get("motor_telemetry", {})
+    if not isinstance(telemetry_config, dict):
+        raise ValueError("motor_telemetry must be a configuration mapping.")
+    telemetry_only = telemetry_config.get("only", False)
+    if type(telemetry_only) is not bool:
+        raise ValueError("motor_telemetry.only must be a boolean.")
+    telemetry_options = {
+        "can_interface": config.get("can_interface", "can0"),
+        "secondary_can_interface": telemetry_config.get("secondary_can_interface"),
+        "arm_roles": telemetry_config.get("arm_roles"),
+        "ros2": ros2,
+    }
+    if telemetry_only:
+        return [JointMotorTelemetryPlugin(None, namespace=f"{namespace}/piper", **telemetry_options)]
+
+    runtime = UnifiedControlPlugin(config, namespace, ros2)
+    telemetry = JointMotorTelemetryPlugin(
+        runtime.read_motor_telemetry, namespace=runtime.topic.rsplit("/", 1)[0].strip("/"),
+        **telemetry_options,
+    )
+    plugins = add_intent_monitor([runtime], config, ros2, joints_card=True)
+    plugins = add_camera_live(plugins, config, ros2, sensor_card=True)
+    return [*plugins, telemetry]

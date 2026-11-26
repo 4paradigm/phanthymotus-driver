@@ -105,7 +105,8 @@ class PiperDiagnosticTests(unittest.TestCase):
                 self.runtime.config['can_interface'] = 'can1'
                 result = diagnose.diagnose('http://fake/mcp')
                 self.assertTrue(result['passed'], result['errors'])
-                self.assertEqual(set(result['cards']), {'arm_control', 'joints', 'model', 'piper_photo', 'piper_camera_live'})
+                self.assertEqual(set(result['cards']), {'arm_control', 'joints', 'model', 'piper_photo',
+                                                        'piper_camera_live', 'piper_joint_motor_telemetry'})
                 calls = [p for method, p in self.requests if method == 'tools/call']
                 self.assertEqual(calls, [
                     {'name': 'arm_control', 'arguments': {'action': 'info'}},
@@ -126,6 +127,17 @@ class PiperDiagnosticTests(unittest.TestCase):
         self.assertFalse(result['passed'])
         self.assertIn('Production tools mismatch', result['errors']['cards'])
         self.assertEqual(self.sdk.calls, [])
+
+    def test_missing_motor_telemetry_card_fails_health_check(self):
+        old_tools = [tool for tool in self.bundle.get_all_tools()
+                     if tool['name'] != 'piper_joint_motor_telemetry']
+        with patch.object(diagnose, 'rpc', side_effect=lambda endpoint, method, params=None:
+                {'tools': old_tools} if method == 'tools/list' else
+                {'serverInfo': {'name': 'PiPER'}} if method == 'initialize' else
+                self.fail('Outdated image received a tool call')):
+            result = diagnose.diagnose('http://fake/mcp')
+        self.assertFalse(result['passed'])
+        self.assertIn('piper_joint_motor_telemetry', result['errors']['cards'])
 
     def test_disconnected_or_stale_snapshot_is_not_a_pass(self):
         self.runtime.closed = True

@@ -1,8 +1,8 @@
-# PiPER Arm control, Joints and On camera
+# PiPER Arm control, Joints, Joint Motor Telemetry and On camera
 
-The current bundle provides three canvas cards: **Arm control** (`arm_control`),
-**Joints** (`joints`) and **On camera** (`piper_camera_live`). Joints and On camera
-are independent read-only sensors. They share the existing driver lifecycle and
+The current bundle provides **Arm control** (`arm_control`), **Joints** (`joints`),
+**Joint Motor Telemetry** (`piper_joint_motor_telemetry`) and **On camera**
+(`piper_camera_live`). The sensor cards use the existing driver lifecycle and
 keep monitoring when the control card stops. No Parameters or
 `state/parameters` stream is published; **Get status** returns feedback, limits,
 motor state, faults, capabilities and actual task outcomes.
@@ -48,6 +48,48 @@ stale-feedback freezing. `model` returns `{"urdf":"..."}`. Finger translation is
 not animated by the current Core; real opening width is available in Get status.
 On camera publishes the existing JPEG topic when its configured live stream and
 camera permission are enabled. Optional photo capture/import remains available.
+
+### Joint Motor Telemetry
+
+This read-only sensor brings the per-joint motor readings from RealMan's
+[`arm_all_state` card](../../realman/rm75_6f_v/driver.yaml) to PiPER. Add
+**Joint Motor Telemetry** to the canvas and select its stream in **Monitor**.
+The `data/json` stream is `/<namespace>/piper/state/joint_motor_telemetry`
+at 5 Hz. It reports J1–J6 motor and driver temperatures (°C), driver voltage
+(V), driver current (A), and the host receive timestamp for each fresh sample.
+
+By default the card uses the driver's configured CAN interface and shared
+feedback cache. For two follower arms on separate Linux SocketCAN interfaces,
+configure the actual interface and role mapping in `config.yaml` or a file
+selected with `CONFIG_PATH`:
+
+```yaml
+can_interface: can0
+motor_telemetry:
+  secondary_can_interface: can1
+  arm_roles:
+    can0: left_follower
+    can1: right_follower
+```
+
+The primary J1–J6 fields stay at the top level for compatibility. The second
+arm has its own readings, receive timestamps and `feedback_status` under
+`additional_arms.can1`. `arm_role` is included for configured roles. Choose
+`motor_telemetry.only: true` to expose only this sensor and use receive-only
+SocketCAN connections for both interfaces. The card opens its dedicated
+receivers when started and closes them when stopped. Info reads the current
+cache. None of these sensor operations sends CAN commands.
+When running a separate telemetry-only instance alongside another PiPER MCP
+server, give it a free `mcp_port` (for example, `15841`) and a distinct `name`
+and `ros_namespace` in its configuration. Set unique
+`PIPER_MCP_SERVER_NAME` and `PIPER_MCP_REGISTRATION_ID` environment variables
+for that instance so its registration and telemetry topic remain independent.
+
+A joint with no frame or a frame older than 0.5 seconds has null readings.
+The overall feedback status is `fresh`, `partial` or `unavailable`. To verify
+the card onsite, check all six readings while the arm is stationary, then
+check that Stop and Start affect only this stream. Verify stale handling by
+replaying a missing-frame case in a test environment.
 
 Long-running requests return a unique `action_id`; their real completed, error
 or cancelled result is POSTed to Core. Receipt timeout is 90 seconds, allowing
