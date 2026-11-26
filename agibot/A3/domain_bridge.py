@@ -241,6 +241,10 @@ def _run_subscription(messages, stop, profile, domain, topic, type_name, qos_dep
         logsafe.install()
     except ImportError:
         pass
+    # This worker publishes/subscribes on Agent Core's local domain. The
+    # parent driver needs the robot Discovery Server, but this child must use
+    # the loopback profile's default discovery to find Agent Core.
+    os.environ.pop("ROS_DISCOVERY_SERVER", None)
     os.environ["ROS_DOMAIN_ID"] = str(domain)
     os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
     if os.path.isfile(profile):
@@ -285,6 +289,8 @@ def _run(messages, profile, domain, lane):
         logsafe.install()
     except ImportError:
         pass
+    # Do not inherit the robot-domain Discovery Server into domain 42.
+    os.environ.pop("ROS_DISCOVERY_SERVER", None)
     os.environ["ROS_DOMAIN_ID"] = str(domain)
     os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
     if os.path.isfile(profile):
