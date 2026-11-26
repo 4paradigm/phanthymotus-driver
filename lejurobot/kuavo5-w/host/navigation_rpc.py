@@ -500,7 +500,75 @@ def remote_joy_neutral(message, owner):
             and all(type(v) is int and v == 0 for v in buttons))
 
 
-def remote_idle_guard(rospy, owner):
+class UpperTopicObservation:
+    """Read a verified upper publisher without registering it on the chassis.
+
+    Uses the installed ROS TCPROS transport and message deserializer. Only
+    master/publisher queries and subscriber connections are made; no topic is
+    advertised or relayed into the chassis control graph.
+    """
+    def __init__(self, master, topic, message_type, owner, callback):
+        import threading
+        import xmlrpc.client
+        from rospy.impl.tcpros_base import TCPROSTransport
+        from rospy.impl.tcpros_pubsub import TCPROSSub
+        class BoundedTransport(xmlrpc.client.Transport):
+            def make_connection(self, host):
+                connection = super().make_connection(host)
+                connection.timeout = 1.
+                return connection
+        caller = '/kuavo5w_upper_idle_observer'
+        self.closed, self.failed = threading.Event(), threading.Event()
+        self.connection, self.thread = None, None
+        try:
+            with xmlrpc.client.ServerProxy(master, transport=BoundedTransport()) as proxy:
+                code, _, state = proxy.getSystemState(caller)
+                if code != 1 or dict(state[0]).get(topic) != [owner]:
+                    raise RuntimeError('boot_remote_upper_publisher_unconfirmed')
+                code, _, uri = proxy.lookupNode(caller, owner)
+                if code != 1:
+                    raise RuntimeError('boot_remote_upper_publisher_unavailable')
+            with xmlrpc.client.ServerProxy(uri, transport=BoundedTransport()) as proxy:
+                code, _, protocol = proxy.requestTopic(caller, topic, [['TCPROS']])
+            if (code != 1 or not isinstance(protocol, (list, tuple)) or len(protocol) != 3
+                    or protocol[0] != 'TCPROS' or not isinstance(protocol[1], str)
+                    or type(protocol[2]) is not int or not 1 <= protocol[2] <= 65535):
+                raise RuntimeError('boot_remote_upper_transport_unconfirmed')
+            # Process all received frames: a short nonzero sample must reset
+            # the quiet window even if zeros follow in the same socket read.
+            self.connection = TCPROSTransport(TCPROSSub(topic, message_type,
+                queue_size=None, tcp_nodelay=True), topic)
+            self.connection.connect(protocol[1], protocol[2], uri, timeout=1.)
+            header = self.connection.header
+            if (header.get('callerid') != owner or header.get('type') != message_type._type
+                    or header.get('md5sum') != message_type._md5sum):
+                raise RuntimeError('boot_remote_upper_transport_identity_mismatch')
+            def receive():
+                try:
+                    while not self.closed.is_set():
+                        for message in self.connection.receive_once():
+                            if not self.closed.is_set():
+                                callback(message)
+                except Exception:
+                    if not self.closed.is_set():
+                        self.failed.set()
+                finally:
+                    self.connection.close()
+            self.thread = threading.Thread(target=receive, daemon=True, name='upper-idle-observer')
+            self.thread.start()
+        except Exception:
+            self.unregister()
+            raise
+
+    def unregister(self):
+        self.closed.set()
+        if self.connection is not None:
+            self.connection.close()
+        if self.thread is not None:
+            self.thread.join(timeout=.2)
+
+
+def remote_idle_guard(rospy, owner, upper_master=None):
     """Live guard retained through mux selection and software-stop release.
 
     Ignore initial latched upper velocity alone: require >=3 callbacks spanning
@@ -531,19 +599,24 @@ def remote_idle_guard(rospy, owner):
             else:
                 sample['count'] = sample.get('count', 0)+1
             sample.update(velocity_at=now, quiet=quiet)
-    subscriptions = [rospy.Subscriber('/joy', Joy, joy, queue_size=1, tcp_nodelay=True),
-                     rospy.Subscriber('/move_base/base_cmd_vel', Twist, velocity, queue_size=1, tcp_nodelay=True)]
+    subscriptions = []
     def check():
         now = time.monotonic()
         with lock:
             if (sample.get('neutral') is not True or now-sample.get('joy_at', 0) > .3
                     or sample.get('quiet') is not True or now-sample.get('velocity_at', 0) > .3
-                    or sample.get('count', 0) < 3 or now-sample.get('since', now) < .3):
+                    or sample.get('count', 0) < 3 or now-sample.get('since', now) < .3
+                    or any(getattr(s, 'failed', None) is not None and s.failed.is_set()
+                           for s in subscriptions)):
                 raise RuntimeError('boot_remote_fresh_neutral_or_zero_output_unconfirmed')
     def close():
         for subscription in subscriptions:
             subscription.unregister()
     try:
+        for topic, kind, callback, publisher in (('/joy', Joy, joy, owner),
+                ('/move_base/base_cmd_vel', Twist, velocity, '/nodelet_manager')):
+            subscriptions.append(UpperTopicObservation(upper_master, topic, kind, publisher, callback)
+                if upper_master else rospy.Subscriber(topic, kind, callback, queue_size=1, tcp_nodelay=True))
         end = time.monotonic()+3.
         while True:
             try:
@@ -676,7 +749,7 @@ def main(request):
             if operation == 'remote_ready':
                 if (current.manual_mode or current.mapping or not current.driver_enable):
                     raise RuntimeError('boot_remote_requires_healthy_auto_nonmapping')
-                guard, close_guard = remote_idle_guard(rospy, args.get('g12_owner'))
+                guard, close_guard = remote_idle_guard(rospy, args.get('g12_owner'), request.get('upper_master'))
                 select_navigation_source(rospy, 'nav_mpc_move_base')
                 guard()
                 current = state()
@@ -827,21 +900,30 @@ def confirm_stationary(rospy, Odometry, guard=None):
     raise RuntimeError('native_navigation_stop_not_confirmed')
 
 
+def rpc_error_code(exc):
+    value = str(exc)
+    if (isinstance(exc, RuntimeError) and re.fullmatch(r'[a-z][a-z0-9_]{0,159}', value)
+            and value.startswith(('native_', 'chassis_', 'boot_remote_'))):
+        return value
+    return 'native_navigation_rpc_failed'
+
+
 if __name__ == '__main__':
     request = None
     try:
         request = json.load(sys.stdin)
         print(json.dumps({'ok': True, 'result': main(request)}), flush=True)
-    except Exception:
+    except Exception as exc:
         # A completed rejection/feedback failure can be stopped and retried.
         # A ROS transport failure may leave the controller service executing.
         if isinstance(request, dict) and request.get('operation') in ('prepare', 'remote_ready', 'navigate'):
             stage_key = '_navigation_stage' if request['operation'] == 'navigate' else '_preparation_stage'
             result = {'success': False, 'stage': request.get(stage_key, 'validate_runtime'),
+                      'error_code': rpc_error_code(exc),
                       'delivery_uncertain': bool(
                 request.get('_command_unresolved') or request.get('_older_command_unresolved'))}
             if request['operation'] == 'navigate':
                 result['goal_submitted'] = bool(request.get('_goal_submitted'))
             print(json.dumps({'ok': True, 'result': result}), flush=True)
         else:
-            print(json.dumps({'ok': False, 'error': 'native_navigation_rpc_failed'}), flush=True)
+            print(json.dumps({'ok': False, 'error': rpc_error_code(exc)}), flush=True)

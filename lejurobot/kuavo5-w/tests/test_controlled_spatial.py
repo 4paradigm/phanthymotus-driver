@@ -616,8 +616,13 @@ class SpatialTests(unittest.TestCase):
         self.assertFalse(self.plugin.unresolved())
 
     def test_map_workflow_is_async_and_rebinds_provisional_tags(self):
-        self.assertEqual(self.call('start_mapping', map_name='new')['state'], 'executing')
-        self.assertEqual(self.completed()[0], 'completed')
+        started = self.call('start_mapping', map_name='new')
+        self.assertEqual(started['state'], 'executing')
+        self.assertIn('mapping_console', started['message'])
+        status, reply = self.completed()
+        self.assertEqual(status, 'completed')
+        self.assertIn('Please call mapping_console', reply['message'])
+        self.assertIn('instead of the G12 remote controller', reply['message'])
         self.assertEqual(self.plugin.store.state('mapping')['phase'], 'mapping')
         self.assertEqual(self.client.commands, [
             ('ChangeMode', {'mode': 'MANUAL'}), ('StartCartoMapping', {})])

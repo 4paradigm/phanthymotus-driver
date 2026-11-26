@@ -53,7 +53,8 @@ class JatenClient:
         target = manager._target('chassis')
         secrets = load_secrets(os.environ.get('KUAVO_SSH_SECRETS', str(manager.state_dir / 'ssh-secrets.json')))
         request = {'operation': operation, 'args': args, 'ros_ip': target['ros_ip'],
-                   'master': manager.settings.get('master', 'http://192.168.26.1:11311')}
+                   'master': target.get('master', 'http://127.0.0.1:11311'),
+                   'upper_master': manager.settings.get('master', 'http://192.168.26.1:11311')}
         source = self._source
         timeout = 45 if operation in ('prepare', 'remote_ready', 'soft_stop', 'navigate') else 25 if operation == 'cancel' else 15
         if operation == 'relocalize':

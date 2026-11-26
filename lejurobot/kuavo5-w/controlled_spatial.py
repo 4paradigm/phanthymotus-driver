@@ -189,6 +189,7 @@ class ControlledSpatialPlugin:
         self._mapping_cleanup = None
         self._mapping_cleanup_key = None
         self._mapping_cleanup_retry_at = 0.
+        self._mapping_console_grant = None
         self.base_preparation_required = False
         self.keyboard = MappingKeyboard(self)
 
@@ -227,8 +228,10 @@ class ControlledSpatialPlugin:
                         'actions': ['info', 'stop', *keyboard_actions]},
                     'x-resource': 'base', 'x-hooks': {'on_interrupt_motion': {'action': 'stop_nav'}},
                     'x-completion': {'actions': ['navigate_to_pose', 'navigate_to_tag', 'start_mapping', 'stop_mapping', 'load_map', 'delete_map'], 'timeout': 1830},
+                    # Keyboard transport is workbench-only, like G1 teaching
+                    # authoring: keep it out of canvas/LLM action forms.
                     'x-action-params': {k: {'params': p, 'description': d, 'required': required.get(k, [])}
-                                        for k, (p, d) in actions.items()}}}
+                                        for k, (p, d) in self.ACTIONS.items()}}}
 
     def _restore(self):
         if not self._restored:
@@ -589,6 +592,11 @@ class ControlledSpatialPlugin:
                             'map_saved': False,
                             'message': 'Obsolete mapping session cleared automatically. No new save was requested.'}
             if action == 'mapping_console':
+                with self.bundle.tracker.lock:
+                    mapping = self.store.state('mapping') or {}
+                    self._mapping_console_grant = ((mapping.get('token'), self.bundle._stop_epoch,
+                        self.bundle.ros1.connection) if mapping.get('phase') == 'mapping'
+                        and not self._operations.locked() else None)
                 return {'protocol': 'motus.workbench/1',
                         'html': (Path(__file__).parent/'resource/mapping_keyboard.html').read_text()}
             if action == 'keyboard_status':
@@ -1082,8 +1090,16 @@ class ControlledSpatialPlugin:
                 raise RuntimeError('finish_or_reconcile_mapping_before_loading')
         else:
             raise ValueError('unsupported_map_action')
+        if action == 'stop_mapping':
+            self._mapping_console_grant = None
+            if self.keyboard.session is not None or self._keyboard_pending:
+                self.keyboard.stop()
+                worker = self.keyboard.thread
+                if worker is not None and worker.is_alive():
+                    worker.join(timeout=8.)
         if self.keyboard.session is not None or self._keyboard_pending:
-            raise RuntimeError('release_mapping_keyboard_and_confirm_stop_before_map_change')
+            raise RuntimeError('mapping_keyboard_stop_unconfirmed' if action == 'stop_mapping'
+                               else 'release_mapping_keyboard_and_confirm_stop_before_map_change')
         restore_archive = False
         if action in ('start_mapping', 'load_map', 'delete_map'):
             exists = args['map_name'] in [Path(m.get('fileName', '')).stem for m in self.client.maps()]
@@ -1176,7 +1192,11 @@ class ControlledSpatialPlugin:
         thread = threading.Thread(target=worker, daemon=True, name='kuavo-map-operation')
         self._workers.add(thread)
         thread.start()
-        return {'state': 'executing', 'action_id': aid, 'operation': action}
+        result = {'state': 'executing', 'action_id': aid, 'operation': action}
+        if action == 'start_mapping':
+            result['message'] = ('Starting mapping. Once ready, call mapping_console to drive the robot. '
+                                 'Use this console instead of the G12 remote controller.')
+        return result
 
     def _delete_map(self, name, cancelled):
         if self.client.current_map()['mapId'] == name:
@@ -1289,7 +1309,8 @@ class ControlledSpatialPlugin:
             self.store.state('mapping', mapping)
             return {'state': 'mapping', 'map_name': name,
                     'remote_control_route': 'factory_RobotMotion', 'chassis_mode': 'MANUAL',
-                    'keyboard_control': 'open_mapping_console_and_enable_explicitly', 'software_stop': True}
+                    'keyboard_control': 'open_mapping_console', 'software_stop': True,
+                    'message': 'Mapping started. Please call mapping_console for remote control. Use this console instead of the G12 remote controller.'}
         if action == 'stop_mapping':
             if not mapping or mapping['phase'] not in ('mapping', 'saving'):
                 raise RuntimeError('no_confirmed_mapping_session_inspect_info')

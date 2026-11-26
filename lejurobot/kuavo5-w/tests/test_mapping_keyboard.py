@@ -60,6 +60,7 @@ class MappingKeyboardTests(unittest.TestCase):
         self.stream = Stream()
         self.client.keyboard_stream = lambda: self.stream
         self.spatial.store.state('mapping', {'name': 'new', 'token': 'mapping-id', 'phase': 'mapping'})
+        self.spatial.dispatch('mapping_console', {})
         self.keyboard = self.spatial.keyboard
 
     def tearDown(self):
@@ -70,6 +71,7 @@ class MappingKeyboardTests(unittest.TestCase):
         self.temp.cleanup()
 
     def open(self):
+        self.spatial.dispatch('mapping_console', {})
         result = self.spatial.dispatch('keyboard_open', {})
         self.assertNotEqual(result['state'], 'error', result)
         self.session, self.seq = result['session_id'], 0
@@ -93,9 +95,17 @@ class MappingKeyboardTests(unittest.TestCase):
         self.assertEqual(schema['x-workbench']['entry'], 'mapping_console')
         for action, params in {'keyboard_open': [], 'keyboard_command': ['session_id', 'seq', 'values'],
                                'keyboard_release': ['session_id'], 'keyboard_status': []}.items():
-            self.assertEqual(schema['x-action-params'][action]['params'], params)
-            self.assertEqual(schema['x-action-params'][action]['required'], params)
+            self.assertNotIn(action, schema['x-action-params'])
+            self.assertIn(action, schema['x-workbench']['actions'])
             self.assertTrue(set(params) <= set(schema['properties']))
+
+    def test_stopped_or_reconnected_panel_cannot_reopen_an_old_grant(self):
+        self.bundle._stop_epoch += 1
+        self.assertEqual(self.spatial.dispatch('keyboard_open', {})['state'], 'error')
+        self.spatial.dispatch('mapping_console', {})
+        self.bundle.ros1.connection = (True, 2)
+        self.assertEqual(self.spatial.dispatch('keyboard_open', {})['state'], 'error')
+        self.assertFalse(self.stream.sent)
 
     def test_zero_activation_and_browser_timeout_hold_and_release_resource(self):
         self.open()
@@ -124,7 +134,7 @@ class MappingKeyboardTests(unittest.TestCase):
 
     def test_stop_map_load_and_navigation_cannot_overwrite_keyboard(self):
         self.open()
-        for action, args in [('stop_mapping', {}), ('load_map', {'map_name': 'other'}),
+        for action, args in [('load_map', {'map_name': 'other'}),
                              ('navigate_to_pose', {'x': 1, 'y': 2, 'yaw': 0}),
                              ('delete_map', {'map_name': 'other', 'confirm_delete': True})]:
             self.assertEqual(self.spatial.dispatch(action, args)['state'], 'error')
@@ -136,6 +146,25 @@ class MappingKeyboardTests(unittest.TestCase):
         self.assertEqual(self.spatial.dispatch('keyboard_open', {})['state'], 'error')
         self.assertEqual(self.spatial.dispatch('keyboard_release', {'session_id': 'old'})['state'], 'error')
         self.assertEqual(self.keyboard.info()['state'], 'ready')
+
+    def test_stop_mapping_releases_keyboard_before_saving_without_extra_confirmation(self):
+        self.open()
+        self.client.feedback['agvState'].update(isMapping=True, runningMode='MANUAL')
+        result = self.spatial.dispatch('stop_mapping', {})
+        self.assertEqual(result['state'], 'executing', result)
+        self.assertTrue(wait_until(lambda: any(e[0]=='completed' and 'map_name' in e[1]
+                                               for e in self.bundle.tracker.events)))
+        self.assertTrue(self.stream.stopping)
+        self.assertIsNone(self.spatial._mapping_console_grant)
+        self.assertIn('SaveCartoMap', [method for method, _ in self.client.commands])
+
+    def test_stop_mapping_never_saves_if_keyboard_stop_is_unconfirmed(self):
+        self.open()
+        self.stream.confirm_stop = False
+        result = self.spatial.dispatch('stop_mapping', {})
+        self.assertEqual(result['state'], 'error')
+        self.assertTrue(self.spatial._keyboard_pending)
+        self.assertFalse(self.client.commands)
 
     def test_pending_shared_mode_enable_or_uncertain_send_rejects_keyboard_before_io(self):
         for attribute in ('_resume_unresolved', '_mode_unresolved', 'motion_send_uncertain'):
@@ -226,6 +255,7 @@ class MappingCardCoexistenceTests(unittest.TestCase):
     def test_start_and_joint_motion_during_active_keyboard_do_not_change_its_route(self):
         stream = Stream()
         self.bundle.spatial.client.keyboard_stream = lambda: stream
+        self.call('controlled_spatial', 'mapping_console')
         opened = self.call('controlled_spatial', 'keyboard_open')
         self.assertNotEqual(opened['state'], 'error', opened)
         self.assertTrue(wait_until(lambda: self.bundle.spatial.keyboard.info()['state'] == 'ready'))

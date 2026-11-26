@@ -24,7 +24,9 @@ provisioning:
   # are in connection_defaults.py. Private environment/0600 secret overrides win.
   # Set use_default_credentials: false per role to require explicit keys/secrets.
   # Upper host is local to the host-network container.
-  chassis: {volume: 50}
+  # Native navigation and keyboard ROS services belong to the chassis master.
+  # This is separate from the upper/controller master used by the ROS bridge.
+  chassis: {volume: 50, master: "http://127.0.0.1:11311"}
 # Start rosbridge_server on the ROS Noetic host and point this URL at it.
 rosbridge_url: "ws://127.0.0.1:9090"
 sensors:

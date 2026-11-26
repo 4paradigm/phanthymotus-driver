@@ -21,7 +21,7 @@ class FactoryKeyboardStream:
         source = ('NAVIGATION_SOURCE = ' + repr(client._source) + '\n' +
                   (Path(__file__).parent/'host/manual_keyboard.py').read_text())
         self.process = manager.transport.open_stream('chassis', target,
-            {'master': manager.settings.get('master', 'http://192.168.26.1:11311'),
+            {'master': target.get('master', 'http://127.0.0.1:11311'),
              'ros_ip': target['ros_ip']}, source,
             load_secrets(os.environ.get('KUAVO_SSH_SECRETS', str(manager.state_dir/'ssh-secrets.json'))))
         os.set_blocking(self.process.stdin.fileno(), False)
@@ -87,6 +87,9 @@ class MappingKeyboard:
             mapping = self.spatial.store.state('mapping') if self.spatial.mapping_active() else None
             if not mapping or mapping.get('phase') != 'mapping':
                 raise RuntimeError('confirmed_mapping_session_required')
+            if (self.spatial._operations.locked() or self.spatial._mapping_console_grant !=
+                    (mapping['token'], self.bundle._stop_epoch, self.bundle.ros1.connection)):
+                raise RuntimeError('open_mapping_console_to_control_mapping')
             if self.session is not None or self.spatial.unresolved():
                 raise RuntimeError('keyboard_or_chassis_operation_busy')
             if self.bundle._transition is not None or 'base' in self.bundle.tracker._active:
