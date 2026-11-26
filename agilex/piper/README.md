@@ -52,9 +52,11 @@ camera permission are enabled. Optional photo capture/import remains available.
 **Device diagnostics** (`piper_diagnostics`) reads the shared CAN receiver on
 demand. It reports receiver connection separately from feedback freshness,
 plus control mode, motor enable flags, controller faults and the gripper fault
-code when available. It requires no canvas data connection. Use **Read
-diagnostics** to take a snapshot. Unavailable feedback leaves the current
-controller fault state unknown.
+code when available. Click **Read diagnostics** on the card to see the
+snapshot summary and open **详细数据** for the raw result in Agent Core.
+The action publishes no stream. Unavailable feedback leaves the current
+controller fault state unknown. Set `PIPER_DIAGNOSTICS_LANGUAGE=zh-CN` in the
+driver service environment for Chinese labels and summaries.
 
 Long-running requests return a unique `action_id`; their real completed, error
 or cancelled result is POSTed to Core. Receipt timeout is 90 seconds, allowing
