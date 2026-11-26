@@ -1,5 +1,9 @@
 """Passive live-color sensor/resource; lifecycle is independent of arm control."""
+import hashlib
 import math
+import re
+import stat
+import uuid
 from pathlib import Path
 import threading
 import time
@@ -9,17 +13,41 @@ from agilex.piper.camera_owner import CameraOwner
 from agilex.piper.camera_worker import CameraSession
 
 
-def camera_settings(config):
+CAPTURE_PREFIX = "motus.capture/1"
+OFFLINE_FRAME = CAPTURE_PREFIX + "|offline"
+BY_ID = re.compile(r"/dev/v4l/by-id/[A-Za-z0-9_.:+-]+-video-index[0-9]+")
+CAMERA_ID = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,47}")
+
+
+def device_identity(device):
+    return hashlib.sha256(device.encode()).hexdigest()[:32]
+
+
+def capture_frame_id(settings, session, sequence):
+    camera_id = settings["camera_id"]
+    return "|".join((CAPTURE_PREFIX, camera_id, f"{camera_id}_color_optical_frame",
+                     session, str(sequence), "host_read", device_identity(settings["device"])))
+
+
+def camera_settings(config, *, secondary=False):
     camera = config.get('camera', {})
+    if secondary:
+        camera = camera["secondary"]
     live = camera.get('live', {})
+    camera_id = camera.get("camera_id")
     settings = dict(enabled=live.get('enabled', False), device=camera.get('device') or '/dev/piper-camera-1',
                     width=live.get('width', 640), height=live.get('height', 480),
                     fps=live.get('fps', 10), jpeg_quality=live.get('jpeg_quality', 80),
                     warmup_seconds=camera.get('warmup_seconds', 3))
     if type(settings['enabled']) is not bool:
         raise ValueError('camera.live.enabled 必须是布尔值')
-    if settings['device'] not in ('/dev/piper-camera-1', '/dev/piper-camera-2'):
-        raise ValueError('实时相机必须使用已按彩色接口绑定的 /dev/piper-camera-1 或 /dev/piper-camera-2')
+    stable = isinstance(settings["device"], str) and BY_ID.fullmatch(settings["device"])
+    if camera_id is not None or secondary:
+        if not (isinstance(camera_id, str) and CAMERA_ID.fullmatch(camera_id) and stable):
+            raise ValueError("Capture provenance requires a distinct camera_id and /dev/v4l/by-id color device")
+    elif not stable and settings["device"] not in ("/dev/piper-camera-1", "/dev/piper-camera-2"):
+        raise ValueError("Select a bound PiPER camera or a stable /dev/v4l/by-id color device")
+    settings["camera_id"] = camera_id
     for key, low, high in (('width', 320, 1280), ('height', 240, 720), ('fps', 1, 30), ('jpeg_quality', 1, 95)):
         if type(settings[key]) is not int or not low <= settings[key] <= high:
             raise ValueError(f'{key} 必须是 [{low}, {high}] 范围内的整数')
@@ -63,11 +91,11 @@ class ImageTransport:
             self.close()
             raise
 
-    def publish(self, jpeg, stamp):
+    def publish(self, jpeg, stamp, frame_id='piper_camera_color_optical_frame'):
         msg = self.message_type()
         msg.header.stamp.sec = int(stamp)
         msg.header.stamp.nanosec = int((stamp - int(stamp)) * 1e9)
-        msg.header.frame_id = 'piper_camera_color_optical_frame'
+        msg.header.frame_id = frame_id
         msg.format, msg.data = 'jpeg', jpeg
         self.publisher.publish(msg)
 
@@ -86,10 +114,11 @@ class PiperCameraLive:
     RETRY_SECONDS = 2.
 
     def __init__(self, runtime, ros2=None, *, session_factory=CameraSession,
-                 publisher_factory=ImageTransport, owner_factory=CameraOwner):
+                 publisher_factory=ImageTransport, owner_factory=CameraOwner, secondary=False):
         self.runtime, self.ros2 = runtime, ros2
-        self.settings = camera_settings(runtime.config)
-        self.topic = runtime.topic.rsplit('/', 1)[0] + '/camera/live'
+        self.settings = camera_settings(runtime.config, secondary=secondary)
+        self.name = "piper_camera_live_b" if secondary else "piper_camera_live"
+        self.topic = runtime.topic.rsplit('/', 1)[0] + ('/camera/live_b' if secondary else '/camera/live')
         self.session_factory, self.publisher_factory, self.owner_factory = session_factory, publisher_factory, owner_factory
         self._lock = threading.RLock()
         self._stop = threading.Event()
@@ -98,22 +127,23 @@ class PiperCameraLive:
         self._error = None
         self._frames = 0
         self._last_time = None
+        self._last_publish_time = None
         self._width = self._height = None
         self._capture_fps = self._publish_fps = 0.
         self._publisher = None
 
     def get_tools(self):
         if getattr(self, 'sensor_card', False):
-            definition = tool('piper_camera_live', 'sensor',
+            definition = tool(self.name, 'sensor',
                 'Live bound color camera. Independent of Arm control and Joints; no robot commands.',
                 {'type': 'object', 'properties': {}, 'additionalProperties': False},
                 topic_out=[{'topic': self.topic, 'format': 'image/jpeg'}])
-            definition['title'] = 'On camera'
+            definition['title'] = 'On camera B' if self.name.endswith('_b') else 'On camera'
             return [definition]
         schema = action_schema({'start': ([], '自动开始实时监控'), 'stop': ([], '停止采集并释放相机'),
                                 'info': ([], '查看相机状态')}, {})
         schema['additionalProperties'] = False
-        definition = tool('piper_camera_live', 'resource',
+        definition = tool(self.name, 'resource',
                           '自动显示绑定彩色相机的当前画面；在顶部「监控」查看，不控制机械臂。', schema,
                           topic_out=[{'topic': self.topic, 'format': 'image/jpeg'}])
         definition['title'] = '实时相机画面'
@@ -133,6 +163,12 @@ class PiperCameraLive:
                         实际分辨率=None if self._width is None else [self._width, self._height],
                         采集帧率=round(self._capture_fps, 2), 发布帧率=round(self._publish_fps, 2),
                         目标帧率=self.settings['fps'], 有效帧数=self._frames, 最后有效时间=self._last_time,
+                        camera_id=self.settings["camera_id"],
+                        device_id=device_identity(self.settings["device"]) if self.settings["camera_id"] else None,
+                        timestamp_source="host_read",
+                        last_capture_timestamp=self._last_time,
+                        last_publish_timestamp=self._last_publish_time,
+                        frame_valid=self._state == "running",
                         错误原因=self._error, publishing=self._publisher is not None,
                         topic_out=[{'topic': self.topic, 'format': 'image/jpeg'}])
             if getattr(self.runtime, 'interface_language', None) == 'en':
@@ -181,7 +217,7 @@ class PiperCameraLive:
             allowed.add('input_topic')
         if set(args) - allowed:
             raise ValueError('Live camera accepts lifecycle arguments only.' if english else '实时相机卡不接受控制或拍照参数')
-        action = args.get('action', 'info' if action == 'piper_camera_live' else action)
+        action = args.get('action', 'info' if action == self.name else action)
         if action not in ('start', 'stop', 'info'):
             raise ValueError('Live camera supports start, stop and info only.' if english else '实时相机只支持启动、停止和状态查询')
         try:
@@ -192,12 +228,16 @@ class PiperCameraLive:
                 raise RuntimeError(public_error(exc)) from exc
             raise
 
-    def _publish(self, stop, jpeg, stamp):
+    def _publish(self, stop, jpeg, stamp, frame_id=None):
         # Serialize with cancellation: no frame can be published after stop wins.
         with self._lock:
             if stop.is_set():
                 return False
-            self._publisher.publish(jpeg, stamp)
+            if frame_id is None:
+                self._publisher.publish(jpeg, stamp)
+            else:
+                self._publisher.publish(jpeg, stamp, frame_id)
+            self._last_publish_time = time.time()
             return True
 
     def _offline(self, stop, error):
@@ -206,8 +246,11 @@ class PiperCameraLive:
                 return
             self._state, self._error = 'offline', str(error).replace('\n', ' ')[:300]
             self._capture_fps = self._publish_fps = 0.
+        if self.settings["camera_id"]:
+            return  # Provenance-enabled image topics carry valid frames only.
         try:
-            self._publish(stop, offline_image(self.settings['width'], self.settings['height']), time.time())
+            jpeg = offline_image(self.settings['width'], self.settings['height'])
+            self._publish(stop, jpeg, 0.0, OFFLINE_FRAME)
         except Exception as exc:
             with self._lock:
                 self._error += '; 发布异常: ' + str(exc).replace('\n', ' ')[:150]
@@ -237,7 +280,11 @@ class PiperCameraLive:
                         break
                     if not Path(self.settings['device']).exists():
                         raise RuntimeError('绑定的彩色相机不存在，请检查 USB 连接')
+                    if self.settings["camera_id"] and not stat.S_ISCHR(Path(self.settings["device"]).stat().st_mode):
+                        raise RuntimeError("Configured camera path is not a character device")
                     session = self.session_factory(self.settings)
+                    session_id = uuid.uuid4().hex
+                    last_stamp = 0.0
                     began = window = time.monotonic()
                     last_sequence = count = 0
                     last_frame = None
@@ -250,9 +297,13 @@ class PiperCameraLive:
                             stamp = frame['timestamp']
                             if not math.isfinite(stamp) or not 0 <= time.time() - stamp <= self.STALE_SECONDS:
                                 raise RuntimeError('相机画面时间无效或已过期')
-                            if not self._publish(stop, frame['jpeg'], stamp):
+                            if frame["sequence"] < last_sequence or stamp <= last_stamp:
+                                raise RuntimeError("Camera sequence or host read timestamp moved backwards")
+                            frame_id = (capture_frame_id(self.settings, session_id, frame["sequence"])
+                                        if self.settings["camera_id"] else None)
+                            if not self._publish(stop, frame['jpeg'], stamp, frame_id):
                                 break
-                            last_sequence, last_frame = frame['sequence'], now
+                            last_sequence, last_frame, last_stamp = frame['sequence'], now, stamp
                             count += 1
                             with self._lock:
                                 self._state, self._error = 'running', None
@@ -295,12 +346,23 @@ def add_camera_live(plugins, config, ros2, *, sensor_card=False):
     runtime = next(p for p in plugins if hasattr(p, 'camera_enabled') and hasattr(p, 'capture'))
     if any(t['name'] == 'piper_camera_live' for p in plugins for t in p.get_tools()):
         raise ValueError('实时相机已注册，拒绝重复采集')
+    camera = PiperCameraLive(runtime, ros2)
+    cameras = [camera]
+    if config.get("camera", {}).get("secondary") is not None:
+        second = PiperCameraLive(runtime, ros2, secondary=True)
+        if (not camera.settings["camera_id"]
+                or camera.settings["camera_id"] == second.settings["camera_id"]
+                or camera.settings["device"].rsplit("-video-index", 1)[0]
+                == second.settings["device"].rsplit("-video-index", 1)[0]
+                or Path(camera.settings["device"]).resolve() == Path(second.settings["device"]).resolve()):
+            raise ValueError("Dual cameras require distinct stable color devices and camera IDs")
+        cameras.append(second)
     original_capture = runtime.capture
     def capture(args):
         device = config.get('camera', {}).get('device') or '/dev/piper-camera-1'
         with CameraOwner(runtime.data_dir, device):
             return original_capture(args)
     runtime.capture = capture
-    camera = PiperCameraLive(runtime, ros2)
-    camera.sensor_card = sensor_card
-    return [*plugins, camera]
+    for camera in cameras:
+        camera.sensor_card = sensor_card
+    return [*plugins, *cameras]

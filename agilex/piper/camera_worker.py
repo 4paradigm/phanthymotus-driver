@@ -91,6 +91,7 @@ def capture_worker(settings, mailbox, stop):
         capture_fps = 0.
         while not stop.is_set():
             ok, frame = cap.read()  # A USB stall is terminated by the parent watchdog.
+            read_timestamp = time.time()
             now = time.monotonic()
             if not ok:
                 raise RuntimeError('相机读取失败，请检查彩色接口或 USB 连接')
@@ -100,7 +101,7 @@ def capture_worker(settings, mailbox, stop):
                 window, frames = now, 0
             if now < next_frame:
                 continue
-            stamp = time.time()
+            stamp = read_timestamp
             jpeg = encode_frame(frame, stamp, settings['jpeg_quality'])
             if stop.is_set():
                 break
