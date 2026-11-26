@@ -16,22 +16,20 @@ from .battery import HeliosBattery
 from .spatial_map import HeliosSpatialMap
 
 
-def main():
+def serve(config, plugin_classes, server_name, driver_id):
     import rclpy
     from rclpy.context import Context
     from rclpy.executors import SingleThreadedExecutor
 
-    config = load_config(__file__)
     context = Context()
     rclpy.init(context=context, domain_id=int(os.environ.get("ROS_DOMAIN_ID", "42")))
     executor = SingleThreadedExecutor(context=context)
     ros2 = SimpleNamespace(ctx_core=context, executor_core=executor)
-    plugins = [HeliosJoints(config, resolve_namespace(config), ros2),
-               HeliosBattery(config, resolve_namespace(config), ros2),
-               HeliosSpatialMap(config, resolve_namespace(config), ros2)]
+    namespace = resolve_namespace(config)
+    plugins = [plugin(config, namespace, ros2) for plugin in plugin_classes]
     bundle = DriverBundle(plugins)
     port = int(config["mcp_port"])
-    server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(lambda: bundle, "rokae-helios", "rokae-helios-driver"))
+    server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(lambda: bundle, server_name, driver_id))
     stopping = threading.Event()
 
     def shutdown(_signum, _frame):
@@ -46,7 +44,7 @@ def main():
             plugin.start()  # Fail startup if model or DDS initialization fails.
         spin = threading.Thread(target=executor.spin, daemon=True)
         spin.start()
-        start_registration(port, config, "rokae-helios-driver")
+        start_registration(port, config, driver_id)
         print(f"[helios] MCP listening on 127.0.0.1:{port}", flush=True)
         server.serve_forever()
     finally:
@@ -54,6 +52,11 @@ def main():
         bundle.stop_all()
         server.server_close()
         rclpy.shutdown(context=context)
+
+
+def main():
+    serve(load_config(__file__), (HeliosJoints, HeliosBattery, HeliosSpatialMap),
+          "rokae-helios", "rokae-helios-driver")
 
 
 if __name__ == "__main__":
