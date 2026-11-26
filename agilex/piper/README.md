@@ -51,7 +51,7 @@ camera permission are enabled. Optional photo capture/import remains available.
 Depth camera publishes `image/depth-zlib` on the sibling `/camera/depth` topic.
 Its 640×480 little-endian `uint16` samples are millimetres, with zero for invalid
 depth. They use the native depth optical frame. The live `camera_info` reports
-the SDK intrinsics for that profile. RGB pixel coordinates require registration
+the source intrinsics for that profile. RGB pixel coordinates require registration
 before sampling this stream.
 
 Long-running requests return a unique `action_id`; their real completed, error
@@ -119,7 +119,7 @@ serial/interface binding; generic `video-index0` may select a depth interface.
 After re-enumeration to a new device number, recreate only the PiPER service to
 refresh the device mapping. Broad hotplug access is deliberately not granted.
 
-### Optional RealSense depth
+### Optional direct RealSense depth
 
 Identify the D435 by serial on the host. Use `v4l2-ctl --list-devices` and
 `v4l2-ctl -d /dev/videoN --list-formats-ext` to locate its Z16 capture node.
@@ -137,6 +137,22 @@ Open **Depth camera** → **View data stream** in the canvas. The depth card's
 stationary target at two known distances, then stop and restart the depth card
 while watching the color stream. A depth outage is reported through `info`, and
 the shared capture supervisor retries the same configured device.
+
+### Reuse an existing ROS 2 depth stream
+
+When a site camera service owns the RealSense, configure the PiPER container
+with `PIPER_DEPTH_ROS_SOURCE` (the source depth topic prefix),
+`PIPER_DEPTH_ROS_DOMAIN_ID`, and `PIPER_DEPTH_ROS_FRAME_ID` (the actual depth
+optical frame). Set `PIPER_DEPTH_SERIAL` to retain the camera's stable identity.
+The source publishes `image_rect_raw` (640×480 `16UC1` millimetres) and matching
+`camera_info` under that prefix. The worker preserves the frame and capture
+timestamp and the card retains its existing output topic and lifecycle.
+
+For a custom source discovery profile, pass `PIPER_DEPTH_ROS_DDS_PROFILE` with
+the path to its read-only mount. A shared-memory source needs the matching
+site IPC and process-user configuration. The source is local to the host.
+Leave the direct-depth Compose override and V4L2 mapping out of a ROS-source
+deployment.
 
 Image-only upgrades preserve old Compose grants. When adopting this fragment,
 remove old `privileged` and `/dev:/dev` entries from the site service as well.

@@ -8,7 +8,7 @@ import re
 import zlib
 
 from common.camera_info import build
-from agilex.piper.camera_live import PiperCameraLive, camera_settings
+from agilex.piper.camera_live import ImageTransport, PiperCameraLive, camera_settings
 from agilex.piper.camera_worker import CameraSession, capture_frames
 
 
@@ -19,8 +19,22 @@ def depth_settings(config):
     settings = camera_settings(config)
     serial = os.environ.get('PIPER_DEPTH_SERIAL', '').strip()
     device = os.environ.get('PIPER_DEPTH_VIDEO_DEVICE', '').strip()
-    return dict(device=device, serial=serial, enabled=bool(serial or device),
-                width=WIDTH, height=HEIGHT, fps=settings['fps'], warmup_seconds=settings['warmup_seconds'])
+    source = os.environ.get('PIPER_DEPTH_ROS_SOURCE', '').strip()
+    frame_id = os.environ.get('PIPER_DEPTH_ROS_FRAME_ID', '').strip()
+    domain = None
+    if source:
+        if device or not frame_id or not re.fullmatch(r'(/[A-Za-z_][A-Za-z_0-9]*)+', source):
+            raise ValueError('Configure one native ROS depth source, its optical frame, and no V4L2 device')
+        try:
+            domain = int(os.environ.get('PIPER_DEPTH_ROS_DOMAIN_ID', ''))
+        except ValueError as exc:
+            raise ValueError('Set PIPER_DEPTH_ROS_DOMAIN_ID to the depth source domain') from exc
+        if not 0 <= domain <= 232:
+            raise ValueError('ROS depth domain must be between 0 and 232')
+    return dict(device=device, serial=serial, enabled=bool(serial or device or source),
+                width=WIDTH, height=HEIGHT, fps=settings['fps'], warmup_seconds=settings['warmup_seconds'],
+                ros_source=source, ros_domain=domain, ros_frame_id=frame_id,
+                ros_profile=os.environ.get('PIPER_DEPTH_ROS_DDS_PROFILE', '').strip())
 
 
 def encode_depth(frame, scale):
@@ -51,6 +65,12 @@ def depth_worker(settings, mailbox, stop):
     from common import logsafe
     logsafe.install(check_fd=False)
     try:
+        if settings.get('ros_source'):
+            from agilex.piper.camera_depth_ros import capture_ros_depth
+
+            capture_ros_depth(settings, mailbox, stop, encode_depth)
+            return
+
         import numpy as np
         import pyrealsense2 as rs
 
@@ -106,8 +126,17 @@ class PiperCameraDepth(PiperCameraLive):
                  **kwargs):
         super().__init__(runtime, ros2, session_factory=session_factory, **kwargs)
 
+        if self.settings['ros_source'] and kwargs.get('publisher_factory') is None:
+            self.publisher_factory = partial(
+                ImageTransport, encoding=self.ENCODING, frame_id=self.settings['ros_frame_id'])
+
     def _enabled(self):
         return self.settings['enabled']
+
+    def _acquire_source(self):
+        if self.settings['ros_source']:
+            return None
+        return super()._acquire_source()
 
     def _check_device(self):
         device = self.settings['device']

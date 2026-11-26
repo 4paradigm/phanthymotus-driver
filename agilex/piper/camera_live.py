@@ -248,6 +248,10 @@ class PiperCameraLive:
         if not Path(self.settings['device']).exists():
             raise RuntimeError('绑定的彩色相机不存在，请检查 USB 连接')
 
+    def _acquire_source(self):
+        self._check_device()
+        return self.owner_factory(self.runtime.data_dir, self.settings['device'])
+
     def _run(self, stop):
         publisher = None
         try:
@@ -259,8 +263,7 @@ class PiperCameraLive:
             while not stop.is_set():
                 owner = session = None
                 try:
-                    self._check_device()
-                    owner = self.owner_factory(self.runtime.data_dir, self.settings['device'])
+                    owner = self._acquire_source()
                     if stop.is_set():
                         break
                     session = self.session_factory(self.settings)

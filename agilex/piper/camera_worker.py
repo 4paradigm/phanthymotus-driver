@@ -83,7 +83,7 @@ def encode_frame(frame, stamp, quality):
     return encoded[:2] + b'\xff\xef' + struct.pack('>H', len(payload) + 2) + payload + encoded[2:]
 
 
-def capture_frames(settings, mailbox, stop, read, encode):
+def capture_frames(settings, mailbox, stop, read, encode, *, frame_time=None):
     window = time.monotonic()
     next_frame = window + settings['warmup_seconds']
     frames = 0
@@ -99,7 +99,7 @@ def capture_frames(settings, mailbox, stop, read, encode):
             window, frames = now, 0
         if now < next_frame:
             continue
-        stamp = time.time()
+        stamp = time.time() if frame_time is None else frame_time()
         payload = encode(frame, stamp)
         if stop.is_set():
             break
