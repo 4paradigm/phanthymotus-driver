@@ -186,6 +186,9 @@ class ControlledSpatialPlugin:
         self._workers = set()
         self._map_deadline = float('inf')
         self._keyboard_pending = False
+        self._mapping_cleanup = None
+        self._mapping_cleanup_key = None
+        self._mapping_cleanup_retry_at = 0.
         self.base_preparation_required = False
         self.keyboard = MappingKeyboard(self)
 
@@ -577,6 +580,14 @@ class ControlledSpatialPlugin:
     def dispatch(self, action, args):
         try:
             self._restore()
+            if action in ('start', 'info', 'list_maps', 'get_pose', 'start_mapping', 'stop_mapping',
+                          'load_map', 'delete_map', 'tag_place', 'untag_place', 'list_tags',
+                          'navigate_to_pose', 'navigate_to_tag'):
+                cleanup = self._auto_reconcile_mapping()
+                if action == 'stop_mapping' and cleanup is not None:
+                    return {**cleanup, 'completion_basis': 'obsolete_mapping_session_cleared',
+                            'map_saved': False,
+                            'message': 'Obsolete mapping session cleared automatically. No new save was requested.'}
             if action == 'mapping_console':
                 return {'protocol': 'motus.workbench/1',
                         'html': (Path(__file__).parent/'resource/mapping_keyboard.html').read_text()}
@@ -611,10 +622,10 @@ class ControlledSpatialPlugin:
                     result['message'] = 'Optimizing and saving the map in background. Please wait; do not restart mapping.'
                 recovery = self._mapping_recovery()
                 if recovery:
-                    result['state'] = 'recovery_required'
-                    result['recovery_required'] = True
-                    result['message'] = 'The previous map operation is no longer running in this driver. Inspect the chassis and reconcile the old session before deleting or starting another map.'
-                    result['recovery'] = recovery
+                    result['state'] = 'loading'
+                    result['message'] = 'Checking the previous mapping operation automatically; waiting for confirmed chassis state.'
+                if self._mapping_cleanup is not None:
+                    result['mapping_cleanup'] = self._mapping_cleanup
                 result['last_mapping_reconciliation'] = self.store.state('last_mapping_reconciliation')
                 try:
                     result['map'] = self.client.current_map()
@@ -627,7 +638,7 @@ class ControlledSpatialPlugin:
                 except NavigationStateUnavailable as exc:
                     result['feedback'] = None
                     result['feedback_status'] = {'state': 'loading', 'missing': list(exc.missing), 'reason': exc.reason}
-                    if result['state'] not in ('error', 'saving', 'recovery_required'):
+                    if result['state'] not in ('error', 'saving'):
                         result['state'] = 'loading'
                     if result['state'] == 'loading':
                         result['message'] = 'Waiting for fresh chassis navigation feedback; checking in background, please wait.'
@@ -656,8 +667,8 @@ class ControlledSpatialPlugin:
                             'finish_or_reconcile_mapping_before_deleting', 'finish_or_reconcile_mapping_before_loading'):
                 recovery = self._mapping_recovery()
                 if recovery:
-                    result.update(recovery_required=True, recovery=recovery,
-                        message='An old mapping session is unconfirmed. Inspect info and use reconcile_mapping before retrying; map files and tags are preserved.')
+                    result.update(mapping_cleanup=self._mapping_cleanup or {'state': 'waiting'},
+                        message='Checking the previous mapping operation automatically; waiting for confirmed chassis state.')
             return result
 
     def _navigate(self, action, args):
@@ -878,7 +889,7 @@ class ControlledSpatialPlugin:
         return any(w.is_alive() and w.name == 'kuavo-map-operation' for w in self._workers.copy())
 
     def _mapping_recovery(self):
-        """Describe the existing recovery action without retiring anything."""
+        """Identify a detached mapping operation without retiring anything."""
         mapping, transition = self.store.state('mapping'), self._map_pending
         if (not mapping or not transition or self._map_worker_active()
                 or transition.get('operation') not in ('start_mapping', 'stop_mapping')):
@@ -889,11 +900,44 @@ class ControlledSpatialPlugin:
                 'previous_chassis_operation_must_be_proven_inactive': True,
                 'container_restart_is_not_evidence': True}
 
+    def _auto_reconcile_mapping(self):
+        """Retire proven obsolete metadata; never retry a factory command."""
+        if not self._mapping_recovery() or not self._operations.acquire(blocking=False):
+            return None
+        try:
+            recovery = self._mapping_recovery()
+            if not recovery:
+                return None
+            key = json.dumps([self.store.state('mapping'), self._map_pending,
+                              self.bundle._stop_epoch, self.bundle.ros1.connection], sort_keys=True)
+            if key == self._mapping_cleanup_key and time.monotonic() < self._mapping_cleanup_retry_at:
+                return None
+            self._mapping_cleanup_key = key
+            self._mapping_cleanup = {'state': 'checking', 'map_name': recovery['map_name']}
+            try:
+                result = self._reconcile_mapping({'map_name': recovery['map_name'],
+                                                   'confirm_abandon': True}, automatic=True)
+            except Exception as exc:
+                # Unknown/lost feedback is not proof that a save ended. Retry
+                # only these reads on a later request, without asking the user
+                # to clear records or issuing a stop/restart/mode command.
+                self._mapping_cleanup.update(state='waiting', error_type=type(exc).__name__)
+                self._mapping_cleanup_retry_at = time.monotonic()+2.
+                return None
+            self._mapping_cleanup = {'state': 'completed', 'map_name': recovery['map_name'],
+                                     'basis': result['basis'], 'files_and_tags_preserved': True,
+                                     'motion_command_sent': False}
+            self._mapping_cleanup_key = None
+            self._mapping_cleanup_retry_at = 0.
+            return result
+        finally:
+            self._operations.release()
+
     @staticmethod
     def _runtime_identity(runtime):
         return str(UUID(runtime['boot_id']))
 
-    def _reconcile_mapping(self, args):
+    def _reconcile_mapping(self, args, automatic=False):
         name = safe_name(args.get('map_name'))
         if args.get('confirm_abandon') is not True:
             raise ValueError('confirm_abandon_required')
@@ -940,7 +984,9 @@ class ControlledSpatialPlugin:
                 if (observation['agvState'].get('isMapping') is not False
                         or observation['state'].get('driving') is not False
                         or observation['state'].get('nodeStates') or observation['state'].get('edgeStates')
-                        or observation['state'].get('actionStates')):
+                        or observation['state'].get('actionStates')
+                        or (automatic and any(observation['state'].get(key) != []
+                                              for key in ('nodeStates', 'edgeStates', 'actionStates')))):
                     raise RuntimeError('chassis_mapping_or_task_still_active')
                 selected = self.client.current_map()
                 if current is not None and selected != current:
@@ -952,7 +998,7 @@ class ControlledSpatialPlugin:
                         'previous_mapping': mapping, 'previous_transition': transition,
                         'chassis_boot_id': identity, 'basis': evidence_type,
                         'current_map': current, 'files_and_tags_preserved': True,
-                        'motion_command_sent': False}
+                        'motion_command_sent': False, 'automatic': automatic}
             with self.bundle.tracker.lock:
                 check()
                 self.store.retire_mapping(mapping, pending, evidence)
@@ -978,8 +1024,8 @@ class ControlledSpatialPlugin:
                       'chassis_map': chassis}
             recovery = self._mapping_recovery()
             if recovery:
-                result.update(recovery_required=True, recovery=recovery,
-                    message='Maps are available, but an old mapping session must be reconciled before map changes.')
+                result.update(mapping_cleanup=self._mapping_cleanup or {'state': 'waiting'},
+                    message='Maps are available; checking the previous mapping operation automatically.')
             return result
         mapping = self.store.state('mapping')
         recovering_save = (action == 'stop_mapping' and mapping and mapping.get('phase') == 'saving'

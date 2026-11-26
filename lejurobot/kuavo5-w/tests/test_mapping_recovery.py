@@ -23,6 +23,7 @@ class ReconciliationTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.bundle, self.client = Bundle(), Client()
+        self.client.feedback['state'].update(nodeStates=[], edgeStates=[], actionStates=[])
         self.plugin = ControlledSpatialPlugin(self.bundle, {'db_path': self.temp.name+'/state.db'}, self.client)
         self.bundle.spatial = self.plugin
         self.addCleanup(self.plugin.close)
@@ -170,47 +171,124 @@ class ReconciliationTests(unittest.TestCase):
         self.assertEqual(self.plugin.store.state('mapping'), self.mapping)
         self.assertIsNone(self.plugin.store.state('last_mapping_reconciliation'))
 
-    def test_info_does_not_claim_orphaned_worker_is_still_optimizing(self):
+    def test_info_automatically_retires_proven_obsolete_session(self):
         result = self.plugin.dispatch('info', {})
-        self.assertEqual(result['state'], 'recovery_required')
-        self.assertEqual(result['recovery']['map_name'], 'failed')
-        self.assertIn('no longer running', result['message'])
-        self.assert_kept()
+        self.assertEqual(result['state'], 'ready')
+        self.assertIsNone(result['mapping'])
+        self.assertIsNone(result['map_transition'])
+        self.assertNotIn('recovery', result)
+        self.assertTrue(result['last_mapping_reconciliation']['automatic'])
+        self.assertEqual(len(self.plugin.store.tags(('failed', 'mapping-test'))), 1)
+        self.assertFalse(self.client.commands)
+        self.assertFalse(self.bundle.pauses)
 
-    def test_blocked_map_actions_identify_the_same_orphan_and_recovery(self):
+    def test_map_request_continues_after_automatic_cleanup(self):
         actions = [('start_mapping', {'map_name': 'new'}),
-                   ('stop_mapping', {}),
                    ('delete_map', {'map_name': 'failed', 'confirm_delete': True}),
                    ('load_map', {'map_name': 'factory'})]
         for action, args in actions:
             with self.subTest(action=action):
-                result = self.plugin.dispatch(action, args)
-                self.assertEqual(result['state'], 'error')
-                self.assertTrue(result.get('recovery_required'), result)
-                self.assertEqual(result['recovery']['action'], 'reconcile_mapping')
-                self.assertEqual(result['recovery']['map_name'], 'failed')
-                self.assertEqual(result['recovery']['stage'], 'ChangeCartoMap')
-                self.assertTrue(result['recovery']['confirm_abandon_required'])
-                self.assert_kept()
-        self.assertFalse(self.client.calls)
+                self.plugin.store.state('mapping', self.mapping)
+                self.plugin.store.state('pending', self.pending)
+                self.plugin._map_pending = copy.deepcopy(self.transition)
+                def execute(actual_action, actual_args):
+                    self.assertEqual((actual_action, actual_args), (action, args))
+                    self.assertIsNone(self.plugin.store.state('mapping'))
+                    self.assertIsNone(self.plugin._map_pending)
+                    return {'state': 'completed'}
+                with patch.object(self.plugin, '_map_action', side_effect=execute):
+                    result = self.plugin.dispatch(action, args)
+                self.assertEqual(result['state'], 'completed')
+                self.assertTrue(self.plugin.store.state('last_mapping_reconciliation')['automatic'])
+        self.assertEqual([call[0] for call in self.client.calls], ['map_runtime_status']*6)
         self.assertFalse(self.client.commands)
 
-    def test_list_maps_exposes_orphan_without_claiming_maps_are_missing(self):
+    def test_stop_mapping_clears_obsolete_session_without_claiming_save_success(self):
+        result = self.plugin.dispatch('stop_mapping', {})
+        self.assertEqual(result['state'], 'completed')
+        self.assertEqual(result['completion_basis'], 'obsolete_mapping_session_cleared')
+        self.assertFalse(result['map_saved'])
+        self.assertTrue(result['files_and_tags_preserved'])
+        self.assertFalse(result['motion_command_sent'])
+        self.assertIsNone(self.plugin.store.state('mapping'))
+        self.assertFalse(self.client.commands)
+
+    def test_list_maps_automatically_clears_only_the_obsolete_session(self):
         result = self.plugin.dispatch('list_maps', {})
         self.assertEqual(result['state'], 'ready')
         self.assertTrue(result['maps'])
-        self.assertTrue(result.get('recovery_required'), result)
-        self.assertEqual(result['recovery']['map_name'], 'failed')
-        self.assert_kept()
+        self.assertNotIn('recovery', result)
+        self.assertIsNone(self.plugin.store.state('mapping'))
+        self.assertEqual(len(self.plugin.store.tags(('failed', 'mapping-test'))), 1)
+        self.assertFalse(self.client.commands)
 
-    def test_feedback_timeout_does_not_hide_mapping_recovery(self):
+    def test_unavailable_feedback_keeps_session_and_retries_automatically(self):
         with patch.object(self.client, 'observe', side_effect=NavigationStateUnavailable(('agvState',), 'timeout')):
             result = self.plugin.dispatch('info', {})
-        self.assertEqual(result['state'], 'recovery_required')
+        self.assertEqual(result['state'], 'loading')
         self.assertEqual(result['feedback_status']['state'], 'loading')
-        self.assertIn('no longer running', result['message'])
-        self.assertEqual(result['recovery']['map_name'], 'failed')
+        self.assertEqual(result['mapping_cleanup']['state'], 'waiting')
+        self.assertNotIn('recovery', result)
         self.assert_kept()
+        # Polling must not repeatedly SSH while waiting for fresh state.
+        calls = len(self.client.calls)
+        self.plugin.dispatch('info', {})
+        self.assertEqual(len(self.client.calls), calls)
+        self.plugin._mapping_cleanup_retry_at = 0.
+        result = self.plugin.dispatch('info', {})
+        self.assertEqual(result['state'], 'ready')
+        self.assertIsNone(self.plugin.store.state('mapping'))
+
+    def test_same_boot_save_is_not_automatically_abandoned(self):
+        self.transition['chassis_boot_id'] = '00000000-0000-0000-0000-000000000001'
+        self.plugin._map_pending = copy.deepcopy(self.transition)
+        self.plugin._persist()
+        self.pending = self.plugin.store.state('pending')
+        result = self.plugin.dispatch('info', {})
+        self.assertEqual(result['state'], 'loading')
+        self.assertEqual(result['mapping_cleanup']['state'], 'waiting')
+        self.assert_kept()
+
+    def test_live_factory_mapping_or_tasks_are_never_automatically_abandoned(self):
+        for group, key, value in [('agvState', 'isMapping', True), ('state', 'driving', True),
+                                  ('state', 'nodeStates', [{}]), ('state', 'edgeStates', [{}]),
+                                  ('state', 'actionStates', [{}])]:
+            with self.subTest(key=key):
+                old = copy.deepcopy(self.client.feedback)
+                self.client.feedback[group][key] = value
+                self.plugin._mapping_cleanup_retry_at = 0.
+                result = self.plugin.dispatch('info', {})
+                self.assertEqual(result['mapping_cleanup']['state'], 'waiting')
+                self.assert_kept()
+                self.client.feedback = old
+        self.assertFalse(self.client.commands)
+
+    def test_stop_does_not_wait_for_automatic_mapping_cleanup(self):
+        with patch.object(self.client, 'native', side_effect=AssertionError('stop must not probe cleanup')):
+            self.plugin.dispatch('stop_nav', {})
+        self.assert_kept()
+
+    def test_missing_task_state_is_not_accepted_as_proof_of_inactivity(self):
+        for key in ('nodeStates', 'edgeStates', 'actionStates'):
+            with self.subTest(key=key):
+                self.client.feedback['state'].pop(key)
+                self.plugin._mapping_cleanup_retry_at = 0.
+                result = self.plugin.dispatch('info', {})
+                self.assertEqual(result['mapping_cleanup']['state'], 'waiting')
+                self.assert_kept()
+                self.client.feedback['state'][key] = []
+
+    def test_stop_during_automatic_checks_prevents_cleanup_and_map_command(self):
+        native = self.client.native
+        def stop(operation, **args):
+            self.bundle._stop_epoch += 1
+            return native(operation, **args)
+        with patch.object(self.client, 'native', side_effect=stop):
+            result = self.plugin.dispatch('delete_map', {'map_name': 'failed', 'confirm_delete': True})
+        self.assertEqual(result['state'], 'error')
+        self.assertEqual(result['mapping_cleanup']['state'], 'waiting')
+        self.assert_kept()
+        self.assertFalse(self.client.commands)
 
     def test_live_map_worker_does_not_advertise_abandonment(self):
         with patch.object(self.plugin, '_map_worker_active', return_value=True):
