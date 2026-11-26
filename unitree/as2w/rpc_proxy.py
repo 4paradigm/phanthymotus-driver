@@ -4,6 +4,9 @@ import threading
 import time
 
 
+_SPORT_TIMEOUT = 5.0
+
+
 def _install_logsafe():
     try:
         from common import logsafe
@@ -20,7 +23,7 @@ def _serve(commands, results, interface, kind):
         if kind == "sport":
             from unitree_sdk2py.as2.sport.sport_client import SportClient
             client = SportClient()
-            client.SetTimeout(5.0)
+            client.SetTimeout(_SPORT_TIMEOUT)
         else:
             from unitree_sdk2py.a2.audio.audio_client import AudioClient
             client = AudioClient()
@@ -35,8 +38,14 @@ def _serve(commands, results, interface, kind):
         command = commands.get()
         if command is None:
             return
-        request_id, method, args = command
+        request_id, method, args, deadline = command
         try:
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    results.put({"request_id": request_id, "result": 3104})
+                    continue
+                client.SetTimeout(remaining)
             if kind == "sport" and method == "GetState":
                 state = {}
                 code = client.GetState(state)
@@ -46,6 +55,9 @@ def _serve(commands, results, interface, kind):
             results.put({"request_id": request_id, "result": result})
         except Exception as exc:
             results.put({"request_id": request_id, "error": str(exc)[:240]})
+        finally:
+            if deadline is not None:
+                client.SetTimeout(_SPORT_TIMEOUT)
 
 
 class _RpcChannel:
@@ -70,15 +82,24 @@ class _RpcChannel:
         except Exception:
             self._startup_error = f"{kind} RPC worker did not become ready"
 
-    def call(self, method, *args):
+    def call(self, method, *args, timeout=None):
         fallback = (3104, {}) if method == "GetState" else 3104
         if self._startup_error:
             return fallback
-        with self._lock:
+        deadline = time.monotonic() + timeout if timeout is not None else None
+        if timeout is None:
+            self._lock.acquire()
+        elif not self._lock.acquire(timeout=timeout):
+            self._report_error(method, "channel busy")
+            return fallback
+        try:
+            if deadline is not None and deadline <= time.monotonic():
+                return fallback
             self._next_request_id += 1
             request_id = self._next_request_id
-            self._commands.put((request_id, method, args))
-            deadline = time.monotonic() + self._timeout
+            self._commands.put((request_id, method, args, deadline))
+            if deadline is None:
+                deadline = time.monotonic() + self._timeout
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -94,6 +115,8 @@ class _RpcChannel:
                 if result.get("request_id") != request_id:
                     continue
                 break
+        finally:
+            self._lock.release()
         if "error" in result:
             self._report_error(method, result["error"])
             return fallback
@@ -127,6 +150,9 @@ class RpcProxy:
 
     def call(self, method, *args):
         return self._sport.call(method, *args)
+
+    def towing_call(self, method, timeout, *args):
+        return self._sport.call(method, *args, timeout=timeout)
 
     def __getattr__(self, name):
         return lambda *args: self.call(name, *args)
