@@ -6,11 +6,11 @@ ARM64 真机使用仓库 Dockerfile 的默认 ROS 基础镜像构建。临时 Co
 
 机载 SDK 的 `get_current_map_name()` 返回 `helioslab`。`get_current_map_info()` 的 `goals` 和 `lines` 均为空，`get_work_points()` 和 `get_charge_points()` 均返回空列表。定位回调实测 `status=0`、`confidence=1.0`。工作点和充电点的非空序列化用 SDK 原生 `Goal.from_json()` 构造的样本验证，覆盖中文名称及 ID 为 0 的点位。未向现场地图添加点位。
 
-**二维地图预览。** 正式 Core 的原卡片同时收到 JSON 状态和 620 × 598 JPEG 预览，`info.preview_topic` 指向 JPEG。底盘的 `getRunMapZip` 提供 310 × 284 的 PGM，分辨率为 0.05 m/像素，原点为 `[-3.64022, -5.07641, 0]`。单车监控的 `current_state.pose`、`robot_base.locate.current_state` 和 VMR 均返回约 `(0.0501, -0.3646, -0.0124)`。确认厂家定位标志为 1，正式画布图像流中箭头中心约为 `(148, 380)` 像素，指向图像右方。保留原卡片 ID、JSON 端口和已有连线。
+**二维地图预览。** 正式 Core 的原卡片同时收到 JSON 状态和 620 × 622 JPEG 预览，`info.preview_topic` 指向 JPEG。底盘的 `getRunMapZip` 提供 310 × 284 的 PGM，分辨率为 0.05 m/像素，原点为 `[-3.64022, -5.07641, 0]`。单车监控的 `current_state.pose`、`robot_base.locate.current_state` 和 VMR 均返回约 `(0.0501, -0.3646, -0.0124)`。确认厂家定位标志为 1，正式画布图像流中箭头中心约为 `(148, 380)` 像素，指向图像右方。保留原卡片 ID、JSON 端口和已有连线。
 
 ## 自动验证
 
-2026-11-26，地图扫描叠加在正式 Core 的原卡片上收到两帧含双雷达点和机器人标记的 JPEG。现场预览的一帧显示左前雷达 590 点、右后雷达 588 点、深度平面检测 0 点；非空深度点的颜色及投影由构造样本验证。54 项 Helios 回归通过。
+2026-11-26，地图扫描叠加在正式 Core 的原卡片上收到两帧含双雷达点和机器人标记的 JPEG。现场预览的一帧显示左前雷达 590 点、右后雷达 588 点、深度平面检测 0 点；非空深度点的颜色及投影由构造样本验证。54 项 Helios 回归通过。[真机地图预览](evidence/spatial-map-preview.jpg)
 
 2026-11-19，初版关节、电池、力矩回归共 37 项通过；本次另增加运行时模型发现、大小限制、同源检查及错误模型回归，`scripts/check_service_yml.py rokae/helios` 通过。执行命令见 README。测试使用本地模拟 WebSocket、固定协议样本和真实 Driver 代码，不需要连接或移动机器人。
 
