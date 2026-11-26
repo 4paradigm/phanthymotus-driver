@@ -87,6 +87,18 @@ class BootRemoteTests(fixtures.unittest.TestCase):
             self.assertEqual(topic, '/cmd_vel')
             self.assertTrue(all(value == 0 for group in message.values() for value in group.values()))
         self.assertFalse(self.bundle.state.motion_blocked)
+        self.bundle.upper_bridge.ensure.assert_called_once()
+        self.assertEqual(self.bundle._upper_route_key,
+                         (self.bundle._stop_epoch, self.bundle.ros1.connection))
+        self.assertEqual(self.bundle.upper_bridge.owner(), 'remote')
+
+    def test_missing_velocity_bridge_never_enables_remote_control(self):
+        self.bundle._upper_route_key = None
+        self.bundle.upper_bridge.ensure.side_effect = RuntimeError('upper_velocity_bridge_not_ready')
+        self.assertTrue(self.remote.attempt())
+        self.assertEqual(self.remote.info()['state'], 'error')
+        self.assertFalse(self.ros.sent_services)
+        self.assertIsNone(self.bundle._upper_route_key)
 
     def test_container_restart_and_repeated_calls_never_replay_consumed_permit(self):
         self.remote.attempt()

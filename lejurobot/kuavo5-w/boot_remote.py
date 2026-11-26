@@ -134,6 +134,10 @@ class BootRemote:
                 return True
         writes_attempted = False
         try:
+            # The two ROS masters have no native velocity link. Establish the
+            # held bridge before enabling; lifecycle start must not be needed
+            # to make the first remote command reach the chassis.
+            b.upper_bridge.ensure()
             with b.spatial._native_lock:
                 observation = b.spatial.client.observe(required=('agvState', 'state'))
                 b.spatial._check_chassis_faults(observation)
@@ -185,6 +189,7 @@ class BootRemote:
                     b.spatial._preparation = None
                     b.spatial._persist()
                     b.spatial.base_preparation_required = False
+                    b._upper_route_key = (b._stop_epoch, b.ros1.connection)
                     self.status = {'state': 'ready', 'controller': 'g12_upper_mpc', 'motion_target_sent': False}
         except Exception as exc:
             if writes_attempted:
