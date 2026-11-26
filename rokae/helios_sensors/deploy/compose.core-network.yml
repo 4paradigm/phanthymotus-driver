@@ -1,0 +1,10 @@
+# Use for an existing non-host-network Core to share both MCP and DDS loopback.
+services:
+  rokae-helios-sensors:
+    network_mode: "container:${HELIOS_CORE_CONTAINER:?set the active Core container name}"
+    volumes:
+      - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+    environment:
+      ROS_DOMAIN_ID: "42"
+      RMW_IMPLEMENTATION: rmw_fastrtps_cpp
+      FASTRTPS_DEFAULT_PROFILES_FILE: /opt/phanthy-motus/dds-local.xml

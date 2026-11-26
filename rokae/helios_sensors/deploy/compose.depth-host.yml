@@ -1,0 +1,10 @@
+# Merge after the generated deployment file and the GMSL overlay for host depth.
+# The generated deployment supplies the image and local log rotation.
+services:
+  rokae-helios-sensors:
+    group_add:
+      - "${HELIOS_DEPTH_SOCKET_GID:?set the host group ID of the depth socket}"
+    volumes:
+      - ${HELIOS_DEPTH_SOCKET_DIR:?set the host depth socket directory}:/run/helios-depth:ro
+    environment:
+      HELIOS_ORBBEC_DEPTH_SOCKET: /run/helios-depth/depth.sock
