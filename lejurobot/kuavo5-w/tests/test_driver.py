@@ -192,6 +192,9 @@ class DriverContractTests(unittest.TestCase):
         self.bundle._upper_route_key = (self.bundle._stop_epoch,self.ros.connection)
         # Generic card tests assume a healthy AUTO chassis; ownership tests
         # exercise the real mode transition against explicit chassis feedback.
+        self.base_mode_patch = patch.object(self.bundle.spatial, 'motion_chassis_mode', return_value='AUTO')
+        self.base_mode_patch.start()
+        self.addCleanup(self.base_mode_patch.stop)
         self.auto_mode_patch = patch.object(self.bundle.spatial, 'ensure_auto_for_motion')
         self.auto_mode_patch.start()
         self.addCleanup(self.auto_mode_patch.stop)

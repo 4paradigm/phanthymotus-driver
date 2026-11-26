@@ -590,11 +590,11 @@ python3 -c "import hashlib,rospy; print(hashlib.sha256(rospy.get_param('/humanoi
 
 | 卡片/操作 | 实际执行者与通路 | 控制模式 | 组合规则 |
 | --- | --- | --- | --- |
-| `base_drive.move/move_relative` | 驱动定时/里程计闭环 → `/cmd_vel` → 上位机MPC → 底盘 | BaseArm；上位机速度输出开启 | 独占base；可并行arm/head/leg；显式命令会暂停base_servo |
-| `base_servo` | ActuCore navi速度流 → ControlSink → `/cmd_vel` → 上位机MPC → 底盘 | BaseArm；上位机速度输出开启 | 独占base；可并行arm/head/leg；显式底盘/导航命令优先，之后须resume并发送新帧 |
+| `base_drive.move/move_relative` | 驱动定时/里程计闭环 → `/cmd_vel` → 上位机MPC → 底盘 | BaseArm（3）、底盘AUTO；上位机速度输出开启 | 独占base；可并行arm/head/leg；显式命令会暂停base_servo |
+| `base_servo` | ActuCore navi速度流 → ControlSink → `/cmd_vel` → 上位机MPC → 底盘 | BaseArm（3）、底盘AUTO；上位机速度输出开启 | 独占base；可并行arm/head/leg；显式底盘/导航命令优先，之后须resume并发送新帧 |
 | `controlled_spatial.navigate_*` | 厂商MoveToTarget → 原生路径规划/跟踪 → `nav_mpc_path_track` | BaseArm、底盘AUTO；上位机速度输出关闭 | 独占base；目标已确认且任务正常时可并行arm/head/leg；不与遥控器/其它底盘动作同时控制 |
 | `controlled_spatial.start_mapping/mapping_console` | 厂商Cartographer；画布键盘 → 底盘临时看门狗 → RobotMotion | 底盘MANUAL；上位机速度输出关闭；面板不使能全身 | 建图会话独占底盘通路；启动其它卡不抢权；独立关节仅在共享状态已就绪时并行 |
-| `controlled_spatial.stop_mapping/load_map` | 厂商地图服务 | 先释放键盘并确认停稳、底盘软停，再切换MANUAL；结束AUTO仍保持软停，不改全身BaseArm | 地图转换独占base；未确认的转换不能被新底盘运动覆盖 |
+| `controlled_spatial.stop_mapping/load_map` | 厂商地图服务 | 先释放键盘并确认停稳；按当前模式选择MANUAL零速/AUTO调度停车，再确认MANUAL；保存后回AUTO并停车、不会载图，load_map独立载图和定位；不改全身BaseArm | 地图转换独占base；未确认的转换不能被新底盘运动覆盖 |
 | `arm` | `/kuavo_arm_traj` → 厂商全身控制器 | BaseArm；不修改底盘速度开关 | 独占arms，与base/head/leg独立 |
 | `head` | `/robot_head_motion_data` → 厂商头部控制 | BaseArm；不修改底盘速度开关 | 独占head，与base/arms/leg独立 |
 | `leg` | 下肢关节轨迹/躯干位姿 → 厂商MPC/WBC | BaseArm；不修改底盘速度开关 | 独占lower_body，包含腰；与base/arms/head独立 |
@@ -1057,3 +1057,7 @@ audit for timing, geometry limitations and deployment status.
 保存与载图分离：`stop_mapping` 返回 `map_loaded:false`，按保存文件的实际指纹绑定语义点并触发上位机同步；`spatial_map` 列表与底盘/本地地图并集一致，选择地图时校验同步预览副本，不改变底盘当前地图、模式或定位。文件同步失败明确报告 `map_preview_sync_failed`，不再将尚未同步的底盘地图误报为不存在。
 
 上位机底盘控制的模式切换：`base_drive/base_servo` 需要 AUTO；从已退出建图的 MANUAL 接管时，先确认无建图/键盘占用和新鲜静止，发送厂商 MANUAL 零速、关闭上位机速度输出，确认原生跟踪器已结束及上位机持续零输出，再切 AUTO 并等待实际反馈，之后才取消旧任务、核对速度源及解除调度停车并发送目标。`controlled_spatial` 建图键盘用 MANUAL，原生导航用 AUTO；卡片生命周期 start 不等于申请建图控制权。模式转换与运动共用停止世代和控制锁，停止可抢占，转换未确认不发目标。
+
+执行模式核对：所有全身运动卡（base_drive、base_servo、arm、leg、head、原生导航）共同使用上位机 BaseArm=3，不把底盘的 MANUAL/AUTO 当成同一个模式枚举。每次新的底盘执行都读取实际模式；缓存的上位机通路若遇到 MANUAL 或不同 mux 选择会重新交接，避免仅凭旧缓存发目标。原生导航在自动准备前允许“已定位但仍MANUAL/调度停车”，准备后再次核对AUTO再发目标；硬件急停、碰撞、驱动故障、未初始化定位和当前图不匹配仍拒绝。模式改变不会替代载图或重定位。
+
+`info.control_ownership.execution_modes` 提供各卡/地图动作的只读模式要求。arm/leg/head 的执行只准备 BaseArm，不改变底盘模式或速度源；tag_place/get_pose/list_maps/delete_map、spatial_map预览、speaker及传感器不为了读取或显示而切运动模式。已有任务/建图占用时不能用另一张卡的执行隐式抢权，须先结束占用；停止请求不会为了“满足模式”而恢复使能。

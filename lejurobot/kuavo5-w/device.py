@@ -1379,6 +1379,8 @@ class KuavoBundle:
             if prepared.get('state') == 'error':
                 raise RuntimeError(prepared['error'])
         joined = self._wait_for_chassis_start(request_epoch) if channel != 'base' or fresh_base_start else None
+        self.state.require_motion_enabled()
+        chassis_mode = self.spatial.motion_chassis_mode() if channel == 'base' else None
         if not self.tracker.lock.acquire(timeout=DISPATCH_LOCK_TIMEOUT_S):
             raise RuntimeError('control transition is busy; query state before retrying')
         try:
@@ -1422,12 +1424,16 @@ class KuavoBundle:
             # This vendor Bool is latched and published on changes, not a
             # heartbeat. read() invalidates it on a connection-generation change.
             velocity, _ = self.state.read('upper_velocity_enabled')
+            chassis_source, _ = self.state.read('base_velocity_source')
             velocity_ready = channel != 'base' or velocity is upper_velocity
             upper_route_key = (self._stop_epoch, self.ros1.connection)
-            route_ready = (channel != 'base' or not upper_velocity
-                           or self._upper_route_key == upper_route_key)
+            route_ready = (channel != 'base' or (chassis_mode == 'AUTO' and
+                           (not upper_velocity or (self._upper_route_key == upper_route_key
+                            and chassis_source in (None, 'nav_mpc_move_base')))))
             velocity_ready = velocity_ready and route_ready
             if channel == 'base' and not upper_velocity:
+                self._upper_route_key = None
+            if channel == 'base' and chassis_mode != 'AUTO':
                 self._upper_route_key = None
             if mapping and not (enabled is True and not self.state.motion_blocked and compatible and fresh):
                 raise RuntimeError('manual_mapping_disallows_shared_enable_or_mode_changes; finish mapping first')
@@ -1467,6 +1473,18 @@ class KuavoBundle:
                     'kuavo_msgs/changeTorsoCtrlMode', {'control_mode': target_mode},
                     'result', 'mpc_mode', target_mode)
                 preparation['mode_changed'] = mode != target_mode
+            if channel == 'base' and not upper_velocity and chassis_mode != 'AUTO':
+                with self.spatial._native_lock:
+                    with self.tracker.lock:
+                        self._check_transition(token)
+                        self.spatial._preparation = {'delivery_uncertain': True}
+                        self.spatial._persist()
+                    self.spatial.ensure_auto_for_motion(token)
+                    with self.tracker.lock:
+                        self._check_transition(token)
+                        self.spatial._preparation = None
+                        self.spatial._persist()
+                preparation['chassis_mode_changed'] = True
             if channel == 'base' and upper_velocity and not route_ready:
                 # The upper enable flag does not select the independent
                 # chassis mux. Hold/cancel old paths and verify that selection
@@ -1564,6 +1582,18 @@ class KuavoBundle:
             transition = self._transition
             mapping = self.spatial.mapping_active()
             return {'mode_policy': 'BaseArm', 'required_mode': CARD_CONTROL_MODE,
+                    'execution_modes': {
+                        'base_drive': {'mpc': 3, 'chassis': 'AUTO', 'velocity_owner': 'upper_mpc'},
+                        'base_servo': {'mpc': 3, 'chassis': 'AUTO', 'velocity_owner': 'upper_mpc'},
+                        'arm': {'mpc': 3, 'chassis': 'preserve'},
+                        'leg': {'mpc': 3, 'chassis': 'preserve'},
+                        'head': {'mpc': 3, 'chassis': 'preserve'},
+                        'controlled_spatial.navigate': {'mpc': 3, 'chassis': 'AUTO', 'velocity_owner': 'native_navigation'},
+                        'controlled_spatial.start_mapping': {'mpc': 'preserve', 'chassis': 'MANUAL'},
+                        'mapping_console': {'mpc': 'preserve', 'chassis': 'MANUAL', 'velocity_owner': 'factory_RobotMotion'},
+                        'controlled_spatial.stop_mapping': {'mpc': 'preserve', 'chassis': 'MANUAL_then_AUTO_held'},
+                        'controlled_spatial.load_map': {'mpc': 'preserve', 'chassis': 'MANUAL_then_AUTO'},
+                        'read_preview_tags_audio': {'mpc': 'preserve', 'chassis': 'preserve'}},
                     'boot_remote': self.boot_remote.info(),
                     'measured_mode': mode, 'control_enabled': enabled,
                     'motion_blocked': self.state.motion_blocked,

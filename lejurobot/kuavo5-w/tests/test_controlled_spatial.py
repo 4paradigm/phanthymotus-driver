@@ -524,8 +524,31 @@ class SpatialTests(unittest.TestCase):
         self.client.stationary = True
         self.assertEqual(self.completed()[0], 'completed')
 
+    def test_navigation_can_prepare_from_a_held_auto_chassis_without_bypassing_localization(self):
+        self.client.feedback['agvState']['softwareEstop'] = True
+        original = self.client.native
+        def native(operation, **args):
+            if operation == 'navigate':
+                self.assertTrue(self.client.feedback['agvState']['softwareEstop'])
+                self.client.feedback['agvState']['softwareEstop'] = False
+            return original(operation, **args)
+        self.client.native = native
+        result = self.navigate()
+        self.assertEqual(result['state'], 'executing', result)
+        self.assertEqual(self.completed()[0], 'completed')
+        self.assertIn('navigate', [op for op, _ in self.client.calls])
+
+    def test_navigation_preparation_may_change_mode_but_still_requires_valid_localization(self):
+        self.client.feedback['agvState'].update(runningMode='MANUAL', softwareEstop=True)
+        self.assertEqual(self.plugin._observation(navigable=True, preparing=True)[0]['x'], 1.)
+        with self.assertRaisesRegex(RuntimeError, 'localized_auto_mode'):
+            self.plugin._observation(navigable=True, held=True)
+        self.client.feedback['localizationStatus']['cartoStatusId'] = 4
+        self.assertEqual(self.navigate()['state'], 'error')
+        self.assertFalse(any(op == 'navigate' for op, _ in self.client.calls))
+
     def test_safety_faults_prevent_submit(self):
-        for field in ('softwareEstop', 'estopButtonEvent', 'bumperEvent', 'driverError'):
+        for field in ('estopButtonEvent', 'bumperEvent', 'driverError'):
             with self.subTest(field=field):
                 self.client.feedback['agvState'][field] = True
                 self.assertEqual(self.navigate()['state'], 'error')
@@ -652,7 +675,7 @@ class SpatialTests(unittest.TestCase):
         self.assertEqual(self.plugin.store.state(self.plugin.store.anchor_key(identity)),
                          {'x': 1., 'y': 2., 'yaw': .3})
         self.assertEqual(self.plugin.store.tags(identity)[0]['name'], 'entry')
-        self.assertEqual(self.client.commands[-1], ('AgvSystemRestart', {}))
+        self.assertEqual(self.client.commands[-1], ('ChangeMode', {'mode':'AUTO'}))
         self.assertFalse(any(method in ('ChangeCartoMap','ChangeRoadMap') for method, _ in self.client.commands))
         self.assertEqual(self.client.identity[0], 'factory')
         self.assertFalse(self.plugin.unresolved())
@@ -870,6 +893,22 @@ class SpatialTests(unittest.TestCase):
                 self.assertFalse(self.client.commands)
                 self.assertFalse(self.client.calls)
                 self.bundle._end_control(token)
+
+    def test_map_start_from_manual_uses_manual_zero_instead_of_dispatch_stop(self):
+        self.client.feedback['agvState']['runningMode'] = 'MANUAL'
+        self.call('start_mapping', map_name='new')
+        self.assertEqual(self.completed()[0], 'completed')
+        self.assertIn('manual_stop', [op for op, _ in self.client.calls])
+        self.assertFalse(any(op == 'soft_stop' for op, _ in self.client.calls))
+        self.assertEqual(self.client.feedback['agvState']['runningMode'], 'MANUAL')
+
+    def test_map_load_from_manual_confirms_auto_after_loading_without_requiring_dispatch_stop(self):
+        self.client.feedback['agvState']['runningMode'] = 'MANUAL'
+        self.call('load_map', map_name='other')
+        self.assertEqual(self.completed()[0], 'completed')
+        self.assertIn('manual_stop', [op for op, _ in self.client.calls])
+        self.assertFalse(any(op == 'soft_stop' for op, _ in self.client.calls))
+        self.assertEqual(self.client.feedback['agvState']['runningMode'], 'AUTO')
 
     def test_worker_preflight_failure_does_not_latch_map_busy(self):
         original = self.plugin._require_stationary

@@ -11,6 +11,7 @@ class ControlOwnershipTests(unittest.TestCase):
     def setUp(self):
         fixtures.DriverContractTests.setUp(self)
         self.auto_mode_patch.stop()
+        self.base_mode_patch.stop()
         self.auto_observation_patch = patch.object(self.bundle.spatial.client, 'observe', return_value={
             'agvState': {'runningMode':'AUTO','isMapping':False,'estopButtonEvent':False,
                          'bumperEvent':False,'driverError':False}, 'state':{'driving':False}})
@@ -45,8 +46,8 @@ class ControlOwnershipTests(unittest.TestCase):
             self.reserve('base_drive','base')
         self.release_all()
 
-    def test_base_drive_changes_manual_to_auto_before_handoff_and_target(self):
-        self.bundle._upper_route_key = None
+    def test_cached_upper_route_is_revalidated_when_chassis_changed_to_manual(self):
+        self.assertIsNotNone(self.bundle._upper_route_key)
         order, mode = [], ['MANUAL']
         def observe(**kwargs):
             return {'agvState':{'runningMode':mode[0], 'isMapping':False,
@@ -70,6 +71,37 @@ class ControlOwnershipTests(unittest.TestCase):
                 patch.object(self.bundle.spatial.client, 'native', side_effect=native):
             self.bundle.start_motion('base','base_drive',(3,),lambda:order.append('target'))
         self.assertEqual(order, ['manual_stop','manual_auto_guard','ChangeMode','upper_handoff','target'])
+        self.release_all()
+
+    def test_cached_upper_route_is_invalidated_by_another_selected_source(self):
+        self.ros.emit('/twist_mux_new/out/nav_source_used', 'mpc_path_track')
+        with patch.object(self.bundle.spatial.client, 'native', return_value={
+                'success':True,'stationary':True,'software_estop':False,
+                'velocity_source':'nav_mpc_move_base','delivery_uncertain':False}) as native:
+            self.reserve('base_servo', 'base')
+        native.assert_called_once_with('upper_handoff')
+        self.release_all()
+
+    def test_native_navigation_changes_manual_to_auto_with_upper_velocity_disabled(self):
+        mode, order = ['MANUAL'], []
+        def observe(**kwargs):
+            return {'agvState':{'runningMode':mode[0], 'isMapping':False,
+                'estopButtonEvent':False,'bumperEvent':False,'driverError':False},
+                'state':{'driving':False}}
+        def command(method, params, timeout):
+            self.assertFalse(self.bundle.state.read('upper_velocity_enabled')[0])
+            order.append(method)
+            mode[0] = params['mode']
+        def native(operation, **args):
+            order.append(operation)
+            return {'success':True,'stationary':True,'manual_zero_sent':True,
+                    'native_tracker_idle':True,'upper_zero':True}
+        with patch.object(self.bundle.spatial.client, 'observe', side_effect=observe), \
+                patch.object(self.bundle.spatial.client, 'command', side_effect=command), \
+                patch.object(self.bundle.spatial.client, 'native', side_effect=native):
+            self.bundle.start_motion('base', 'controlled_spatial', (3,), lambda:order.append('target'))
+        self.assertEqual(order, ['manual_stop','manual_auto_guard','ChangeMode','target'])
+        self.assertFalse(self.bundle.state.read('upper_velocity_enabled')[0])
         self.release_all()
 
     def test_failed_chassis_handoff_does_not_publish_target(self):

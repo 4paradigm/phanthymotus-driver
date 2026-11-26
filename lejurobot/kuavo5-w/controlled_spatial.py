@@ -448,6 +448,18 @@ class ControlledSpatialPlugin:
                 if self._closed.wait(.5):
                     raise RuntimeError('driver_is_shutting_down')
 
+    def motion_chassis_mode(self):
+        """Read the actual chassis mode for each new base execution."""
+        observation = self.client.observe(required=('agvState', 'state'))
+        self._check_chassis_faults(observation)
+        agv = observation['agvState']
+        if agv.get('isMapping') is not False:
+            raise RuntimeError('factory_mapping_owns_chassis_finish_mapping_first')
+        mode = agv.get('runningMode')
+        if mode not in ('AUTO', 'MANUAL'):
+            raise RuntimeError('chassis_mode_unknown_before_motion')
+        return mode
+
     def ensure_auto_for_motion(self, token, timeout=8., observation=None):
         """Change only an idle, nonmapping MANUAL chassis to AUTO.
 
@@ -588,7 +600,7 @@ class ControlledSpatialPlugin:
             raise RuntimeError('invalid_map_fingerprint')
         return text(name, 'map_id'), fingerprint
 
-    def _observation(self, navigable=False, identity=None):
+    def _observation(self, navigable=False, identity=None, preparing=False, held=False):
         observation = self.client.observe()
         pose = observation['pose2d']
         result = {'x': number(pose.get('x'), 'x'), 'y': number(pose.get('y'), 'y'),
@@ -598,10 +610,10 @@ class ControlledSpatialPlugin:
             raise RuntimeError('map_localization_not_initialized')
         if navigable:
             agv = observation['agvState']
-            if agv.get('isMapping') is not False or agv.get('runningMode') != 'AUTO':
+            if agv.get('isMapping') is not False or (not preparing and agv.get('runningMode') != 'AUTO'):
                 raise RuntimeError('navigation_requires_localized_auto_mode: isMapping='
                                    + str(agv.get('isMapping')) + ', runningMode=' + str(agv.get('runningMode')))
-            if (agv.get('softwareEstop') is not False or agv.get('estopButtonEvent') is not False
+            if ((not (preparing or held) and agv.get('softwareEstop') is not False) or agv.get('estopButtonEvent') is not False
                     or agv.get('bumperEvent') is not False or agv.get('driverError') is not False):
                 flags = ('softwareEstop', 'estopButtonEvent', 'bumperEvent', 'driverError')
                 raise RuntimeError('chassis_stop_or_fault_is_active: ' + ','.join(k for k in flags if agv.get(k) is not False))
@@ -787,7 +799,7 @@ class ControlledSpatialPlugin:
         # All potentially blocking IO is outside the publication/tracker lock.
         epoch = self.bundle._stop_epoch
         self.client.native('probe')
-        self._observation(navigable=True, identity=identity)
+        self._observation(navigable=True, identity=identity, preparing=True)
         if self._identity() != identity:
             raise RuntimeError('map_changed_during_navigation_preflight')
         # Explicit discrete commands have priority over the continuous stream.
@@ -822,7 +834,7 @@ class ControlledSpatialPlugin:
                     if cancelled.is_set():
                         return
                     try:
-                        self._observation(navigable=True, identity=identity)
+                        self._observation(navigable=True, identity=identity, held=True)
                         break
                     except NavigationStateUnavailable:
                         if attempt:
@@ -1437,11 +1449,14 @@ class ControlledSpatialPlugin:
         recovering_save = action == 'stop_mapping' and mapping and mapping['phase'] == 'saving'
         if not recovering_save:
             self._require_stationary()
-        manual_save = action == 'stop_mapping'
-        hold = self.client.native('manual_stop' if manual_save else 'soft_stop')
+        mode = self.client.observe(required=('agvState',))['agvState'].get('runningMode')
+        if mode not in ('MANUAL', 'AUTO'):
+            raise RuntimeError('chassis_mode_unknown_before_map_operation')
+        manual_hold = mode == 'MANUAL'
+        hold = self.client.native('manual_stop' if manual_hold else 'soft_stop')
         if (hold.get('success') is not True or hold.get('stationary') is not True
-                or hold.get('manual_zero_sent' if manual_save else 'software_estop') is not True):
-            raise RuntimeError('map_operation_requires_confirmed_manual_stop' if manual_save
+                or hold.get('manual_zero_sent' if manual_hold else 'software_estop') is not True):
+            raise RuntimeError('map_operation_requires_confirmed_manual_stop' if manual_hold
                                else 'map_operation_requires_confirmed_software_stop')
         if cancelled.is_set():
             raise RuntimeError('map_operation_interrupted')
@@ -1473,7 +1488,7 @@ class ControlledSpatialPlugin:
             self.store.state('mapping', mapping)
             return {'state': 'mapping', 'map_name': name,
                     'remote_control_route': 'factory_RobotMotion', 'chassis_mode': 'MANUAL',
-                    'keyboard_control': 'open_mapping_console', 'software_stop': True,
+                    'keyboard_control': 'open_mapping_console', 'software_stop': hold.get('software_estop') is True,
                     'message': 'Mapping started. Please call mapping_console for remote control. Use this console instead of the G12 remote controller.'}
         if action == 'stop_mapping':
             if not mapping or mapping['phase'] not in ('mapping', 'saving'):
@@ -1501,6 +1516,7 @@ class ControlledSpatialPlugin:
                                                    for m in self.client.maps()], cancelled, 1500)
             self._command('AgvSystemRestart', {}, cancelled)
             self._wait(lambda: self.client.observe()['agvState'].get('isMapping') is False, cancelled, 60)
+            self._command('ChangeMode', {'mode': 'AUTO'}, cancelled)
             hold = self.client.native('soft_stop')
             if hold.get('software_estop') is not True or hold.get('stationary') is not True:
                 raise RuntimeError('post_restart_software_stop_unconfirmed')
