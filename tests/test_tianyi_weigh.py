@@ -1525,6 +1525,7 @@ def test_failures_tell_the_caller_to_leave_the_next_step_to_the_user(hanging):
 def test_descriptions_say_only_move_when_the_user_asks(hanging, tmp_path):
     p, _, _ = _async_plugin(hanging, tmp_path)
     assert "只在用户要求时调用" in p.get_tool()["description"]
+    assert p.get_tool()["inputSchema"]["x-is-dangerous"] is True
     sensor = weigh.WeighStatePlugin({}, "ns", _FakeRos2(), p)
     assert "不要自行调用 weigh 或 reset" in sensor.get_tool()["description"]
 

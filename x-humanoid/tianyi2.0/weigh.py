@@ -1699,6 +1699,8 @@ class WeighPlugin:
                                  "silent_completion": True},
                 # 经 arm 卡驱动双臂指令（未选中的手臂保持原位）、经 hand 卡设手型。
                 "x-resource": ["arm_l", "arm_r", "hand_l", "hand_r"],
+                # 两个动作都会让双臂和手指自己动起来，与同驱动的 servo / loco_servo 卡一样标为危险。
+                "x-is-dangerous": True,
             },
         }
 
