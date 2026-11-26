@@ -1,6 +1,6 @@
 # ROKAE Helios-2.1 Camera Sensors
 
-使用机载 Orbbec SDK 2.9.3 和 GMSL2 Gemini 335Lg。已配置的传感器随驱动自动采集，Core 可独立管理两条流。驱动在 `127.0.0.1:15750` 注册 MCP，沿用官方 Core 的 ROS 2 domain 42 和本机 Fast DDS。可以和 Helios 的关节、电池、RGB 驱动并行部署。
+使用机载 Orbbec SDK 2.9.3 和 GMSL2 Gemini 335Lg。已配置的传感器随驱动自动采集，Core 可独立管理两条流。驱动在 `127.0.0.1:15754` 提供 MCP，沿用官方 Core 的 ROS 2 domain 42 和本机 Fast DDS。可以和 Helios 的关节、电池、RGB 驱动并行部署。
 
 | 卡片 | 格式 | 数据 |
 |---|---|---|
@@ -17,7 +17,7 @@ IMU 加速度和角速度使用传感器坐标系。姿态是从传感器坐标�
 - 按仓库流程构建 `./build.sh rokae/helios_sensors`。审核镜像的服务模板为 [service.yml](deploy/service.yml)。
 - 将 [compose.orbbec-gmsl.yml](deploy/compose.orbbec-gmsl.yml) 合并在部署 Compose 之后。填写机器上已安装的 `HELIOS_ORBBEC_SDK_HOST_DIR` 和两个已核对的 GMSL 相机设备节点。SDK、USB 枚举目录和 udev 信息以只读方式挂载，设备访问权限限于配置里的 V4L2 节点。设备节点与序列号属于现场配置。
 - 设置 `HELIOS_ORBBEC_IMU_SERIAL` 和 `HELIOS_ORBBEC_DEPTH_SERIAL`，分别选择不同的 Gemini 335Lg。一张卡的序列号留空时，该卡显示 `unconfigured`。可用 `HELIOS_ORBBEC_IMU_FRAME_ID` 和 `HELIOS_ORBBEC_DEPTH_FRAME_ID` 设置已核对的传感器坐标系。
-- 机载 Core 使用 host 网络时，直接用标准服务模板。Core 使用 bridge 网络时再合并 [compose.core-network.yml](deploy/compose.core-network.yml)，配置 `HELIOS_CORE_CONTAINER` 共享 Core 的网络命名空间。
+- 机载 Core 使用 host 网络时，直接用标准服务模板。Core 使用 bridge 网络且启用本机 Fast DDS 配置时，在生成的驱动 Compose 后合并 [compose.core-network.yml](deploy/compose.core-network.yml)。设置 `HELIOS_CORE_CONTAINER` 为正在运行的 Core 容器名。驱动共享 Core 的 loopback，并显式使用同一份只读 DDS 配置及 ROS 2 domain 42。合并后先运行 `docker compose -f docker-compose.yml -f rokae/helios_sensors/deploy/compose.core-network.yml config`，核对 `network_mode` 指向 Core 容器，`FASTRTPS_DEFAULT_PROFILES_FILE` 指向只读挂载的 `/opt/phanthy-motus/dds-local.xml`。同时使用设备覆盖文件时，将它们一并传给 `config` 和 `up`。
 
 部分 Jetson GMSL 现场环境中，SDK 在容器里能枚举相机但收不到深度帧。这时可在机载主机启动原生深度源，再合并 [compose.depth-host.yml](deploy/compose.depth-host.yml)。数据经本机 Unix socket 传给 Driver，Core 的 ROS 2 流与卡片接口一致。
 

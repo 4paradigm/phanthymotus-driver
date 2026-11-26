@@ -23,7 +23,7 @@ from .orbbec import DEPTH_FORMAT, DEPTH_FPS, HEIGHT, IMU_HZ, WIDTH, capture
 
 DRIVER_ID = "rokae-helios-sensors-driver"
 DRIVER_NAME = "ROKAE Helios-2.1 Camera Sensors"
-DEFAULT_PORT = 15750
+DEFAULT_PORT = 15754
 DEPTH_HINT = "image/depth-zlib"
 DEPTH_MAX_FRAME_AGE = .2
 IMU_FIELDS = {**{f"accel_{axis}_m_s2": None for axis in "xyz"},

@@ -1,20 +1,84 @@
-import math
 import json
+import math
+import os
+import shutil
 import socket
 import struct
+import subprocess
 import threading
 import time
 import zlib
 from io import BytesIO
+from pathlib import Path
 
 import pytest
+import yaml
 from PIL import Image
 
 from rokae.helios_sensors.depth_preview import depth_preview_jpeg
 from rokae.helios_sensors.depth_socket import HEADER, read_depth_frame
-from rokae.helios_sensors.main import SensorCard
+from rokae.helios_sensors.main import DEFAULT_PORT, SensorCard
 from rokae.helios_sensors.orbbec import HEIGHT, WIDTH, encode_depth
 from rokae.helios_sensors.orientation import OrientationFilter
+
+REPO = Path(__file__).resolve().parents[1]
+DRIVER = REPO / "rokae/helios_sensors"
+
+
+def test_driver_descriptor_matches_runtime_and_uses_an_unallocated_port():
+    path = DRIVER / "driver.yaml"
+    descriptor = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert 15700 <= DEFAULT_PORT <= 15799
+    assert descriptor["port"] == DEFAULT_PORT
+    assert descriptor["mcp_url"] == f"http://localhost:{DEFAULT_PORT}/mcp"
+    collisions = [
+        other.relative_to(REPO).as_posix()
+        for other in REPO.glob("*/*/driver.yaml")
+        if other != path
+        and str(yaml.safe_load(other.read_text(encoding="utf-8")).get("port")) == str(DEFAULT_PORT)
+    ]
+    assert not collisions, f"MCP port {DEFAULT_PORT} is also allocated in {collisions}"
+
+
+@pytest.mark.parametrize("base_has_dds", [True, False], ids=["standard", "missing-dds"])
+def test_core_network_overlay_keeps_dds_contract_in_merged_compose(tmp_path, base_has_dds):
+    docker = shutil.which("docker")
+    if docker is None or subprocess.run(
+        [docker, "compose", "version"], capture_output=True, check=False
+    ).returncode:
+        pytest.skip("Docker Compose CLI is required to render the deployment")
+
+    deploy = DRIVER / "deploy"
+    service = "rokae-helios-sensors"
+    profile = "/opt/phanthy-motus/dds-local.xml"
+    template = yaml.safe_load((deploy / "service.yml").read_text(encoding="utf-8"))
+    generated = template[service]
+    generated["image"] = "helios-camera-sensors:test"
+    if not base_has_dds:
+        generated["volumes"].remove(f"{profile}:{profile}:ro")
+        for key in ("FASTRTPS_DEFAULT_PROFILES_FILE", "ROS_DOMAIN_ID", "RMW_IMPLEMENTATION"):
+            del generated["environment"][key]
+    compose = tmp_path / "docker-compose.yml"
+    compose.write_text(yaml.safe_dump({"services": template}), encoding="utf-8")
+    env = {**os.environ, "HELIOS_CORE_CONTAINER": "helios-test-core"}
+    result = subprocess.run(
+        [docker, "compose", "-f", str(compose), "-f", str(deploy / "compose.core-network.yml"),
+         "config", "--format", "json", "--no-path-resolution"],
+        cwd=tmp_path, env=env, capture_output=True, text=True, encoding="utf-8", timeout=20,
+    )
+    assert result.returncode == 0, result.stderr
+    merged = json.loads(result.stdout)["services"][service]
+    assert merged["network_mode"] == "container:helios-test-core"
+    assert merged["environment"]["ROS_DOMAIN_ID"] == "42"
+    assert merged["environment"]["RMW_IMPLEMENTATION"] == "rmw_fastrtps_cpp"
+    assert merged["environment"]["FASTRTPS_DEFAULT_PROFILES_FILE"] == profile
+    assert "FASTDDS_BUILTIN_TRANSPORTS" not in merged["environment"]
+    mounts = [mount for mount in merged["volumes"] if mount["target"] == profile]
+    assert len(mounts) == 1
+    assert mounts[0]["type"] == "bind"
+    assert mounts[0]["source"] == profile
+    assert mounts[0]["read_only"] is True
+    assert merged["logging"] == {"driver": "local", "options": {"max-file": "3", "max-size": "10m"}}
 
 
 def test_depth_encodes_millimetres_and_preserves_invalid_pixels():
