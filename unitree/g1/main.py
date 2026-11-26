@@ -374,17 +374,25 @@ class G1DeviceBundle:
                     is_base = (resource == "base" or isinstance(resource, list) and "base" in resource
                                or tool_name in ("loco", "switch_mode", "switch_mode_expert", "spatial"))
                     follow = getattr(self, "_follow_card", None)
-                    if is_base and tool_name != "g1_stationary_follow" and follow is not None:
-                        stopping = action in ("stop", "stop_move", "emergency_stop", "interrupt_motion")
-                        if stopping:
-                            follow.dispatch("stop", {})
-                        elif follow.active:
-                            return {"error": "g1_stationary_follow is active; stop it before another base action"}
+                    stopping = action in ("stop", "stop_move", "emergency_stop", "interrupt_motion")
+                    if is_base and tool_name != "g1_stationary_follow" and follow is not None and stopping:
+                        follow.dispatch("stop", {})
                     interrupts_motion = tool_name == "smart_motion" and action == "interrupt_motion"
-                    if point and tool_name != "loco_relative_move" and (is_base or interrupts_motion) and tool_def["type"] == "actuator":
-                        result = point.dispatch_base(p, action, args)
+                    def execute():
+                        if point and tool_name != "loco_relative_move" and (is_base or interrupts_motion) and tool_def["type"] == "actuator":
+                            return point.dispatch_base(p, action, args)
+                        return p.dispatch(action, args)
+                    # Serialize base admission against the follower worker's
+                    # get_state/move pair. Stop verbs bypass the lock so they
+                    # can interrupt a blocked motion call promptly.
+                    if is_base and not stopping:
+                        with self._follow_base_lock:
+                            if (tool_name != "g1_stationary_follow" and follow is not None
+                                    and follow.blocks_base):
+                                return {"error": "g1_stationary_follow is active or stopping; stop it before another base action"}
+                            result = execute()
                     else:
-                        result = p.dispatch(action, args)
+                        result = execute()
                     # A plugin that only knows its own verbs declines these
                     # rather than failing at them — see common/lifecycle.py.
                     if action in _lifecycle.LIFECYCLE_ACTIONS and _lifecycle.is_declined(result):

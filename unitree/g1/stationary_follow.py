@@ -134,6 +134,7 @@ class StationaryFollowPlugin:
         self._cleanup_in_progress = False
         self._shutdown = threading.Event()
         self._owned = False
+        self._last_motion_at = 0.0
         self._last_received = None
         self._last_decision = {"command": "none", "reason": "idle"}
 
@@ -147,7 +148,8 @@ class StationaryFollowPlugin:
                     "action": {"type": "string", "enum": ["start", "stop", "info"]},
                     "input_topic": {"type": "string", "description": "sensor/pose2d 人物姿态流话题"},
                 },
-                "x-action-params": {"info": {"params": []}},
+                "x-action-params": {"start": {"params": ["input_topic"]},
+                                    "stop": {"params": []}, "info": {"params": []}},
                 "x-resource": "base",
             },
             "topic_in": [{"format": "sensor/pose2d", "desc": "COCO-17 人物姿态流"}],
@@ -162,6 +164,11 @@ class StationaryFollowPlugin:
     def active(self):
         with self._lock:
             return self._node is not None
+
+    @property
+    def blocks_base(self):
+        with self._lock:
+            return self._node is not None or self._cleanup_in_progress
 
     def stop(self):
         self._stop()
@@ -261,6 +268,8 @@ class StationaryFollowPlugin:
                         else:
                             result = self._motion.move(0.0, 0.0, decision["vyaw"], .12)
                             self._owned = result.get("ret") == 0
+                            if self._owned:
+                                self._last_motion_at = time.monotonic()
                     except Exception as exc:
                         result = {"error": str(exc)}
                     if (result.get("error") or result.get("ret", 0) != 0) and state.get("base_available") is True:
@@ -291,6 +300,11 @@ class StationaryFollowPlugin:
         def cleanup():
             if worker is not None and worker.is_alive():
                 worker.join()
+            # A successful TimedMove can still be within its 0.12 s lease
+            # after the worker exits. Keep base ownership until it expires.
+            remaining = self._last_motion_at + .15 - time.monotonic()
+            if remaining > 0:
+                time.sleep(remaining)
             if node is not None:
                 self._executor.remove_node(node)
                 node.destroy_node()
