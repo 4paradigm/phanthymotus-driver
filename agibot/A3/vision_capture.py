@@ -15,6 +15,10 @@ from uuid import uuid4
 
 FRAME_KEY = "camera_chest_front_d457_rgb"
 STREAM_NAME = "chest_front_d457_rgb"
+# 预览流正常刷新间隔是几十毫秒到几百毫秒（真机实测 frame_age 0.01–0.25 s）；
+# 超过这个秒数说明流已经停了或卡住。存档不能拿旧画面当“现在”交差——调用方会
+# 拿它当刚拍的证据，所以宁可直接报 CAMERA_UNAVAILABLE 让调用方重试。
+DEFAULT_MAX_FRAME_AGE_S = 2.0
 
 
 class VisionCapturePlugin:
@@ -24,6 +28,8 @@ class VisionCapturePlugin:
         self.nodes = nodes
         self._output_dir = Path(plugin_config.get(
             "output_dir", "/opt/phanthy-motus/data/vision_capture"))
+        self._max_frame_age_s = float(plugin_config.get(
+            "max_frame_age_s", DEFAULT_MAX_FRAME_AGE_S))
         self._last_capture = None
 
     # -- tool card --
@@ -100,6 +106,12 @@ class VisionCapturePlugin:
         if not jpeg:
             result = {"ok": False, "code": "CAMERA_UNAVAILABLE",
                       "message": "预览流暂无可用帧；确认相机流在跑后重试"}
+        elif frame_age is None or frame_age > self._max_frame_age_s:
+            # 缓存里那一帧比阈值还旧 = 预览流已经停了。旧画面不能当“现在”存档。
+            age_text = "未知" if frame_age is None else f"{frame_age:.1f} s"
+            result = {"ok": False, "code": "CAMERA_UNAVAILABLE",
+                      "message": f"缓存帧已过期（{age_text}，上限 "
+                                 f"{self._max_frame_age_s:g} s）；确认预览流在跑后重试"}
         elif not jpeg.startswith(b"\xff\xd8") or not jpeg.endswith(b"\xff\xd9"):
             result = {"ok": False, "code": "CAMERA_UNAVAILABLE",
                       "message": "缓存帧不是完整 JPEG，等待下一帧后重试"}
@@ -190,6 +202,10 @@ class VisionCapturePlugin:
                 "photos_dir": str(self._output_dir / "photos"),
                 "stream": STREAM_NAME,
                 "frame_available": jpeg is not None,
+                "frame_fresh": bool(
+                    jpeg is not None and frame_age is not None
+                    and frame_age <= self._max_frame_age_s),
+                "max_frame_age_s": self._max_frame_age_s,
                 "last_capture": self._last_capture}
         if frame_age is not None:
             info["frame_age_s"] = round(max(frame_age, 0.0), 2)

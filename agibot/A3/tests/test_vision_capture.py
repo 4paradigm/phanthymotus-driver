@@ -40,6 +40,43 @@ def test_capture_writes_jpeg_and_reports_paths(snapshot, tmp_path):
     assert not any(p.name.startswith(".") for p in (tmp_path / "cap" / "photos").iterdir())
 
 
+def test_stale_cache_is_unavailable_instead_of_saving_old_frame(snapshot, tmp_path):
+    card, nodes = make_card(snapshot, tmp_path,
+                            frame_age=snapshot.DEFAULT_MAX_FRAME_AGE_S + 5)
+    result = card.dispatch("capture_photo", {})
+    assert result["ok"] is False
+    assert result["code"] == "CAMERA_UNAVAILABLE"
+    assert "过期" in result["message"]
+    # 旧帧不能落盘：调用方会把存档当“刚拍的”
+    assert not (tmp_path / "cap" / "photos").exists()
+    info = card.dispatch("info", {})
+    assert info["frame_available"] is True   # 缓存里确实有帧
+    assert info["frame_fresh"] is False      # 但它已经不是“现在”
+    assert info["max_frame_age_s"] == snapshot.DEFAULT_MAX_FRAME_AGE_S
+    # 流恢复（新的单调时间戳）后拍照恢复
+    nodes.latest_frames[snapshot.FRAME_KEY] = (JPEG, time.monotonic())
+    assert card.dispatch("capture_photo", {})["ok"] is True
+
+
+def test_frame_with_unknown_timestamp_is_unavailable(snapshot, tmp_path):
+    card, _ = make_card(snapshot, tmp_path)
+    card.nodes.latest_frames[snapshot.FRAME_KEY] = (JPEG, None)
+    result = card.dispatch("capture_photo", {})
+    assert result["code"] == "CAMERA_UNAVAILABLE"
+    assert "过期" in result["message"]
+
+
+def test_max_frame_age_is_configurable(snapshot, tmp_path):
+    nodes = SimpleNamespace(latest_frames={
+        snapshot.FRAME_KEY: (JPEG, time.monotonic() - 0.5)})
+    strict = snapshot.VisionCapturePlugin(
+        nodes, {"output_dir": str(tmp_path / "strict"), "max_frame_age_s": 0.1})
+    assert strict.dispatch("capture_photo", {})["code"] == "CAMERA_UNAVAILABLE"
+    default = snapshot.VisionCapturePlugin(
+        nodes, {"output_dir": str(tmp_path / "default")})
+    assert default.dispatch("capture_photo", {})["ok"] is True
+
+
 def test_capture_without_frame_is_unavailable_not_hanging(snapshot, tmp_path):
     card, _ = make_card(snapshot, tmp_path, frame=None)
     result = card.dispatch("capture_photo", {})
@@ -98,6 +135,7 @@ def test_info_reports_frame_and_last_capture(snapshot, tmp_path):
     card, _ = make_card(snapshot, tmp_path)
     info = card.dispatch("info", {})
     assert info["frame_available"] is True
+    assert info["frame_fresh"] is True
     assert info["stream"] == "chest_front_d457_rgb"
     assert info["last_capture"] is None
     card.dispatch("capture_photo", {})

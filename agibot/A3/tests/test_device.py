@@ -782,10 +782,10 @@ class VisionCaptureTests(unittest.TestCase):
     paths (relay forward / in-container re-encode). Each half is pinned here so a
     refactor of either encoding path cannot silently starve snaphots."""
 
-    def _build(self, output_dir, relay=False):
+    def _build(self, output_dir, relay=False, **capture_cfg):
         config = json.loads(json.dumps(BASE_CONFIG))
         config["plugins"] = dict(FULL_PLUGINS, vision_capture={
-            "enabled": True, "output_dir": str(output_dir)})
+            "enabled": True, "output_dir": str(output_dir), **capture_cfg})
         if relay:
             executors = types.ModuleType("rclpy.executors")
             executors.MultiThreadedExecutor = FakeExecutor
@@ -832,6 +832,20 @@ class VisionCaptureTests(unittest.TestCase):
             self.assertEqual(saved["frame_age_s"], 0.0)
             listed = card.dispatch("list", {})
             self.assertEqual([f["filename"] for f in listed["files"]], ["smoke.jpg"])
+
+    def test_stale_frame_is_refused_through_the_plugin_config(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plugins, nodes = self._build(temp_dir, max_frame_age_s=0.5)
+            card = find_plugin(plugins, "vision_capture")
+            nodes.latest_frames["camera_chest_front_d457_rgb"] = (
+                JPEG, time.monotonic() - 2.0)
+            result = card.dispatch("capture_photo", {})
+            self.assertEqual(result["code"], "CAMERA_UNAVAILABLE")
+            self.assertIn("过期", result["message"])
+
+            nodes.latest_frames["camera_chest_front_d457_rgb"] = (
+                JPEG, time.monotonic())
+            self.assertTrue(card.dispatch("capture_photo", {})["ok"])
 
     def test_relay_callback_stashes_compressed_frame(self):
         with tempfile.TemporaryDirectory() as temp_dir:
