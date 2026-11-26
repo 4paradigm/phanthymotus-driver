@@ -129,20 +129,25 @@ class JointMotorTelemetryPlugin:
                 passive = [] if self._read_feedback is not None else [self._can_interface]
                 if self._secondary_can_interface is not None:
                     passive.append(self._secondary_can_interface)
-                with ExitStack() as cleanup:
-                    receivers = {}
-                    for interface in passive:
-                        driver = PiperDriver(interface)
-                        cleanup.callback(driver.close)
-                        driver.connect(read_only=True)
-                        receivers[interface] = driver
-                    if self._ros2 is not None:
-                        self._transport = self._publisher_factory(
-                            self._ros2, self._namespace, self._topics(), 1 / PUBLISH_HZ,
-                            lambda: self._tick(generation),
-                        )
-                    self._passive_receivers = receivers
-                    self._passive_cleanup = cleanup.pop_all()
+                try:
+                    with ExitStack() as cleanup:
+                        receivers = {}
+                        for interface in passive:
+                            driver = PiperDriver(interface)
+                            cleanup.callback(driver.close)
+                            driver.connect(read_only=True)
+                            receivers[interface] = driver
+                        if self._ros2 is not None:
+                            self._transport = self._publisher_factory(
+                                self._ros2, self._namespace, self._topics(), 1 / PUBLISH_HZ,
+                                lambda: self._tick(generation),
+                            )
+                        self._passive_receivers = receivers
+                        self._passive_cleanup = cleanup.pop_all()
+                except Exception as exc:
+                    self._publish_error = f"Could not start PiPER motor telemetry: {exc}"
+                    raise
+                self._publish_error = None
                 self._running = True
             return {"state": "running", "topic_out": self._topics()}
 

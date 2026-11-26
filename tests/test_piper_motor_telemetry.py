@@ -93,18 +93,29 @@ class MotorTelemetryTests(unittest.TestCase):
             receiver.connect.assert_called_once_with(read_only=True)
             receiver.close.assert_called_once_with()
 
-    def test_start_cleans_up_if_secondary_receiver_fails(self):
+    def test_bundle_reports_secondary_receiver_startup_error_until_retry(self):
         [plugin] = build_plugins({"motor_telemetry": {
             "only": True, "secondary_can_interface": "can1",
         }}, "aloha", None)
+        bundle = DriverBundle([plugin])
         first, second = Mock(), Mock()
         second.connect.side_effect = OSError("CAN interface unavailable")
         with patch("agilex.piper.motor_telemetry.PiperDriver", side_effect=[first, second]):
-            with self.assertRaises(OSError):
-                plugin.start()
+            bundle.start_all()
         first.close.assert_called_once_with()
         second.close.assert_called_once_with()
-        self.assertEqual(plugin.info()["state"], "idle")
+        error = bundle.dispatch(TOOL_NAME, {"action": "info"})
+        self.assertEqual(error["state"], "error")
+        self.assertIn("CAN interface unavailable", error["publish_error"])
+        self.assertFalse(error["publishing"])
+
+        recovered_receivers = [Mock(**{"get_motor_telemetry.return_value": ()}) for _ in range(2)]
+        with patch("agilex.piper.motor_telemetry.PiperDriver", side_effect=recovered_receivers):
+            bundle.start_all()
+        self.addCleanup(bundle.stop_all)
+        recovered = bundle.dispatch(TOOL_NAME, {"action": "info"})
+        self.assertEqual(recovered["state"], "running")
+        self.assertIsNone(recovered["publish_error"])
 
     def test_separate_bundle_can_advertise_a_distinct_mcp_identity(self):
         for server_name, identifier in (("", ""), ("piper-aloha-telemetry", "piper-aloha-telemetry-driver")):
