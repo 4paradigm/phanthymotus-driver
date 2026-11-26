@@ -143,6 +143,9 @@ TARGET_REALIGN_DEG = 12.0
 # three runs, so its band only removes the average residual.
 TARGET_ARRIVAL_CREEP_M = 0.05
 TARGET_ARRIVAL_CREEP_BANDS = ((15.0, 0.09), (60.0, 0.03), (110.0, 0.15), (180.0, 0.10))
+# Whole-body brake advance combines recorded settling and measured endpoint
+# error. It is in metres, independent of the 0.8 normalised startup input.
+WHOLE_BODY_STOP_ADVANCE_M = 0.10
 
 
 def target_arrival_creep(bearing_deg):
@@ -173,7 +176,7 @@ def _write_trace(samples, commands, result):
         old.unlink()
 
 
-def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
+def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None, *, whole_body=False):
     """Drive to a point (x forward, y left, metres) in the start body frame.
 
     Uses forward motion plus heading control only: turn in place toward the
@@ -187,6 +190,12 @@ def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
     if (not all(math.isfinite(v) for v in (target_x, target_y))
             or not 0.1 <= target_distance <= 3.0):
         raise ValueError('target must be a finite point 0.1-3 m from the start')
+    # Whole-body startup requires a higher input than the lower-body gait.
+    # This selects commands, not metres per second or a distance correction.
+    cruise_command, approach_command = (0.8, 0.8) if whole_body else (0.6, 0.5)
+    if whole_body and target_distance <= WHOLE_BODY_STOP_ADVANCE_M:
+        raise ValueError('whole-body target must exceed the stopping advance')
+    initial_mode = getattr(owner, '_walking_workmode', None)
     estimator = ImuOdometry()
     leg_slip = LEG_SLIP_SCALE['forward'] if slip_scale is None else float(slip_scale)
     leg = (LegOdometry(slip_scale=leg_slip)
@@ -204,7 +213,8 @@ def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
     last_command_at = None
     dead_reckoned_m = 0.0
     start_bearing = math.atan2(target_y, target_x)
-    arrival_creep = target_arrival_creep(start_bearing)
+    arrival_creep = (-WHOLE_BODY_STOP_ADVANCE_M if whole_body
+                     else target_arrival_creep(start_bearing))
     samples, commands = [], []
 
     def publish(vx, vyaw=0):
@@ -227,6 +237,9 @@ def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
             problem = owner._rotate_mode_error()
             if problem:
                 raise ValueError(problem['error'])
+            if (initial_mode is not None
+                    and getattr(owner, '_walking_workmode', None) != initial_mode):
+                raise ValueError('walking mode changed during target movement')
             read_started = time.monotonic()
             raw = owner._read_distance_imu()
             joints = owner._read_distance_joints() if leg is not None else None
@@ -349,7 +362,7 @@ def run_target(owner, x_m, y_m, full_scale=None, slip_scale=None):
                             turn = 0.0
                         if abs(err_deg) <= TARGET_TURN_DONE_DEG:
                             walk_aligned = True
-                        last_command = 0.6 if distance > 0.3 else 0.5
+                        last_command = cruise_command if distance > 0.3 else approach_command
                         publish(last_command, turn)
                     else:
                         # Turn first (or realign): no forward motion.

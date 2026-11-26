@@ -148,6 +148,13 @@ class BumiDeviceBundle:
             self._plugins.append(loco_plugin)
             print("[bundle] LocoPlugin loaded")
 
+        if (plugins_cfg.get("walking_mode", {}).get("enabled", False)
+                and high_ctrl is not None and loco_plugin is not None):
+            from walking_mode import WalkingModePlugin
+            loco_plugin.attach_walking_mode(WalkingModePlugin(
+                plugins_cfg["walking_mode"], high_ctrl, loco_plugin))
+            print("[bundle] Walking mode loaded into loco and loco_relative_move (App TCP)")
+
         if (plugins_cfg.get("loco_servo", {}).get("enabled", False)
                 and high_ctrl is not None):
             from loco_servo import LocoServoPlugin

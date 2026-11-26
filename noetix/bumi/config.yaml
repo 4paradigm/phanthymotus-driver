@@ -6,6 +6,17 @@ plugins:
     enabled: true
   loco:
     enabled: true
+  # Shared walking_mode action in loco and loco_relative_move, enabled by default.
+  # Requires loco for chassis arbitration. Startup only prepares the backend.
+  walking_mode:
+    enabled: true
+    # Connect to the SDK motion board directly; App use can pause UDP discovery.
+    # Set empty only when passive discovery of perception_ip is required.
+    app_host: "192.168.55.102"
+    discovery_source_ip: "192.168.55.102"
+    discovery_timeout_s: 3.0
+    query_timeout_s: 1.0
+    verify_timeout_s: 4.0
   # 底盘的流式控制卡片（motus.control/1 的 twist）。和上面的 loco 是同一个身体的
   # 两条路径：loco 是调用形态，一次 tools/call 一个动作；这张是数据面，订阅一路
   # control/velocity 指令流，给 actucore 的 navi 这类策略用。两者显式仲裁 ——

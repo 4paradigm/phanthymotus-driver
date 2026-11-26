@@ -407,6 +407,38 @@ navi 流水线时仍保留 `dry_run: true`，用于核对视觉控制方向。�
 `footprint` 的出错方向是单边的（以为自己更宽只是多减速，以为更窄就是把肩膀送进
 门框），所以默认值刻意偏宽；死区不是，所以它宁可声明成估计值也不写零。
 
+## 运动卡片中的行走模式切换
+
+在 `loco` 或 `loco_relative_move` 的 `ACTION` 中选择 `walking_mode`，
+再选择 `walking_model` 的 `lower_body`（仅腿部）或 `whole_body`（全身）。
+
+```json
+{"name":"loco","arguments":{"action":"walking_mode","walking_model":"whole_body"}}
+```
+
+`loco.move` 和 `loco_relative_move` 的移动、旋转均支持两种模式。
+`loco.move` 的 `vx` 是归一化输入，`duration` 是秒，均不是目标距离。
+全身模式下 `0 < vx < 0.8` 按 `0.8` 下发，结果中的 `vx` 为实际输入；`vx=0` 仍为零，
+仅腿部、倒退、横移与转向输入不变。此补偿用于起步，不保证两种模式速度相同。
+相对移动需要同时填写 `x_m`、`y_m`，直行时 `y_m` 填 0。
+目标移动的前进输入按模式区分：仅腿部使用 `0.6/0.5`，全身使用 `0.8`，停止仍为 `0`。
+全身模式单独提前 `0.10 m` 刹停，目标须大于此提前量；这是初始验收值，距离精度仍需实测确认。
+切换前须平稳站立并停止移动，已有底盘动作或非行走状态会拒绝切换。
+切换只发送一次，经服务端与 SDK 反馈确认后同步返回最终结果。
+两张卡片的 `stop_move` 均可取消本次切换，后续请求可直接通过任一卡片发起。
+
+`plugins.loco.enabled` 和 `plugins.walking_mode.enabled` 默认均为 `true`。
+`plugins.walking_mode.app_host` 默认直连 SDK 运动板 `192.168.55.102`，跳过 UDP 发现。
+手机 App 交替控制时，发现广播可能暂停；保留直连地址可避免等待这段广播。
+机器人运动板地址不同时应修改此项；省略时沿用 `discovery_source_ip`。
+显式留空才按 `discovery_source_ip` 监听 UDP 9090，端口无法共享或收不到广播时需指定 `app_host`。
+发现、查询和确认超时分别由 `discovery_timeout_s`、`query_timeout_s`、
+`verify_timeout_s` 控制，默认 3、1、4 秒。整次网络等待最多 20 秒，
+调用方超时应长于此值，Agent Core 的 actuator 默认调用超时为 60 秒。
+命令写入单独限制为 100 毫秒，停止请求等待当前写入结束后刹停。
+超时、保护或断连会返回错误，发送中断时保留 `command_may_have_been_sent`。
+该功能依赖机器人模式服务的网络可达性及固件支持。
+
 ## Direct action cards
 
 The former `switch_mode` tool is split into three user-facing cards. Internal
