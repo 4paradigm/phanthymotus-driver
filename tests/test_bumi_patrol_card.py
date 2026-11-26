@@ -308,3 +308,28 @@ def test_patrol_sources_and_default_baseline_are_packaged():
     docker = (BUMI / "Dockerfile").read_text(encoding="utf-8")
     assert "COPY patrol_baseline.py patrol_card.py /work/" in docker
     assert "patrol-baseline-bumi-fixed.json" in docker
+
+
+@pytest.mark.parametrize("timestamp_ms", [0, 1795676400123, 4102444800000])
+def test_real_photo_method_preserves_frame_time_and_saved_bytes(tmp_path, timestamp_ms):
+    import ast
+    import time
+    from types import SimpleNamespace
+    # Exercise the production method while keeping ROS/SDK outside this test.
+    tree = ast.parse((BUMI / "device.py").read_text(encoding="utf-8"))
+    capture_class = next(node for node in tree.body if isinstance(node, ast.ClassDef)
+                         and node.name == "VisionCapturePlugin")
+    capture_method = next(node for node in capture_class.body if isinstance(node, ast.FunctionDef)
+                          and node.name == "_capture_photo")
+    scope = {"datetime": datetime, "timezone": timezone, "time": time}
+    exec(compile(ast.Module(body=[capture_method], type_ignores=[]), "actual_photo_method", "exec"), scope)
+    frame = {"data": b"synthetic-jpeg-payload", "timestamp_ms": timestamp_ms}
+    capture = SimpleNamespace(_output_dir=tmp_path, _frame=lambda: (frame, 1))
+    result = scope["_capture_photo"](capture, {})
+    assert result["ok"] is True
+    assert Path(result["file_path"]).read_bytes() == frame["data"]
+    assert result["timestamp_source"] == "camera_host_publish"
+    if timestamp_ms:
+        assert datetime.fromisoformat(result["frame_captured_at"]).timestamp() == timestamp_ms / 1000
+    else:
+        assert result["frame_captured_at"] is None
