@@ -50,7 +50,9 @@ def test_canvas_read_start_stop_without_vendor_runtime(monkeypatch, tmp_path):
     bundle = DriverBundle([plugin])
     definition, = bundle.get_all_tools()
     assert (definition["name"], definition["type"], definition["multiInstance"]) == ("spatial_map", "sensor", False)
-    assert definition["topic_out"] == [{"topic": "/rokae_helios/state/spatial_map", "format": "data/json"}]
+    assert definition["topic_out"] == [{"topic": "/rokae_helios/state/spatial_map", "format": "data/json"},
+                                       {"topic": "/rokae_helios/state/spatial_map/preview", "format": "image/jpeg"}]
+    assert bundle.dispatch("spatial_map", {"action": "info"})["preview_topic"] == definition["topic_out"][1]["topic"]
     assert bundle.dispatch("spatial_map", {"action": "read"})["data"] == {
         "state": "idle", "stations": None, "map_name": None, "localization": None,
     }

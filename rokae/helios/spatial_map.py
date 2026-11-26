@@ -8,6 +8,7 @@ import threading
 import time
 
 from common.vendor_runtime import tool
+from .spatial_map_preview import MapPreview
 
 
 class HeliosSpatialMap:
@@ -15,8 +16,12 @@ class HeliosSpatialMap:
 
     def __init__(self, config, namespace="rokae_helios", ros2=None):
         self._ros2 = ros2
-        self._node = self._publisher = None
-        self._topics = [{"topic": f"/{namespace}/state/spatial_map", "format": "data/json"}]
+        self._node = self._publisher = self._image_publisher = None
+        base = f"/{namespace}/state/spatial_map"
+        self._topics = [{"topic": base, "format": "data/json"},
+                        {"topic": base + "/preview", "format": "image/jpeg"}]
+        chassis_url = os.getenv("HELIOS_BATTERY_STATE_URL") or config.get("battery_state_url", "ws://192.168.0.100/ws/AGVInfo")
+        self._preview = MapPreview(chassis_url)
         self._python = Path(os.getenv("HELIOS_SDK_PYTHON_DIR", "/opt/sdk-python")) / "bin/python3.12"
         self._sdk = Path(os.getenv("HELIOS_VMR_SDK_DIR", "/opt/vmr-sdk")) / "lib"
         self._host = os.getenv("HELIOS_VMR_HOST") or config.get("spatial_map_sdk_host", "192.168.0.100")
@@ -28,9 +33,11 @@ class HeliosSpatialMap:
         self._last_read = self._next_attempt = 0.0
 
     def get_tool(self):
-        return tool("spatial_map", "sensor",
-                    "读取当前地图名称、定位状态码与置信度，以及工作点和充电点的名称、类型和 ID。",
-                    topic_out=self._topics)
+        definition = tool("spatial_map", "sensor",
+                          "查看厂家二维底图和机器人位置、朝向；同时输出当前地图、定位反馈和站点。",
+                          topic_out=self._topics)
+        definition["preview_topic"] = self._topics[1]["topic"]
+        return definition
 
     def start(self):
         if self._ros2 is None or self._node is not None:
@@ -38,17 +45,19 @@ class HeliosSpatialMap:
         from rclpy.node import Node
         from rclpy.qos import QoSProfile, ReliabilityPolicy
         from std_msgs.msg import String
+        from sensor_msgs.msg import CompressedImage
 
         node = Node("helios_spatial_map", context=self._ros2.ctx_core)
         try:
             qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
             self._publisher = node.create_publisher(String, self._topics[0]["topic"], qos)
-            self._message = String
+            self._image_publisher = node.create_publisher(CompressedImage, self._topics[1]["topic"], qos)
+            self._message, self._image_message = String, CompressedImage
             node.create_timer(1.0, self._tick)
             self._ros2.executor_core.add_node(node)
             self._node = node
         except Exception:
-            self._publisher = None
+            self._publisher = self._image_publisher = None
             node.destroy_node()
             raise
 
@@ -111,11 +120,17 @@ class HeliosSpatialMap:
 
     def _publish(self):
         if self._publisher is not None:
-            self._publisher.publish(self._message(data=json.dumps(self.payload(), ensure_ascii=False)))
+            data = self.payload()
+            self._publisher.publish(self._message(data=json.dumps(data, ensure_ascii=False)))
+            frame = self._image_message(format="jpeg")
+            frame.header.stamp = self._node.get_clock().now().to_msg()
+            frame.data = self._preview.frame(data["map_name"])
+            self._image_publisher.publish(frame)
 
     def _stop_capture(self):
         self._enabled = False
         self._end_process()
+        self._preview.stop()
         self._data = {"state": "idle"}
         self._publish()
 
@@ -125,7 +140,7 @@ class HeliosSpatialMap:
             if self._node is not None:
                 self._ros2.executor_core.remove_node(self._node)
                 self._node.destroy_node()
-                self._node = self._publisher = None
+                self._node = self._publisher = self._image_publisher = None
 
     def dispatch(self, action, args):
         with self._lock:
@@ -139,6 +154,7 @@ class HeliosSpatialMap:
                         raise ValueError("spatial_map requires the VMR SDK and its Python runtime mounts")
                     self._data = {"state": "waiting"}
                     self._launch()
+                    self._preview.start()
                     self._enabled = True
                 return {"state": "running", "topic_out": self._topics}
             if action == "stop":
