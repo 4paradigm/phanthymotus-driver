@@ -1279,6 +1279,21 @@ class NativePreparationTests(unittest.TestCase):
         self.assertTrue(result['stationary'])
         self.assertEqual(self.events, ['stationary'])
 
+    def test_held_stationary_probe_is_read_only_and_requires_finished_tracker(self):
+        message = types.SimpleNamespace(motion_type=2,
+            _connection_header={'callerid':'/lqr_path_track','latching':'0'})
+        with patch.dict(sys.modules, {'jaten_msgs.msg':types.SimpleNamespace(MotionState=object)}), \
+                patch.object(sys.modules['rospy'], 'wait_for_message', return_value=message):
+            result = self.call('held_stationary')
+        self.assertTrue(result['software_estop'])
+        self.assertEqual(self.events,['stationary'])
+        for motion_type,header in [(1,message._connection_header),(2,{'callerid':'/other','latching':'0'})]:
+            message.motion_type,message._connection_header=motion_type,header
+            with patch.dict(sys.modules, {'jaten_msgs.msg':types.SimpleNamespace(MotionState=object)}), \
+                    patch.object(sys.modules['rospy'], 'wait_for_message', return_value=message):
+                with self.assertRaisesRegex(RuntimeError,'not_finished'):
+                    self.call('held_stationary')
+
     def test_cancel_and_stationary_before_release_then_stationary_again(self):
         result = self.call()
         self.assertEqual(self.events, [0, 2, ('tracker', 3), 'stationary', 1, 'stationary'])

@@ -190,6 +190,7 @@ class ControlledSpatialPlugin:
         self._mapping_cleanup_key = None
         self._mapping_cleanup_retry_at = 0.
         self._mapping_console_grant = None
+        self._preparation_check_at = 0.
         self.base_preparation_required = False
         self.keyboard = MappingKeyboard(self)
 
@@ -283,6 +284,8 @@ class ControlledSpatialPlugin:
             return None
         if self._map_pending is not None:
             return 'map transition is active or unconfirmed; inspect controlled_spatial.info; stop_nav does not finish map saving'
+        if self._preparation is not None:
+            return 'chassis preparation is unconfirmed; waiting for held stationary chassis feedback'
         return 'native navigation is active or unresolved; stop_nav must be confirmed first'
 
     def allows_independent_motion(self, channel):
@@ -449,6 +452,7 @@ class ControlledSpatialPlugin:
             self._restore()
             if self.mapping_active() or self._keyboard_pending:
                 raise RuntimeError('manual_mapping_owns_chassis_no_startup_preparation')
+            self._settle_held_preparation()
             if self.unresolved():
                 raise RuntimeError('previous_chassis_operation_unresolved_stop_first')
             if not self.bundle.ros1.connection[0]:
@@ -583,6 +587,8 @@ class ControlledSpatialPlugin:
     def dispatch(self, action, args):
         try:
             self._restore()
+            if action in ('info', 'start', 'start_mapping', 'load_map', 'delete_map'):
+                self._settle_held_preparation()
             if action in ('start', 'info', 'list_maps', 'get_pose', 'start_mapping', 'stop_mapping',
                           'load_map', 'delete_map', 'tag_place', 'untag_place', 'list_tags',
                           'navigate_to_pose', 'navigate_to_tag'):
@@ -895,6 +901,53 @@ class ControlledSpatialPlugin:
 
     def _map_worker_active(self):
         return any(w.is_alive() and w.name == 'kuavo-map-operation' for w in self._workers.copy())
+
+    def _settle_held_preparation(self):
+        """Clear only a resolved preparation after passive held/idle evidence."""
+        if time.monotonic() < self._preparation_check_at or not self._native_lock.acquire(blocking=False):
+            return
+        try:
+            with self.bundle.tracker.lock:
+                preparation = self._preparation
+                epoch, connection = self.bundle._stop_epoch, self.bundle.ros1.connection
+                def eligible():
+                    return (preparation is not None and preparation.get('delivery_uncertain') is False
+                        and self._preparation == preparation and epoch == self.bundle._stop_epoch
+                        and connection[0] and connection == self.bundle.ros1.connection
+                        and not self._closed.is_set() and self.bundle._transition is None
+                        and not self.bundle.tracker._active and not self._task and not self._uncertain
+                        and self._map_pending is None and not self.store.state('mapping')
+                        and not self._keyboard_pending and self.keyboard.session is None
+                        and not self.bundle.state.motion_send_uncertain
+                        and not self.bundle._resume_unresolved() and not self.bundle._mode_unresolved())
+                if not eligible():
+                    return
+            self._preparation_check_at = time.monotonic()+2.
+            try:
+                observation = self.client.observe(required=('agvState', 'state'))
+                state = observation['state']
+                if (observation['agvState'].get('isMapping') is not False or state.get('driving') is not False
+                        or any(state.get(key) != [] for key in ('nodeStates', 'edgeStates', 'actionStates'))):
+                    return
+                result = self.client.native('held_stationary')
+                if (result.get('success') is not True or result.get('stationary') is not True
+                        or result.get('software_estop') is not True):
+                    return
+                final = self.client.observe(required=('agvState', 'state'))
+                if (final['agvState'].get('isMapping') is not False or final['state'].get('driving') is not False
+                        or any(final['state'].get(key) != [] for key in ('nodeStates', 'edgeStates', 'actionStates'))):
+                    return
+            except Exception:
+                return
+            with self.bundle.tracker.lock:
+                if eligible():
+                    self._preparation = None
+                    self._persist()
+                    self.base_preparation_required = True
+                    with self._startup_guard:
+                        self._startup_key = None
+        finally:
+            self._native_lock.release()
 
     def _mapping_recovery(self):
         """Identify a detached mapping operation without retiring anything."""

@@ -401,7 +401,7 @@ SSH RPC 辅助源码随镜像构建，每次在底盘执行固定操作，使用
 匹配明确时才向 Cartographer 发初始位姿，并用激光与回读位姿复核。
 如果起点匹配不明确，载图结果会提示定位未确认。回到起点附近、停稳后重新调用 `load_map`。
 旧地图没有建图起点记录时，继续使用厂商原有的定位流程。
-`base_drive`和`controlled_spatial`可以同时start，共用底盘预检。已有建图会话时，两张卡的start只报告准备已延后，不取消任务、不切模式、不解除暂停；`base_servo.start`只连接输入并保持paused。
+`base_drive`和`controlled_spatial`可以同时start，共用底盘预检。已有建图会话时，两张卡的start只报告准备已延后，不取消任务、不切模式、不解除暂停；`base_servo.start`只连接输入并保持paused。厂商跟踪器队列为空且明确发布`FINISH_STOP`时可能不再发布速度；此时暂停确认使用底盘软停和新鲜静止里程计，不等待不存在的空闲零速流。已结清但遗留的`chassis_preparation.delivery_uncertain=false`记录，在无控制/地图/导航任务且两次新鲜网页反馈确认空闲时，可通过只读`held_stationary`再次确认软停、跟踪器结束和静止里程计后自动核销；不解除软停、不恢复运动。真正未确认的释放请求、导航提交和其他忙状态仍保留阻断。
 
 建图采用厂家网页的手动通路：`start_mapping`先关闭上位机速度输出、确认底盘软停并取消旧原生任务，在底盘MANUAL模式开始建图，之后保持MANUAL。无需G12遥控器，不再为遥控器恢复AUTO。全身BaseArm与底盘MANUAL是不同状态。
 

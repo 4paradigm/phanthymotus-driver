@@ -47,6 +47,7 @@ class TrackerFeedbackTests(unittest.TestCase):
             'jaten_msgs.msg': types.SimpleNamespace(PathTrackRequest=message, TrackEdge=types.SimpleNamespace,
                                                   MotionState=object),
             'geometry_msgs.msg': types.SimpleNamespace(Twist=object)}
+        modules['nav_msgs.msg'] = types.SimpleNamespace(Odometry=object)
         p = patch.dict(sys.modules, modules)
         p.start(); self.addCleanup(p.stop)
         for replacement in (
@@ -72,7 +73,34 @@ class TrackerFeedbackTests(unittest.TestCase):
         self.response.num_edge_remain = 0
         self.response.success = False
         self.motion = 2
-        self.module.tracker_command(self.ros, 3)
+        with patch.object(self.module, 'confirm_software_stop') as held, \
+                patch.object(self.module, 'confirm_stationary') as stationary:
+            self.module.tracker_command(self.ros, 3)
+        held.assert_called_once_with(self.ros, True)
+        stationary.assert_called_once()
+
+    def test_empty_finished_tracker_does_not_wait_for_unpublished_idle_velocity(self):
+        self.response.num_edge_remain = 0
+        self.motion = 2
+        original = self.ros.wait_for_message
+        def receive(topic, *args, **kwargs):
+            if not topic.endswith('/motion_state'):
+                raise AssertionError('finished tracker has no idle velocity stream')
+            return original(topic, *args, **kwargs)
+        self.ros.wait_for_message = receive
+        with patch.object(self.module, 'confirm_software_stop'), \
+                patch.object(self.module, 'confirm_stationary'):
+            self.module.tracker_command(self.ros, 3)
+
+    def test_empty_finished_tracker_still_requires_software_stop_and_stationarity(self):
+        self.response.num_edge_remain = 0
+        self.motion = 2
+        for helper in ('confirm_software_stop', 'confirm_stationary'):
+            with self.subTest(helper=helper), patch.object(self.module, 'confirm_software_stop'), \
+                    patch.object(self.module, 'confirm_stationary'):
+                with patch.object(self.module, helper, side_effect=RuntimeError('unconfirmed')):
+                    with self.assertRaisesRegex(RuntimeError, 'unconfirmed'):
+                        self.module.tracker_command(self.ros, 3)
 
     def test_service_success_does_not_replace_motion_feedback(self):
         self.motion = 1

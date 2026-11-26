@@ -391,6 +391,14 @@ def tracker_command(rospy, operation, request=None):
             if motion.motion_type in range(1, 8):
                 return
             continue
+        if empty and motion.motion_type == 2:  # factory FINISH_STOP
+            # An empty, finished factory tracker does not publish idle Twist
+            # frames. Prove the held chassis is stationary instead of waiting
+            # for a zero frame that the idle publisher never sends.
+            from nav_msgs.msg import Odometry
+            confirm_software_stop(rospy, True)
+            confirm_stationary(rospy, Odometry)
+            return
         if not empty and motion.motion_type != 8:  # factory CAR_PAUSED
             continue
         velocity = rospy.wait_for_message('/twist_mux_new/in/nav/mpc_path_track', Twist, timeout=1.)
@@ -679,6 +687,18 @@ def main(request):
     from nav_msgs.msg import Odometry
     rospy.init_node('motus_navigation_rpc', anonymous=True, disable_signals=True,
                     disable_rosout=True, log_level=rospy.ERROR)
+    if request['operation'] == 'held_stationary':
+        # Read-only settlement of a completed preparation, never a substitute
+        # for cancelling a known/uncertain navigation submission.
+        from jaten_msgs.msg import MotionState
+        confirm_software_stop(rospy, True)
+        motion = rospy.wait_for_message('/mpc_path_track/motion_state', MotionState, timeout=2.)
+        if not tracker_live_message(motion) or motion.motion_type != 2:
+            raise RuntimeError('native_tracker_not_finished')
+        confirm_stationary(rospy, Odometry)
+        confirm_software_stop(rospy, True)
+        return {'success': True, 'stationary': True, 'software_estop': True,
+                'completion_basis': 'held_finished_tracker_and_fresh_stationary_odometry'}
     if request['operation'] == 'stationary':
         confirm_stationary(rospy, Odometry)
         return {'success': True, 'stationary': True, 'completion_basis': 'fresh_distinct_odometry'}
