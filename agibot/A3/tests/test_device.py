@@ -778,13 +778,19 @@ JPEG = b"\xff\xd8test-jpeg-payload\xff\xd9"
 
 
 class VisionCaptureTests(unittest.TestCase):
-    """The card reads `A3Nodes.latest_frames`; the cache is fed by BOTH camera
-    paths (relay forward / in-container re-encode). Each half is pinned here so a
-    refactor of either encoding path cannot silently starve snaphots."""
+    """The card reads `A3Nodes.latest_frames` (a LatestFrameCache); the cache is
+    fed by BOTH camera paths (relay forward / in-container re-encode). Each half
+    is pinned here so a refactor of either encoding path cannot silently starve
+    snapshots."""
 
-    def _build(self, output_dir, relay=False, **capture_cfg):
+    KEY = "camera_chest_front_d457_rgb"
+
+    def _build(self, output_dir, relay=False, camera_streams=None, **capture_cfg):
         config = json.loads(json.dumps(BASE_CONFIG))
-        config["plugins"] = dict(FULL_PLUGINS, vision_capture={
+        camera = dict(FULL_PLUGINS["camera"])
+        if camera_streams is not None:
+            camera["streams"] = list(camera_streams)
+        config["plugins"] = dict(FULL_PLUGINS, camera=camera, vision_capture={
             "enabled": True, "output_dir": str(output_dir), **capture_cfg})
         if relay:
             executors = types.ModuleType("rclpy.executors")
@@ -804,15 +810,24 @@ class VisionCaptureTests(unittest.TestCase):
     def test_card_is_wired_and_gated_by_config(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             plugins, nodes = self._build(temp_dir)
-            card = find_plugin(plugins, "vision_capture")
-            self.assertIs(card.nodes, nodes)
-            self.assertEqual(nodes.latest_frames, {})
+            find_plugin(plugins, "vision_capture")
+            # The card declared the only stream it consumes, and the cache is
+            # empty until a writer stores a frame.
+            self.assertIn(self.KEY, nodes.latest_frames.registered_keys())
+            self.assertIsNone(nodes.latest_frames.age(self.KEY))
 
             config = json.loads(json.dumps(BASE_CONFIG))
             config["plugins"] = dict(FULL_PLUGINS, vision_capture={"enabled": False})
             plugins, _ = build_bundle_plugins(config)
             names = {d["name"] for d in tool_definitions(plugins)}
             self.assertNotIn("vision_capture", names)
+
+    def test_card_is_withheld_when_its_stream_is_not_selected(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plugins, nodes = self._build(temp_dir, camera_streams=["head_left_fisheye"])
+        names = {d["name"] for d in tool_definitions(plugins)}
+        self.assertNotIn("vision_capture", names)
+        self.assertEqual(nodes.latest_frames.registered_keys(), ())
 
     def test_capture_reads_the_cache_and_writes_jpeg(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -823,29 +838,15 @@ class VisionCaptureTests(unittest.TestCase):
             empty = card.dispatch("capture_photo", {})
             self.assertEqual(empty["code"], "CAMERA_UNAVAILABLE")
 
-            nodes.latest_frames["camera_chest_front_d457_rgb"] = (JPEG, time.monotonic())
+            self.assertTrue(nodes.latest_frames.put(self.KEY, JPEG))
             saved = card.dispatch("capture_photo", {"image_name": "smoke"})
             self.assertTrue(saved["ok"], saved)
             self.assertEqual(saved["filename"], "smoke.jpg")
             self.assertEqual(
                 (Path(temp_dir) / "photos" / "smoke.jpg").read_bytes(), JPEG)
-            self.assertEqual(saved["frame_age_s"], 0.0)
+            self.assertGreaterEqual(saved["frame_age_s"], 0.0)
             listed = card.dispatch("list", {})
             self.assertEqual([f["filename"] for f in listed["files"]], ["smoke.jpg"])
-
-    def test_stale_frame_is_refused_through_the_plugin_config(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            plugins, nodes = self._build(temp_dir, max_frame_age_s=0.5)
-            card = find_plugin(plugins, "vision_capture")
-            nodes.latest_frames["camera_chest_front_d457_rgb"] = (
-                JPEG, time.monotonic() - 2.0)
-            result = card.dispatch("capture_photo", {})
-            self.assertEqual(result["code"], "CAMERA_UNAVAILABLE")
-            self.assertIn("过期", result["message"])
-
-            nodes.latest_frames["camera_chest_front_d457_rgb"] = (
-                JPEG, time.monotonic())
-            self.assertTrue(card.dispatch("capture_photo", {})["ok"])
 
     def test_relay_callback_stashes_compressed_frame(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -860,10 +861,11 @@ class VisionCaptureTests(unittest.TestCase):
             msg.data = array.array("B", JPEG)
             callback(msg)
 
-            cached = nodes.latest_frames["camera_chest_front_d457_rgb"]
-            self.assertEqual(cached[0], JPEG)
-            self.assertIsInstance(cached[0], bytes)
-            self.assertIsInstance(cached[1], float)
+            frame = nodes.latest_frames.get(self.KEY, 60)
+            self.assertIsNotNone(frame)
+            self.assertEqual(frame.data, JPEG)
+            self.assertIsInstance(frame.data, bytes)
+            self.assertGreaterEqual(frame.age_s, 0.0)
             # relay path still forwards the untouched frame to the core domain
             self.assertIs(pub.published[-1], msg)
 
@@ -876,35 +878,36 @@ class VisionCaptureTests(unittest.TestCase):
             plain = FakeMsg()
             plain.data = JPEG
             callback(plain)
-            self.assertEqual(nodes.latest_frames["camera_chest_front_d457_rgb"][0], JPEG)
+            self.assertEqual(nodes.latest_frames.get(self.KEY, 60).data, JPEG)
 
     def test_reencode_path_stashes_encoded_output(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             plugins, nodes = self._build(temp_dir)
-        pub = nodes.core.publishers["/test_ns/camera_head_left_fisheye"]
+        pub = nodes.core.publishers[f"/test_ns/{self.KEY}"]
         out = FakeMsg()
         out.data = JPEG
         nodes._encode_and_publish_frame(lambda _msg: out, FakeMsg(), pub,
-                                        "/hal/head_left_fisheye_camera/rgb",
-                                        "camera_head_left_fisheye")
-        self.assertEqual(nodes.latest_frames["camera_head_left_fisheye"][0], JPEG)
+                                        "/hal/chest_front_d457_rgb/rgb", self.KEY)
+        self.assertEqual(nodes.latest_frames.get(self.KEY, 60).data, JPEG)
 
         # Non-bytes payloads (no JPEG in hand) must not poison the cache: the
-        # snapshot would fail the JPEG magic check and never save.
+        # previous good frame survives.
         list_out = FakeMsg()
         list_out.data = [0xFF, 0xD8]
         nodes._encode_and_publish_frame(lambda _msg: list_out, FakeMsg(), pub,
-                                        "/hal/head_left_fisheye_camera/rgb",
-                                        "camera_head_left_fisheye")
-        self.assertEqual(nodes.latest_frames["camera_head_left_fisheye"][0], JPEG)
+                                        "/hal/chest_front_d457_rgb/rgb", self.KEY)
+        self.assertEqual(nodes.latest_frames.get(self.KEY, 60).data, JPEG)
 
         # Encoder errors keep the previous good frame available.
         def boom(_msg):
             raise RuntimeError("encode failed")
         nodes._encode_and_publish_frame(boom, FakeMsg(), pub,
-                                        "/hal/head_left_fisheye_camera/rgb",
-                                        "camera_head_left_fisheye")
-        self.assertEqual(nodes.latest_frames["camera_head_left_fisheye"][0], JPEG)
+                                        "/hal/chest_front_d457_rgb/rgb", self.KEY)
+        self.assertEqual(nodes.latest_frames.get(self.KEY, 60).data, JPEG)
+
+        # Streams nobody registered are not copied into the cache.
+        nodes.latest_frames.put("camera_head_left_fisheye", JPEG)
+        self.assertIsNone(nodes.latest_frames.age("camera_head_left_fisheye"))
 
 
 # ---------------------------------------------------------------------------

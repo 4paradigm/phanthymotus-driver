@@ -30,7 +30,7 @@ RUN cd /tmp/a3_ws && \
 
 WORKDIR /work
 COPY common/ /work/common/
-COPY main.py device.py vision_capture.py domain_bridge.py config.yaml driver.yaml /work/agibot/A3/
+COPY main.py device.py vision_capture.py latest_frames.py domain_bridge.py config.yaml driver.yaml /work/agibot/A3/
 COPY zenoh_bridge.sh jazzy_relay.py jazzy_relay.sh /work/agibot/A3/
 RUN chmod 0755 /work/agibot/A3/zenoh_bridge.sh /work/agibot/A3/jazzy_relay.sh
 COPY resource/ /work/agibot/A3/resource/

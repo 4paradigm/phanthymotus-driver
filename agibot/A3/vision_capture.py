@@ -1,14 +1,15 @@
 """Save A3 camera snapshots (chest D457 RGB) to persistent storage.
 
-一期只做拍照。帧源是 A3Nodes 维护的最新帧缓存 `latest_frames`（mirror 回调
-在容器内逐帧写入，relay 与非 relay 两条编码路径都会经过），因此本卡不新增
-任何 DDS 订阅，也不独占相机——预览流与快照共享同一路流。录像依赖镜像加装
-ffmpeg，二期连同 Dockerfile 一起提（go1 版有现成口径可抄）。
+一期只做拍照。帧源是 A3Nodes 的 `LatestFrameCache`（latest_frames.py）：relay
+转发与容器内重编码两条路径都在发布前写入，本卡只登记自己消费的流并按年龄取帧，
+因此不新增任何 DDS 订阅，也不独占相机——预览流与快照共享同一路流。录像依赖镜像
+加装 ffmpeg，二期连同 Dockerfile 一起提（go1 版有现成口径可抄）。
+
+卡片的四个 action 返回同一个信封：`ok / state`，失败再加 `code / message`。
 """
 
 import os
 import re
-import time
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
@@ -25,7 +26,9 @@ class VisionCapturePlugin:
     PREFIX = "vision_capture"
 
     def __init__(self, nodes, plugin_config):
-        self.nodes = nodes
+        # 接线错误要炸在构建时：没有帧缓存就不可能拍照。
+        self._frames = nodes.latest_frames
+        self._frames.register(FRAME_KEY, jpeg=True)
         self._output_dir = Path(plugin_config.get(
             "output_dir", "/opt/phanthy-motus/data/vision_capture"))
         self._max_frame_age_s = float(plugin_config.get(
@@ -61,10 +64,10 @@ class VisionCapturePlugin:
         }
 
     def start(self):
-        return {"state": "ready"}
+        return self._ok("ready")
 
     def stop(self):
-        return {"state": "idle"}
+        return self._ok("idle")
 
     def shutdown(self):
         pass
@@ -84,46 +87,45 @@ class VisionCapturePlugin:
             return self.stop()
         return None
 
+    # -- result envelope: every action returns ok/state, failures add code --
+
+    @staticmethod
+    def _ok(state, **payload):
+        return {"ok": True, "state": state, **payload}
+
+    @staticmethod
+    def _error(code, message):
+        return {"ok": False, "state": "error", "code": code, "message": message}
+
     # -- capture --
 
-    def _latest_frame(self):
-        entry = getattr(self.nodes, "latest_frames", {}).get(FRAME_KEY)
-        if not entry:
-            return None, None
-        jpeg, ts = entry
-        return jpeg, (time.monotonic() - ts) if ts is not None else None
-
     def _capture_photo(self, args):
-        path = self._file_path(args.get("image_name"))
-        if isinstance(path, str):
-            # _file_path 校验失败时直接返回错误结构
-            return {"ok": False, "code": "INVALID_ARGUMENT", "message": path}
-        if path.exists():
+        path, error = self._resolve_name(args.get("image_name"))
+        if error is not None:
+            result = self._error("INVALID_ARGUMENT", error)
+        elif path.exists():
             # rename 会静默覆盖同名文件，先拒绝而不是覆盖旧照片。
-            return {"ok": False, "code": "FILE_EXISTS", "state": "error",
-                    "message": f"file already exists: {path.name}"}
-        jpeg, frame_age = self._latest_frame()
-        if not jpeg:
-            result = {"ok": False, "code": "CAMERA_UNAVAILABLE",
-                      "message": "预览流暂无可用帧；确认相机流在跑后重试"}
-        elif frame_age is None or frame_age > self._max_frame_age_s:
-            # 缓存里那一帧比阈值还旧 = 预览流已经停了。旧画面不能当“现在”存档。
-            age_text = "未知" if frame_age is None else f"{frame_age:.1f} s"
-            result = {"ok": False, "code": "CAMERA_UNAVAILABLE",
-                      "message": f"缓存帧已过期（{age_text}，上限 "
-                                 f"{self._max_frame_age_s:g} s）；确认预览流在跑后重试"}
-        elif not jpeg.startswith(b"\xff\xd8") or not jpeg.endswith(b"\xff\xd9"):
-            result = {"ok": False, "code": "CAMERA_UNAVAILABLE",
-                      "message": "缓存帧不是完整 JPEG，等待下一帧后重试"}
+            result = self._error("FILE_EXISTS", f"file already exists: {path.name}")
         else:
-            result = self._save_jpeg(path, jpeg)
-        result["state"] = "captured" if result.get("ok") else "error"
-        if result.get("ok") and frame_age is not None:
-            result["frame_age_s"] = round(max(frame_age, 0.0), 2)
+            frame = self._frames.get(FRAME_KEY, self._max_frame_age_s)
+            if frame is None:
+                result = self._error("CAMERA_UNAVAILABLE", self._unavailable_message())
+            else:
+                result = self._save_jpeg(path, frame.data, frame.age_s)
         self._last_capture = {"status": result["state"], "result": result}
         return result
 
-    def _save_jpeg(self, path, jpeg):
+    def _unavailable_message(self):
+        age = self._frames.age(FRAME_KEY)
+        if age is None:
+            return "预览流暂无可用帧；确认相机流在跑后重试"
+        if age > self._max_frame_age_s:
+            return (f"缓存帧已过期（{age:.1f} s，上限 "
+                    f"{self._max_frame_age_s:g} s）；确认预览流在跑后重试")
+        # 时钟回退时时间戳在未来：无法判定新鲜度，等下一帧。
+        return "缓存帧时间戳异常（时钟回退）；等待下一帧后重试"
+
+    def _save_jpeg(self, path, jpeg, frame_age_s):
         temporary_path = None
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -134,25 +136,28 @@ class VisionCapturePlugin:
                 output.flush()
                 os.fsync(output.fileno())
             temporary_path.replace(path)
-            return {"ok": True, "media_type": "photo",
-                    "file_path": str(path), "filename": path.name,
-                    "channel_reply_path": self._channel_path(path),
-                    "mime": "image/jpeg", "size": len(jpeg),
-                    "captured_at": datetime.now().astimezone().isoformat(timespec="seconds")}
+            return self._ok(
+                "captured", media_type="photo",
+                file_path=str(path), filename=path.name,
+                channel_reply_path=self._channel_path(path),
+                mime="image/jpeg", size=len(jpeg),
+                captured_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+                frame_age_s=round(max(frame_age_s, 0.0), 2))
         except FileExistsError:
-            return {"ok": False, "code": "FILE_EXISTS", "message": f"file already exists: {path.name}"}
+            return self._error("FILE_EXISTS", f"file already exists: {path.name}")
         except OSError as exc:
             if temporary_path is not None:
                 temporary_path.unlink(missing_ok=True)
-            return {"ok": False, "code": "SAVE_FAILED", "message": str(exc)}
+            return self._error("SAVE_FAILED", str(exc))
 
-    def _file_path(self, name):
+    def _resolve_name(self, name):
+        """Map a requested filename to a path, or to a validation message."""
         directory = self._output_dir / "photos"
         if name:
             if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,99}", name):
-                return "文件名只能用 1-100 个字母、数字、'_' 或 '-'，不带扩展名"
-            return directory / f"{name}.jpg"
-        return directory / f"{STREAM_NAME}_{datetime.now():%Y%m%d_%H%M%S_%f}_{uuid4().hex[:8]}.jpg"
+                return None, "文件名只能用 1-100 个字母、数字、'_' 或 '-'，不带扩展名"
+            return directory / f"{name}.jpg", None
+        return directory / f"{STREAM_NAME}_{datetime.now():%Y%m%d_%H%M%S_%f}_{uuid4().hex[:8]}.jpg", None
 
     def _channel_path(self, path):
         channel_root = Path(os.environ.get("PHANTHY_CHANNEL_OUTPUT_DIR", "/work/resource/vision_capture"))
@@ -180,35 +185,33 @@ class VisionCapturePlugin:
                                    "channel_reply_path": self._channel_path(path),
                                    "size": metadata.st_size, "mime": "image/jpeg"}))
         files.sort(key=lambda item: item[0], reverse=True)
-        return {"ok": True, "state": "listed", "files": [item[1] for item in files]}
+        return self._ok("listed", files=[item[1] for item in files])
 
     def _delete_file(self, name):
         if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,99}\.jpg", name, re.I):
-            return {"ok": False, "code": "INVALID_ARGUMENT",
-                    "message": "name must be a complete .jpg filename"}
+            return self._error("INVALID_ARGUMENT", "name must be a complete .jpg filename")
         path = self._output_dir / "photos" / name
         if not path.is_file():
-            return {"ok": False, "code": "NOT_FOUND", "message": f"file not found: {name}"}
+            return self._error("NOT_FOUND", f"file not found: {name}")
         try:
             path.unlink()
         except FileNotFoundError:
             # 另一条删除请求先完成时，返回正常的不存在结果。
-            return {"ok": False, "code": "NOT_FOUND", "message": f"file not found: {name}"}
-        return {"ok": True, "state": "deleted", "filename": name}
+            return self._error("NOT_FOUND", f"file not found: {name}")
+        return self._ok("deleted", filename=name)
 
     def _info(self):
-        jpeg, frame_age = self._latest_frame()
-        info = {"state": "ready", "output_dir": str(self._output_dir),
-                "photos_dir": str(self._output_dir / "photos"),
-                "stream": STREAM_NAME,
-                "frame_available": jpeg is not None,
-                "frame_fresh": bool(
-                    jpeg is not None and frame_age is not None
-                    and frame_age <= self._max_frame_age_s),
-                "max_frame_age_s": self._max_frame_age_s,
-                "last_capture": self._last_capture}
-        if frame_age is not None:
-            info["frame_age_s"] = round(max(frame_age, 0.0), 2)
+        age = self._frames.age(FRAME_KEY)
+        info = self._ok(
+            "ready", output_dir=str(self._output_dir),
+            photos_dir=str(self._output_dir / "photos"),
+            stream=STREAM_NAME,
+            frame_available=age is not None,
+            frame_fresh=self._frames.get(FRAME_KEY, self._max_frame_age_s) is not None,
+            max_frame_age_s=self._max_frame_age_s,
+            last_capture=self._last_capture)
+        if age is not None:
+            info["frame_age_s"] = round(max(age, 0.0), 2)
         return info
 
 
