@@ -254,7 +254,6 @@ class VisionPickAndDrop:
             self._checked_config()
             if not self.info()["inputs_ready"]:
                 raise RuntimeError("start the camera/VOP inputs before observing or transferring")
-            self.device._camera.require_pick_camera()
             if action != "observe" and not self._snapshot:
                 return {"state": "error", "code": "OBSERVATION_REQUIRED", "observation_required": True}
             target = resolve_targets(action, args, self._snapshot, self.cfg) if action != "observe" else None
