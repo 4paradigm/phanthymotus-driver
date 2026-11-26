@@ -124,7 +124,7 @@ class Bundle:
         from slam_mapping import SlamMappingPlugin
         p = cfg.get("plugins", {})
         self.plugins = []
-        if dds_ready and p.get("state", {}).get("enabled", True): self.plugins.append(StatePlugin(p.get("state", {}), namespace, executor))
+        if dds_ready and p.get("state", {}).get("enabled", True): self.plugins.append(StatePlugin(p.get("state", {}), namespace, executor, battery_power_config=p.get("battery_power")))
         loco = None
         loco_servo = None
         special_motion = None
@@ -173,7 +173,7 @@ class Bundle:
     def start_all(self):
         for plugin in self.plugins: plugin.start()
     def stop_all(self):
-        for plugin in self.plugins: plugin.stop()
+        for plugin in self.plugins: getattr(plugin, "shutdown", plugin.stop)()
     def tools(self):
         out = [
             {"name": "model", "type": "resource", "description": "Unitree As2W wheel-legged robot URDF model", "inputSchema": {"type": "object", "properties": {}}},

@@ -1,10 +1,19 @@
 """Unitree As2W driver plugins (official AS2 SDK SportClient)."""
 import json
+import logging
+from collections import deque
+from copy import copy
 import math
 import struct
 import threading
 import time
 from uuid import uuid4
+from contextlib import nullcontext
+
+try:
+    from battery_power import BatteryPower, PowerConfig
+except ModuleNotFoundError:
+    from unitree.as2w.battery_power import BatteryPower, PowerConfig
 
 from std_msgs.msg import String
 from unitree_sdk2py.core.channel import ChannelSubscriber
@@ -26,6 +35,9 @@ except ImportError:
     pass
 
 
+_BMS_QUEUE_CAPACITY = 64  # ~3.2 seconds at the observed 20 Hz; fixed memory bound.
+_POWER_ERROR_LOG_INTERVAL_S = 10.0
+_LOG = logging.getLogger(__name__)
 _STATE_PUBLISH_HZ = 60.0
 _REMOTE_PUBLISH_HZ = 10.0
 _REMOTE_FRESH_S = 0.5
@@ -200,10 +212,12 @@ def _acp_notify(action_id, status, result, tool="loco"):
 
 class _StateNode:
     _ODOM_INTERVAL = 0.1
+    _CLOSE_WAIT_S = 1.0
 
     def __init__(self, namespace, executor):
         from rclpy.node import Node
         self.node = Node("as2w_state")
+        self._executor = executor
         self.imu = self.node.create_publisher(String, f"/{namespace}/state/imu", _LOW_LAT_QOS or 1)
         self.joints = self.node.create_publisher(String, f"/{namespace}/state/joints", _LOW_LAT_QOS or 1)
         self.joint_state = self.node.create_publisher(String, f"/{namespace}/state/joint_state", _LOW_LAT_QOS or 1)
@@ -226,10 +240,14 @@ class _StateNode:
         # and ROS publication from the callback can make the callback queue
         # fall behind the robot's LowState stream.  Keep only the newest
         # object and let a small publisher worker consume it.  This gives the
-        # frontend the newest pose instead of an old queue of poses.
+        # frontend the newest pose instead of an old queue of poses. BMS also
+        # retains a bounded FIFO for power integration; legacy Battery stays
+        # on the latest-value publication path.
         self._latest_lock = threading.Lock()
         self._latest_low = None
         self._latest_bms = None
+        self._bms_samples = deque(maxlen=_BMS_QUEUE_CAPACITY)
+        self._bms_queue_overflows = 0
         self._latest_sport = None
         self._low_generation = 0
         self._bms_generation = 0
@@ -243,8 +261,12 @@ class _StateNode:
         self._remote_enabled = True
         self._remote_last_publish_mono = 0.0
         self._stop_event = threading.Event()
+        self._close_lock = threading.Lock()
+        self._close_requested = False
+        self._cleanup_started = False
+        self._cleanup_done = threading.Event()
         self._publisher_thread = threading.Thread(
-            target=self._publish_loop, daemon=True, name="as2w-state-publish")
+            target=self._run_publisher, daemon=True, name="as2w-state-publish")
         # queueLen=1 in the bundled SDK rejects new samples when full; it is
         # not a latest-value queue. LowState is high-rate, so consume it
         # directly and let the callback replace the cached pointer.
@@ -255,16 +277,61 @@ class _StateNode:
         self._publisher_thread.start()
 
     def close(self):
-        for subscriber in (self._low, self._bms, self._sport):
+        with self._close_lock:
+            if self._close_requested:
+                return
+            self._close_requested = True
+            self._stop_event.set()
+        worker = self._publisher_thread
+        if worker is threading.current_thread():
+            return  # The worker's finally owns cleanup; never join ourselves.
+        if worker.is_alive():
+            worker.join(timeout=self._CLOSE_WAIT_S)
+        if not worker.is_alive():
+            self._finish_close()
+        # On timeout keep DDS/ROS resources alive. No reaper thread or repeated
+        # wait is needed: the existing worker cleans up after its last publish.
+
+    def _run_publisher(self):
+        try:
+            self._publish_loop()
+        except Exception:
+            _LOG.exception("AS2-W state publisher exited unexpectedly")
+        finally:
+            self._stop_event.set()
+            self._finish_close()
+
+    def _finish_close(self):
+        # Called after the publishing phase, either by its owning worker or by
+        # close() after the worker has exited. Nothing publishes after cleanup.
+        with self._close_lock:
+            if self._cleanup_started:
+                return
+            self._cleanup_started = True
+        try:
+            card = getattr(self, '_power_card', None)
+            if card is not None:
+                try:
+                    card.detach(self)
+                except Exception:
+                    _LOG.exception("AS2-W battery power detach failed")
+            for subscriber in (self._low, self._bms, self._sport):
+                try:
+                    subscriber.Close()
+                except Exception:
+                    _LOG.exception("AS2-W state subscriber close failed")
+            remove_node = getattr(self._executor, 'remove_node', None)
+            if remove_node is not None:
+                try:
+                    remove_node(self.node)
+                except Exception:
+                    _LOG.exception("AS2-W state executor removal failed")
             try:
-                subscriber.Close()
+                self.node.destroy_node()
             except Exception:
-                pass
-        self._stop_event.set()
-        publisher_thread = getattr(self, "_publisher_thread", None)
-        if publisher_thread is not None:
-            publisher_thread.join(timeout=1.0)
-        self.node.destroy_node()
+                _LOG.exception("AS2-W state node destruction failed")
+        finally:
+            self._cleanup_done.set()
 
     def _publish(self, publisher, value):
         message = String()
@@ -312,7 +379,27 @@ class _StateNode:
                 self._published_sport_generation = sport_generation
             self._maybe_publish_odom()
             self._maybe_publish_remote()
+            self._process_battery_power()
             self._stop_event.wait(wait_for)
+
+    def _drain_bms_samples(self):
+        with self._latest_lock:
+            samples = tuple(self._bms_samples)
+            self._bms_samples.clear()
+        return samples
+
+    def _process_battery_power(self):
+        # Always drain, including while the logical card is stopped. The legacy
+        # Battery publisher above still uses its unchanged latest-value path.
+        samples = self._drain_bms_samples()
+        card = getattr(self, '_power_card', None)
+        if card is not None:
+            try:
+                card.tick_samples(self, samples)
+            except Exception as exc:
+                # Never let this optional card terminate the shared worker.
+                # Reset its continuity before retrying on the next iteration.
+                card.processing_failed(self, exc)
 
     def _on_low(self, msg):
         latest_lock = getattr(self, "_latest_lock", None)
@@ -404,6 +491,25 @@ class _StateNode:
         with latest_lock:
             self._latest_bms = bms
             self._bms_generation += 1
+            received_mono = time.monotonic()
+            timestamp_ms = int(time.time() * 1000)
+            samples = getattr(self, '_bms_samples', None)
+            if samples is not None:
+                if len(samples) == samples.maxlen:
+                    self._bms_queue_overflows += 1
+                # Drop oldest on overflow. The retained sequence gap forces the
+                # calculator to break integration; no missing interval is bridged.
+                # Copy only calculation fields, not the SDK message or its
+                # mutable voltage arrays. Deferred samples own these values.
+                sample = {name: getattr(bms, name, None)
+                          for name in ('current', 'soc', 'soh')}
+                for name in ('bmsvoltage', 'cell_vol'):
+                    try:
+                        sample[name] = tuple(getattr(bms, name))
+                    except (AttributeError, TypeError):
+                        sample[name] = None
+                samples.append((sample, self._bms_generation,
+                                received_mono, timestamp_ms))
         if getattr(self, "_publisher_thread", None) is None:
             self._publish_bms(bms)
 
@@ -547,13 +653,157 @@ class _StateNode:
             }
 
 
+class _BatteryPowerCard:
+    """Always-on monitor; Canvas lifecycle never owns the shared data stream."""
+    _LIFECYCLE_FIELDS = {
+        "always_on": True,
+        "lifecycle": "logical",
+        "stop_behavior": "detach_only",
+        "physical_shutdown": "driver_bundle_stop",
+    }
+
+    def __init__(self, config, namespace):
+        self._lock = threading.RLock()
+        self.core = BatteryPower(PowerConfig(**{
+            k: v for k, v in config.items() if k in PowerConfig.__dataclass_fields__}))
+        self.topic = f"/{namespace}/state/battery_power"
+        self.node = None
+        self.running = False  # Physical stream; enabled by bind, not Canvas start.
+        self.logical_running = False
+        self.last_publish = None
+        self.last_status = None
+        self.error_count = 0
+        self.last_error = None
+        self._last_error_log_mono = None
+
+    def tool(self):
+        return {"name": "battery_power", "type": "sensor", "multiInstance": False,
+                "description": (
+                    "Always-on AS2-W battery power monitoring from Driver "
+                    "startup; intelligent control is not required. Canvas stop "
+                    "only detaches the logical card; monitoring continues until "
+                    "Driver shutdown. Runtime uses recent power after at least "
+                    "180 valid seconds, with a 300-second window."),
+                "inputSchema": {"type": "object", "properties": {},
+                                "x-action-descriptions": {
+                                    "start": "Attach to the existing always-on monitor without resetting statistics.",
+                                    "stop": "Detach the logical card; power calculation and publication continue.",
+                                    "info": "Report logical lifecycle and physical stream state."}},
+                "topic_out": [{"topic": self.topic, "format": "data/json"}]}
+
+    def bind(self, node):
+        with self._lock:
+            if self.node is node and self.running:
+                return
+            publisher = node.node.create_publisher(
+                String, self.topic, _LOW_LAT_QOS or 1)
+            self.node = node
+            self.publisher = publisher
+            self.core.reset()  # Preserve process energy, break node epochs.
+            self.last_publish = self.last_status = None
+            self.logical_running = False
+            self.running = True
+            node._power_card = self
+
+    def start(self):
+        with self._lock:
+            if self.running and self.node is not None:
+                self.logical_running = True
+
+    def stop(self):
+        with self._lock:
+            # Canvas/intelligent-control stop does not own the physical stream.
+            self.logical_running = False
+
+    def _record_error(self, exc):
+        self.error_count += 1
+        self.last_error = f"{type(exc).__name__}: {str(exc)[:160]}"
+        now = time.monotonic()
+        if (self._last_error_log_mono is None
+                or now - self._last_error_log_mono >= _POWER_ERROR_LOG_INTERVAL_S):
+            self._last_error_log_mono = now
+            _LOG.warning("battery_power failure (total=%d): %r",
+                         self.error_count, self.last_error)
+
+    def _publish_invalid(self, node):
+        if node is not None:
+            try:
+                node._publish(self.publisher, self.core.snapshot(time.monotonic()))
+            except Exception as exc:
+                # Stop/shutdown still completes when ROS is unavailable.
+                self._record_error(exc)
+
+    def processing_failed(self, node, exc):
+        with self._lock:
+            self._record_error(exc)
+            if self.node is node and self.running:
+                self.core.reset()
+                self.last_publish = self.last_status = None
+                self._publish_invalid(node)
+
+    def detach(self, node):
+        with self._lock:
+            if self.node is node:
+                was_running = self.running
+                self.running = False
+                self.logical_running = False
+                self.node = None
+                self.core.reset()
+                if was_running:
+                    self._publish_invalid(node)
+
+    def tick_samples(self, node, samples):
+        # Processing serializes with physical detach/shutdown. Canvas stop only
+        # changes logical state; no shared cache lock is held during computation.
+        with self._lock:
+            if not self.running or self.node is not node:
+                return
+            now = time.monotonic()
+            # Drain received samples before checking freshness. Worker
+            # delays are not BMS gaps; update() checks receive times and sequences.
+            for msg, sequence, received, stamp in samples:
+                if msg is not None and received is not None:
+                    self.core.update(msg, sequence, received, stamp)
+            data = self.core.snapshot(now)
+            status = (data['status'], data['runtime_status'], data['fresh'])
+            if (self.last_publish is None or now - self.last_publish >= 1.0
+                    or status != self.last_status):
+                node._publish(self.publisher, data)
+                self.last_publish, self.last_status = now, status
+
+    def info(self):
+        with self._lock:
+            stream_running = self.running and self.node is not None
+            # MCP status queries must not expire the live accumulator before
+            # the worker consumes continuous samples waiting in the BMS queue.
+            view = copy(self.core)
+            view.segments = self.core.segments.copy()
+            return {"state": "running" if self.logical_running and stream_running else "idle",
+                    "stream_state": "running" if stream_running else "idle",
+                    **self._LIFECYCLE_FIELDS,
+                    "topic_out": self.tool()['topic_out'],
+                    "diagnostics": {
+                        **view.diagnostics(time.monotonic()),
+                        "processing_error_count": self.error_count,
+                        "last_processing_error": self.last_error,
+                        "bms_queue_capacity": _BMS_QUEUE_CAPACITY,
+                        "bms_queue_overflows": getattr(self.node, '_bms_queue_overflows', 0),
+                    }}
+
+
 class StatePlugin:
     PREFIX = "state"
     ODOM_AXES = ("vx", "vy", "wz")
-    def __init__(self, config, namespace, executor):
+    def __init__(self, config, namespace, executor, battery_power_config=None):
+        self._lifecycle_lock = threading.RLock()
+        self._shutdown = False
+        self._power_card = (_BatteryPowerCard(battery_power_config, namespace)
+                            if battery_power_config is not None and battery_power_config.get("enabled", True) else None)
         self._namespace = namespace
         self._executor = executor
         self._state = _StateNode(namespace, executor)
+        if self._power_card is not None:
+            self._power_card.bind(self._state)
     def get_tools(self):
         specs = (("imu", "state/imu", "data/json", "As2W IMU state"),
                  ("joints", "state/joints", "sensor/skeleton", "As2W 12-joint leg skeleton for model animation"),
@@ -576,6 +826,8 @@ class StatePlugin:
             "standing. The state/odom output converts velocity to body frame, "
             "where +X is forward and +Y is left, for navigation.")
         loco_state["topic_out"] = self._loco_state_topics()
+        if getattr(self, "_power_card", None) is not None:
+            tools.append(self._power_card.tool())
         return tools
 
     def _loco_state_topics(self):
@@ -610,17 +862,50 @@ class StatePlugin:
                 pass
         return result
     def start(self):
-        # Sensor cards share one LowState subscription.  Recreate it when a
-        # dashboard stopped the card instead of claiming a dead stream is live.
-        if self._state is None:
-            self._state = _StateNode(self._namespace, self._executor)
+        with getattr(self, '_lifecycle_lock', nullcontext()):
+            if getattr(self, '_shutdown', False):
+                return
+            state = self._state
+            stopped = getattr(state, '_stop_event', None)
+            if state is None or (stopped is not None and stopped.is_set()):
+                self._state = _StateNode(self._namespace, self._executor)
+                if getattr(self, '_power_card', None) is not None:
+                    self._power_card.bind(self._state)
 
     def stop(self):
-        if self._state is not None:
-            self._state.close()
-            self._state = None
+        with getattr(self, '_lifecycle_lock', nullcontext()):
+            card = getattr(self, '_power_card', None)
+            if card is not None and not getattr(self, '_shutdown', False):
+                # Core may stop any card in this shared plugin. Keep the node
+                # alive for Battery Power and the established Battery stream.
+                # Each card's dispatch owns its logical state independently.
+                return
+            if self._state is not None:
+                self._state.close()
+                self._state = None
+
+    def shutdown(self):
+        with self._lifecycle_lock:
+            self._shutdown = True
+            self.stop()
+
     def dispatch(self, action, args):
+        with getattr(self, '_lifecycle_lock', nullcontext()):
+            return self._dispatch(action, args)
+
+    def _dispatch(self, action, args):
         name = args.get("_tool_name")
+        if action == 'start' and getattr(self, '_shutdown', False):
+            return {"state": "idle", "error": "driver shutdown"}
+        if name == "battery_power" and getattr(self, '_power_card', None) is not None:
+            if action == 'start':
+                self.start()
+                self._power_card.start()
+            elif action == 'stop':
+                self._power_card.stop()
+            elif action not in ('info', 'battery_power'):
+                return None
+            return self._power_card.info()
         if name == "remote_controller":
             if action == "start":
                 if self._state is None:

@@ -249,6 +249,40 @@ shared IMU, joint, or battery subscription. `active` is an observation for
 future operator-takeover logic; this driver does not turn it into a motion
 command.
 
+`battery_power` is an **Always-on** sensor. With
+`plugins.battery_power.enabled: true` (and the shared state plugin enabled),
+Driver startup automatically processes BMS samples and publishes
+`/<namespace>/state/battery_power`; Dashboard intelligent control is not a
+prerequisite. Canvas `start` and `stop` only attach/detach the logical card.
+They do not reset the average-power window or discharged energy and do not
+interrupt calculation or ROS publication. MCP `info` distinguishes logical
+`state` from physical `stream_state` and advertises `always_on: true`.
+
+While Battery Power is enabled, ordinary `StatePlugin.stop()` also retains the
+shared node, so stopping another shared state card cannot interrupt battery
+monitoring. Driver Bundle shutdown is the physical teardown boundary: it
+stops processing and releases the shared DDS/ROS resources and worker. A newly
+created state node starts a new observation window; old-node batches are
+rejected, while process-lifetime discharged energy is retained. A new Driver
+process starts its own energy counter. Runtime estimation requires at least
+180 seconds of valid discharge observations with at least 90% time coverage;
+the full sliding window is 300 seconds. Stale, charging, and invalid-data
+handling is unchanged.
+
+`battery_power` uses the confirmed AS2-W nominal battery capacity of **648 Wh
+(15000 mAh)** by default, in both `config.yaml` and `PowerConfig`. Override
+`capacity_wh` for a different battery, or explicitly set it to `null` (`None`
+in Python) to disable runtime estimates with `capacity_unconfigured`. Capacity
+is not scaled by SOH; the existing recent-power runtime formula is unchanged.
+
+Voltage uses `bmsvoltage[0]` in mV, cross-checked against the second field
+and the observed 12-cell layout. Array meanings and complete current-sign
+conventions still need hardware confirmation. SOH is only the BMS report.
+Discharge power is voltage times negative current magnitude; energy uses
+trapezoidal integration of consecutive valid receive-time samples. Charging,
+invalid data, stale data, missing sequences, and long gaps break continuity.
+Runtime reflects recent demand and does not guarantee future task duration.
+
 For a no-hardware check, run `python3 test_driver.py` in `as2w`. In a built
 container, verify the media tools with `ffmpeg -version` and
 `ffprobe -version`. On an AS2W host, inspect the shared inputs and outputs with
