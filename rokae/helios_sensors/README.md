@@ -33,6 +33,24 @@ python3 -B -m rokae.helios_sensors.depth_socket \
 预先创建由运行用户和 `video` 组访问的 socket 目录，并将持有该组 GID 的 `HELIOS_DEPTH_SOCKET_GID` 传给 Compose。主机深度源只在 Driver 连接后采集，Driver 停流时释放相机。
 主机深度源使用与镜像同一提交的源码，并安装 NumPy，两个进程才会使用相同的采集设置。
 
+需要随机器启动时，可使用 [systemd 服务模板](deploy/helios-depth-source@.service)。将同一提交的仓库放在 `/opt/phanthy-motus/helios-camera-sensors`，并在 `/etc/phanthy-motus/helios-depth-source.env` 填写实际的 SDK 目录和深度相机序列号。`LD_LIBRARY_PATH` 填与 SDK 目录相同的绝对路径。
+
+```ini
+HELIOS_ORBBEC_SDK_HOST_DIR=/path/to/orbbec-sdk
+HELIOS_ORBBEC_DEPTH_SERIAL=实际深度相机序列号
+LD_LIBRARY_PATH=/path/to/orbbec-sdk
+```
+
+在仓库根目录安装模板，将 `admin` 替换为有相机访问权限的主机用户：
+
+```bash
+sudo install -m 0644 rokae/helios_sensors/deploy/helios-depth-source@.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now helios-depth-source@admin.service
+```
+
+将驱动 Compose 的 `HELIOS_DEPTH_SOCKET_DIR` 设为 `/run/motus-helios-depth`，`HELIOS_DEPTH_SOCKET_GID` 设为主机 `video` 组的 GID。服务监听该目录中的 `depth.sock`，异常退出后自动重启。同一台相机使用一个主机深度源。
+
 ### 深度预览
 
 `camera_depth` 的 `info` 返回 `preview_topic`。应用 [Core 前端补丁](core-preview.patch) 后，画布的「查看数据流」优先打开 JPEG 预览，监控页也只订阅同一驱动成对发布的 JPEG 预览。原始毫米深度仍是卡片的第一输出，已有接线继续使用原话题。补丁已在 Helios 的 Core `release.261118.56edda4` 上验证，并可应用于 Phanthy Motus 源码 `d7dab1461`。

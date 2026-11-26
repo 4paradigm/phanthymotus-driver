@@ -1,0 +1,22 @@
+[Unit]
+Description=ROKAE Helios-2.1 host depth source
+Before=docker.service
+
+[Service]
+Type=exec
+User=%i
+Group=video
+Environment=PYTHONPATH=/opt/phanthy-motus/helios-camera-sensors
+EnvironmentFile=/etc/phanthy-motus/helios-depth-source.env
+RuntimeDirectory=motus-helios-depth
+RuntimeDirectoryMode=0750
+# Keep the directory inode for the driver's existing bind mount on restart.
+RuntimeDirectoryPreserve=yes
+ExecStartPre=-/usr/bin/unlink /run/motus-helios-depth/depth.sock
+ExecStart=/usr/bin/python3 -B -m rokae.helios_sensors.depth_socket --sdk-dir ${HELIOS_ORBBEC_SDK_HOST_DIR} --serial ${HELIOS_ORBBEC_DEPTH_SERIAL} --socket /run/motus-helios-depth/depth.sock --group video
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target
