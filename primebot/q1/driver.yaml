@@ -11,3 +11,4 @@ build_context_extras:
   - ../../common
 cards:
   - { name: battery, type: sensor }
+  - { name: imu, type: sensor }

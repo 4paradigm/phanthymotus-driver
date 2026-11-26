@@ -18,18 +18,23 @@ def battery_state(msg):
     }
 
 
-def read_robot(domain, output, stopping):
-    from common import logsafe
-    logsafe.install(check_fd=False)
-
+def configure_robot_dds():
     from ament_index_python.packages import get_package_share_directory
-    import rclpy
-    from rclpy.qos import qos_profile_sensor_data
-    from aimdk_msgs.msg import Bms
 
     profile = Path(get_package_share_directory("aimdk_msgs")) / "config/fastdds_profiles.xml"
     for key in ("FASTRTPS_DEFAULT_PROFILES_FILE", "FASTDDS_DEFAULT_PROFILES_FILE"):
         os.environ[key] = os.environ.get("Q1_FASTDDS_PROFILE", str(profile))
+
+
+def read_robot(domain, output, stopping):
+    from common import logsafe
+    logsafe.install(check_fd=False)
+
+    import rclpy
+    from rclpy.qos import qos_profile_sensor_data
+    from aimdk_msgs.msg import Bms
+
+    configure_robot_dds()
     rclpy.init(domain_id=domain)
     node = rclpy.create_node("primebot_q1_battery_reader", start_parameter_services=False)
     node.create_subscription(
