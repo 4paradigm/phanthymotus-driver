@@ -2709,7 +2709,6 @@ class LocoPlugin:
         self._publish_error = None # why the current/last stream died, None if it stopped cleanly
         self._blocked = None       # reason walks are refused (mc_mode transition)
         self._seq = 0
-        self._limits = None
 
     def get_tool(self):
         lim = self.CARD_LIMITS
@@ -2852,14 +2851,11 @@ class LocoPlugin:
                 "duration": duration, "superseded": old["id"] if old else None}
 
     def _effective_limits(self):
-        """Card limits ∩ firmware GetVelocityLimitValue (angular converted rad/s → deg/s).
+        """Read GetVelocityLimitValue for this walk and intersect with the card limits.
 
-        Fails closed: raises if the firmware limits are unreadable or malformed
-        (non-numeric, min > max, a range excluding 0, or empty); only a valid
-        reading is cached. A missing field is 0 (proto3 JSON omits zero values).
+        Convert angular rad/s to deg/s. A missing field is 0 (proto3 JSON omits
+        zero values). Unreadable or malformed limits raise and the walk is rejected.
         """
-        if self._limits is not None:
-            return self._limits
         v = self.nodes.rpc.get_velocity_limit().get("vel_limit_value")
         if not isinstance(v, dict) or not v:
             raise ValueError(f"响应缺少 vel_limit_value: {v!r}")
@@ -2876,7 +2872,6 @@ class LocoPlugin:
                 raise ValueError(f"{axis} 固件限制 [{low:g}, {high:g}] 不合法（需 min ≤ 0 ≤ max）")
             card = self.CARD_LIMITS[axis]
             limits[axis] = (max(card[0], low), min(card[1], high))
-        self._limits = limits
         return limits
 
     # -- streaming --------------------------------------------------------------

@@ -1182,10 +1182,28 @@ class RpcDispatchTests(unittest.TestCase):
                                 "angular_velocity_limit_min": -0.2, "angular_velocity_limit_max": 0.2}}
         loco = find_plugin(self.plugins, "loco")
         for args in ({"forward": 0.3}, {"angular": 15}):
-            self.assertEqual(loco.dispatch("walk", dict(args, duration=1))["code"], "INVALID_ARG")
-        (url, _), = self.transport.calls_to("MotionControlMotionService", "GetVelocityLimitValue")
-        self.assertIn("10.42.10.12:56322", url)
-        self.assertAlmostEqual(loco._limits["angular"][1], math.degrees(0.2))
+            result = loco.dispatch("walk", dict(args, duration=1))
+            self.assertEqual(result["code"], "INVALID_ARG")
+            self.assertAlmostEqual(result["limits"]["angular"][1], math.degrees(0.2))
+        calls = self.transport.calls_to("MotionControlMotionService", "GetVelocityLimitValue")
+        self.assertEqual(len(calls), 2)
+        for url, _ in calls:
+            self.assertIn("10.42.10.12:56322", url)
+
+    def test_loco_walk_rechecks_firmware_limits_after_an_accepted_walk(self):
+        loco = find_plugin(self.plugins, "loco")
+        args = {"forward": 0.4, "duration": 1}
+        self.assertEqual(loco.dispatch("walk", args)["state"], "accepted")
+        loco.stop()
+        frame_count = len(self.nodes.locomotion_pub.published)
+
+        self.transport.responses["MotionControlMotionService/GetVelocityLimitValue"] = {
+            "vel_limit_value": dict(FIRMWARE_VEL_LIMITS, forward_velocity_limit_max=0.2)}
+        result = loco.dispatch("walk", args)
+        self.assertEqual(result["state"], "rejected")
+        self.assertEqual(result["code"], "INVALID_ARG")
+        self.assertEqual(result["limits"]["forward"], [-0.3, 0.2])
+        self.assertEqual(len(self.nodes.locomotion_pub.published), frame_count)
 
     def test_loco_schema_declares_completion_and_interrupt_hooks(self):
         schema = find_plugin(self.plugins, "loco").get_tool()["inputSchema"]
@@ -1333,14 +1351,13 @@ class RpcDispatchTests(unittest.TestCase):
                 self.transport.responses["MotionControlMotionService/GetVelocityLimitValue"] = response
                 result = loco.dispatch("walk", {"forward": 0.1, "duration": 1})
                 self.assertEqual(result["code"], "NOT_READY")
-                self.assertIsNone(loco._limits)
         self.assertEqual(self.nodes.locomotion_pub.published, [])
-        # A later valid reading is accepted and cached.
         self.transport.responses["MotionControlMotionService/GetVelocityLimitValue"] = {
             "vel_limit_value": dict(FIRMWARE_VEL_LIMITS)}
         self.assertEqual(loco.dispatch("walk", {"forward": 0.1, "duration": 1})["state"], "accepted")
-        self.assertEqual(loco._limits["forward"], (-0.3, 0.6))
         loco.stop()
+        self.transport.responses["MotionControlMotionService/GetVelocityLimitValue"] = cases["rpc_rejected"]
+        self.assertEqual(loco.dispatch("walk", {"forward": 0.1, "duration": 1})["code"], "NOT_READY")
 
     def test_loco_omitted_firmware_limit_field_means_zero(self):
         # proto3 JSON drops zero-valued fields: no forward min = no reversing.
@@ -1349,8 +1366,9 @@ class RpcDispatchTests(unittest.TestCase):
         self.transport.responses["MotionControlMotionService/GetVelocityLimitValue"] = {
             "vel_limit_value": limits}
         loco = find_plugin(self.plugins, "loco")
-        self.assertEqual(loco.dispatch("walk", {"forward": -0.1, "duration": 1})["code"], "INVALID_ARG")
-        self.assertEqual(loco._limits["forward"], (0.0, 0.6))
+        result = loco.dispatch("walk", {"forward": -0.1, "duration": 1})
+        self.assertEqual(result["code"], "INVALID_ARG")
+        self.assertEqual(result["limits"]["forward"], [0.0, 0.6])
 
     def test_waist_control_publishes_wrapper(self):
         waist = find_plugin(self.plugins, "waist_control")
