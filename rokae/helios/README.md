@@ -1,12 +1,21 @@
 # ROKAE Helios-2.1 状态卡片
 
-通过现有 iNex 和底盘 WebSocket 读取 20 轴关节及双电池状态。两张传感器卡可独立开始、停止，不提供运动、使能、模式切换或充放电控制。
+通过 iNex 和底盘 WebSocket 读取 20 轴关节及双电池状态，通过 VMR SDK 读取地图、定位与站点。三张传感器卡可独立启停。
 
 | 工具 | 类型 | 输出 |
 |---|---|---|
 | `joints` | sensor | 关节骨架和逐轴状态，默认 10 Hz |
 | `battery` | sensor | 两块电池状态，默认 1 Hz |
 | `model` | resource | 运行时读取本机 iNex 的 URDF，骨架渲染器自动调用 |
+| `spatial_map` | sensor | 读取当前地图名称、定位反馈以及工作点和充电点的 ID、名称和类型 |
+
+### 地图、定位与站点
+
+在现有 Compose 配置后合并 `deploy/compose.spatial-map.yml`，将主机端变量 `HELIOS_SDK_PYTHON_DIR` 和 `HELIOS_VMR_SDK_DIR` 指向配套的 CPython 3.12 和 VMR SDK 目录。SDK 默认连接底盘 `192.168.0.100:9003`，可在 `config.yaml` 修改。驱动加载时只声明卡片，画布启动此卡后才连接底盘。
+
+每两秒查询当前地图和两类站点，通过 `/<namespace>/state/spatial_map` 发布 `data/json`。`map_name` 是 VMR 返回的地图标识。每个 `stations` 条目保留原始 `id`、`name`，`type` 由对应的 SDK 查询区分为 `work` 或 `charge`。成功读到零个点时返回 `[]`。无法提供当前地图快照时，地图和站点均为 `null`。
+
+`localization` 提供 VMR 回调中的 `status_code`、`confidence`、`x`、`y`、`theta` 及十进制字符串 `timestamp_ns`。保留厂商定位码；传输状态 `online` 表示同时收到地图及新鲜定位反馈。定位时间戳停止更新 3 秒后，定位字段在下一次采样置空，地图和站点仍可用，状态为 `partial`。停止卡片后释放 SDK 连接。
 
 ## 数据与单位
 
@@ -73,7 +82,7 @@
 仓库根目录安装本 Driver 的 requirements 及 pytest 后执行：
 
 ```bash
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=. python -m pytest -q tests/test_helios_joints.py tests/test_helios_battery.py tests/test_helios_torque.py tests/test_helios_model.py
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=. python -m pytest -q tests/test_helios_*.py
 python scripts/check_service_yml.py rokae/helios
 ```
 

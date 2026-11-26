@@ -1,5 +1,11 @@
 # 验证范围
 
+## spatial_map 真机验证（2026-11-26）
+
+ARM64 真机使用仓库 Dockerfile 的默认 ROS 基础镜像构建。临时 Core（`release.261118.56edda4`）与测试 Driver 使用独立数据库和网络命名空间。Core 发现了 `joints`、`model`、`battery` 及 `spatial_map`。经 Core 调用地图卡，在画布使用的 `/ws/bus/rokae_helios/state/spatial_map` 收到连续两份定位源时间戳不同的数据。停止后收到空值和 `idle`，再次启动后恢复当前地图和新的定位反馈。
+
+机载 SDK 的 `get_current_map_name()` 返回 `helioslab`。`get_current_map_info()` 的 `goals` 和 `lines` 均为空，`get_work_points()` 和 `get_charge_points()` 均返回空列表。定位回调实测 `status=0`、`confidence=1.0`。工作点和充电点的非空序列化用 SDK 原生 `Goal.from_json()` 构造的样本验证，覆盖中文名称及 ID 为 0 的点位。未向现场地图添加点位。
+
 ## 自动验证
 
 2026-11-19，初版关节、电池、力矩回归共 37 项通过；本次另增加运行时模型发现、大小限制、同源检查及错误模型回归，`scripts/check_service_yml.py rokae/helios` 通过。执行命令见 README。测试使用本地模拟 WebSocket、固定协议样本和真实 Driver 代码，不需要连接或移动机器人。
