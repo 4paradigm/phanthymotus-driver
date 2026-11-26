@@ -270,6 +270,7 @@ def run(request):
             deadline = time.monotonic()+LEASE_S
     finally:
         # Local loopback zero does not depend on the failed SSH/browser link.
+        failure = sys.exc_info()[1]
         try:
             zero_sent = False
             if ws is not None:
@@ -283,8 +284,11 @@ def run(request):
                     if not zero_sent:
                         raise RuntimeError('keyboard_zero_stop_send_unconfirmed')
                     namespace['confirm_stationary'](rospy, Odometry)
-                    emit({'state': 'stopped', 'stationary': True, 'manual_zero_sent': True,
-                          'completion_basis':'factory_manual_zero_and_fresh_stationary_odometry'})
+                    reply = {'state': 'stopped', 'stationary': True, 'manual_zero_sent': True,
+                             'completion_basis':'factory_manual_zero_and_fresh_stationary_odometry'}
+                    if failure is not None and not isinstance(failure, EOFError):
+                        reply['error'] = guard_error_code(failure)
+                    emit(reply)
                 finally:
                     ws.close()
         finally:

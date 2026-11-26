@@ -1049,3 +1049,5 @@ The candidate was reverted after validation; this is not a full live container
 upgrade. Native IMU silence was reproduced even in an independent SDK reader as
 root, then recovered by a camera-only device soft reboot. See the spatial input
 audit for timing, geometry limitations and deployment status.
+
+键盘SSH确认等待与运动租约分开：运行中允许最多1秒接收回复，底盘本地300ms失联零速保护不变，不重发旧方向。帧按80ms起点间隔发送，通信耗时计入周期，不在回复后额外等待80ms；`info.keyboard.last_roundtrip_ms/max_roundtrip_ms` 显示当前会话通信耗时，供定位抖动。该修改需部署后再进行现场持续操作验证。

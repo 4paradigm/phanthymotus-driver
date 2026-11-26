@@ -11,6 +11,7 @@ from uuid import uuid4
 from bootstrap import load_secrets
 
 LINEAR_LIMIT, ANGULAR_LIMIT, LEASE_S = .15, .3, .3
+FRAME_INTERVAL_S = .08
 
 
 def confirmed_stop(reply):
@@ -99,6 +100,8 @@ class MappingKeyboard:
         self.thread = None
         self.last_error = None
         self.last_failure = None
+        self.last_roundtrip_ms = None
+        self.max_roundtrip_ms = None
 
     def info(self):
         with self.lock:
@@ -107,6 +110,8 @@ class MappingKeyboard:
                     'busy': s is not None or self.spatial._keyboard_pending,
                     'session_id': s['id'] if s else None, 'last_error': self.last_error,
                     'last_failure': self.last_failure,
+                    'last_roundtrip_ms': self.last_roundtrip_ms,
+                    'max_roundtrip_ms': self.max_roundtrip_ms,
                     'linear_limit_m_s': LINEAR_LIMIT, 'angular_limit_rad_s': ANGULAR_LIMIT,
                     'watchdog_ms': int(LEASE_S*1000), 'route': 'factory_RobotMotion_MANUAL'}
 
@@ -143,6 +148,7 @@ class MappingKeyboard:
                  'seq': -1, 'values': [0., 0.], 'stop': threading.Event()}
             self.session, self.last_error = s, None
             self.last_failure = None
+            self.last_roundtrip_ms = self.max_roundtrip_ms = None
             self.spatial._keyboard_pending = True
             self.spatial._persist()
             self.thread = threading.Thread(target=self._run, args=(s,), daemon=True, name='mapping-keyboard')
@@ -207,11 +213,14 @@ class MappingKeyboard:
             reply = stream.read(45)  # Initial hold/cancel is allowed no motion.
             if confirmed_stop(reply):
                 stopped = True
+                if reply.get('error'):
+                    self.last_error = self.last_failure = guard_error(reply)
                 return
             if reply.get('state') != 'held':
                 raise RuntimeError(guard_error(reply))
             seq, activated = 0, False
             while True:
+                sent_at = time.monotonic()
                 with self.lock:
                     if not self._valid(s):
                         break
@@ -219,10 +228,19 @@ class MappingKeyboard:
                     # Nonblocking single-frame write under the publication lock:
                     # a stop epoch cannot be overtaken by an older direction.
                     stream.send({'nonce': reply['nonce'], 'seq': seq, 'values': values})
-                reply = stream.read(8 if not activated else .25)
+                # This is an acknowledgement deadline, not the chassis motion
+                # lease. The chassis independently sends zero at 300ms. A
+                # delayed reply must not turn a shorter 250ms SSH read into a
+                # false watchdog failure, nor cause a stale command retry.
+                reply = stream.read(8 if not activated else 1.)
+                elapsed = time.monotonic()-sent_at
+                self.last_roundtrip_ms = round(elapsed*1000, 1)
+                self.max_roundtrip_ms = max(self.max_roundtrip_ms or 0., self.last_roundtrip_ms)
                 if confirmed_stop(reply):
                     stopped = True
-                    self.last_error = 'keyboard_remote_stopped'
+                    self.last_error = guard_error(reply) if reply.get('error') else 'keyboard_remote_stopped'
+                    if reply.get('error'):
+                        self.last_failure = self.last_error
                     break
                 if reply.get('state') != 'ready' or reply.get('seq') != seq:
                     raise RuntimeError(guard_error(reply))
@@ -232,7 +250,9 @@ class MappingKeyboard:
                         if self._valid(s):
                             s['phase'], s['values'] = 'ready', [0., 0.]
                     activated = True
-                s['stop'].wait(.08)
+                # Pace start-to-start; SSH latency already consumed part (or
+                # all) of the interval. Do not add another 80ms after each ACK.
+                s['stop'].wait(max(0., FRAME_INTERVAL_S-elapsed))
         except Exception as exc:
             if not s['stop'].is_set() and not s['cancelled'].is_set():
                 self.last_error = guard_error({'error':str(exc)})
@@ -248,6 +268,8 @@ class MappingKeyboard:
                         reply = stream.read(max(.01, end-time.monotonic()))
                         if confirmed_stop(reply):
                             stopped = True
+                            if reply.get('error'):
+                                self.last_error = self.last_failure = guard_error(reply)
                             break
                 except Exception:
                     pass

@@ -83,6 +83,51 @@ class MappingKeyboardTests(unittest.TestCase):
         return self.spatial.dispatch('keyboard_command',
             {'session_id': self.session, 'seq': self.seq, 'values': values})
 
+    def test_chassis_watchdog_reason_survives_a_confirmed_zero_stop(self):
+        original = self.stream.read
+        def read(timeout):
+            if self.stream.held and not self.stream.stopping:
+                return {'state':'stopped', 'stationary':True, 'manual_zero_sent':True,
+                    'completion_basis':'factory_manual_zero_and_fresh_stationary_odometry',
+                    'error':'keyboard_watchdog_expired'}
+            return original(timeout)
+        self.stream.read = read
+        self.spatial.dispatch('keyboard_open', {})
+        self.assertTrue(wait_until(lambda:self.keyboard.session is None))
+        self.assertEqual(self.keyboard.info()['state'], 'idle')
+        self.assertEqual(self.keyboard.last_failure, 'keyboard_watchdog_expired')
+        self.assertFalse(self.spatial._keyboard_pending)
+
+    def test_delayed_ack_does_not_end_lease_or_add_another_frame_interval(self):
+        original_read, original_send = self.stream.read, self.stream.send
+        delayed, sent_after_reply = threading.Event(), threading.Event()
+        returned_at, gaps = [], []
+        def read(timeout):
+            if self.stream.held and not self.stream.stopping and self.stream.sent[-1]['seq'] > 0:
+                if timeout < .26:
+                    raise TimeoutError('factory_keyboard_guard_timeout')
+                delayed.set()
+                time.sleep(.26)
+                returned_at[:] = [time.monotonic()]
+            return original_read(timeout)
+        def send(value):
+            if returned_at:
+                gaps.append(time.monotonic()-returned_at.pop())
+                sent_after_reply.set()
+            original_send(value)
+        self.stream.read, self.stream.send = read, send
+        self.open()
+        # Browser heartbeats remain fresh while an SSH reply is delayed.
+        end = time.monotonic()+1.5
+        while not sent_after_reply.is_set() and time.monotonic() < end:
+            self.assertNotEqual(self.send([0., 0.])['state'], 'error')
+            time.sleep(.03)
+        self.assertTrue(delayed.is_set())
+        self.assertTrue(sent_after_reply.is_set())
+        self.assertLess(gaps[0], .06)
+        self.assertIsNone(self.keyboard.last_failure)
+        self.assertGreaterEqual(self.keyboard.info()['max_roundtrip_ms'], 250.)
+
     def test_panel_open_has_no_side_effects_and_exposes_existing_canvas_contract(self):
         page = self.spatial.dispatch('mapping_console', {})
         self.assertEqual(page['protocol'], 'motus.workbench/1')
@@ -565,6 +610,8 @@ class ChassisGuardTests(unittest.TestCase):
                         self.assertEqual(commands[1], ('motion', {'vx': 0., 'vy': 0., 'vw': 0.}))
                         self.assertEqual(commands[-1], ('motion', {'vx': 0., 'vy': 0., 'vw': 0.}))
                         self.assertTrue(outputs[-1]['manual_zero_sent'])
+                        if cause == 'timeout':
+                            self.assertEqual(outputs[-1]['error'], 'keyboard_watchdog_expired')
                         if cause == 'held_release':
                             self.assertEqual([item for item in commands if item[0] == 'dispatch'], [('dispatch', 1)])
                         else:
