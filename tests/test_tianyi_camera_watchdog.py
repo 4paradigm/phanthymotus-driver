@@ -18,6 +18,7 @@ Run: PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest tests/test_tianyi_camera
 from __future__ import annotations
 
 import ast
+import json
 import threading
 import time
 from pathlib import Path
@@ -35,7 +36,7 @@ def load_camera_class():
         body=[ast.ImportFrom(module="__future__",
                              names=[ast.alias(name="annotations")], level=0), cls],
         type_ignores=[])
-    ns = {"threading": threading, "time": time, "Node": object}
+    ns = {"json": json, "threading": threading, "time": time, "Node": object}
     exec(compile(ast.fix_missing_locations(module), str(BUNDLE / "device.py"), "exec"), ns)
     return ns["CameraPlugin"]
 
@@ -45,6 +46,7 @@ CameraPlugin = load_camera_class()
 
 def make_plugin(*, grace=0.3, stall=0.3, poll=0.02):
     p = CameraPlugin.__new__(CameraPlugin)
+    p._monitor_only = False
     p._running = False
     p._latest_frame = None
     p._frame_lock = threading.Lock()
@@ -60,6 +62,44 @@ def make_plugin(*, grace=0.3, stall=0.3, poll=0.02):
     p.restarts = []
     p._restart_orbbec_service = lambda: (p.restarts.append(time.time()), None)[1]
     return p
+
+
+def test_monitor_only_keeps_service_watchdog_without_second_rgb_publisher(monkeypatch):
+    import sys
+    from types import SimpleNamespace as NS
+    subscriptions, publishers, ensures = [], [], []
+    class Node:
+        def __init__(self, *args, **kwargs): pass
+        def create_subscription(self, *args):
+            subscriptions.append(args)
+            return object()
+        def create_publisher(self, *args):
+            publishers.append(args)
+            return object()
+    monkeypatch.setitem(CameraPlugin.__init__.__globals__, 'Node', Node)
+    monkeypatch.setitem(CameraPlugin.start.__globals__, '_RELIABLE_QOS', object())
+    monkeypatch.setitem(CameraPlugin.start.__globals__, '_LOW_LAT_QOS', object())
+    monkeypatch.setitem(sys.modules, 'sensor_msgs.msg', NS(Image=object, CompressedImage=object))
+    monkeypatch.setattr(CameraPlugin, '_ensure_orbbec_service', staticmethod(lambda: ensures.append(True)))
+    ros = NS(ctx_tianyi=None, ctx_core=None, executor_tianyi=NS(add_node=lambda n: None),
+             executor_core=NS(add_node=lambda n: None))
+    p = CameraPlugin({}, 'test', ros, monitor_only=True)
+    try:
+        p.start(); p.start()
+        assert publishers == [] and p._encode_thread is None
+        assert len(subscriptions) == 1 and ensures == [True]
+        assert p._watchdog_thread.is_alive()
+        subscriptions[0][2](object())
+        assert p._last_frame_at > 0 and p._latest_frame is None
+        p.stop(); p._watchdog_thread.join(timeout=2)
+        assert not p._watchdog_thread.is_alive()
+        p.start()
+        assert len(subscriptions) == 1 and ensures == [True, True]
+        assert publishers == [] and p._encode_thread is None
+    finally:
+        p.stop()
+        if p._watchdog_thread is not None:
+            p._watchdog_thread.join(timeout=2)
 
 
 def arm(p):
@@ -182,9 +222,36 @@ def test_restart_helper_is_unconditional_unlike_ensure():
     「它看着 active 但其实死了」。两者不能复用同一个函数。"""
     src = (BUNDLE / "device.py").read_text(encoding="utf-8")
     cam = src[src.index("class CameraPlugin"):src.index("class CameraSnapshotPlugin")]
-    assert "systemctl\", \"restart\", \"orbbec_head.service\"" in cam.replace("'", '"')
+    assert '"try-restart" if startup_recovery else "restart"' in cam
     assert "_restart_orbbec_service" in cam
     # 看门狗不得去重建订阅（start 的注释解释了为什么重建不可靠）
     wd = cam[cam.index("def _watchdog_loop"):]
     for forbidden in ("create_subscription", "destroy_subscription", "destroy_node"):
         assert forbidden not in wd, forbidden
+
+
+def test_host_clock_step_uses_orbbec_process_start_and_host_monotonic_time(monkeypatch):
+    import subprocess
+    import sys
+    from types import SimpleNamespace
+
+    start_wall_us = 1_795_650_787_072_192
+    start_mono_us = 13_855_789
+    elapsed_ns = 561_000_000_000
+    step_ns = -1_792_011_000
+    monkeypatch.setitem(sys.modules, 'clock_probe', SimpleNamespace(sample_host_clocks=lambda _: (
+        start_wall_us * 1000 + elapsed_ns + step_ns, start_mono_us * 1000 + elapsed_ns)))
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        return SimpleNamespace(stdout=json.dumps({'data': [{
+            'ExecMainStartTimestamp': {'data': start_wall_us},
+            'ExecMainStartTimestampMonotonic': {'data': start_mono_us},
+        }]}))
+
+    monkeypatch.setattr(subprocess, 'run', run)
+    assert CameraPlugin._orbbec_host_clock_step_ns() == step_ns
+    assert calls[0][-4:] == ['org.freedesktop.DBus.Properties', 'GetAll', 's', 'org.freedesktop.systemd1.Service']
+    assert CameraPlugin._restart_orbbec_service(startup_recovery=True) is None
+    assert calls[1][-3:] == ['systemctl', 'try-restart', 'orbbec_head.service']

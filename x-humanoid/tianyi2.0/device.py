@@ -946,8 +946,9 @@ class StatePlugin:
 class CameraPlugin:
     """Orbbec 头部 RGB 相机 — 独立编码线程避免阻塞executor"""
 
-    def __init__(self, plugin_config: dict, namespace: str, ros2):
+    def __init__(self, plugin_config: dict, namespace: str, ros2, *, monitor_only=False):
         self._ns = namespace
+        self._monitor_only = monitor_only
         self._ros2 = ros2
         self._topic = f"/{namespace}/camera/head"
         self._running = False
@@ -979,8 +980,9 @@ class CameraPlugin:
         self._sub_node = Node("tianyi2_camera_sub", context=ros2.ctx_tianyi)
         ros2.executor_tianyi.add_node(self._sub_node)
 
-        self._pub_node = Node("tianyi2_camera_pub", context=ros2.ctx_core)
-        ros2.executor_core.add_node(self._pub_node)
+        if not self._monitor_only:
+            self._pub_node = Node("tianyi2_camera_pub", context=ros2.ctx_core)
+            ros2.executor_core.add_node(self._pub_node)
 
     def get_tool(self) -> dict:
         return {
@@ -1048,7 +1050,7 @@ class CameraPlugin:
                 self._last_encode_error = ""
 
             # Publish JPEG as CompressedImage
-            if self._pub is None:
+            if not self._monitor_only and self._pub is None:
                 self._pub = self._pub_node.create_publisher(CompressedImage, self._topic, _LOW_LAT_QOS)
 
             # Subscribe - callback just grabs the frame, doesn't encode
@@ -1063,7 +1065,9 @@ class CameraPlugin:
             self._watchdog_gave_up = False
 
             # Separate encoding thread - avoids blocking executor
-            if previous is not None and previous.is_alive():
+            if self._monitor_only:
+                pass  # The shared calibrated producer owns JPEG publication.
+            elif previous is not None and previous.is_alive():
                 # Refused to exit within the grace period. It observes the flag
                 # we just re-armed and resumes, so don't stack a second one.
                 print("[CameraPlugin] WARNING: previous encode thread still running, reusing it")
@@ -1078,7 +1082,8 @@ class CameraPlugin:
                     name="tianyi2-camera-watchdog")
                 self._watchdog_thread.start()
 
-            print("[CameraPlugin] subscription + encode thread created", flush=True)
+            print("[CameraPlugin] camera monitor armed" if self._monitor_only else
+                  "[CameraPlugin] subscription + encode thread created", flush=True)
 
     @staticmethod
     def _ensure_orbbec_service():
@@ -1224,6 +1229,8 @@ else:
             return
         # 看门狗的唯一存活信号。放在锁外、只写一个 float —— 这是 30fps 的路径。
         self._last_frame_at = time.time()
+        if self._monitor_only:
+            return
         with self._frame_lock:
             if self._running:
                 self._latest_frame = (msg, getattr(self, "_frame_generation", 0))
@@ -1316,17 +1323,41 @@ else:
     _NSENTER = ["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--"]
 
     @classmethod
-    def _restart_orbbec_service(cls) -> str | None:
-        """无条件重启主机上的 orbbec_head。成功返回 None，失败返回原因。
+    def _orbbec_host_clock_step_ns(cls) -> int | None:
+        import subprocess
+        from clock_probe import sample_host_clocks
+
+        try:
+            result = subprocess.run(
+                cls._NSENTER + [
+                    "busctl", "--json=short", "call", "org.freedesktop.systemd1",
+                    "/org/freedesktop/systemd1/unit/orbbec_5fhead_2eservice",
+                    "org.freedesktop.DBus.Properties", "GetAll", "s",
+                    "org.freedesktop.systemd1.Service",
+                ], check=True, capture_output=True, text=True, timeout=2)
+            properties, = json.loads(result.stdout)["data"]
+            start_wall = properties["ExecMainStartTimestamp"]["data"]
+            start_mono = properties["ExecMainStartTimestampMonotonic"]["data"]
+            wall, mono = sample_host_clocks(time)
+            if start_wall > 0 and 0 < start_mono * 1000 <= mono:
+                return (wall - mono) - (start_wall - start_mono) * 1000
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+            print(f"[CameraPlugin] cannot check Orbbec host clock: {error}", flush=True)
+        return None
+
+    @classmethod
+    def _restart_orbbec_service(cls, *, startup_recovery=False) -> str | None:
+        """重启主机上的 orbbec_head。成功返回 None，失败返回原因。
 
         和 `_ensure_orbbec_service` 区别开：那个是「必要时才动」（active 且配置没变
         就不碰正在跑的流），看门狗要的恰恰是「它看着是 active 但其实死了，给我重启」。
         """
         import subprocess
         try:
+            action = "try-restart" if startup_recovery else "restart"
             subprocess.run(
-                cls._NSENTER + ["systemctl", "restart", "orbbec_head.service"],
-                check=True, capture_output=True, text=True, timeout=30)
+                cls._NSENTER + ["systemctl", action, "orbbec_head.service"],
+                check=True, capture_output=True, text=True, timeout=4 if startup_recovery else 30)
             return None
         except Exception as e:
             return str(e)
@@ -1834,6 +1865,8 @@ class ImuPlugin(_JsonSensor):
             "reason": "waiting_for_upstream_imu",
         }
         self._subscriptions = []  # Keep rclpy subscriptions alive for the plugin lifetime.
+        self._pub_thread = None
+        self._publish_lock = threading.RLock()
         self._camera_acceleration = None
         self._camera_acceleration_timestamp_ms = None
         self._camera_angular_velocity = None
@@ -1860,13 +1893,20 @@ class ImuPlugin(_JsonSensor):
         are emitted.
         """
         from sensor_msgs.msg import Imu as RosImu
+        if self._running:
+            return
+        if self._pub_thread is not None:
+            self._pub_thread.join(timeout=1)
+            if self._pub_thread.is_alive():
+                raise RuntimeError('IMU display worker did not stop')
         self._running = True
-        self._subscriptions = [
-            self._sub_node.create_subscription(
-                RosImu, "/ob_camera_head/accel/sample", self._on_camera_accel, _LOW_LAT_QOS),
-            self._sub_node.create_subscription(
-                RosImu, "/ob_camera_head/gyro/sample", self._on_camera_gyro, _LOW_LAT_QOS),
-        ]
+        if not self._subscriptions:
+            self._subscriptions = [
+                self._sub_node.create_subscription(
+                    RosImu, "/ob_camera_head/accel/sample", self._on_camera_accel, _LOW_LAT_QOS),
+                self._sub_node.create_subscription(
+                    RosImu, "/ob_camera_head/gyro/sample", self._on_camera_gyro, _LOW_LAT_QOS),
+            ]
         # Match StatePlugin/force_sensor behaviour: publish a snapshot even
         # while the vendor IMU stream is unavailable, so Agent Core renders a
         # useful card state instead of an empty panel.
@@ -1875,42 +1915,49 @@ class ImuPlugin(_JsonSensor):
         print("[ImuPlugin] subscribed: /ob_camera_head/accel/sample, /ob_camera_head/gyro/sample")
 
     def stop(self):
-        self._running = False
+        with self._publish_lock:
+            self._running = False
+        if self._pub_thread is not None:
+            self._pub_thread.join(timeout=1)
 
     def _publish_camera_imu(self):
         """Publish only the samples actually received from the camera."""
-        if not self._running:
-            return
-        timestamps = [ts for ts in (
-            self._camera_acceleration_timestamp_ms,
-            self._camera_angular_velocity_timestamp_ms,
-        ) if ts is not None]
-        if not timestamps:
-            return
-        payload = {"available": True, "timestamp_ms": max(timestamps)}
-        if self._camera_acceleration is not None:
-            payload["linear_acceleration"] = self._camera_acceleration
-        if self._camera_angular_velocity is not None:
-            payload["angular_velocity"] = self._camera_angular_velocity
-        self._latest = payload
+        with self._publish_lock:
+            if not self._running:
+                return
+            timestamps = [ts for ts in (
+                self._camera_acceleration_timestamp_ms,
+                self._camera_angular_velocity_timestamp_ms,
+            ) if ts is not None]
+            if not timestamps:
+                return
+            payload = {"available": True, "timestamp_ms": max(timestamps)}
+            if self._camera_acceleration is not None:
+                payload["linear_acceleration"] = self._camera_acceleration
+            if self._camera_angular_velocity is not None:
+                payload["angular_velocity"] = self._camera_angular_velocity
+            self._latest = payload
 
-        # The dashboard only needs the latest state.  Bound transport to 30 Hz
-        # so a high-rate IMU cannot congest the domain-42 bridge.
-        now = time.monotonic()
-        if now - self._last_pub < 1.0 / 30.0:
-            return
-        self._last_pub = now
-        out = String()
-        out.data = json.dumps(self._latest)
-        self._pub.publish(out)
+            # The dashboard only needs the latest state.  Bound transport to 30 Hz
+            # so a high-rate IMU cannot congest the domain-42 bridge.
+            now = time.monotonic()
+            if now - self._last_pub < 1.0 / 30.0:
+                return
+            self._last_pub = now
+            out = String()
+            out.data = json.dumps(self._latest)
+            self._pub.publish(out)
 
     def _publish_snapshot_loop(self):
         while self._running:
-            snapshot = dict(self._latest)
-            snapshot["timestamp_ms"] = int(time.time() * 1000)
-            out = String()
-            out.data = json.dumps(snapshot)
-            self._pub.publish(out)
+            with self._publish_lock:
+                if not self._running:
+                    break
+                snapshot = dict(self._latest)
+                snapshot["timestamp_ms"] = int(time.time() * 1000)
+                out = String()
+                out.data = json.dumps(snapshot)
+                self._pub.publish(out)
             time.sleep(0.5)
 
     def _on_camera_accel(self, msg):
@@ -1950,6 +1997,8 @@ class DepthCameraPlugin:
     Cropping, compression, and the synchronous socket-bridge write all run on
     one dedicated worker, never on either ROS executor.
     """
+    _CALIBRATION_WAIT_S = 2.0
+
     def __init__(self, plugin_config, namespace, ros2):
         self._running = False
         # Legacy Navi binds /visual_depth before consulting the ROS graph.
@@ -1963,6 +2012,11 @@ class DepthCameraPlugin:
         self._received_frames = self._invalid_frames = self._stale_frames = 0
         self._coalesced_frames = self._publish_errors = 0
         self._source_geometry = None
+        self._native_intrinsics = {}
+        self._camera_declaration = None
+        self._registration_map = None
+        self._registered_to_color = False
+        self._camera_info_subscriptions = []
         self._latest_image = None
         self._latest_image_lock = threading.Lock()
         self._frame_ready = threading.Condition(self._latest_image_lock)
@@ -2001,7 +2055,7 @@ class DepthCameraPlugin:
                 raise
 
     def _start_stream(self):
-        from sensor_msgs.msg import Image
+        from sensor_msgs.msg import CameraInfo, Image
         import cv2
         import numpy as np
         self._cv2, self._np = cv2, np
@@ -2028,6 +2082,12 @@ class DepthCameraPlugin:
         from sensor_msgs.msg import CompressedImage as _CI
         if self._pub is None:
             self._pub = self._pub_node.create_publisher(_CI, self._topic, latest_qos)
+        if not self._camera_info_subscriptions:
+            for stream in ("depth", "color"):
+                subscription = self._sub_node.create_subscription(
+                    CameraInfo, f"/ob_camera_head/{stream}/camera_info",
+                    lambda msg, kind=stream: self._on_camera_info(kind, msg), ingress_qos)
+                self._camera_info_subscriptions.append(subscription)
         if self._subscription is None:
             self._subscription = self._sub_node.create_subscription(
                 Image, "/ob_camera_head/depth/image_raw", self._on_image, ingress_qos)
@@ -2040,6 +2100,8 @@ class DepthCameraPlugin:
             self._invalid_frames = self._stale_frames = self._coalesced_frames = 0
             self._publish_errors = 0
             self._source_geometry = self._latest_image = None
+            self._camera_declaration = None
+            self._registered_to_color = False
             self._next_publish_due = 0.0
             self._last_transform_ms = self._max_transform_ms = 0.0
             self._last_compress_ms = self._max_compress_ms = 0.0
@@ -2076,6 +2138,13 @@ class DepthCameraPlugin:
                 self._latest_image = None
                 self._next_publish_due = 0.0
                 self._frame_ready.notify_all()
+
+    def _on_camera_info(self, stream, msg):
+        from head_depth_calibration import Intrinsics
+
+        calibration = Intrinsics.from_camera_info(msg)
+        with self._frame_ready:
+            self._native_intrinsics[stream] = calibration
 
     def _on_image(self, msg):
         with self._frame_ready:
@@ -2137,12 +2206,22 @@ class DepthCameraPlugin:
             self._record_stale(generation)
             return
         try:
-            dashboard = self._to_dashboard_depth(msg)
-            if dashboard is None:
+            converted = self._to_dashboard_depth(msg)
+            if converted is None:
                 with self._frame_ready:
                     if generation == self._generation:
                         self._invalid_frames += 1
                 return
+            dashboard, geometry, declaration, registered = converted
+            with self._frame_ready:
+                if not self._running or generation != self._generation:
+                    return
+                # Core snapshots camera_info at start. An aligned stream must
+                # stay in the geometry already supplied to its consumers.
+                if self._registered_to_color and declaration != self._camera_declaration:
+                    self._invalid_frames += 1
+                    self._last_error = "depth calibration changed during streaming"
+                    return
             raw_depth = dashboard.astype("<u2", copy=False).tobytes()
             transformed_at = time.monotonic()
             transform_ms = (transformed_at - started) * 1000
@@ -2176,25 +2255,15 @@ class DepthCameraPlugin:
                 raise ConnectionError("socket bridge did not accept depth frame")
             finished = time.monotonic()
             bridge_ms = (finished - bridge_started) * 1000
-            width, height = int(msg.width), int(msg.height)
-            crop_width, crop_height = width, height
-            if width * 3 > height * 4:
-                crop_width = height * 4 // 3
-            elif width * 3 < height * 4:
-                crop_height = width * 3 // 4
-            geometry = {
-                "width": width, "height": height,
-                "frame_id": str(getattr(msg.header, "frame_id", "")),
-                "encoding": str(msg.encoding),
-                "crop_xywh": [(width - crop_width) // 2, (height - crop_height) // 2,
-                              crop_width, crop_height],
-                "output_size": [640, 480],
-            }
             with self._frame_ready:
                 if not self._running or generation != self._generation:
                     return
                 previous = self._last_published_at if self._forwarded_frames else None
                 self._source_geometry = geometry
+                self._camera_declaration = declaration
+                self._registered_to_color = registered
+                if registered:
+                    self._frame_ready.notify_all()
                 self._last_published_at = finished
                 if self._first_published_at is None:
                     self._first_published_at = finished
@@ -2243,17 +2312,53 @@ class DepthCameraPlugin:
         if raw.size < needed:
             return None
         depth = raw[:needed].reshape(height, step)[:, :width * 2].view(self._np.uint16).reshape(height, width)
-        if width == 640 and height == 480:
-            return depth
-        if width * 3 > height * 4:
-            crop_width = height * 4 // 3
-            left = (width - crop_width) // 2
-            depth = depth[:, left:left + crop_width]
-        elif width * 3 < height * 4:
-            crop_height = width * 3 // 4
-            top = (height - crop_height) // 2
-            depth = depth[top:top + crop_height, :]
-        return self._cv2.resize(depth, (640, 480), interpolation=self._cv2.INTER_NEAREST)
+        from common.camera_info import build
+        from head_depth_calibration import center_crop, color_to_depth_map
+
+        frame_id = str(msg.header.frame_id)
+        crop = center_crop(width, height)
+        left, top, crop_width, crop_height = crop
+        if not crop_width or not crop_height:
+            return None
+        with self._frame_ready:
+            native = self._native_intrinsics.get("depth")
+            color = self._native_intrinsics.get("color")
+        if native is not None and (frame_id, width, height) != (native.frame_id, native.width, native.height):
+            native = None
+        registered = native is not None and color is not None and frame_id == color.frame_id
+        if registered:
+            output_camera = color.cropped((0, 0, color.width, color.height), 640, 480)
+            key = (native, output_camera)
+            if self._registration_map is None or self._registration_map[0] != key:
+                mapping = color_to_depth_map(native, output_camera, self._cv2, self._np)
+                self._registration_map = (key, mapping)
+            depth = self._cv2.remap(depth, self._registration_map[1], None, self._cv2.INTER_NEAREST)
+        else:
+            output_camera = native.cropped(crop, 640, 480) if native is not None else None
+            if (width, height) != (640, 480):
+                depth = depth[top:top + crop_height, left:left + crop_width]
+                interpolation = (self._cv2.INTER_NEAREST_EXACT if output_camera is not None
+                                 else self._cv2.INTER_NEAREST)
+                depth = self._cv2.resize(depth, (640, 480), interpolation=interpolation)
+
+        geometry = {
+            "width": width, "height": height, "frame_id": frame_id, "encoding": str(msg.encoding),
+            "crop_xywh": None if registered else list(crop), "output_size": [640, 480],
+        }
+        declaration = None
+        if output_camera is not None:
+            target = "color" if registered else "depth"
+            declaration = build(
+                topic=self._topic, id=f"x-humanoid/tianyi2.0/head/{target}",
+                format="image/depth-zlib", width=640, height=480, distortion_model="pinhole",
+                K=output_camera.k, D=output_camera.d, source="derived-from-K",
+                measured_on=f"/ob_camera_head/{target}/camera_info",
+                pipeline=["x-humanoid/tianyi2.0/camera_depth"],
+                vendor={"input_topic": "/ob_camera_head/depth/image_raw", "frame_id": frame_id,
+                        "registration_to_color": "registered" if registered else "unknown"},
+            )
+        return depth, geometry, declaration, registered
+
     def dispatch(self, action, args):
         # main.py only invokes start() for the first lazy start in a process.
         # Every later lifecycle transition is delivered here, so handle both
@@ -2262,19 +2367,30 @@ class DepthCameraPlugin:
         if action == "start":
             try:
                 self.start()
+                with self._frame_ready:
+                    generation = self._generation
+                    self._frame_ready.wait_for(
+                        lambda: (self._registered_to_color or not self._running
+                                 or self._generation != generation),
+                        timeout=self._CALIBRATION_WAIT_S)
             except Exception as exc:
                 return {"state": "error", "error": str(exc)}
         elif action == "stop":
             self.stop()
         now = time.monotonic()
         duration = now - self._first_published_at if self._first_published_at is not None else 0
-        geometry = self._source_geometry
+        with self._frame_ready:
+            geometry = self._source_geometry
+            declaration = self._camera_declaration
+            registered = self._registered_to_color
         return {"state": "running" if self._running else "idle",
                 "topic_out": [{"topic": self._topic, "format": "image/depth-zlib"}],
                 "input_topic": "/ob_camera_head/depth/image_raw", "target_hz": self._max_hz,
                 "source_geometry": dict(geometry) if geometry else None,
-                "registration_to_color": "unknown",
-                "registration_note": "输入为厂商原生 depth/image_raw；仅作居中裁剪及缩放，未验证已投影到 RGB 视角。",
+                **({"camera_info": [declaration]} if declaration is not None else {}),
+                "registration_to_color": "registered" if registered else "unknown",
+                "registration_note": ("按同一光学坐标系的厂商深度和 RGB 内参重采样。"
+                                      if registered else "原生深度经居中裁剪及缩放，尚无同坐标系 RGB 配对内参。"),
                 "compression_backend": self._compression_backend,
                 "compression_level": 1,
                 "received_frames": self._received_frames, "published_frames": self._forwarded_frames,
@@ -2313,23 +2429,80 @@ class PointCloudPlugin:
     _format = "sensor/pointcloud"
     def __init__(self, plugin_config, namespace, ros2):
         self._running = False; self._topic = f"/{namespace}/camera/head/points"; self._last = 0.0; self._intrinsics = None
+        # A separate native topic keeps the original Orbbec frame and bytes.
+        # The display output continues to use gravity leveling and floor shift.
+        self._native_topic = f"/{namespace}/camera/head/points_native"
+        self._native_metadata_topic = self._native_topic + "/metadata"
+        self._native_lock = threading.Lock()
+        self._native_last = None
+        self._native_hz = max(0.2, min(float(plugin_config.get("native_hz", 2.0)), 5.0))
+        self._native_max_bytes = max(1024, min(int(plugin_config.get("native_max_bytes", 12_000_000)), 20_000_000))
+        self._native_generation = uuid4().hex
+        self._native_evidence = None
+        self._native_error = None
+        self._native_forwarded = 0
+        self._native_pub = self._native_metadata_pub = None
+        self._subscriptions_registered = False
         self._floor_offset_m = max(-3.0, min(float(plugin_config.get("floor_offset_m", 1.50)), 3.0))
         self._gravity_world = None; self._gravity_lock = threading.Lock()
         self._sub_node = Node("tianyi2_points_sub", context=ros2.ctx_tianyi); self._pub_node = Node("tianyi2_points_pub", context=ros2.ctx_core)
         ros2.executor_tianyi.add_node(self._sub_node); ros2.executor_core.add_node(self._pub_node)
+    def _outputs(self):
+        return [{"topic": self._topic, "format": self._format},
+                {"topic": self._native_topic, "format": "sensor/pointcloud2"}]
+
+    def _native_info(self):
+        from slam_pointcloud import input_declaration
+        with self._native_lock:
+            return {
+                "topic_out": self._outputs(),
+                "input_metadata": [input_declaration(
+                    self._native_topic, self._native_metadata_topic, self._native_evidence)],
+                "native_status": {
+                    "frames_forwarded": self._native_forwarded,
+                    "source_header": self._native_evidence,
+                    "error": self._native_error,
+                    "clock_verified": False,
+                    "extrinsic_verified": False,
+                    "note": "Orbbec header clock semantics and dynamic head mount are unverified",
+                },
+            }
+
     def get_tool(self):
-        return {"name": "camera_pointcloud", "type": "sensor", "description": "天轶2.0 Orbbec 头部彩色点云（限频、限点）", "inputSchema": {"type": "object", "properties": {}}, "topic_out": [{"topic": self._topic, "format": self._format}]}
+        return {"name": "camera_pointcloud", "type": "sensor",
+                "description": "天轶2.0 Orbbec display cloud and bounded raw PointCloud2 (unverified for SLAM)",
+                "inputSchema": {"type": "object", "properties": {}}, **self._native_info()}
+
     def start(self):
-        from sensor_msgs.msg import PointCloud2, Image, CameraInfo, Imu
-        from std_msgs.msg import UInt8MultiArray
-        self._running = True; self._pub = self._pub_node.create_publisher(UInt8MultiArray, self._topic, _LOW_LAT_QOS)
-        self._sub_node.create_subscription(PointCloud2, "/ob_camera_head/depth/points", self._on_cloud, _LOW_LAT_QOS)
-        # Gemini 336 currently has its depth image enabled even when the vendor
-        # point-cloud stream is disabled.  This fallback keeps the card live.
-        self._sub_node.create_subscription(CameraInfo, "/ob_camera_head/depth/camera_info", self._on_info, _RELIABLE_QOS)
-        self._sub_node.create_subscription(Image, "/ob_camera_head/depth/image_raw", self._on_depth, _LOW_LAT_QOS)
-        self._sub_node.create_subscription(Imu, "/ob_camera_head/accel/sample", self._on_accel, _LOW_LAT_QOS)
-    def stop(self): self._running = False
+        with self._native_lock:
+            if self._running:
+                return
+            if not self._subscriptions_registered:
+                from sensor_msgs.msg import PointCloud2, Image, CameraInfo, Imu
+                from std_msgs.msg import UInt8MultiArray
+                latest = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
+                                    history=HistoryPolicy.KEEP_LAST, depth=1,
+                                    durability=DurabilityPolicy.VOLATILE)
+                self._pub = self._pub_node.create_publisher(UInt8MultiArray, self._topic, _LOW_LAT_QOS)
+                self._native_pub = self._pub_node.create_publisher(PointCloud2, self._native_topic, latest)
+                self._native_metadata_pub = self._pub_node.create_publisher(String, self._native_metadata_topic, latest)
+                self._sub_node.create_subscription(PointCloud2, "/ob_camera_head/depth/points", self._on_cloud, _LOW_LAT_QOS)
+                # Gemini 336 currently has its depth image enabled even when the vendor
+                # point-cloud stream is disabled. The display fallback remains unchanged;
+                # it is NOT silently promoted to the native PointCloud2 output.
+                self._sub_node.create_subscription(CameraInfo, "/ob_camera_head/depth/camera_info", self._on_info, _RELIABLE_QOS)
+                self._sub_node.create_subscription(Image, "/ob_camera_head/depth/image_raw", self._on_depth, _LOW_LAT_QOS)
+                self._sub_node.create_subscription(Imu, "/ob_camera_head/accel/sample", self._on_accel, _LOW_LAT_QOS)
+                self._subscriptions_registered = True
+            self._native_last = None
+            self._native_generation = uuid4().hex
+            self._native_evidence = self._native_error = None
+            self._native_forwarded = 0
+            self._running = True
+
+    def stop(self):
+        with self._native_lock:
+            self._running = False
     def _on_accel(self, msg):
         """Estimate display-frame up from the camera's stationary IMU vector."""
         # Optical raw coordinates are (right, down, forward); the renderer's
@@ -2377,8 +2550,39 @@ class PointCloudPlugin:
         wy += floor_offset_m
         # Invert the renderer map above to pack the leveled world point.
         return -wz, wx, -wy
+    def _forward_native(self, msg):
+        """Cross Domain 0 -> 42 while preserving the original PointCloud2.
+
+        Both topics use bounded BEST_EFFORT queues with no cross-topic ordering
+        guarantee. PR371 consumes the numeric cloud independently; this sidecar
+        supplies optional diagnostics, not an admission prerequisite.
+        """
+        with self._native_lock:
+            if not self._running or (self._native_last is not None and
+                    time.monotonic() - self._native_last < 1.0 / self._native_hz):
+                return
+            from slam_pointcloud import native_cloud_evidence, frame_declaration
+            try:
+                evidence = native_cloud_evidence(msg, max_bytes=self._native_max_bytes)
+                # The original msg carries the vendor's frame/fields/stamp/data.
+                # Neither display transform nor receive-time restamp is applied.
+                self._native_pub.publish(msg)
+                sidecar = String(data=json.dumps(
+                    frame_declaration(evidence, self._native_generation),
+                    allow_nan=False))
+                self._native_metadata_pub.publish(sidecar)
+            except (ValueError, TypeError, AttributeError, OverflowError, RuntimeError) as error:
+                self._native_error = str(error)
+                return
+            self._native_last = time.monotonic()
+            self._native_forwarded += 1
+            self._native_evidence = evidence
+            self._native_error = None
+
     def _on_cloud(self, msg):
-        if not self._running or time.monotonic() - self._last < 0.5: return
+        if not self._running: return
+        self._forward_native(msg)
+        if time.monotonic() - self._last < 0.5: return
         fields = {f.name: f.offset for f in msg.fields}
         if not all(k in fields for k in ("x", "y", "z")): return
         self._last = time.monotonic(); raw = bytes(msg.data); count = min(msg.width * msg.height, 10000); gravity = self._gravity_snapshot()
@@ -2411,7 +2615,19 @@ class PointCloudPlugin:
         if not count: return
         from std_msgs.msg import UInt8MultiArray
         out = UInt8MultiArray(); out.data = list(struct.pack("<II", 12, count) + packed); self._pub.publish(out)
-    def dispatch(self, action, args): return {"state": "running" if self._running else "idle", "topic_out": [{"topic": self._topic, "format": self._format}]}
+    def dispatch(self, action, args):
+        if action == 'start':
+            # Bundle dispatcher only calls start() on first activation.
+            # A previously stopped sensor must re-arm on later start actions.
+            if not self._running:
+                self.start()
+        elif action == 'stop':
+            self.stop()
+        elif action == 'info':
+            return {'state': 'running' if self._running else 'idle',
+                    **self._native_info()}
+        return {'state': 'running' if self._running else 'idle',
+                'topic_out': self._outputs()}
 
 
 # ══════════════════════════════════════════════════════════════════════════════

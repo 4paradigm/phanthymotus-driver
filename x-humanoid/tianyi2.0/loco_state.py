@@ -1,7 +1,7 @@
-"""Read-only Tianyi locomotion state from the Slamtec chassis REST API.
+"""Read-only Tianyi telemetry and source-timestamped chassis odometry.
 
 Sources follow the supplied Slamware OpenAPI 1.1.0 document. Odometry uses
-localization/odopose, never the map-localized localization/pose endpoint.
+localization/odopose for telemetry; the SLAM port integrates diagnostic increments.
 """
 
 import copy
@@ -17,7 +17,8 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from std_msgs.msg import String
 
-from common.odom import build_interface, build_sample, mean_twist, resolve_stamp_ms
+from common.odom import build_interface, build_sample, is_fresh, mean_twist, resolve_stamp_ms
+from loco_odometry import OdometrySource, CLOCK_ID, MAX_AGE_NS, UNCERTAINTY_NS
 
 
 class _LocoStateClient:
@@ -310,6 +311,7 @@ class LocoStatePlugin:
         self._odom_interface = build_interface(
             provides=["vx", "vy", "wz"], rate_hz=self._hz,
             pose_drift="unbounded", timing={"stamp_source": "received"})
+        self._odom_interface["slam_pose"] = {"available": True, "profile": "motus_slam/1"}
         self._node = Node("tianyi2_loco_state_pub", context=ros2.ctx_core)
         ros2.executor_core.add_node(self._node)
         qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -329,8 +331,11 @@ class LocoStatePlugin:
         }
         self._slow_timestamps = {}
         self._latest = locomotion_snapshot({}, {})
+        self._slam_sample = {"stamp_ms": None, "pose": None, "vendor": {"motus_slam": {
+            "status": "waiting", "stamp_source": "unknown", "reason": "source not started"}}}
         self._displacement = _DisplacementTracker()
         self._samples = 0
+        self._odometry = OdometrySource(base_url, self._hz, self._publish_odometry)
 
     def get_tool(self):
         return {
@@ -341,7 +346,7 @@ class LocoStatePlugin:
                 "mode/body_height unavailable. "
                 f"Persistent HTTP: pose/speed {self._hz:g}Hz, IMU {self._imu_hz:g}Hz, "
                 f"mileage {self._length_hz:g}Hz to {self._topic}, "
-                f"and the same reading as motus.odom/1 to {self._odom_topic}"),
+                f"and source-timestamped planar SLAM odometry to {self._odom_topic}"),
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._topic, "format": "data/json"},
                           {"topic": self._odom_topic, "format": "state/odom"}],
@@ -359,11 +364,13 @@ class LocoStatePlugin:
                                             name="tianyi-loco-state", daemon=True)
             self._slow_thread.start()
             self._thread.start()
+            self._odometry.start()
 
     def stop(self):
         # Shutdown only. Never clear this event while the old worker is alive.
         with self._lifecycle_lock:
             self._stop_event.set()
+            self._odometry.stop()
             if self._thread is not None:
                 self._thread.join(timeout=self._timeout + 1)
             if self._slow_thread is not None:
@@ -425,13 +432,38 @@ class LocoStatePlugin:
             with self._lock:
                 self._latest = snapshot
                 self._samples += 1
+                self._publish_odom_locked()
             out = String()
             out.data = json.dumps(snapshot, allow_nan=False)
             self._pub.publish(out)
-            odom = String()
-            odom.data = json.dumps(odometry_sample(snapshot), allow_nan=False)
-            self._odom_pub.publish(odom)
             self._stop_event.wait(max(0, 1 / self._hz - (time.monotonic() - started)))
+
+    def _publish_odometry(self, sample):
+        with self._lock:
+            self._slam_sample = copy.deepcopy(sample)
+            self._publish_odom_locked()
+
+    def _publish_odom_locked(self):
+        # Control feedback retains its REST receive time even while diagnostic
+        # timing is lost. Pose has its own diagnostic measurement time; neither
+        # REST pose nor receive time can substitute for it.
+        sample = odometry_sample(self._latest)
+        sample["stamp_ms"] = self._latest["sample_timestamps_ms"].get("speed")
+        if not is_fresh(sample, int(time.time() * 1000), MAX_AGE_NS // 1_000_000):
+            sample["twist"] = [None] * 6
+            sample["vendor"]["samples"] = 0
+        sample["pose"] = copy.deepcopy(self._slam_sample["pose"])
+        if sample["pose"] is not None:
+            sample["pose"]["stamp_ms"] = self._slam_sample["stamp_ms"]
+        quality = copy.deepcopy(self._slam_sample["vendor"]["motus_slam"])
+        if sample["pose"] is not None:
+            # Preserve precise source time and make old top-level-only SLAM
+            # decoders reject a packet whose twist and pose times differ.
+            quality["stamp_ns"] = quality["measurement"]["stamp_ns"]
+        sample["vendor"]["motus_slam"] = quality
+        message = String()
+        message.data = json.dumps(sample, allow_nan=False)
+        self._odom_pub.publish(message)
 
     def dispatch(self, action, args):
         if action == "stop":
@@ -457,11 +489,16 @@ class LocoStatePlugin:
             return {"state": state,
                     "topic_out": self.get_tool()["topic_out"],
                     "odom_interface": copy.deepcopy(self._odom_interface),
+                    "slam_odometry": {**self._odometry.info(), "clock_id": CLOCK_ID,
+                                      "synchronization": "bounded_software",
+                                      "clock_mapping_budget_ms": UNCERTAINTY_NS // 1_000_000},
                     "available": latest["available"], "samples": samples,
                     "sampling": {"pose_speed_hz": self._hz,
                                  "imu_hz": self._imu_hz,
                                  "length_hz": self._length_hz,
-                                 "transport": "persistent_http"},
+                                 "transport": "persistent_http",
+                                 "slam_odometry_transport": "diagnostic_tcp",
+                                 "slam_odometry_publish_hz": self._hz},
                     "last_sample_ago_ms": int(time.time() * 1000) - stamp if stamp else None,
                     "errors": latest["errors"]}
         return None

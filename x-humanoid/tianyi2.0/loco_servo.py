@@ -18,11 +18,11 @@ from slamtec_velocity import (ChassisBusy, CommandLeaseExpired,
 
 INPUT_TOPIC = "/actucore/navi/cmd"
 WATCHDOG_MS = 500
-MAX_OBS_AGE_MS = 600
+MAX_OBS_AGE_MS = 1200
 CANCEL_AFTER_MS = 1000
 FOLLOW_KEYS = ("wz_limit",)
 SPEED_PRESETS = {"slow": 0.15, "normal": 0.30, "fast": 0.50}
-FOOTPRINT_HALF_WIDTH_M = 0.39  # Conservative envelope; measured width is 0.55 m.
+FOOTPRINT_HALF_WIDTH_M = 0.30  # Conservative envelope for the measured 0.55 m full width.
 TOGGLES = {"dry_run": True, "rotate_only": False, "require_standing": False}
 CONFIG_KEYS = (*TOGGLES, "speed_preset", "min_vx",
                "linear_acceleration", "angular_acceleration", *FOLLOW_KEYS)
@@ -159,6 +159,16 @@ def _validated_wz_limit(value, max_wz):
     return float(value)
 
 
+def _start_input_topic(args):
+    topic = args.get("input_topic")
+    if not topic:
+        topics = args.get("input_topics")
+        topic = topics[0] if isinstance(topics, list) and topics else INPUT_TOPIC
+    if not isinstance(topic, str) or not topic.strip().startswith("/"):
+        raise ValueError("input_topic must be an absolute ROS topic")
+    return topic.strip()
+
+
 def _validated_speed_preset(value, max_vx):
     choices = ", ".join(SPEED_PRESETS)
     if not isinstance(value, str) or value not in SPEED_PRESETS:
@@ -206,8 +216,7 @@ def build_descriptor(hz=10.0, max_vx=0.3, max_wz=1.0, min_vx=0.0,
                  "watchdog_ms": WATCHDOG_MS, "max_obs_age_ms": MAX_OBS_AGE_MS,
                  "cancel_after_ms": CANCEL_AFTER_MS},
         "force_torque": None,
-        # Conservative static envelope for the normal navigation posture.
-        # Navi adds its own separate dynamic clearance margin.
+        # Conservative width in the normal navigation posture. Navi adds clearance.
         "footprint": {"half_width": FOOTPRINT_HALF_WIDTH_M,
                       "source": "estimate"},
     }
@@ -436,14 +445,12 @@ class LocoServoPlugin:
     def _start(self, args):
         if self._closing:
             return {"state": "error", "error": "previous control worker is stopping; retry stop before restart"}
-        topic = args.get("input_topic")
-        if not topic:
-            topics = args.get("input_topics")
-            topic = topics[0] if isinstance(topics, list) and topics else INPUT_TOPIC
-        if not isinstance(topic, str) or not topic.strip().startswith("/"):
-            return {"state": "error", "error": "input_topic must be an absolute ROS topic"}
+        try:
+            topic = _start_input_topic(args)
+        except ValueError as exc:
+            return {"state": "error", "error": str(exc)}
         if self._running:
-            if self._input_topic != topic.strip():
+            if self._input_topic != topic:
                 return {"state": "error", "error": "stop before changing input_topic"}
             if any(key in args for key in CONFIG_KEYS):
                 result = self._configure(args)
@@ -463,7 +470,7 @@ class LocoServoPlugin:
         self._generation += 1
         generation = self._generation
         self._yielded = False
-        self._input_topic = topic.strip()
+        self._input_topic = topic
         self._barrier_ms = int(time.time() * 1000)
         self._sink = ControlSink(self._parsed_descriptor, self._apply,
                                  on_watchdog=self._soft_hold, on_abort=self._soft_hold)

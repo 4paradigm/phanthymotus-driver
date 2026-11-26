@@ -19,6 +19,8 @@ sys.path.insert(0, sys.argv[2])
 core = types.ModuleType("loco_servo")
 core.TOGGLES = ()
 core.CONFIG_KEYS = ()
+core._start_input_topic = lambda args: "/actucore/navi/cmd"
+core._step_limits = lambda *args: ()
 core._validated_min_vx = lambda value, limit: value
 core._validated_speed_preset = lambda value, limit: (value, limit)
 core.LocoServoPlugin = type("Core", (), {})

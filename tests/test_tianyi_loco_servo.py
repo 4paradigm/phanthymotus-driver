@@ -200,7 +200,13 @@ def setup(monkeypatch):
         plugins.append(plugin)
         return plugin
 
-    yield types.SimpleNamespace(module=module, clock=clock, ros=ros, create=create,
+    def bundle_servo(*args, slamtec_client, **kwargs):
+        assert slamtec_client is None
+        return module.LocoServoPlugin(*args, **kwargs)
+
+    bundle_module = types.SimpleNamespace(LocoServoPlugin=bundle_servo)
+    yield types.SimpleNamespace(module=module, bundle_module=bundle_module,
+                                clock=clock, ros=ros, create=create,
                                 launch_controller=lambda plugin: launch_controller(plugin, plugin._generation))
     for plugin in plugins:
         plugin.stop()
@@ -253,7 +259,7 @@ def test_startup_is_inert_and_domain_routing_is_correct(setup):
 
 def test_declared_footprint_is_reported_and_survives_live_reconfiguration(setup):
     descriptor = setup.module.build_descriptor()
-    assert descriptor["footprint"] == {"half_width": 0.39,
+    assert descriptor["footprint"] == {"half_width": 0.30,
                                        "source": "estimate"}
 
     plugin = start(setup)
@@ -723,6 +729,17 @@ def test_timing_separates_input_ttl_age_from_receipt_watchdog_budget(setup):
     assert timing["execution_deadline_basis"] == "receive_watchdog"
     assert timing["receive_watchdog_ms"] == 500
     assert plugin._backend.deadlines[-1] == pytest.approx(original["stamp_ms"] + 90 + 500, abs=1)
+
+
+@pytest.mark.parametrize("age_ms,accepted", [(830, True), (1200, True), (1201, False)])
+def test_tianyi_navigation_enforces_observation_age_limit(setup, age_ms, accepted):
+    plugin = start(setup)
+    now = int(setup.clock.time() * 1000)
+    send(plugin, command(setup, obs_stamp_ms=now - age_ms))
+    assert bool(plugin._counts["accepted"]) is accepted
+    rate = plugin._info()["control_interface"]["rate"]
+    assert rate["max_obs_age_ms"] == 1200
+    assert "max_feedback_gap_ms" not in rate
 
 
 def test_zero_is_prioritized_and_cannot_be_overwritten_by_a_later_motion(setup):
@@ -1287,7 +1304,7 @@ def load_bundle():
 
 
 def test_bundle_requires_manual_pause_before_explicit_motion_and_cancel_before_resume(setup, monkeypatch):
-    monkeypatch.setitem(sys.modules, "loco_servo_process", setup.module)
+    monkeypatch.setitem(sys.modules, "loco_servo_process", setup.bundle_module)
     bundle = load_bundle()({"plugins": {"loco_servo": {"enabled": True, "dry_run": False}}}, "ubuntu", setup.ros, None)
     class Nav:
         def start(self):
@@ -1362,7 +1379,7 @@ def test_custom_input_and_idempotent_start_keep_one_subscription(setup):
 
 
 def test_unknown_tool_cannot_steal_base_ownership(setup, monkeypatch):
-    monkeypatch.setitem(sys.modules, "loco_servo_process", setup.module)
+    monkeypatch.setitem(sys.modules, "loco_servo_process", setup.bundle_module)
     bundle = load_bundle()({"plugins": {"loco_servo": {"enabled": True, "dry_run": False}}}, "ubuntu", setup.ros, None)
     bundle.start_all()
     try:
@@ -1602,7 +1619,7 @@ def test_unconfirmed_stop_refuses_stop_resume_config_and_handover(setup):
 
 
 def test_bundle_does_not_start_other_motion_when_sdk_stop_fails(setup, monkeypatch):
-    monkeypatch.setitem(sys.modules, "loco_servo_process", setup.module)
+    monkeypatch.setitem(sys.modules, "loco_servo_process", setup.bundle_module)
     bundle = load_bundle()({"plugins": {"loco_servo": {"enabled": True, "dry_run": False}}}, "ubuntu", setup.ros, None)
     calls = []
     class Home:

@@ -172,6 +172,14 @@ class SlamtecClient:
         """获取定位质量"""
         return self._get("/api/core/slam/v1/localization/quality")
 
+    def get_localization_enabled(self) -> dict:
+        """读取底盘地图定位开关。"""
+        return self._get("/api/core/slam/v1/localization/:enable")
+
+    def set_localization_enabled(self, enabled: bool) -> dict:
+        """控制底盘地图定位开关。"""
+        return self._put("/api/core/slam/v1/localization/:enable", {"enable": enabled})
+
     # ── Motion ────────────────────────────────────────────────────────────────
 
     def get_current_action(self) -> dict:
@@ -391,12 +399,13 @@ class SlamtecClient:
 
     # ── Navigation Status ──────────────────────────────────────────────────────
 
-    def get_nav_status(self) -> dict:
+    def get_nav_status(self, *, strict: bool = False) -> dict:
         """获取当前导航/运动动作状态。
 
         API 返回 ActionInfo: {action_id, action_name, stage, state: {status, result, reason}}
         本方法将 state 展开到顶层，返回 {action_state, result, reason, action_id, ...}，
         action_state=-1 表示无活跃action（区别于HTTP错误）。
+        strict=True 时，无法解析的非空响应返回错误，供底盘接管预检使用。
         """
         url = f"{self._base}/api/core/motion/v1/actions/:current"
         req = urllib.request.Request(url, method="GET")
@@ -407,9 +416,11 @@ class SlamtecClient:
                     return {"action_state": -1}
                 try:
                     result = json.loads(body)
-                except (json.JSONDecodeError, ValueError):
-                    return {"action_state": -1}
+                except ValueError:
+                    result = None
                 if not isinstance(result, dict):
+                    if strict:
+                        return {"error": "invalid current action response"}
                     return {"action_state": -1}
                 # Unwrap nested state: {state: {status, result, reason}} → flat top-level
                 state = result.pop("state", None)
