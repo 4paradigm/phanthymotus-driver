@@ -902,6 +902,30 @@ private config and rollback record remain under
 `~/.motus/navfn-validation-20261125/` on the chassis. No persistent planner
 override has been installed, and motion validation of the fallback is pending.
 
+On 2026-11-27 the MCR optimizer failed again during the reported P1 request
+(02:22:20); the LQR process respawned and the driver could not confirm the new
+path. The driver now detects a changed LQR URI/PID during path confirmation and
+reports the specific failure. `load_map` also reports an error completion when
+localization remains unconfirmed, retaining its detailed result in
+`info.last_map_localization`. Relocalization uses the chassis-local software
+hold and fresh odometry; `/enable_control_state` belongs to the other ROS master.
+Its TF listener waits for a scan covered by its actual timestamp history.
+
+A blocked native submission must not delay the physical stop request. Stop now
+requests an independent chassis hold before waiting for submission ordering.
+A chassis-local stop generation prevents an older navigation/preparation helper
+from subsequently releasing that hold. Cancellation and stationary confirmation
+are still required before clearing the unresolved-task record; a zero command
+on the upper-MPC route cannot cancel a native tracker on another mux input.
+
+The current vendor binaries still need investigation: a held Navfn `GetPlan`
+diagnostic blocked in `GlobalPlannerService::makePlanServiceCallback()` calling
+`makePlan()` on the same mutex; tracker pause/cancel replies also did not always
+produce the requested runtime state. Small navigation trials did not pass the
+complete acceptance/arrival/stop checks. These changes must not be described as
+a verified end-to-end navigation fix, and no automatic planner replacement or
+unconditional stop release is installed by the driver.
+
 ### 2026-11-20 camera/navi geometry verification
 
 Compared the shared camera/control contracts with Bumi, Tianyi 2.0, R1 and the

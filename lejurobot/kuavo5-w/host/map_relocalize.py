@@ -14,6 +14,28 @@ def separation(a, b):
     return math.hypot(a[0]-b[0], a[1]-b[1]), abs(math.remainder(a[2]-b[2], math.tau))
 
 
+def stationary_hold(chassis, odom, now):
+    """Chassis-local hold; upper enable_control_state lives on another master."""
+    twist = odom.twist.twist
+    values = (twist.linear.x, twist.linear.y, twist.angular.z)
+    return (chassis.soft_estop is True
+            and 0 <= now-odom.header.stamp.to_sec() <= .5
+            and all(math.isfinite(v) and abs(v) < .01 for v in values))
+
+
+def scan_with_transform(read_scan, transform, errors):
+    # A new TF listener may not yet cover the first buffered laser frame.
+    # Wait for a newer scan rather than substituting a transform at another time.
+    deadline = time.monotonic() + 3.
+    while time.monotonic() < deadline:
+        scan = read_scan()
+        try:
+            return scan, transform('base_link', scan.header.frame_id, scan.header.stamp)
+        except errors:
+            continue
+    return None, None
+
+
 def estimate(score, anchor, current):
     """Search only around the saved starting pose. Keep a good live pose."""
     if score(current) >= .8:
@@ -47,7 +69,6 @@ def main(request):
     from jaten_msgs.msg import RobotChassisState
     from nav_msgs.msg import OccupancyGrid, Odometry
     from sensor_msgs.msg import LaserScan
-    from std_msgs.msg import Bool
 
     rospy.init_node('motus_map_relocalize', anonymous=True, disable_signals=True, disable_rosout=True)
     transforms = tf2_ros.Buffer()
@@ -58,28 +79,26 @@ def main(request):
         return transform.translation.x, transform.translation.y, yaw(transform.rotation)
 
     def stopped():
-        if rospy.wait_for_message('/enable_control_state', Bool, timeout=1).data:
-            return False
         chassis = rospy.wait_for_message('/jaten_behavior_manager/robot_state', RobotChassisState, timeout=1)
-        if not chassis.soft_estop:
-            return False
         odom = rospy.wait_for_message('/odom_encoder', Odometry, timeout=1)
-        twist = odom.twist.twist
-        return (0 <= time.time()-odom.header.stamp.to_sec() <= .5
-                and max(abs(twist.linear.x), abs(twist.linear.y), abs(twist.angular.z)) < .01)
+        return stationary_hold(chassis, odom, time.time())
 
     if not stopped():
         return {'state': 'stationary_pause_required'}
 
     anchor = tuple(request['args']['anchor'][key] for key in ('x', 'y', 'yaw'))
     grid = rospy.wait_for_message('/map', OccupancyGrid, timeout=2)
-    scan = rospy.wait_for_message('/scan', LaserScan, timeout=2)
+    scan, mounting = scan_with_transform(
+        lambda: rospy.wait_for_message('/scan', LaserScan, timeout=1), transform,
+        (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException))
+    if scan is None:
+        return {'state': 'scan_transform_unavailable'}
     info = grid.info
     if (grid.header.frame_id != 'map' or not .02 <= info.resolution <= .1
             or not 0 < len(grid.data) == info.width*info.height <= 2_000_000
             or not 0 <= (rospy.Time.now()-scan.header.stamp).to_sec() <= .5):
         return {'state': 'invalid_map_or_scan'}
-    lx, ly, angle = transform('base_link', scan.header.frame_id, scan.header.stamp)
+    lx, ly, angle = mounting
     beams = []
     for i in range(0, len(scan.ranges), max(1, len(scan.ranges)//240)):
         radius = scan.ranges[i]

@@ -740,6 +740,7 @@ class ControlledSpatialPlugin:
                     'factory_maps': '/home/jt/jmap_config/jmaps',
                     'archive': self.archive.snapshot() if self.archive else {'state': 'disabled'}}
                 result['last_map_operation'] = self.store.state('last_map_operation')
+                result['last_map_localization'] = self.store.state('last_map_localization')
                 result['last_preparation_recovery'] = self.store.state('last_preparation_recovery')
                 result['last_preparation_failure'] = self.store.state('last_preparation_failure')
                 if self._map_pending and self._map_pending.get('stage_started_at'):
@@ -888,7 +889,11 @@ class ControlledSpatialPlugin:
                         if stage in ('hold_and_cancel', 'pause_old_tracker', 'mux_handoff',
                                      'goal_submit', 'confirm_new_path', 'resume_new_tracker', 'confirm_mux_handoff',
                                      'release_software_stop', 'validate_runtime'):
-                            raise RuntimeError('native_navigation_failed_at_' + stage)
+                            detail = response.get('error_code')
+                            known = {'native_navigation_tracker_restarted', 'native_navigation_tracker_unavailable',
+                                     'native_tracker_target_unconfirmed'}
+                            raise RuntimeError('native_navigation_failed_at_' + stage
+                                               + (': ' + detail if detail in known else ''))
                         raise RuntimeError('native_navigation_goal_rejected')
                     task_id = response.get('task_id')
                     if response.get('success') is not True or not isinstance(task_id, str) or not task_id or len(task_id) > 160:
@@ -986,6 +991,15 @@ class ControlledSpatialPlugin:
             self._persist()
         if self._map_pending is not None:
             raise RuntimeError('map_transition_unconfirmed_inspect_info')
+        # Do not queue the physical hold behind a slow native SUBMIT. This
+        # separate chassis RPC also invalidates the submit's final-release epoch.
+        if not self._native_lock.acquire(blocking=False):
+            held = self.client.native('manual_hold')
+            if (held.get('success') is not True or held.get('stationary') is not True
+                    or held.get('software_estop') is not True):
+                raise RuntimeError('chassis_immediate_hold_unconfirmed')
+        else:
+            self._native_lock.release()
         with self._native_lock:
             if self._preparation is not None:
                 uncertain = self._preparation['delivery_uncertain']
@@ -1411,7 +1425,8 @@ class ControlledSpatialPlugin:
                     result = self._mutate_map(action, args, mapping, cancelled)
                 if cancelled.is_set() and action != 'delete_map':
                     raise RuntimeError('map_operation_interrupted')
-                timing.update(state='completed', elapsed_s=time.monotonic()-started)
+                completion = 'error' if result.get('localization_required') is True else 'completed'
+                timing.update(state=completion, elapsed_s=time.monotonic()-started)
                 self.store.state('last_map_operation', timing)
                 result['timing'] = dict(timing)
                 with self.bundle.tracker.lock:
@@ -1425,7 +1440,7 @@ class ControlledSpatialPlugin:
                     self._persist()
                 if self.archive is not None:
                     self.archive.schedule()
-                self.bundle.tracker.finish('base', aid, self.PREFIX, 'completed', result)
+                self.bundle.tracker.finish('base', aid, self.PREFIX, completion, result)
             except Exception as exc:
                 error_code = map_failure_code(exc)
                 timing.update(state='error', elapsed_s=time.monotonic()-started,
@@ -1635,7 +1650,9 @@ class ControlledSpatialPlugin:
                 if (correction.get('state') not in ('corrected', 'already_aligned')
                         or self.store.state('unconfirmed:' + self.store.anchor_key(identity))):
                     localization.update(state='unconfirmed', reason='anchor_relocalization_not_verified')
-            return {'state': 'completed', 'map_name': name,
+            self.store.state('last_map_localization', {'map_name': name,
+                'map_fingerprint': identity[1], 'at': time.time(), **localization})
+            return {'state': 'completed' if localization['state'] == 'initialized' else 'error', 'map_name': name,
                     'localization_required': localization['state'] != 'initialized',
                     'localization': localization, 'feedback': feedback}
         raise ValueError('unsupported_map_action')

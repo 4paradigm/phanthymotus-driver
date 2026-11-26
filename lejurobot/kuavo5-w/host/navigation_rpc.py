@@ -15,6 +15,45 @@ import base64
 import fcntl
 import shutil
 import urllib.request
+from contextlib import contextmanager
+import stat
+
+STOP_EPOCH_PATH = '/tmp/motus-kuavo-native-stop-epoch'
+
+
+@contextmanager
+def stop_epoch_file(exclusive=False):
+    fd = os.open(STOP_EPOCH_PATH, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise RuntimeError('native_navigation_stop_epoch_insecure')
+        fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        with os.fdopen(fd, 'r+', closefd=False) as stream:
+            yield stream
+    finally:
+        os.close(fd)
+
+
+def stop_epoch(advance=False):
+    with stop_epoch_file(advance) as stream:
+        value = int(stream.read() or '0')
+        if advance:
+            value += 1
+            stream.seek(0)
+            stream.write(str(value))
+            stream.truncate()
+            stream.flush()
+        return value
+
+
+def guarded_navigation_release(expected_epoch, release):
+    # A stop increments under an exclusive lock before dispatching its hold.
+    # It either prevents this release, or follows an already-started release.
+    with stop_epoch_file() as stream:
+        if int(stream.read() or '0') != expected_epoch:
+            raise RuntimeError('native_navigation_superseded_by_stop')
+        return release()
 
 
 def map_archive_read(operation, args, root=Path('/home/jt/jmap_config/jmaps')):
@@ -433,11 +472,33 @@ def confirm_software_stop(rospy, expected, require_healthy=False):
     raise RuntimeError('chassis_software_stop_feedback_unconfirmed')
 
 
-def confirm_tracker_target(rospy, target):
+def tracker_process_identity():
+    """A respawned LQR process cannot confirm the previous goal's path."""
+    import rosgraph
+    import xmlrpc.client
+    class BoundedTransport(xmlrpc.client.Transport):
+        def make_connection(self, host):
+            connection = super().make_connection(host)
+            connection.timeout = 1.
+            return connection
+    try:
+        uri = rosgraph.Master('/motus_navigation_rpc').lookupNode('/lqr_path_track')
+        with xmlrpc.client.ServerProxy(uri, transport=BoundedTransport()) as proxy:
+            code, _, pid = proxy.getPid('/motus_navigation_rpc')
+        if code != 1 or type(pid) is not int or pid <= 0:
+            raise ValueError('invalid_pid')
+        return uri, pid
+    except Exception:
+        raise RuntimeError('native_navigation_tracker_unavailable') from None
+
+
+def confirm_tracker_target(rospy, target, expected_process=None):
     """Do not release a paused old path merely because a goal was queued."""
     from nav_msgs.msg import Path as RosPath
     end, since, count = time.monotonic() + 6., None, 0
     while time.monotonic() < end:
+        if expected_process is not None and tracker_process_identity() != expected_process:
+            raise RuntimeError('native_navigation_tracker_restarted')
         try:
             path = rospy.wait_for_message('/lqr_path_track/tracking_path', RosPath,
                                           timeout=min(1., max(.01, end - time.monotonic())))
@@ -446,6 +507,8 @@ def confirm_tracker_target(rospy, target):
             # Keep the stop asserted for the complete bounded confirmation window.
             since, count = None, 0
             continue
+        if expected_process is not None and tracker_process_identity() != expected_process:
+            raise RuntimeError('native_navigation_tracker_restarted')
         if not tracker_live_message(path) or path.header.frame_id.strip('/') != 'map' or not path.poses:
             continue
         point = path.poses[-1].pose.position
@@ -774,6 +837,8 @@ def main(request):
     types = {'navigate': MoveToTarget, 'check': CheckArrived, 'cancel': SetDispatchMode}
     operation = request['operation']
     args = request.get('args', {})
+    if operation in ('soft_stop', 'manual_hold', 'cancel'):
+        stop_epoch(advance=True)
     # Verify the native cancellation and submission really have one owner.
     services = dict(rosgraph.Master('/motus_navigation_rpc').getSystemState()[2])
     owners = [services.get(name, []) for name in names.values()]
@@ -790,6 +855,7 @@ def main(request):
     if operation == 'probe':
         return {'owner': owners[0][0], 'services': names}
     if operation in ('prepare', 'remote_ready', 'upper_handoff', 'soft_stop', 'manual_hold'):
+        preparation_epoch = stop_epoch()
         from jaten_msgs.msg import RobotChassisState
         proxy = rospy.ServiceProxy(names['cancel'], types['cancel'])
         def state():
@@ -848,7 +914,7 @@ def main(request):
                 guard()  # state() can block; do not release on an older neutral check.
             if released:
                 request['_preparation_stage'] = 'release_software_stop'
-                command(1)
+                guarded_navigation_release(preparation_epoch, lambda: command(1))
             request['_preparation_stage'] = 'confirm_release_state'
             end = time.monotonic() + 3.
             while time.monotonic() < end:
@@ -880,6 +946,7 @@ def main(request):
         raise ValueError('unsupported_navigation_operation')
     proxy = rospy.ServiceProxy(names[operation], types[operation])
     if operation == 'navigate':
+        navigation_epoch = stop_epoch()
         # The upper controller's velocity switch and the chassis dispatcher
         # have independent ownership state. STATUS_IDLE gives the dispatcher
         # control without changing the chassis AUTO mode or its safety limits.
@@ -917,6 +984,7 @@ def main(request):
             request['_navigation_stage'] = 'mux_handoff'
             select_navigation_source(rospy)
             request['_navigation_stage'] = 'goal_submit'
+            planner_process = tracker_process_identity()
             request['_goal_submitted'] = True
             response = mutate(lambda: proxy(x=args['x'], y=args['y'], theta=args['yaw'], options=options))
             if not response.success:
@@ -924,7 +992,7 @@ def main(request):
             if not getattr(response, 'task_id', ''):
                 raise RuntimeError('native_navigation_task_id_missing')
             request['_navigation_stage'] = 'confirm_new_path'
-            confirm_tracker_target(rospy, args)
+            confirm_tracker_target(rospy, args, planner_process)
             request['_navigation_stage'] = 'resume_new_tracker'
             tracker_command(rospy, 4, request)
             # Goal submission can itself change ownership on factory images.
@@ -932,7 +1000,8 @@ def main(request):
             select_navigation_source(rospy)
             request['_navigation_stage'] = 'release_software_stop'
             confirm_software_stop(rospy, True, require_healthy=True)
-            if not mutate(lambda: dispatch(control_mode=1)).success:
+            if not guarded_navigation_release(navigation_epoch,
+                    lambda: mutate(lambda: dispatch(control_mode=1))).success:
                 raise RuntimeError('native_navigation_release_rejected')
             confirm_software_stop(rospy, False, require_healthy=True)
         except Exception:

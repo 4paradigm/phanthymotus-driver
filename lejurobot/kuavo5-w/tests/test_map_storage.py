@@ -234,7 +234,7 @@ class LoadEfficiencyTests(unittest.TestCase):
             self.client.commands.clear()
             if changed=='identity':self.client.identity=('factory','changed-grid')
             else:self.client.feedback['state']['agvPosition']['positionInitialized']=False
-            self.assertEqual(self.load()[0],'completed')
+            self.assertEqual(self.load()[0], 'completed' if changed == 'identity' else 'error')
             self.assertIn(('ChangeCartoMap',{'mapName':'factory'}),self.client.commands)
 
     def test_redundant_mode_command_is_skipped_only_with_fresh_feedback(self):

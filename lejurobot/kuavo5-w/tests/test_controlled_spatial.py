@@ -449,7 +449,7 @@ class SpatialTests(unittest.TestCase):
         self.assertEqual(stops[0]['state'], 'paused')
         self.assertTrue(self.client.feedback['agvState']['softwareEstop'])
         self.assertFalse(self.plugin.unresolved())
-        self.assertEqual([c[0] for c in self.client.calls], ['prepare', 'soft_stop'])
+        self.assertEqual([c[0] for c in self.client.calls], ['manual_hold', 'prepare', 'soft_stop'])
 
     def test_arrival_uses_exact_native_task_id(self):
         result = self.navigate()
@@ -629,6 +629,7 @@ class SpatialTests(unittest.TestCase):
         thread.start()
         time.sleep(.05)
         self.assertFalse(result)
+        self.assertTrue(any(c[0] == 'manual_hold' for c in self.client.calls))
         self.assertFalse(any(c[0] == 'cancel' for c in self.client.calls))
         release.set()
         thread.join(2)
@@ -737,7 +738,7 @@ class SpatialTests(unittest.TestCase):
         self.client.feedback['state']['agvPosition']['positionInitialized'] = False
         self.assertEqual(self.call('load_map', map_name='other')['state'], 'executing')
         status, result = self.completed()
-        self.assertEqual(status, 'completed')
+        self.assertEqual(status, 'error')
         self.assertTrue(result['localization_required'])
         self.assertEqual(result['localization']['state'], 'unconfirmed')
         self.assertTrue(self.client.feedback['agvState']['softwareEstop'])
@@ -802,8 +803,13 @@ class SpatialTests(unittest.TestCase):
         self.client.native = lambda op, **args: (
             {'state': 'no_distinct_anchor_match'} if op == 'relocalize' else native(op, **args))
         self.assertEqual(self.call('load_map', map_name='other')['state'], 'executing')
-        _, result = self.completed()
+        status, result = self.completed()
+        self.assertEqual(status, 'error')
+        self.assertEqual(result['state'], 'error')
         self.assertTrue(result['localization_required'])
+        saved = self.plugin.store.state('last_map_localization')
+        self.assertEqual(saved['anchor']['state'], 'no_distinct_anchor_match')
+        self.assertIsNone(self.plugin._map_pending)
         self.assertIn('map_relocalization_unconfirmed', self.navigate()['error'])
 
     def test_loading_waits_for_mode_feedback_after_command_ack(self):
@@ -1363,6 +1369,9 @@ class NativePreparationTests(unittest.TestCase):
                       Path(__file__).resolve().parents[1] / 'host/navigation_rpc.py')
         self.module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.module)
+        epoch_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(epoch_dir.cleanup)
+        self.module.STOP_EPOCH_PATH = str(Path(epoch_dir.name)/'stop-epoch')
         self.state = types.SimpleNamespace(estop=False, bumper=False, driver_error=False, soft_estop=True)
         self.events, self.reject, self.fail_after_release = [], None, False
         classes = {name: type(name, (), {'_type': 'leju_mobile_base_msgs/' + name, '_md5sum': name})
@@ -1419,6 +1428,8 @@ class NativePreparationTests(unittest.TestCase):
         self.path_feedback_patch = patch.object(self.module, 'confirm_tracker_target',
                                                 side_effect=lambda *a: self.events.append('new_path'))
         self.path_feedback_patch.start(); self.addCleanup(self.path_feedback_patch.stop)
+        self.process_patch = patch.object(self.module, 'tracker_process_identity', return_value=('http://lqr', 123))
+        self.process_patch.start(); self.addCleanup(self.process_patch.stop)
 
     def call(self, operation='prepare'):
         return self.module.main({'master': 'http://test:11311', 'ros_ip': '127.0.0.1', 'operation': operation})
@@ -1453,6 +1464,39 @@ class NativePreparationTests(unittest.TestCase):
             self.assertTrue(response['ok'])
             self.assertFalse(response['result']['success'])
             self.assertIs(response['result']['delivery_uncertain'], uncertain)
+
+    def test_planner_restart_keeps_stop_and_never_resumes_replacement_process(self):
+        self.path_feedback_patch.stop()
+        with patch.object(self.module, 'confirm_tracker_target',
+                          side_effect=RuntimeError('native_navigation_tracker_restarted')):
+            request = {'master': 'http://test:11311', 'ros_ip': '127.0.0.1', 'operation': 'navigate',
+                       'args': {'x': 1., 'y': 2., 'yaw': .3, 'speed': .2}}
+            with self.assertRaisesRegex(RuntimeError, 'native_navigation_tracker_restarted'):
+                self.module.main(request)
+        self.assertNotIn(1, self.events)
+        self.assertNotIn(('tracker', 4), self.events)
+        self.assertEqual(self.events[-1], 0)
+        self.assertTrue(self.state.soft_estop)
+
+    def test_target_confirmation_rejects_process_change_before_accepting_path(self):
+        self.path_feedback_patch.stop()
+        self.process_patch.stop()
+        nav = types.SimpleNamespace(Path=object)
+        with patch.dict(sys.modules, {'nav_msgs.msg': nav}), \
+                patch.object(self.module, 'tracker_process_identity', return_value=('http://new-lqr', 456)):
+            with self.assertRaisesRegex(RuntimeError, 'native_navigation_tracker_restarted'):
+                self.module.confirm_tracker_target(sys.modules['rospy'],
+                    {'x': 1., 'y': 2.}, ('http://old-lqr', 123))
+
+    def test_stop_generation_prevents_late_release_from_older_submit(self):
+        before = self.module.stop_epoch()
+        self.assertEqual(self.module.stop_epoch(advance=True), before + 1)
+        release = unittest.mock.Mock()
+        with self.assertRaisesRegex(RuntimeError, 'native_navigation_superseded_by_stop'):
+            self.module.guarded_navigation_release(before, release)
+        release.assert_not_called()
+        self.module.guarded_navigation_release(before + 1, release)
+        release.assert_called_once()
 
     def test_manual_auto_guard_reads_zero_sources_without_releasing_or_switching(self):
         self.state.manual_mode, self.state.mapping, self.state.driver_enable = True, False, True
