@@ -514,8 +514,7 @@ class TianyiDeviceBundle:
 
         # An active stream reserves the base against ordinary call-shaped
         # motion. Explicit cancel/brake still goes through the stop handshake.
-        # Keep this arbitration in the bundle; existing card implementations
-        # and the shared navigation client remain unchanged.
+        # Keep command arbitration in the bundle.
         import threading as _threading
         self._base_command_lock = _threading.RLock()
         self._base_owner = ""
@@ -524,7 +523,7 @@ class TianyiDeviceBundle:
             from loco_servo_process import LocoServoPlugin
             self._loco_servo = LocoServoPlugin(
                 plugins_cfg["loco_servo"], namespace, ros2,
-                conflict=self._base_motion_problem)
+                conflict=self._base_motion_problem, slamtec_client=slamtec_client)
             self._plugins.append(self._loco_servo)
             print("[bundle] LocoServoPlugin loaded")
 

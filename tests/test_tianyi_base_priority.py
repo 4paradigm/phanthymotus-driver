@@ -52,7 +52,7 @@ def make_bundle(module, ros, monkeypatch, **config):
 @pytest.mark.parametrize("dry_run", [False, True])
 def test_listening_servo_reserves_every_ordinary_motion_without_touching_sdk(
         setup, monkeypatch, dry_run):
-    bundle, calls = make_bundle(setup.module, setup.ros, monkeypatch, dry_run=dry_run)
+    bundle, calls = make_bundle(setup.bundle_module, setup.ros, monkeypatch, dry_run=dry_run)
     servo = bundle._loco_servo
     try:
         assert bundle.dispatch("loco_servo", {"action": "start"})["state"] == "running"
@@ -73,7 +73,7 @@ def test_listening_servo_reserves_every_ordinary_motion_without_touching_sdk(
 
 
 def test_priority_survives_watchdog_zero_and_queries_but_stop_releases_it(setup, monkeypatch):
-    bundle, calls = make_bundle(setup.module, setup.ros, monkeypatch)
+    bundle, calls = make_bundle(setup.bundle_module, setup.ros, monkeypatch)
     servo = bundle._loco_servo
     try:
         bundle.dispatch("loco_servo", {"action": "start"})
@@ -106,7 +106,7 @@ def test_priority_survives_watchdog_zero_and_queries_but_stop_releases_it(setup,
 
 @pytest.mark.parametrize("tool,action", STOPS)
 def test_cancel_and_brake_pass_priority_and_require_explicit_resume(setup, monkeypatch, tool, action):
-    bundle, calls = make_bundle(setup.module, setup.ros, monkeypatch)
+    bundle, calls = make_bundle(setup.bundle_module, setup.ros, monkeypatch)
     servo = bundle._loco_servo
     try:
         bundle.dispatch("loco_servo", {"action": "start"})
@@ -124,7 +124,7 @@ def test_cancel_and_brake_pass_priority_and_require_explicit_resume(setup, monke
 
 
 def test_failed_start_has_no_reservation_and_stop_commands_keep_confirmation_guard(setup, monkeypatch):
-    bundle, calls = make_bundle(setup.module, setup.ros, monkeypatch)
+    bundle, calls = make_bundle(setup.bundle_module, setup.ros, monkeypatch)
     servo = bundle._loco_servo
     try:
         assert bundle.dispatch("loco_servo", {"action": "start", "input_topic": "bad"})["state"] == "error"

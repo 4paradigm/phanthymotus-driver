@@ -43,8 +43,8 @@ import time
 from types import SimpleNamespace
 import uuid
 
-from loco_servo import (CONFIG_KEYS, LocoServoPlugin as _Core, TOGGLES,
-                        _validated_min_vx, _validated_speed_preset)
+from loco_servo import (CONFIG_KEYS, LocoServoPlugin as _Core, TOGGLES, _start_input_topic,
+                        _step_limits, _validated_min_vx, _validated_speed_preset)
 
 from slamtec_velocity import SlamtecVelocityBackend
 
@@ -302,9 +302,10 @@ def _child(control_fd, data_fd):
 
 
 class LocoServoPlugin:
-    def __init__(self, config, namespace, ros2, conflict=None):
+    def __init__(self, config, namespace, ros2, conflict=None, *, slamtec_client=None):
         self._config, self._namespace, self._ros2 = dict(config), namespace, ros2
         self._conflict = conflict or (lambda: "")
+        self._slamtec = slamtec_client
         self._model = _Core(config, namespace, ros2)
         self._rpc_lock = threading.RLock()
         self._state_lock = threading.RLock()
@@ -493,6 +494,22 @@ class LocoServoPlugin:
                                      handover_wait_ms=max(0, math.ceil((self._unsafe_until - time.monotonic()) * 1000)))
         return result
 
+    def _exit_map_localization(self):
+        state = self._slamtec.get_localization_enabled()
+        if state.get("raw") is False:
+            return
+        if state.get("raw") is not True:
+            raise RuntimeError(f"cannot read map localization: {state}")
+        status = self._slamtec.get_nav_status()
+        if status.get("action_state") not in (-1, 4):
+            raise RuntimeError(f"cannot exit map localization while chassis is busy or unknown: {status}")
+        result = self._slamtec.set_localization_enabled(False)
+        if result.get("error") or result.get("raw") is False:
+            raise RuntimeError(f"cannot disable map localization: {result}")
+        confirmed = self._slamtec.get_localization_enabled()
+        if confirmed.get("raw") is not False:
+            raise RuntimeError(f"map localization disable unconfirmed: {confirmed}")
+
     def dispatch(self, action, args):
         if action == "stop":
             return self.stop()
@@ -501,6 +518,11 @@ class LocoServoPlugin:
             # its admission epoch. They are not transport/SDK failures.
             try:
                 json.dumps(args, allow_nan=False)
+                state = self._last_info["state"]
+                if action == "start":
+                    topic = _start_input_topic(args)
+                    if state in ("running", "paused") and topic != self._last_info["input"]:
+                        raise ValueError("stop before changing input_topic")
                 if action in ("start", "config"):
                     if any(key in args and type(args[key]) is not bool for key in TOGGLES):
                         raise ValueError("configuration toggles must be boolean")
@@ -509,9 +531,10 @@ class LocoServoPlugin:
                         self._model._max_vx)
                     _validated_min_vx(args.get("min_vx", self._model._min_vx),
                                       vx_limit)
-                    for key, current in zip(("linear_acceleration", "angular_acceleration"),
-                                            self._model._accel):
-                        self._model._positive(args, key, current)
+                    linear, angular = self._model._accel
+                    _step_limits(self._model._hz,
+                                 self._model._positive(args, "linear_acceleration", linear),
+                                 self._model._positive(args, "angular_acceleration", angular))
                     from loco_servo import _validated_wz_limit
                     _validated_wz_limit(args.get("wz_limit", self._model._wz_limit), self._model._max_wz)
             except (ValueError, TypeError) as exc:
@@ -520,10 +543,25 @@ class LocoServoPlugin:
                 self._mark_fault("velocity control process exited; stop/start the card")
             if self._fault:
                 return self._decorate(self._last_info)
-            if action in ("start", "resume"):
+            dry_run = self._model._settings["dry_run"]
+            admitting = self.reserves_chassis()
+            enabling_live = (
+                (action == "start" and state == "idle"
+                 and not args.get("dry_run", dry_run))
+                or (action == "resume" and state in ("running", "paused")
+                    and not admitting and not dry_run)
+                or (action in ("start", "config") and admitting
+                    and dry_run and args.get("dry_run") is False)
+            )
+            if action in ("start", "resume") or enabling_live:
                 problem = self._conflict()
                 if problem:
                     return {"state": "error", "error": problem}
+            if enabling_live and self._slamtec is not None:
+                try:
+                    self._exit_map_localization()
+                except RuntimeError as exc:
+                    return {"state": "error", "error": str(exc)}
             if self._process is None:
                 if action != "start":
                     result = self._model.dispatch(action, args)

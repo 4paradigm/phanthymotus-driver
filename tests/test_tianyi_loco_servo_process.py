@@ -2,6 +2,7 @@
 
 import errno
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -13,6 +14,7 @@ import types
 
 import pytest
 
+from test_tianyi_loco_servo import load_bundle
 from test_tianyi_sdk_worker import native_worker
 
 
@@ -157,6 +159,91 @@ def test_process_start_is_inert_and_parent_keeps_ros_subscription(process_setup)
     assert node.subscriptions[0][1] == "/actucore/navi/cmd"
     assert info["backend"]["state"] == "ready"
     assert info["counts"]["accepted"] == 0
+
+
+@pytest.mark.parametrize("opening", ["start", "config", "resume"])
+def test_bundle_exits_map_localization_before_enabling_velocity(
+        process_setup, native_worker, monkeypatch, opening):
+    from nav_client import SlamtecClient
+
+    calls = []
+    localization_enabled = True
+    localization_path = "/api/core/slam/v1/localization/:enable"
+    action_path = "/api/core/motion/v1/actions/:current"
+
+    def open_url(request, *, timeout):
+        nonlocal localization_enabled
+        if request.method == "PUT":
+            assert not bundle._loco_servo.reserves_chassis() or opening == "config"
+            assert json.loads(request.data) == {"enable": False}
+            localization_enabled = False
+            reply = True
+        elif request.full_url.endswith(localization_path):
+            reply = localization_enabled
+        else:
+            assert request.full_url.endswith(action_path)
+            reply = {"state": {"status": 4}}
+        calls.append((request.method, request.full_url.removeprefix("http://chassis")))
+        return io.BytesIO(json.dumps(reply).encode())
+
+    monkeypatch.setattr("urllib.request.urlopen", open_url)
+    monkeypatch.setitem(sys.modules, "loco_servo_process", process_setup.module)
+    client = SlamtecClient("http://chassis")
+    bundle = load_bundle()(
+        {"plugins": {"loco_servo": {"enabled": True, "dry_run": True,
+                                   "sdk_binary": str(native_worker), "sdk_host": "ok"}}},
+        "ubuntu", process_setup.ros, client)
+    bundle.start_all()
+    try:
+        assert not calls
+        invalid = bundle.dispatch("loco_servo", {"action": "start", "dry_run": False,
+                                                "input_topic": "invalid"})
+        assert invalid["state"] == "error" and not calls
+        if opening != "start":
+            assert bundle.dispatch("loco_servo", {"action": "start"})["state"] == "running"
+            if opening == "resume":
+                assert bundle.dispatch("loco_servo", {"action": "pause"})["state"] == "paused"
+                assert bundle.dispatch("loco_servo", {"action": "config", "dry_run": False})["ok"]
+            assert not calls
+
+        args = {"action": opening}
+        if opening != "resume":
+            args["dry_run"] = False
+        result = bundle.dispatch("loco_servo", args)
+        assert result["state"] == "running" and result["dry_run"] is False, result
+        assert bundle._loco_servo.reserves_chassis()
+        assert not localization_enabled
+        assert calls == [("GET", localization_path), ("GET", action_path),
+                         ("PUT", localization_path), ("GET", localization_path)]
+        assert bundle.dispatch("loco_servo", {"action": "start"})["state"] == "running"
+        assert len(calls) == 4
+        assert bundle.dispatch("loco_servo", {"action": "stop"})["state"] == "idle"
+        assert bundle.dispatch("loco_servo", {"action": "start"})["state"] == "running"
+        assert calls[4:] == [("GET", localization_path)]
+    finally:
+        bundle.stop_all()
+
+
+@pytest.mark.parametrize("blocked", ["active_navigation", "readback"])
+def test_process_does_not_arm_if_map_localization_cannot_be_disabled(
+        process_setup, native_worker, blocked):
+    writes = []
+    client = types.SimpleNamespace(
+        get_localization_enabled=lambda: {"raw": True},
+        get_nav_status=lambda: {"action_state": 1 if blocked == "active_navigation" else -1},
+        set_localization_enabled=lambda enable: writes.append(enable) or {"raw": True},
+    )
+    config = {"dry_run": False, "sdk_binary": str(native_worker), "sdk_host": "ok"}
+    card = process_setup.module.LocoServoPlugin(
+        config, "ubuntu", process_setup.ros, slamtec_client=client)
+    try:
+        result = card.dispatch("start", {})
+        assert result["state"] == "error" and "map localization" in result["error"], result
+        assert writes == ([] if blocked == "active_navigation" else [False])
+        assert not card.reserves_chassis()
+        assert not process_setup.ros.executor_core.nodes
+    finally:
+        card.stop()
 
 
 def test_continuous_10hz_commands_keep_one_native_action(process_setup):

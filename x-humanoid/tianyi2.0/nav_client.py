@@ -172,6 +172,14 @@ class SlamtecClient:
         """获取定位质量"""
         return self._get("/api/core/slam/v1/localization/quality")
 
+    def get_localization_enabled(self) -> dict:
+        """读取底盘地图定位开关。"""
+        return self._get("/api/core/slam/v1/localization/:enable")
+
+    def set_localization_enabled(self, enabled: bool) -> dict:
+        """控制底盘地图定位开关。"""
+        return self._put("/api/core/slam/v1/localization/:enable", {"enable": enabled})
+
     # ── Motion ────────────────────────────────────────────────────────────────
 
     def get_current_action(self) -> dict:
