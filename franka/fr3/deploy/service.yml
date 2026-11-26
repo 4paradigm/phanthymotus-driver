@@ -6,6 +6,8 @@ franka-fr3:
   extra_hosts:
     - phanthy-motus:127.0.0.1
   volumes:
+    - /opt/phanthy-motus/franka-ip-sync:/opt/phanthy-motus/franka-ip-sync
+    - /opt/phanthy-motus/franka-controller-access:/opt/phanthy-motus/franka-controller-access:ro
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
     - /opt/phanthy-motus/data/certs/cert.pem:/opt/phanthy-motus/data/certs/cert.pem:ro
     - /dev:/dev:ro
@@ -27,6 +29,7 @@ franka-fr3:
   tmpfs:
     - /dev/shm:rw,nosuid,nodev,size=128m
   environment:
+    - FRANKA_ROBOT_INTERFACE=${FRANKA_ROBOT_INTERFACE:-}
     - FRANKA_REALTIME_POLICY=${FRANKA_REALTIME_POLICY:-standard}
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp

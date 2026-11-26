@@ -20,7 +20,7 @@ class PnpRemoteTeleopPlugin:
     PREFIX = "teach"
     COMPLETION_ACTIONS = ("stop_trajectory", "stop_motion", "delete_trajectory")
 
-    def __init__(self, acp_callback=None):
+    def __init__(self, acp_callback=None, controller_configuration=None, joint_streams=None):
         self._lock = threading.RLock()
         self._recording = None
         self._playback = None
@@ -29,6 +29,8 @@ class PnpRemoteTeleopPlugin:
         self._init = {"state": "not_initialized"}
         self._init_thread = None
         self._password = ""
+        self._controller_configuration = controller_configuration
+        self._joint_streams = joint_streams
         self._acp_callback = acp_callback or self._post_completion
         self._acp = None
         self._align_cancel = threading.Event()
@@ -36,10 +38,12 @@ class PnpRemoteTeleopPlugin:
         self._settings = {"pnp_host": "", "ssh_user": "pnp", "right_slave_ip": "172.16.0.2",
                           "left_slave_ip": "172.16.0.3", "read_vendor_slave_ips": True}
         self._unit = "pnp-fr3-right-teleop.service"
-        self._hosts = {"right": os.environ.get("FRANKA_PNP_SSH_HOST", "pnp@172.16.0.200")}
+        self._hosts = {}
+        if controller_configuration is None:
+            self._hosts["right"] = os.environ.get("FRANKA_PNP_SSH_HOST", "pnp@172.16.0.200")
         left = os.environ.get("FRANKA_PNP_LEFT_SSH_HOST", "").strip()
         if left:
-            if left == self._hosts["right"]:
+            if left == self._hosts.get("right"):
                 raise ValueError("左右两台 PNP 主控机需要不同的 SSH 地址")
             self._hosts["left"] = left
 
@@ -72,6 +76,8 @@ class PnpRemoteTeleopPlugin:
             },
         })
         definition = tool(self.PREFIX, "actuator", "FR3 PNP teaching and trajectory recording", schema)
+        if self._controller_configuration is not None:
+            return [definition]
         definition["configSchema"] = {
             "type": "object",
             "properties": {
@@ -93,6 +99,8 @@ class PnpRemoteTeleopPlugin:
             raise RuntimeError(result["message"])
 
     def _configure(self, args):
+        if self._controller_configuration is not None:
+            return
         keys = set(self._settings)
         supplied = {key: args[key] for key in keys if key in args}
         settings = {**self._settings, **supplied}
@@ -122,10 +130,21 @@ class PnpRemoteTeleopPlugin:
         if self._init_thread and self._init_thread.is_alive():
             return
         from franka.fr3.pnp_initialize import initialize
-        self._init = {"state": "initializing", "stage": "starting"}
-        password, self._password = self._password, ""
         settings = dict(self._settings)
-        host = self._hosts["right"]
+        shared = self._controller_configuration is not None
+        if shared:
+            try:
+                address, slave_ips, username, password = self._controller_configuration.snapshot()
+            except RuntimeError as error:
+                raise RuntimeError(f'Controller Configuration is not ready: {error}') from error
+            host = f"{username}@{address}"
+            if host == self._hosts.get("left"):
+                raise ValueError("The shared PNP host and the optional left PNP host must be different")
+        else:
+            password, self._password = self._password, ""
+            host = self._hosts["right"]
+            slave_ips = {side: settings[f"{side}_slave_ip"] for side in ("left", "right")}
+        self._init = {"state": "initializing", "stage": "starting"}
 
         def progress(stage):
             with self._lock:
@@ -133,14 +152,13 @@ class PnpRemoteTeleopPlugin:
 
         def work():
             try:
-                slave_ips = {"right": settings["right_slave_ip"], "left": settings["left_slave_ip"]}
                 selected_host = host
-                if not settings["pnp_host"]:
+                if not shared and not settings["pnp_host"]:
                     from franka.fr3.pnp_discovery import discover
                     address = discover(slave_ips, settings["ssh_user"], password, progress)
                     selected_host = settings["ssh_user"] + "@" + address
                 result = initialize(selected_host, password, progress, slave_ips=slave_ips,
-                                    read_vendor=settings["read_vendor_slave_ips"])
+                                    read_vendor=not shared and settings["read_vendor_slave_ips"])
                 with self._lock:
                     self._hosts["right"] = selected_host
                     for side, address in result.get("slave_ips", {}).items():
@@ -156,6 +174,15 @@ class PnpRemoteTeleopPlugin:
         self._init_thread.start()
 
     def _ssh(self, side, *args):
+        if self._joint_streams is not None and args and (
+                args[0].startswith("pnp-align-") or args[0] == "pnp-play-recording"):
+            # Keep idle FCI released until the host has taken ownership.
+            _, addresses, _, _ = self._controller_configuration.snapshot()
+            with self._joint_streams.paused(addresses.values()):
+                return self._command(side, *args)
+        return self._command(side, *args)
+
+    def _command(self, side, *args):
         host = self._hosts[side]
         from franka.fr3.pnp_initialize import paths
         key, known = paths()
@@ -509,9 +536,10 @@ class PnpRemoteTeleopPlugin:
                     return self._status()
                 if action == "start":
                     self._configure(args)
+                    if self._controller_configuration is None or not self._loaded or self._init.get("state") == "error":
+                        self._initialize()
                     self._loaded = True
                     self._stopped = False
-                    self._initialize()
                     return self._status()
                 if action == "follow":
                     if not self._loaded:

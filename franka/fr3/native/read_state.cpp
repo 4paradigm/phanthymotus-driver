@@ -1,3 +1,4 @@
+#include <franka/rate_limiting.h>
 // One connection per robot: idle state reads and joint control never overlap.
 // stdin: MOVE id speed_rad_s tolerance_rad timeout_s q1..q7 | STOP id | QUIT
 // stdout: newline-delimited state JSON and asynchronous motion/stop events.
@@ -45,7 +46,8 @@ std::string quoted(const std::string& value) {
   return out.str();
 }
 
-void write_array(std::ostream& out, const char* name, const fr3::Joints& values) {
+template <size_t N>
+void write_array(std::ostream& out, const char* name, const std::array<double, N>& values) {
   out << '"' << name << "\":[";
   for (std::size_t i = 0; i < values.size(); ++i) {
     if (i != 0) out << ',';
@@ -135,6 +137,9 @@ class RobotLock {
 struct Sample {
   fr3::Joints q{}, q_d{}, dq{}, tau{};
   int mode = 0;
+  Clock::time_point captured{};
+  std::array<double, 16> O_T_EE{};
+  std::array<double, 16> F_T_EE{};
 };
 
 // Single SDK producer, single stdout consumer. A full queue drops telemetry;
@@ -194,7 +199,7 @@ class Session {
   void sample(const franka::RobotState& state) {
     const auto now = Clock::now();
     if (now < next_sample_) return;
-    samples_.push({state.q, state.q_d, state.dq, state.tau_J, static_cast<int>(state.robot_mode)});
+    samples_.push({state.q, state.q_d, state.dq, state.tau_J, static_cast<int>(state.robot_mode), now, state.O_T_EE, state.F_T_EE});
     next_sample_ = now + std::chrono::microseconds(33333);
   }
 
@@ -225,7 +230,16 @@ class Session {
           write_array(std::cout, "q_d", current.q_d); std::cout << ',';
           write_array(std::cout, "dq", current.dq); std::cout << ',';
           write_array(std::cout, "tau_J", current.tau);
-          std::cout << ",\"robot_mode\":" << current.mode
+          std::cout << ',';
+          write_array(std::cout, "O_T_EE", current.O_T_EE);
+          std::cout << ',';
+          write_array(std::cout, "F_T_EE", current.F_T_EE);
+          const auto ns = [](Clock::time_point t) {
+            return std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count();
+          };
+          std::cout << ",\"captured_ns\":" << ns(current.captured)
+                    << ",\"published_ns\":" << ns(Clock::now())
+                    << ",\"robot_mode\":" << current.mode
                     << ",\"capabilities\":[\"joint_position\"],";
           write_realtime(std::cout, rt_);
           std::cout << "}\n";
@@ -324,11 +338,11 @@ class Session {
             pending.append(buffer, static_cast<std::size_t>(count));
             std::size_t end;
             while ((end = pending.find('\n')) != std::string::npos) {
-              if (end > 4096) throw std::runtime_error("Command exceeds 4096 bytes");
+              if (end > 524288) throw std::runtime_error("Command exceeds 524288 bytes");
               accept(pending.substr(0, end));
               pending.erase(0, end + 1);
             }
-            if (pending.size() > 4096) throw std::runtime_error("Command exceeds 4096 bytes");
+            if (pending.size() > 524288) throw std::runtime_error("Command exceeds 524288 bytes");
           }
         }
         if (eof) std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -363,7 +377,16 @@ class Session {
         if (!stationary(initial)) throw std::runtime_error("Robot must be idle and stationary before motion");
         // A start based on desired positions avoids the discontinuity caused by
         // commanding a measured position that differs from the SDK's q_d.
-        fr3::Trajectory trajectory(initial.q_d, command);
+        std::optional<fr3::PathTrajectory> path;
+        std::optional<fr3::TimedTrajectory> timed;
+        if (command.timed.empty()) {
+          path.emplace(initial.q_d, command, franka::computeUpperLimitsJointVelocity,
+                       franka::computeLowerLimitsJointVelocity);
+        } else {
+          timed.emplace(initial.q_d, command, franka::computeUpperLimitsJointVelocity,
+                        franka::computeLowerLimitsJointVelocity);
+        }
+        const double duration = timed ? timed->duration() : path->duration();
         double elapsed = 0.0;
         bool first = true;
         event("motion", command.id, "running", "", &command.target);
@@ -384,10 +407,10 @@ class Session {
           in_control_ = true;
           elapsed += period.toSec();
           if (elapsed > command.timeout) throw std::runtime_error("Motion execution timed out");
-          franka::JointPositions positions(trajectory.at(elapsed));
+          franka::JointPositions positions(timed ? timed->at(elapsed) : path->at(elapsed));
           // Continue the smooth trajectory while the non-RT StopMove request
           // performs the manufacturer's controlled stop. Do not jump to q_d.
-          if (elapsed >= trajectory.duration() + 0.25)
+          if (elapsed >= duration + 0.25)
             return franka::MotionFinished(positions);
           return positions;
         }, franka::ControllerMode::kJointImpedance, true);
@@ -417,7 +440,10 @@ class Session {
         settled = stationary(state);
         if (settled && (cancelled_ || *error <= command.tolerance)) break;
         if (static_cast<bool>(state.current_errors)) {
-          failure = "Robot reports motion errors; inspect Desk before retrying";
+          std::ostringstream details;
+          details << state.current_errors;
+          const std::string errors = "Robot motion errors: " + details.str();
+          failure = failure.empty() ? errors : failure + "; " + errors;
           break;
         }
       } while (Clock::now() < deadline);

@@ -213,6 +213,12 @@ class BumiDeviceBundle:
                                                    and media_ctrl is not None)))
             print("[bundle] VisionCapturePlugin loaded")
 
+        if plugins_cfg.get("live_stream", {}).get("enabled", False):
+            from live_stream import LiveStreamPlugin
+            self._plugins.append(LiveStreamPlugin(
+                plugins_cfg["live_stream"], namespace, executor))
+            print("[bundle] LiveStreamPlugin loaded")
+
     def start_all(self) -> None:
         failed = 0
         for i, p in enumerate(self._plugins):
