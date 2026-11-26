@@ -33,22 +33,24 @@ IMU_FIELDS = {**{f"accel_{axis}_m_s2": None for axis in "xyz"},
               "orientation_reference": None}
 
 
-class SensorCard:
-    def __init__(self, kind, serial, directory, node, namespace, frame_id, depth_socket=""):
+class _SensorCard:
+    """Shared capture and lifecycle behavior for the two sensor plugins."""
+
+    def __init__(self, serial, directory, node, namespace, frame_id, depth_socket=""):
         from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
         from sensor_msgs.msg import CompressedImage
         from std_msgs.msg import String
 
-        self.kind, self.serial, self.directory = kind, serial, directory
+        self.serial, self.directory = serial, directory
         self.depth_socket = depth_socket
         self.node, self.frame_id = node, frame_id
-        self.name = "imu" if kind == "imu" else "camera_depth"
-        topic = f"/{namespace}/state/imu" if kind == "imu" else f"/{namespace}/camera/depth"
-        self.topic = {"topic": topic, "format": "data/json" if kind == "imu" else DEPTH_HINT}
-        self.message_type = String if kind == "imu" else CompressedImage
+        is_imu = self.CAPTURE_KIND == "imu"
+        topic = f"/{namespace}/state/imu" if is_imu else f"/{namespace}/camera/depth"
+        self.topic = {"topic": topic, "format": "data/json" if is_imu else DEPTH_HINT}
+        self.message_type = String if is_imu else CompressedImage
         self.publisher = node.create_publisher(self.message_type, topic, qos_profile_sensor_data)
         self.preview_topic = None
-        if kind == "depth":
+        if not is_imu:
             self.preview_topic = {"topic": f"{topic}/preview", "format": "image/jpeg"}
             self.preview = node.create_publisher(
                 CompressedImage, self.preview_topic["topic"],
@@ -63,7 +65,7 @@ class SensorCard:
         self.worker_context = mp.get_context("spawn")
 
     def get_tool(self):
-        if self.kind == "imu":
+        if self.CAPTURE_KIND == "imu":
             description = (
                 "Helios 相机 IMU。读取 Gemini 335Lg 内置传感器，输出相机坐标系下同步采样的"
                 "三轴加速度（m/s²）和三轴角速度（rad/s）。"
@@ -78,7 +80,7 @@ class SensorCard:
                 "彩色 JPEG 用于低带宽预览，毫米深度数据中的 0 表示无有效测量。"
                 "深度图采用相机光学坐标系，内参缺失时留空。"
             )
-        return tool(self.name, "sensor", description,
+        return tool(self.PREFIX, "sensor", description,
                     {"type": "object", "properties": {
                         "action": {"type": "string", "enum": ["start", "stop", "info"]}}},
                     topic_out=self.output_topics())
@@ -105,7 +107,7 @@ class SensorCard:
                       "device_stamp_us": self.device_stamp if state == "online" else None,
                       "timestamp_ms": int(time.time() * 1000),
                       "error": self.error, "topic_out": self.output_topics()}
-            if self.kind == "imu":
+            if self.CAPTURE_KIND == "imu":
                 result.update(IMU_FIELDS)
                 if state == "online":
                     result.update(self.values)
@@ -128,7 +130,7 @@ class SensorCard:
                 self.start()
             with self.lock:
                 result = {**self.get_tool(), **self.payload()}
-                if self.kind == "depth":
+                if self.CAPTURE_KIND == "depth":
                     result["preview_topic"] = self.preview_topic["topic"]
                     result["camera_info"] = [camera_info(
                         topic=self.topic["topic"], id="rokae/helios-2.1/gemini335lg-depth",
@@ -136,12 +138,12 @@ class SensorCard:
                         K=self.intrinsics, source="derived-from-K" if self.intrinsics else "unknown",
                         pipeline=("native", "mm", "zlib"))]
             return result
-        if action in ("read", self.name):
+        if action in ("read", self.PREFIX):
             return self.payload()
         return None
 
     def publish_status(self):
-        if self.kind == "imu":
+        if self.CAPTURE_KIND == "imu":
             msg = self.message_type()
             msg.data = json.dumps(self.payload(), allow_nan=False)
             self.publisher.publish(msg)
@@ -162,7 +164,7 @@ class SensorCard:
             self.received = self.values = self.device_stamp = self.intrinsics = self.error = None
             self.count = 0
             self.last_publish = 0
-            self.thread = threading.Thread(target=self.run, name=self.name, daemon=True)
+            self.thread = threading.Thread(target=self.run, name=self.PREFIX, daemon=True)
             self.thread.start()
             self.publish_status()
 
@@ -174,13 +176,13 @@ class SensorCard:
 
     def publish_frame(self, received, stamp, data, geometry):
         with self.lock:
-            frame_age_limit = DEPTH_MAX_FRAME_AGE if self.kind == "depth" else 1
+            frame_age_limit = DEPTH_MAX_FRAME_AGE if self.CAPTURE_KIND == "depth" else 1
             if self.stop_capture.is_set() or time.monotonic() - received >= frame_age_limit:
                 return
             self.received, self.device_stamp = received, stamp
             self.count += 1
             self.error = None
-            if self.kind == "imu":
+            if self.CAPTURE_KIND == "imu":
                 accel, gyro, orientation = data
                 self.values = {**{f"accel_{axis}_m_s2": v for axis, v in zip("xyz", accel)},
                                **{f"gyro_{axis}_rad_s": v for axis, v in zip("xyz", gyro)}}
@@ -211,7 +213,7 @@ class SensorCard:
         if self.depth_socket:
             target, args = from_depth_socket, (self.depth_socket, child_stop, output)
         else:
-            target, args = capture, (self.kind, self.directory, self.serial, child_stop, output)
+            target, args = capture, (self.CAPTURE_KIND, self.directory, self.serial, child_stop, output)
         child = self.worker_context.Process(target=target, args=args, daemon=True)
         try:
             child.start()
@@ -260,6 +262,16 @@ class SensorCard:
                 self.stop_capture.wait(3)
 
 
+class ImuSensorCard(_SensorCard):
+    PREFIX = "imu"
+    CAPTURE_KIND = "imu"
+
+
+class DepthSensorCard(_SensorCard):
+    PREFIX = "camera_depth"
+    CAPTURE_KIND = "depth"
+
+
 def camera_serial(name):
     serial = os.getenv(name, "").strip()
     if serial and not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", serial):
@@ -284,11 +296,11 @@ def main():
     rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
     node = Node("helios_orbbec_sensors", start_parameter_services=False)
     plugins = [
-        SensorCard("imu", imu_serial, directory, node, topic_namespace,
-                   os.getenv("HELIOS_ORBBEC_IMU_FRAME_ID", "helios_gemini_imu_frame")),
-        SensorCard("depth", depth_serial, directory, node, topic_namespace,
-                   os.getenv("HELIOS_ORBBEC_DEPTH_FRAME_ID", "helios_gemini_depth_optical_frame"),
-                   os.getenv("HELIOS_ORBBEC_DEPTH_SOCKET", "")),
+        ImuSensorCard(imu_serial, directory, node, topic_namespace,
+                      os.getenv("HELIOS_ORBBEC_IMU_FRAME_ID", "helios_gemini_imu_frame")),
+        DepthSensorCard(depth_serial, directory, node, topic_namespace,
+                        os.getenv("HELIOS_ORBBEC_DEPTH_FRAME_ID", "helios_gemini_depth_optical_frame"),
+                        os.getenv("HELIOS_ORBBEC_DEPTH_SOCKET", "")),
     ]
     bundle = DriverBundle(plugins)
     port = int(os.getenv("HELIOS_SENSOR_MCP_PORT", str(DEFAULT_PORT)))

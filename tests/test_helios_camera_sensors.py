@@ -17,7 +17,7 @@ from PIL import Image
 
 from rokae.helios_sensors.depth_preview import depth_preview_jpeg
 from rokae.helios_sensors.depth_socket import HEADER, read_depth_frame
-from rokae.helios_sensors.main import DEFAULT_PORT, SensorCard
+from rokae.helios_sensors.main import DEFAULT_PORT, DepthSensorCard, ImuSensorCard
 from rokae.helios_sensors.orbbec import HEIGHT, WIDTH, encode_depth
 from rokae.helios_sensors.orientation import OrientationFilter
 
@@ -142,8 +142,8 @@ def test_depth_rejects_invalid_frames(bad_layout):
 
 
 def test_stale_imu_unsets_measurements():
-    card = object.__new__(SensorCard)
-    card.kind, card.serial = "imu", "test"
+    card = object.__new__(ImuSensorCard)
+    card.serial = "test"
     card.preview_topic = None
     card.lock, card.stop_capture = threading.RLock(), threading.Event()
     card.thread, card.topic, card.count = object(), {}, 1
@@ -162,34 +162,39 @@ def test_stale_imu_unsets_measurements():
     assert payload["orientation_w"] is None and payload["orientation_source"] is None
 
 
-@pytest.mark.parametrize("kind,name", [("imu", "imu"), ("depth", "camera_depth")])
-def test_sensor_exposes_only_canvas_lifecycle_actions(kind, name):
-    card = object.__new__(SensorCard)
-    card.kind, card.name, card.topic = kind, name, {"topic": "/test/source", "format": "data/json"}
-    card.preview_topic = {"topic": "/test/source/preview", "format": "image/jpeg"} if kind == "depth" else None
+@pytest.mark.parametrize("card_type,name,output_format", [
+    (ImuSensorCard, "imu", "data/json"),
+    (DepthSensorCard, "camera_depth", "image/depth-zlib"),
+])
+def test_sensor_exposes_stable_prefix_and_canvas_lifecycle_actions(card_type, name, output_format):
+    card = object.__new__(card_type)
+    card.topic = {"topic": "/test/source", "format": output_format}
+    card.preview_topic = {"topic": "/test/source/preview", "format": "image/jpeg"} if name == "camera_depth" else None
     tool = card.get_tool()
     actions = tool["inputSchema"]["properties"]["action"]["enum"]
+    assert card_type.PREFIX == tool["name"] == name
     assert tool["type"] == "sensor"
     assert tool["topic_out"][0] == card.topic
     assert set(actions) <= {"start", "stop", "info", "config"}
 
 
 def test_sensor_dispatch_follows_framework_contract():
-    card = object.__new__(SensorCard)
-    card.name = "imu"
+    card = object.__new__(ImuSensorCard)
     calls = []
     card.start = lambda: calls.append("start")
     card.stop = lambda: calls.append("stop")
+    card.payload = lambda: {"state": "online"}
 
     assert card.dispatch("start", {}) == {"state": "running"}
     assert card.dispatch("stop", {}) == {"state": "idle"}
+    assert card.dispatch("imu", {}) == card.dispatch("read", {}) == {"state": "online"}
     assert card.dispatch("unknown", {}) is None
     assert calls == ["start", "stop"]
 
 
 def test_sensor_retries_when_camera_frames_time_out(monkeypatch):
-    card = object.__new__(SensorCard)
-    card.kind, card.serial = "imu", "test"
+    card = object.__new__(ImuSensorCard)
+    card.serial = "test"
     card.preview_topic = None
     card.lock, card.stop_capture = threading.RLock(), threading.Event()
     card.thread, card.topic, card.count = object(), {}, 1
