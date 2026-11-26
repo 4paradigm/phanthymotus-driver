@@ -105,6 +105,8 @@ class Outcome:
     reason: str = ""
     values: tuple[float, ...] | None = None
     warnings: list[str] = field(default_factory=list)
+    # Applied commands only. Same monotonic clock and units as ControlSink.clock.
+    expires_at_ms: float | None = None
 
     @property
     def applied(self) -> bool:
@@ -170,6 +172,11 @@ class ControlSink:
         wall_clock: `() -> int` Unix 毫秒 —— **只**用来和消息里的 `stamp_ms` /
             `obs_stamp_ms` 比，因为那两个字段是另一个进程按 Unix 纪元打的。
             默认 `_wall_ms`；测试注入。两个时钟不是疏忽，见 `_wall_ms`。
+        max_ttl_ms: optional upper bound on the requested lifetime.
+        future_tolerance_ms: optional maximum lead for command and observation stamps.
+        require_observation: reject commands without an observation timestamp.
+        min_stamp_ms: optional Unix timestamp of the current control session.
+        require_live_lease: reject commands exactly at their expiry boundary.
     """
 
     def __init__(
@@ -182,6 +189,11 @@ class ControlSink:
         escalate_after: int = 5,
         clock=None,
         wall_clock=None,
+        max_ttl_ms: float | None = None,
+        future_tolerance_ms: float | None = None,
+        require_observation: bool = False,
+        min_stamp_ms: float | None = None,
+        require_live_lease: bool = False,
     ):
         self.descriptor: Descriptor = (
             descriptor if isinstance(descriptor, Descriptor) else parse_descriptor(descriptor)
@@ -212,6 +224,11 @@ class ControlSink:
         # bug 活下来的那个条件：测试于是永远在「stamp 和 now 同一个纪元」的前提下
         # 跑，而那恰恰是真实链路上不成立的。要同一个纪元的测试必须显式说出来。
         self._wall_clock = wall_clock or _wall_ms
+        self._max_ttl_ms = max_ttl_ms
+        self._future_tolerance_ms = future_tolerance_ms
+        self._require_observation = require_observation
+        self._min_stamp_ms = min_stamp_ms
+        self._require_live_lease = require_live_lease
 
         # Last command actually applied — the baseline for step clamping and
         # for the velocity check.
@@ -248,9 +265,10 @@ class ControlSink:
         if outcome is not None:
             return self._count(outcome)
 
-        outcome = self._check_freshness(message, self._wall_clock())
-        if outcome is not None:
-            return self._count(outcome)
+        freshness = self._check_freshness(message, self._wall_clock())
+        if isinstance(freshness, Outcome):
+            return self._count(freshness)
+        expires_at_ms = now + freshness
 
         outcome = self._check_arbitration(message, now)
         if outcome is not None:
@@ -285,7 +303,8 @@ class ControlSink:
         self._last_watchdog_ms = None
 
         verdict = Verdict.CLAMPED if clamped else Verdict.APPLIED
-        return self._count(Outcome(verdict, values=values, warnings=warnings))
+        return self._count(Outcome(verdict, values=values, warnings=warnings,
+                                   expires_at_ms=expires_at_ms))
 
     def tick(self) -> Outcome | None:
         """Drive the watchdog. Call periodically — at least once per watchdog_ms.
@@ -497,8 +516,8 @@ class ControlSink:
             return Outcome(Verdict.REJECTED, "source is required and must be a string")
         return None
 
-    def _check_freshness(self, message: dict, now: int) -> Outcome | None:
-        """2. Age and ordering. Routine failures — dropped, not rejected.
+    def _check_freshness(self, message: dict, now: float) -> Outcome | float:
+        """2. Age and ordering. Return the remaining output lease on success.
 
         A command can be freshly generated and still act on an 800 ms old
         picture, which is why `obs_stamp_ms` is checked separately from
@@ -512,21 +531,33 @@ class ControlSink:
             return Outcome(Verdict.REJECTED,
                            "ttl_ms is required, finite, and must be positive")
 
+        if self._max_ttl_ms is not None and ttl > self._max_ttl_ms:
+            return Outcome(Verdict.REJECTED, f"ttl_ms exceeds {self._max_ttl_ms} ms")
+        if self._min_stamp_ms is not None and stamp < self._min_stamp_ms:
+            return Outcome(Verdict.REJECTED, "command predates the current start/resume")
+
         age = now - stamp
-        if age > ttl:
+        obs_stamp = message.get("obs_stamp_ms")
+        if (self._require_observation or obs_stamp is not None) and not _finite_number(obs_stamp):
+            return Outcome(Verdict.REJECTED, "obs_stamp_ms must be finite")
+        obs_age = now - obs_stamp if obs_stamp is not None else None
+
+        tolerance = self._future_tolerance_ms
+        if tolerance is not None and (age < -tolerance or
+                                       (obs_age is not None and obs_age < -tolerance)):
+            return Outcome(Verdict.REJECTED, "command or observation timestamp is in the future")
+
+        remaining = ttl - age
+        if remaining < 0 or (remaining == 0 and self._require_live_lease):
             return Outcome(Verdict.DROPPED, f"expired: {age} ms old, ttl {int(ttl)} ms")
 
         max_obs_age = self.descriptor.max_obs_age_ms
-        obs_stamp = message.get("obs_stamp_ms")
-        if obs_stamp is not None and not _finite_number(obs_stamp):
-            return Outcome(Verdict.REJECTED, "obs_stamp_ms must be finite")
-        if max_obs_age is not None and isinstance(obs_stamp, (int, float)):
-            obs_age = now - obs_stamp
-            if obs_age > max_obs_age:
-                return Outcome(
-                    Verdict.DROPPED,
-                    f"observation {obs_age} ms old, limit {max_obs_age} ms",
-                )
+        if max_obs_age is not None and obs_age is not None:
+            obs_remaining = max_obs_age - obs_age
+            if obs_remaining < 0 or (obs_remaining == 0 and self._require_live_lease):
+                return Outcome(Verdict.DROPPED,
+                               f"observation {obs_age} ms old, limit {max_obs_age} ms")
+            remaining = min(remaining, obs_remaining)
 
         seq = message.get("seq")
         if not isinstance(seq, int) or isinstance(seq, bool):
@@ -535,7 +566,7 @@ class ControlSink:
         last = self._seq_by_source.get(source)
         if last is not None and seq <= last:
             return Outcome(Verdict.DROPPED, f"seq {seq} not newer than {last}")
-        return None
+        return min(remaining, self.descriptor.watchdog_ms)
 
     def _check_arbitration(self, message: dict, now: int) -> Outcome | None:
         """3. Priority between sources.

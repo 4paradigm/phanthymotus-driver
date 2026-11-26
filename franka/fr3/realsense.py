@@ -146,7 +146,21 @@ def _capture_once(namespace, serial_number, routes, commands, quit_event, status
         node = rclpy.create_node(f"{namespace}_realsense_rgbd_{suffix}")
         publishers = {}
         pipeline = rs.pipeline(context)
-        pipeline.start(config)
+        active_profile = pipeline.start(config)
+        def intrinsics(stream):
+            value = active_profile.get_stream(stream).as_video_stream_profile().get_intrinsics()
+            return {**{key: getattr(value, key) for key in
+                       ("width", "height", "fx", "fy", "ppx", "ppy")},
+                    "model": str(value.model), "coeffs": list(value.coeffs)}
+        extr = active_profile.get_stream(rs.stream.depth).get_extrinsics_to(
+            active_profile.get_stream(rs.stream.color))
+        status["calibration"] = {
+            "version": 2, "serial_number": serial_number,
+            "session_id": str(time.time_ns()), "depth_aligned_to": "depth",
+            "depth_scale_m": 0.001, "rgb_intrinsics": intrinsics(rs.stream.color),
+            "depth_intrinsics": intrinsics(rs.stream.depth),
+            "depth_to_color": {"rotation": list(extr.rotation), "translation": list(extr.translation)},
+        }
         streaming = True
         started_at = time.monotonic()
         last_received = {stream: None for stream in STREAMS}
@@ -389,6 +403,7 @@ class RealSenseSession:
                 "error": error,
                 "device_name": self._status.get("device_name"),
                 "serial_number": self.serial_number,
+                "calibration": copy.deepcopy(self._status.get("calibration")),
                 "width": profile.get("width", default_width),
                 "height": profile.get("height", default_height),
                 "fps": profile.get("fps"),

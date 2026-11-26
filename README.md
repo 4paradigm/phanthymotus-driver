@@ -31,6 +31,7 @@ Each driver is a standalone [MCP](https://modelcontextprotocol.io) HTTP server t
 | [`limx/tron2`](limx/tron2/README.md) | LimX TRON2 dual-arm robot | 15791 | Head/wrist RGB cameras, joint skeleton with gripper outlines, arm MoveJ and verified saved-home reset |
 | `pnpbotics/adam` | PNPbotics Adam Humanoid | 15702 | State, locomotion (gRPC), upper body control, dexterous hands, 3D model |
 | `linkerhand/l20_lite` | LinkerHand L20 Lite | 15733 | USB-RS485/Modbus 115200, 10-joint position/speed/torque control and state reads |
+| [`phanthy/office`](phanthy/office/README.md) | Office scene: front-desk Windows PC + printer | 15750 | Over SSH: list today's visitors and print their badge from the visitor-management site |
 
 ## Quick Start
 

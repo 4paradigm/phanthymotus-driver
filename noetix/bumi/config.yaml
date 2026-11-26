@@ -140,3 +140,8 @@ plugins:
     arm_kp: 5.0
     arm_kd: 0.5
     send_commands: true       # false = 只计算不下发，用来核对映射和限幅而不让机器人动
+  live_stream:
+    enabled: true
+    # The RTMP address is a card setting entered on the canvas, never here.
+    fps: 15
+    video_bitrate_kbps: 1200

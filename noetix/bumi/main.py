@@ -232,8 +232,16 @@ class BumiDeviceBundle:
         if plugins_cfg.get("vision_capture", {}).get("enabled", False):
             from device import VisionCapturePlugin
             self._plugins.append(VisionCapturePlugin(
-                plugins_cfg["vision_capture"], camera_plugin))
+                plugins_cfg["vision_capture"], camera_plugin, namespace=namespace,
+                executor=executor, mic_enabled=bool(plugins_cfg.get("mic", {}).get("enabled", False)
+                                                   and media_ctrl is not None)))
             print("[bundle] VisionCapturePlugin loaded")
+
+        if plugins_cfg.get("live_stream", {}).get("enabled", False):
+            from live_stream import LiveStreamPlugin
+            self._plugins.append(LiveStreamPlugin(
+                plugins_cfg["live_stream"], namespace, executor))
+            print("[bundle] LiveStreamPlugin loaded")
 
     def start_all(self) -> None:
         failed = 0

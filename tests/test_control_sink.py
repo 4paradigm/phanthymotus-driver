@@ -474,6 +474,46 @@ def test_stale_observation_is_dropped_even_when_the_command_is_fresh():
     assert apply.calls == []
 
 
+@pytest.mark.parametrize(
+    "ttl, observation_age, expected_lease",
+    [(80, 0, 80), (500, 450, 50), (500, 0, 200)],
+)
+def test_accepted_command_exposes_a_monotonic_lease(ttl, observation_age, expected_lease):
+    wall, mono, apply = FakeClock(1_700_000_000_000), FakeClock(4000), Recorder()
+    raw = descriptor_dict()
+    raw["rate"]["max_obs_age_ms"] = 500
+    sink = ControlSink(raw, apply, clock=mono, wall_clock=wall)
+    outcome = sink.submit(message(wall, [0.1, 0.1], ttl_ms=ttl,
+                                  obs_stamp_ms=wall.now - observation_age))
+    assert outcome.applied
+    assert outcome.expires_at_ms == mono.now + expected_lease
+
+
+@pytest.mark.parametrize(
+    "changes, verdict, reason",
+    [
+        ({"ttl_ms": 501}, Verdict.REJECTED, "ttl_ms"),
+        ({"stamp_ms": 1051}, Verdict.REJECTED, "future"),
+        ({"obs_stamp_ms": 1051}, Verdict.REJECTED, "future"),
+        ({"obs_stamp_ms": None}, Verdict.REJECTED, "obs_stamp_ms"),
+        ({"stamp_ms": 899}, Verdict.REJECTED, "start/resume"),
+        ({"stamp_ms": 900}, Verdict.DROPPED, "expired"),
+        ({"obs_stamp_ms": 500}, Verdict.DROPPED, "observation"),
+    ],
+)
+def test_strict_freshness_rejects_without_applying_or_granting_a_lease(changes, verdict, reason):
+    clock, apply = FakeClock(1000), Recorder()
+    raw = descriptor_dict()
+    raw["rate"]["max_obs_age_ms"] = 500
+    sink = make_sink(clock, apply, raw, max_ttl_ms=500, future_tolerance_ms=50,
+                     min_stamp_ms=900, require_observation=True, require_live_lease=True)
+    result = sink.submit(message(clock, [0.1, 0.1], **changes))
+    assert result.verdict is verdict
+    assert reason in result.reason
+    assert result.expires_at_ms is None
+    assert not apply.calls
+
+
 def test_out_of_order_seq_is_dropped():
     clock, apply = FakeClock(), Recorder()
     sink = make_sink(clock, apply)
