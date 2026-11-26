@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 import test_controlled_spatial as spatial_fixtures
 from controlled_spatial import ControlledSpatialPlugin, SpatialStore
+from mapping_keyboard import confirmed_stop
 import test_driver as driver_fixtures
 from test_driver import wait_until
 
@@ -192,6 +193,35 @@ class MappingKeyboardTests(unittest.TestCase):
         self.assertEqual(result['state'], 'error')
         self.assertTrue(self.spatial._keyboard_pending)
         self.assertFalse(self.client.commands)
+
+    def test_spontaneous_confirmed_remote_stop_is_not_lost_while_waiting_for_ready(self):
+        original=self.stream.read
+        def read(timeout):
+            if self.stream.held and not self.stream.stopping:
+                return {'state':'stopped','stationary':True,'software_estop':True}
+            return original(timeout)
+        self.stream.read=read
+        result=self.spatial.dispatch('keyboard_open',{})
+        self.assertNotEqual(result['state'],'error')
+        self.assertTrue(wait_until(lambda:self.keyboard.session is None))
+        self.assertEqual(self.keyboard.info()['state'],'idle')
+        self.assertFalse(self.spatial._keyboard_pending)
+        self.assertTrue(self.stream.closed)
+
+    def test_incomplete_remote_stop_acknowledgement_never_clears_pending(self):
+        for reply in ({'state':'stopped'}, {'state':'stopped','stationary':True},
+                      {'state':'stopped','stationary':False,'software_estop':True}):
+            self.assertFalse(confirmed_stop(reply))
+        original=self.stream.read
+        def read(timeout):
+            if self.stream.held:
+                raise ConnectionError('closed') if self.stream.stopping else RuntimeError('bad_ack')
+            return original(timeout)
+        self.stream.read=read
+        self.spatial.dispatch('keyboard_open',{})
+        self.assertTrue(wait_until(lambda:self.keyboard.session is None))
+        self.assertTrue(self.spatial._keyboard_pending)
+        self.assertEqual(self.keyboard.info()['state'],'stop_unconfirmed')
 
     def test_pending_shared_mode_enable_or_uncertain_send_rejects_keyboard_before_io(self):
         for attribute in ('_resume_unresolved', '_mode_unresolved', 'motion_send_uncertain'):

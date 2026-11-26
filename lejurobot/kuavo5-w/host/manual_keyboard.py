@@ -254,9 +254,22 @@ def run(request):
         subscription.unregister()
 
 
+def guard_error_code(exc):
+    code = str(exc)
+    known = {'keyboard_initial_stop_unconfirmed', 'keyboard_chassis_feedback_is_stale',
+        'keyboard_requires_healthy_manual_mapping', 'keyboard_activation_requires_zero',
+        'keyboard_initial_stop_ownership_lost', 'keyboard_release_rejected',
+        'keyboard_command_expired', 'keyboard_watchdog_expired',
+        'keyboard_software_stop_is_active', 'keyboard_stop_rejected',
+        'invalid_factory_websocket_handshake', 'factory_websocket_closed',
+        'factory_websocket_api_error', 'factory_motion_rejected',
+        'factory_websocket_disconnected', 'factory_websocket_write_busy'}
+    return code if code in known else 'factory_keyboard_guard_failed'
+
+
 if __name__ == '__main__':
     try:
         # The transport's first line is a configuration, not a velocity frame.
         run(json.loads(sys.stdin.buffer.readline(16385)))
-    except Exception:
-        print(json.dumps({'state': 'error', 'error': 'factory_keyboard_guard_failed'}), flush=True)
+    except Exception as exc:
+        print(json.dumps({'state': 'error', 'error': guard_error_code(exc)}), flush=True)

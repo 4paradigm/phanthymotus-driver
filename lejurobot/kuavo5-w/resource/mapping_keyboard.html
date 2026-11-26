@@ -27,7 +27,7 @@ After preparation completes, release all keys and press again.</p>
 <p class="muted">Saving mapping automatically releases keyboard control and confirms the stop first.
 A hardware emergency stop remains independent of this panel.</p>
 <script>
-let port=null,serial=0,session=null,seq=0,ready=false,inflight=false,opening=false,releasing=false,suspended=false,generation=0;
+let port=null,serial=0,session=null,seq=0,ready=false,inflight=false,opening=false,releasing=false,suspended=false,generation=0,statusChecking=false;
 const pending=new Map(),pressed=new Set(),state=document.getElementById('state');
 const release=document.getElementById('release');
 const aliases={KeyI:'KeyW',KeyK:'KeyS',KeyJ:'KeyA',KeyL:'KeyD',KeyW:'KeyW',KeyS:'KeyS',KeyA:'KeyA',KeyD:'KeyD'};
@@ -132,4 +132,15 @@ setInterval(async()=>{
   else if(r.state==='error'||r.state==='idle'||r.state==='stopping'){await disarm(r.error||r.last_error||'Keyboard stopped. Reopen mapping_console to continue.');}
  }catch(e){if(session===current)await disarm(e.message);}finally{inflight=false;}
 },80);
+setInterval(async()=>{
+ if(!port||session||opening||!releasing||statusChecking)return;
+ statusChecking=true;
+ try{const result=await call('keyboard_status');
+  if(!result.busy&&result.state==='idle'){
+   releasing=false;pressed.clear();ready=false;
+   paint('Stopped. Keyboard control released. Refocus this panel to continue mapping.');
+  }
+ }catch(e){/* Keep the stop warning until a positive status arrives. */}
+ finally{statusChecking=false;}
+},1000);
 </script></body></html>

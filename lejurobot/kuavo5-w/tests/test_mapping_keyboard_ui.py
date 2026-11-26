@@ -12,22 +12,22 @@ class KeyboardPanelTests(unittest.TestCase):
         script = r'''
 const fs=require('fs'),vm=require('vm'),assert=require('assert');
 const source=fs.readFileSync(process.argv[1],'utf8').split('<script>')[1].split('</script>')[0];
-const listeners={},docListeners={},elements={};let tick,ready=false,focused=true,holdOpen=false,heldOpen=null;
+const listeners={},docListeners={},elements={};let tick,statusTick,ready=false,focused=true,holdOpen=false,heldOpen=null;
 function element(){return {disabled:false,textContent:'',dataset:{},classList:{toggle(){}},addEventListener(){},setPointerCapture(){}};}
 for(const id of ['state','release','stop'])elements[id]=element();
 const buttons=['KeyW','KeyS','KeyA','KeyD'].map(code=>({...element(),dataset:{code}}));
 const requests=[];
-let mappingStarting=true;
+let mappingStarting=true,stopPending=false;
 const port={start(){},postMessage(m){requests.push(m.args);let result={state:'ready'};
  if(m.args.action==='keyboard_open')result=mappingStarting?{state:'loading',mapping_state:'starting'}:{state:'loading',session_id:'lease'};
- if(m.args.action==='keyboard_status')result={state:'idle',mapping_state:mappingStarting?'starting':'mapping',console_authorized:true};
+ if(m.args.action==='keyboard_status')result={state:stopPending?'stop_unconfirmed':'idle',busy:stopPending,mapping_state:mappingStarting?'starting':'mapping',console_authorized:true};
  if(m.args.action==='keyboard_command')result={state:ready?'ready':'loading'};
  if(m.args.action==='keyboard_release')result={state:'idle'};
  if(m.args.action==='keyboard_open'&&holdOpen){heldOpen=m;return;}
  queueMicrotask(()=>port.onmessage({data:{id:m.id,result}}));
 }};
 const parent={};const context={parent,setTimeout(fn,ms){if(ms===500){mappingStarting=false;queueMicrotask(fn);return 0;}return setTimeout(fn,ms);},clearTimeout,Promise,Map,Set,Number,Error,Date,
- setInterval(fn){tick=fn;},window:{focus(){focused=true;},addEventListener(k,f){listeners[k]=f;}},
+ setInterval(fn,ms){if(ms===80)tick=fn;else statusTick=fn;},window:{focus(){focused=true;},addEventListener(k,f){listeners[k]=f;}},
  document:{hidden:false,hasFocus(){return focused;},getElementById(id){return elements[id];},querySelectorAll(){return buttons;},
  addEventListener(k,f){docListeners[k]=f;}}};
 vm.createContext(context);vm.runInContext(source,context);
@@ -62,7 +62,11 @@ const values=()=>JSON.parse(JSON.stringify(requests.filter(x=>x.action==='keyboa
  await new Promise(resolve=>setImmediate(resolve));
  assert.equal(requests.at(-1).action,'keyboard_release','Late preparation after blur must be released');
  assert.equal(requests.at(-1).session_id,'late-lease');
+ stopPending=true;
  await elements.stop.onclick();assert.equal(requests.at(-2).action,'stop');assert.equal(requests.at(-1).action,'keyboard_status');
+ await statusTick();assert(elements.state.textContent.includes('pending'));
+ stopPending=false;await statusTick();
+ assert(elements.state.textContent.includes('Stopped.'),'Late stop confirmation must clear stale stop warning');
  const stopped=requests.length;focused=true;listeners.focus();await tick();
  assert.equal(requests.length,stopped,'Stop all motion must not automatically re-arm on focus');
 })().catch(e=>{console.error(e);process.exitCode=1;});

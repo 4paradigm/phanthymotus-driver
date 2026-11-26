@@ -13,6 +13,26 @@ from bootstrap import load_secrets
 LINEAR_LIMIT, ANGULAR_LIMIT, LEASE_S = .15, .3, .3
 
 
+def confirmed_stop(reply):
+    return (reply.get('state') == 'stopped' and reply.get('stationary') is True
+            and reply.get('software_estop') is True)
+
+
+def guard_error(reply):
+    code = reply.get('error')
+    return code if isinstance(code, str) and code in {
+        'keyboard_initial_stop_unconfirmed', 'keyboard_chassis_feedback_is_stale',
+        'keyboard_requires_healthy_manual_mapping', 'keyboard_activation_requires_zero',
+        'keyboard_initial_stop_ownership_lost', 'keyboard_release_rejected',
+        'keyboard_command_expired', 'keyboard_watchdog_expired',
+        'keyboard_software_stop_is_active', 'keyboard_stop_rejected',
+        'factory_keyboard_stream_disconnected', 'factory_keyboard_guard_timeout',
+        'invalid_factory_websocket_handshake', 'factory_websocket_closed',
+        'factory_websocket_api_error', 'factory_motion_rejected',
+        'factory_websocket_disconnected', 'factory_websocket_write_busy',
+        'factory_keyboard_guard_failed'} else 'factory_keyboard_guard_failed'
+
+
 class FactoryKeyboardStream:
     def __init__(self, client):
         self.stop_lock = threading.Lock()
@@ -71,6 +91,7 @@ class MappingKeyboard:
         self.session = None
         self.thread = None
         self.last_error = None
+        self.last_failure = None
 
     def info(self):
         with self.lock:
@@ -78,6 +99,7 @@ class MappingKeyboard:
             return {'state': s['phase'] if s else 'stop_unconfirmed' if self.spatial._keyboard_pending else 'idle',
                     'busy': s is not None or self.spatial._keyboard_pending,
                     'session_id': s['id'] if s else None, 'last_error': self.last_error,
+                    'last_failure': self.last_failure,
                     'linear_limit_m_s': LINEAR_LIMIT, 'angular_limit_rad_s': ANGULAR_LIMIT,
                     'watchdog_ms': int(LEASE_S*1000), 'route': 'factory_RobotMotion_MANUAL'}
 
@@ -113,6 +135,7 @@ class MappingKeyboard:
                  'mapping_token': mapping['token'], 'phase': 'loading', 'last_at': time.monotonic(),
                  'seq': -1, 'values': [0., 0.], 'stop': threading.Event()}
             self.session, self.last_error = s, None
+            self.last_failure = None
             self.spatial._keyboard_pending = True
             self.spatial._persist()
             self.thread = threading.Thread(target=self._run, args=(s,), daemon=True, name='mapping-keyboard')
@@ -175,8 +198,11 @@ class MappingKeyboard:
             with self.lock:
                 s['stream'] = stream
             reply = stream.read(45)  # Initial hold/cancel is allowed no motion.
+            if confirmed_stop(reply):
+                stopped = True
+                return
             if reply.get('state') != 'held':
-                raise RuntimeError('factory_keyboard_preparation_failed')
+                raise RuntimeError(guard_error(reply))
             seq, activated = 0, False
             while True:
                 with self.lock:
@@ -187,8 +213,12 @@ class MappingKeyboard:
                     # a stop epoch cannot be overtaken by an older direction.
                     stream.send({'nonce': reply['nonce'], 'seq': seq, 'values': values})
                 reply = stream.read(8 if not activated else .25)
+                if confirmed_stop(reply):
+                    stopped = True
+                    self.last_error = 'keyboard_remote_stopped'
+                    break
                 if reply.get('state') != 'ready' or reply.get('seq') != seq:
-                    raise RuntimeError('factory_keyboard_command_unconfirmed')
+                    raise RuntimeError(guard_error(reply))
                 seq += 1
                 if not activated:
                     with self.lock:
@@ -196,9 +226,10 @@ class MappingKeyboard:
                             s['phase'], s['values'] = 'ready', [0., 0.]
                     activated = True
                 s['stop'].wait(.08)
-        except Exception:
+        except Exception as exc:
             if not s['stop'].is_set() and not s['cancelled'].is_set():
-                self.last_error = 'factory_keyboard_guard_failed_inspect_stop_confirmation'
+                self.last_error = guard_error({'error':str(exc)})
+                self.last_failure = self.last_error
         finally:
             with self.lock:
                 s['phase'] = 'stopping'
@@ -206,10 +237,9 @@ class MappingKeyboard:
                 try:
                     stream.stop()
                     end = time.monotonic()+8
-                    while time.monotonic() < end:
+                    while not stopped and time.monotonic() < end:
                         reply = stream.read(max(.01, end-time.monotonic()))
-                        if (reply.get('state') == 'stopped' and reply.get('stationary') is True
-                                and reply.get('software_estop') is True):
+                        if confirmed_stop(reply):
                             stopped = True
                             break
                 except Exception:
