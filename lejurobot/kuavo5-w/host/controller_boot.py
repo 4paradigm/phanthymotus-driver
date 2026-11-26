@@ -183,6 +183,22 @@ class TimeoutTransport(xmlrpc.client.Transport):
         return connection
 
 
+def persist_status(status):
+    STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary = STATUS_PATH.with_suffix('.tmp')
+    temporary.write_text(json.dumps(status) + '\n')
+    temporary.replace(STATUS_PATH)
+
+
+def record_controller_exit(sequence, exit_code):
+    sequence.state, sequence.error = 'failed', 'controller_process_exited'
+    status = dict(sequence.status(), controller_exit_code=exit_code)
+    # ROS may have gone away with the child. Persist the terminal diagnostic
+    # before publishing or raising, so startup cannot look ready/waiting later.
+    persist_status(status)
+    return status
+
+
 def wait_for_master(stop, timeout=180, adopt_existing=False):
     deadline = time.monotonic() + timeout
     while not stop.is_set() and time.monotonic() < deadline:
@@ -272,9 +288,11 @@ def run(version, adopt_existing=False):
     try:
         while not stop.is_set() and not rospy.is_shutdown():
             now = time.monotonic()
-            if child is not None and child.poll() is not None:
-                sequence.state, sequence.error = 'failed', 'controller_process_exited'
-                pub.publish(String(data=json.dumps(sequence.status())))
+            exit_code = child.poll() if child is not None else None
+            if exit_code is not None:
+                status = record_controller_exit(sequence, exit_code)
+                print('[controller-boot] ' + json.dumps(status), flush=True)
+                pub.publish(String(data=json.dumps(status)))
                 raise RuntimeError('controller_process_exited_no_restart')
             if now >= next_params and sequence.state != 'failed':
                 try:
@@ -307,10 +325,7 @@ def run(version, adopt_existing=False):
                     g12_neutral=bool(measured.get('g12_owner')) and measured.get('g12_neutral') is True
                         and age is not None and age <= .3
                         and 0 <= now-measured.get('g12_owner_at', 0) <= 3.)
-            STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
-            temporary = STATUS_PATH.with_suffix('.tmp')
-            temporary.write_text(json.dumps(status) + '\n')
-            temporary.replace(STATUS_PATH)
+            persist_status(status)
             pub.publish(String(data=json.dumps(status)))
             state = (sequence.state, sequence.error)
             if state != last_state:

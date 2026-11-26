@@ -390,6 +390,17 @@ class G12GuardTests(fixtures.unittest.TestCase):
             factory.return_value.__enter__.return_value = proxy
             self.assertIsNone(controller.g12_owner([[('/joy', ['/sdk'])], [], []], master, '/sdk'))
 
+    def test_controller_exit_is_persisted_as_terminal_failure_before_ros_publish(self):
+        sequence = controller.BootSequence(63, lambda action: None)
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(controller, 'STATUS_PATH', Path(directory)/'controller/status.json'):
+            status = controller.record_controller_exit(sequence, 17)
+            saved = json.loads(controller.STATUS_PATH.read_text())
+        self.assertEqual(status['state'], 'failed')
+        self.assertEqual(status['error'], 'controller_process_exited')
+        self.assertEqual(status['controller_exit_code'], 17)
+        self.assertEqual(saved, status)
+
 
 if __name__ == '__main__':
     fixtures.unittest.main()

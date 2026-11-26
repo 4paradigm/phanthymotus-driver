@@ -218,6 +218,11 @@ def run(request):
                 if vx or vw:
                     raise RuntimeError('keyboard_activation_requires_zero')
                 motion()
+                # Another factory client may have released the held chassis
+                # while the lease/zero frame was in flight. Recheck fresh
+                # feedback at the release boundary; never adopt that release.
+                if manual().soft_estop is not True:
+                    raise RuntimeError('keyboard_initial_stop_ownership_lost')
                 if not dispatch(control_mode=1).success:
                     raise RuntimeError('keyboard_release_rejected')
                 namespace['confirm_software_stop'](rospy, False)

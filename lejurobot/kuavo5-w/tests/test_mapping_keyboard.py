@@ -91,7 +91,11 @@ class MappingKeyboardTests(unittest.TestCase):
         self.assertFalse(self.spatial.unresolved())
         schema = self.spatial.get_tool()['inputSchema']
         self.assertEqual(schema['x-workbench']['entry'], 'mapping_console')
-        self.assertNotIn('keyboard_command', schema['x-action-params'])
+        for action, params in {'keyboard_open': [], 'keyboard_command': ['session_id', 'seq', 'values'],
+                               'keyboard_release': ['session_id'], 'keyboard_status': []}.items():
+            self.assertEqual(schema['x-action-params'][action]['params'], params)
+            self.assertEqual(schema['x-action-params'][action]['required'], params)
+            self.assertTrue(set(params) <= set(schema['properties']))
 
     def test_zero_activation_and_browser_timeout_hold_and_release_resource(self):
         self.open()
@@ -340,7 +344,7 @@ class ChassisGuardTests(unittest.TestCase):
         self.assertTrue(wire.closed)
 
     def test_full_remote_guard_orders_zero_release_and_stop_on_eof_or_mode_loss(self):
-        for cause in ('eof', 'mode', 'timeout'):
+        for cause in ('eof', 'mode', 'timeout', 'early_release', 'release_on_zero'):
             with self.subTest(cause=cause):
                 read_fd, write_fd = os.pipe()
                 state = types.SimpleNamespace(manual_mode=True, mapping=True, estop=False,
@@ -366,7 +370,11 @@ class ChassisGuardTests(unittest.TestCase):
                     'jaten_msgs.msg': types.SimpleNamespace(RobotChassisState=object),
                     'leju_mobile_base_msgs.srv': types.SimpleNamespace(SetDispatchMode=object),
                     'nav_msgs.msg': types.SimpleNamespace(Odometry=object)}
-                ws = types.SimpleNamespace(send=lambda value: commands.append(('motion', json.loads(value)['params'])), close=lambda: None)
+                def motion(value):
+                    commands.append(('motion', json.loads(value)['params']))
+                    if cause == 'release_on_zero' and len(commands) == 2:
+                        state.soft_estop = False
+                ws = types.SimpleNamespace(send=motion, close=lambda: None)
                 def run():
                     try:
                         remote.run({'master': 'unused', 'ros_ip': 'unused'})
@@ -381,9 +389,21 @@ class ChassisGuardTests(unittest.TestCase):
                     worker.start()
                     try:
                         self.assertTrue(wait_until(lambda: outputs and outputs[-1]['state'] == 'held'))
+                        if cause == 'early_release':
+                            state.soft_estop = False
                         def send(seq, values):
                             os.write(write_fd, (json.dumps({'nonce': outputs[-1]['nonce'], 'seq': seq, 'values': values})+'\n').encode())
                         send(1, [0, 0])
+                        if cause in ('early_release', 'release_on_zero'):
+                            worker.join(1)
+                            self.assertFalse(worker.is_alive())
+                            self.assertEqual(outputs[-1]['state'], 'stopped')
+                            self.assertNotIn(('dispatch', 1), commands)
+                            self.assertEqual(commands[-1], ('dispatch', 0))
+                            self.assertTrue(state.soft_estop)
+                            self.assertTrue(errors)
+                            self.assertFalse(any(value.get('state') == 'ready' for value in outputs))
+                            continue
                         self.assertTrue(wait_until(lambda: outputs[-1]['state'] == 'ready'))
                         if cause == 'mode':
                             state.manual_mode = False

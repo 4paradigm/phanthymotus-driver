@@ -190,8 +190,14 @@ class ControlledSpatialPlugin:
         self.keyboard = MappingKeyboard(self)
 
     def get_tool(self):
-        keyboard_actions = ['keyboard_open', 'keyboard_command', 'keyboard_release', 'keyboard_status']
-        props = {'action': {'type': 'string', 'enum': [*self.ACTIONS, *keyboard_actions]},
+        keyboard_actions = {
+            'keyboard_open': ([], '准备MANUAL建图键盘控制，首帧必须为零速度'),
+            'keyboard_command': (['session_id', 'seq', 'values'], '≤0.15 m/s、0.3 rad/s；发送带会话和递增序号的键盘速度心跳'),
+            'keyboard_release': (['session_id'], '释放指定键盘会话并确认底盘停止'),
+            'keyboard_status': ([], '读取键盘会话、控制权和停止确认状态'),
+        }
+        actions = {**self.ACTIONS, **keyboard_actions}
+        props = {'action': {'type': 'string', 'enum': list(actions)},
                  'session_id': {'type': 'string'}, 'seq': {'type': 'integer', 'minimum': 0},
                  'values': {'type': 'array', 'items': {'type': 'number'}, 'minItems': 2, 'maxItems': 2,
                             'description': '≤0.15 m/s、0.3 rad/s；面板内部使用[vx,vw]，无侧移'},
@@ -206,6 +212,8 @@ class ControlledSpatialPlugin:
         required = {'start_mapping': ['map_name'], 'tag_place': ['name'], 'untag_place': ['name'],
                     'load_map': ['map_name'], 'delete_map': ['map_name', 'confirm_delete'],
                     'reconcile_mapping': ['map_name', 'confirm_abandon'],
+                    'keyboard_command': ['session_id', 'seq', 'values'],
+                    'keyboard_release': ['session_id'],
                     'navigate_to_pose': ['x', 'y', 'yaw'],
                     'navigate_to_tag': ['tag_name']}
         return {'name': self.PREFIX, 'type': 'actuator', 'multiInstance': False,
@@ -217,7 +225,7 @@ class ControlledSpatialPlugin:
                     'x-resource': 'base', 'x-hooks': {'on_interrupt_motion': {'action': 'stop_nav'}},
                     'x-completion': {'actions': ['navigate_to_pose', 'navigate_to_tag', 'start_mapping', 'stop_mapping', 'load_map', 'delete_map'], 'timeout': 1830},
                     'x-action-params': {k: {'params': p, 'description': d, 'required': required.get(k, [])}
-                                        for k, (p, d) in self.ACTIONS.items()}}}
+                                        for k, (p, d) in actions.items()}}}
 
     def _restore(self):
         if not self._restored:
