@@ -248,8 +248,6 @@ class _StateNode:
         self._latest_bms = None
         self._bms_samples = deque(maxlen=_BMS_QUEUE_CAPACITY)
         self._bms_queue_overflows = 0
-        self._bms_received_mono = None
-        self._bms_timestamp_ms = None
         self._latest_sport = None
         self._low_generation = 0
         self._bms_generation = 0
@@ -493,16 +491,25 @@ class _StateNode:
         with latest_lock:
             self._latest_bms = bms
             self._bms_generation += 1
-            self._bms_received_mono = time.monotonic()
-            self._bms_timestamp_ms = int(time.time() * 1000)
+            received_mono = time.monotonic()
+            timestamp_ms = int(time.time() * 1000)
             samples = getattr(self, '_bms_samples', None)
             if samples is not None:
                 if len(samples) == samples.maxlen:
                     self._bms_queue_overflows += 1
                 # Drop oldest on overflow. The retained sequence gap forces the
                 # calculator to break integration; no missing interval is bridged.
-                samples.append((bms, self._bms_generation,
-                                self._bms_received_mono, self._bms_timestamp_ms))
+                # Copy only calculation fields, not the SDK message or its
+                # mutable voltage arrays. Deferred samples own these values.
+                sample = {name: getattr(bms, name, None)
+                          for name in ('current', 'soc', 'soh')}
+                for name in ('bmsvoltage', 'cell_vol'):
+                    try:
+                        sample[name] = tuple(getattr(bms, name))
+                    except (AttributeError, TypeError):
+                        sample[name] = None
+                samples.append((sample, self._bms_generation,
+                                received_mono, timestamp_ms))
         if getattr(self, "_publisher_thread", None) is None:
             self._publish_bms(bms)
 
@@ -665,7 +672,6 @@ class _BatteryPowerCard:
         self.logical_running = False
         self.last_publish = None
         self.last_status = None
-        self.skip_sequence = 0
         self.error_count = 0
         self.last_error = None
         self._last_error_log_mono = None
@@ -694,7 +700,6 @@ class _BatteryPowerCard:
             self.node = node
             self.publisher = publisher
             self.core.reset()  # Preserve process energy, break node epochs.
-            self.skip_sequence = 0  # Accept this new node's retained samples.
             self.last_publish = self.last_status = None
             self.logical_running = False
             self.running = True
@@ -747,9 +752,6 @@ class _BatteryPowerCard:
                 if was_running:
                     self._publish_invalid(node)
 
-    def tick(self, node, msg, sequence, received, stamp):
-        self.tick_samples(node, ((msg, sequence, received, stamp),))
-
     def tick_samples(self, node, samples):
         # Processing serializes with physical detach/shutdown. Canvas stop only
         # changes logical state; no shared cache lock is held during computation.
@@ -760,7 +762,7 @@ class _BatteryPowerCard:
             # Drain received samples before checking freshness. Worker
             # delays are not BMS gaps; update() checks receive times and sequences.
             for msg, sequence, received, stamp in samples:
-                if msg is not None and sequence > self.skip_sequence and received is not None:
+                if msg is not None and received is not None:
                     self.core.update(msg, sequence, received, stamp)
             data = self.core.snapshot(now)
             status = (data['status'], data['runtime_status'], data['fresh'])

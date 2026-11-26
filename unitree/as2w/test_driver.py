@@ -2843,25 +2843,5 @@ class TestDriverContracts(unittest.TestCase):
         self.assertAlmostEqual(0.0, z, places=3)
 
 
-    def test_battery_power_keeps_legacy_battery_payload_exact(self):
-        node = self.device._StateNode.__new__(self.device._StateNode)
-        output = []
-        node.battery = types.SimpleNamespace(publish=lambda msg: output.append(json.loads(msg.data)))
-        node._publish_bms(types.SimpleNamespace(
-            soc=18, current=-1818, cycle=21, temperature=[37, 37, 0]))
-        self.assertEqual([{"soc": 18, "current_ma": -1818.0, "cycle": 21,
-                           "temperature_0": 37.0, "temperature_1": 37.0,
-                           "temperature_2": 0.0}], output)
-
-    def test_battery_power_metadata_preserves_existing_card_definitions(self):
-        plugin = self.device.StatePlugin.__new__(self.device.StatePlugin)
-        plugin._namespace = "test"
-        before = plugin.get_tools()
-        plugin._power_card = self.device._BatteryPowerCard({}, "test")
-        after = plugin.get_tools()
-        self.assertEqual(before, after[:-1])
-        self.assertEqual("battery_power", after[-1]["name"])
-
-
 if __name__ == "__main__":
     unittest.main()

@@ -275,20 +275,13 @@ handling is unchanged.
 in Python) to disable runtime estimates with `capacity_unconfigured`. Capacity
 is not scaled by SOH; the existing recent-power runtime formula is unchanged.
 
-Operator-reported hardware acceptance, recorded on 2026-11-22: the official
-ARM64 image built successfully and automated code review reported no issues.
-The Dashboard displayed voltage, SOH, instantaneous and average power,
-discharged energy, and remaining runtime. The real sliding window reached
-299.987 s with 6073 integration intervals; skipped intervals, processing errors,
-and queue overflows were all zero. At 95% SOC and 99.24177 W average power,
-the 648 Wh estimate was 372.182 minutes, consistent with the formula. Independent
-Card stop/start passed, discharged energy was retained, and the original
-Battery Card continued publishing while Battery Power was stopped. That test
-used the earlier physical-stop semantics; the Always-on lifecycle update needs
-fresh on-device acceptance with intelligent control left off. These
-observations validate the previously tested image; the Always-on lifecycle
-change has not been rebuilt or deployed as part of this update. The runtime value
-remains an estimate at recent power demand, not a guarantee for future loads.
+Voltage uses `bmsvoltage[0]` in mV, cross-checked against the second field
+and the observed 12-cell layout. Array meanings and complete current-sign
+conventions still need hardware confirmation. SOH is only the BMS report.
+Discharge power is voltage times negative current magnitude; energy uses
+trapezoidal integration of consecutive valid receive-time samples. Charging,
+invalid data, stale data, missing sequences, and long gaps break continuity.
+Runtime reflects recent demand and does not guarantee future task duration.
 
 For a no-hardware check, run `python3 test_driver.py` in `as2w`. In a built
 container, verify the media tools with `ffmpeg -version` and
