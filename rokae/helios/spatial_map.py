@@ -156,7 +156,7 @@ class HeliosSpatialMap:
             self._finish_navigation({**self._navigation, "state": "error",
                                      "message": "VMR connection closed before the navigation outcome was known"})
         for future in self._pending.values():
-            future.set_exception(RuntimeError("VMR connection closed; check chassis state before retrying"))
+            future.set_exception(ConnectionError("VMR connection closed; check chassis state before retrying"))
         self._pending.clear()
         if proc is not None and proc.poll() is None:
             proc.stdin.close()
@@ -168,9 +168,7 @@ class HeliosSpatialMap:
 
     def _tick(self):
         with self._lock:
-            if not self._users and not self.control.building and self._navigation is None:
-                if self._process is not None:
-                    self._release_capture()
+            if self._release_if_unused():
                 return
             now = time.monotonic()
             if self._process is not None:
@@ -198,7 +196,7 @@ class HeliosSpatialMap:
         with self._lock:
             proc = self._process
             if proc is None or proc.poll() is not None:
-                raise RuntimeError("VMR worker unavailable")
+                raise ConnectionError("VMR worker unavailable")
             ident = uuid.uuid4().hex
             future = Future()
             self._pending[ident] = future
@@ -267,18 +265,23 @@ class HeliosSpatialMap:
             if key == "spatial_map" and self._publisher:
                 self._publisher.publish(self._message(data=json.dumps({"state": "idle", "map_name": None,
                                                                         "stations": None, "localization": None})))
-            # Keep receiving the final VMR result after the last card requests cancellation.
-            if not self._users and not self.control.building and self._navigation is None:
-                self._release_capture()
+            self._release_if_unused()
 
-    def _release_capture(self):
-        self._end_process()
-        self.chassis.stop()
-        self.control.close()
-        self.control.selected = None
-        self.cloud.clear()
-        self.selected_cloud.clear()
-        self._data = {"state": "idle"}
+    def _release_if_unused(self):
+        if self._users or self.control.building:
+            return False
+        # A live worker can still report the outcome of a cancellation.
+        if self._navigation and self._process is not None and self._process.poll() is None:
+            return False
+        if self._process is not None or self.control.db is not None:
+            self._end_process()
+            self.chassis.stop()
+            self.control.close()
+            self.control.selected = None
+            self.cloud.clear()
+            self.selected_cloud.clear()
+            self._data = {"state": "idle"}
+        return True
 
     def stop(self):
         with self._operations, self._lock:
@@ -307,9 +310,13 @@ class HeliosSpatialMap:
                 self._enable(key)
                 return {"state": "ready" if key == "controlled_spatial" else "running", "topic_out": topics}
             if action == "stop":
-                if key == "controlled_spatial" and key in self._users:
-                    self.command("stop_nav")
-                self._disable(key)
+                try:
+                    if key == "controlled_spatial" and key in self._users:
+                        self.command("stop_nav")
+                except ConnectionError:
+                    pass  # The disconnected worker cannot accept a cancellation request.
+                finally:
+                    self._disable(key)
                 return {"state": "idle", "topic_out": topics}
             if key == "controlled_spatial":
                 self._enable(key)

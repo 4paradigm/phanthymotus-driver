@@ -228,7 +228,8 @@ def test_canvas_navigation_reports_acp_outcome(vmr_sensor, acp_posts):
     assert acp_posts.empty()
 
 
-def test_lost_worker_reports_unknown_navigation_outcome(vmr_sensor, acp_posts):
+@pytest.mark.parametrize("tick_before_stop", [False, True])
+def test_stop_after_worker_exit_releases_card_and_reports_unknown_navigation(vmr_sensor, acp_posts, tick_before_stop):
     sensor = vmr_sensor
     bundle = DriverBundle([sensor])
     bundle.dispatch("controlled_spatial", {"action": "start"})
@@ -236,8 +237,30 @@ def test_lost_worker_reports_unknown_navigation_outcome(vmr_sensor, acp_posts):
     accepted = bundle.dispatch("controlled_spatial", {"action": "navigate_to_pose", "x": 2, "y": 0, "yaw": 0})
     sensor._process.kill()
     sensor._process.wait(timeout=3)
+    if tick_before_stop:
+        sensor._tick()
+    assert bundle.dispatch("controlled_spatial", {"action": "stop"})["state"] == "idle"
+    assert sensor.control.db is None
+    assert sensor._users == set()
+    sensor.chassis.stop.assert_called_once()
     sensor._tick()
+    assert sensor._process is None
     _, payload = acp_posts.get(timeout=3)
     assert payload["action_id"] == accepted["action_id"]
     assert payload["status"] == "error"
     assert "outcome was known" in payload["result"]["message"]
+
+
+def test_stop_with_disconnected_worker_preserves_other_map_card(vmr_sensor):
+    sensor = vmr_sensor
+    bundle = DriverBundle([sensor])
+    for name in ("spatial_map", "controlled_spatial"):
+        bundle.dispatch(name, {"action": "start"})
+    sensor._process.kill()
+    sensor._process.wait(timeout=3)
+    assert bundle.dispatch("controlled_spatial", {"action": "stop"})["state"] == "idle"
+    assert sensor._users == {"spatial_map"}
+    assert sensor.control.db is not None
+    sensor.chassis.stop.assert_not_called()
+    assert bundle.dispatch("spatial_map", {"action": "stop"})["state"] == "idle"
+    assert sensor.control.db is None
