@@ -260,6 +260,12 @@ class ControlledSpatialPlugin:
                                     'map_transition': self._map_pending, 'chassis_preparation': self._preparation,
                                     'keyboard_stop_unconfirmed': self._keyboard_pending})
 
+    def preparation_failed(self, exc):
+        self.store.state('last_preparation_failure', {
+            'at': time.time(), 'error_type': type(exc).__name__,
+            'error': str(exc)[:180].encode('unicode_escape').decode('ascii'),
+            'preparation': self._preparation})
+
     def unresolved(self):
         self._restore()
         return (self._uncertain or self._task is not None or self._map_pending is not None
@@ -466,6 +472,10 @@ class ControlledSpatialPlugin:
         Caller owns the shared control transition and native-operation lock.
         This never loads a map or releases a stop; upper/native handoff follows.
         """
+        with self.bundle.tracker.lock:
+            self.bundle._check_transition(token)
+            self._preparation = {'delivery_uncertain': False, 'stage': 'observe_chassis_auto'}
+            self._persist()
         def check():
             with self.bundle.tracker.lock:
                 self.bundle._check_transition(token)
@@ -544,7 +554,7 @@ class ControlledSpatialPlugin:
             with self._native_lock:
                 with self.bundle.tracker.lock:
                     self.bundle._check_transition(token)
-                    self._preparation = {'delivery_uncertain': True}
+                    self._preparation = {'delivery_uncertain': False, 'stage': 'observe_chassis_start'}
                     self._persist()
                 if initial_observation['agvState'].get('runningMode') == 'MANUAL':
                     # A paused upper MPC may publish no idle velocity stream.
@@ -560,9 +570,12 @@ class ControlledSpatialPlugin:
                         self.base_preparation_required = False
                     return {'success': True, 'stationary': True, 'auto_transition_deferred': True,
                             'completion_basis': 'manual_stationary_auto_handoff_deferred_to_base_execution'}
+                self._preparation = {'delivery_uncertain': True, 'operation': 'prepare', 'stage': 'native_prepare'}
+                self._persist()
                 result = self.client.native('prepare')
                 if result.get('success') is False and result.get('delivery_uncertain') is False:
-                    self._preparation = {'delivery_uncertain': False}
+                    self._preparation = {'delivery_uncertain': False, 'operation': 'prepare',
+                                         'stage': result.get('stage'), 'error_code': result.get('error_code')}
                     self._persist()
                 if (result.get('success') is not True or result.get('stationary') is not True
                         or result.get('software_estop') is not False or result.get('old_task_cancelled') is not True):
@@ -591,7 +604,8 @@ class ControlledSpatialPlugin:
                 self.bundle.state.motion_blocked = was_blocked
                 self.base_preparation_required = False
             return {**result, 'completion_basis': 'old_task_cancelled_and_fresh_stationary_release_feedback'}
-        except Exception:
+        except Exception as exc:
+            self.preparation_failed(exc)
             if token is not None:
                 self.bundle.pause('chassis_start_failed_or_interrupted', expected_transition=token)
             raise
@@ -727,6 +741,7 @@ class ControlledSpatialPlugin:
                     'archive': self.archive.snapshot() if self.archive else {'state': 'disabled'}}
                 result['last_map_operation'] = self.store.state('last_map_operation')
                 result['last_preparation_recovery'] = self.store.state('last_preparation_recovery')
+                result['last_preparation_failure'] = self.store.state('last_preparation_failure')
                 if self._map_pending and self._map_pending.get('stage_started_at'):
                     result['map_stage_elapsed_s'] = max(0., time.time()-self._map_pending['stage_started_at'])
                 if mapping and mapping.get('phase') == 'saving':

@@ -1477,7 +1477,7 @@ class KuavoBundle:
                 with self.spatial._native_lock:
                     with self.tracker.lock:
                         self._check_transition(token)
-                        self.spatial._preparation = {'delivery_uncertain': True}
+                        self.spatial._preparation = {'delivery_uncertain': False, 'stage': 'observe_chassis_auto'}
                         self.spatial._persist()
                     self.spatial.ensure_auto_for_motion(token)
                     with self.tracker.lock:
@@ -1495,15 +1495,22 @@ class KuavoBundle:
                 with self.spatial._native_lock:
                     with self.tracker.lock:
                         self._check_transition(token)
-                        self.spatial._preparation = {'delivery_uncertain': True}
+                        self.spatial._preparation = {'delivery_uncertain': False, 'stage': 'observe_chassis_auto'}
                         self.spatial._persist()
                     self.spatial.ensure_auto_for_motion(token)
                     velocity, _ = self.state.read('upper_velocity_enabled')
+                    with self.tracker.lock:
+                        self._check_transition(token)
+                        self.spatial._preparation = {'delivery_uncertain': True,
+                            'operation': 'upper_handoff', 'stage': 'native_upper_handoff'}
+                        self.spatial._persist()
                     handoff = self.spatial.client.native('upper_handoff')
                     with self.tracker.lock:
                         self._check_transition(token)
                         if handoff.get('delivery_uncertain') is False:
-                            self.spatial._preparation = {'delivery_uncertain': False}
+                            self.spatial._preparation = {'delivery_uncertain': False,
+                                'operation': 'upper_handoff', 'stage': handoff.get('stage'),
+                                'error_code': handoff.get('error_code')}
                             self.spatial._persist()
                         if (handoff.get('success') is not True or handoff.get('stationary') is not True
                                 or handoff.get('software_estop') is not False
@@ -1536,7 +1543,9 @@ class KuavoBundle:
                 return result
         except _UncertainMotionSend:
             raise  # The caller owns cancellation of this already-tracked action.
-        except Exception:
+        except Exception as exc:
+            if channel == 'base' and self.spatial._preparation is not None:
+                self.spatial.preparation_failed(exc)
             self.pause('automatic_control_preparation_failed', status='error', expected_transition=token)
             raise
         finally:

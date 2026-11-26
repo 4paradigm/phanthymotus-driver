@@ -869,6 +869,20 @@ class SpatialTests(unittest.TestCase):
         self.assertEqual(self.plugin._preparation['delivery_uncertain'], False)
         self.bundle._end_control(token)
 
+    def test_initial_auto_observation_failure_is_recorded_as_read_only(self):
+        token,_,_=self.bundle._begin_control('test_auto')
+        self.plugin._preparation={'delivery_uncertain':True}
+        self.client.observe=lambda **kwargs:(_ for _ in ()).throw(NavigationStateUnavailable(('agvState',)))
+        with self.assertRaises(NavigationStateUnavailable):
+            self.plugin.ensure_auto_for_motion(token)
+        self.assertEqual(self.plugin._preparation,{'delivery_uncertain':False,'stage':'observe_chassis_auto'})
+        self.plugin.preparation_failed(RuntimeError('read_only_feedback_unavailable'))
+        evidence=self.plugin.store.state('last_preparation_failure')
+        self.assertFalse(evidence['preparation']['delivery_uncertain'])
+        self.assertFalse(self.client.commands)
+        self.assertFalse(self.client.calls)
+        self.bundle._end_control(token)
+
     def test_read_only_auto_guard_failure_does_not_create_uncertain_mode_write(self):
         self.client.feedback['agvState']['runningMode']='MANUAL'
         token,_,_=self.bundle._begin_control('test_auto')
