@@ -123,6 +123,7 @@ class BumiDeviceBundle:
         plugins_cfg = cfg.get("plugins", {})
         camera_plugin = None
         loco_plugin = None
+        loco_servo_plugin = None
         # The camera subprocess reads this env var; set it before any plugin can
         # start that subprocess, so the raw RGB-D branch is published only when
         # the visual odometry card is enabled.
@@ -151,12 +152,13 @@ class BumiDeviceBundle:
         if (plugins_cfg.get("loco_servo", {}).get("enabled", False)
                 and high_ctrl is not None):
             from loco_servo import LocoServoPlugin
-            self._plugins.append(LocoServoPlugin(
+            loco_servo_plugin = LocoServoPlugin(
                 plugins_cfg["loco_servo"], namespace, executor, high_ctrl,
                 # When the call-shaped card is enabled, both paths share its
                 # lock/rate limiter and explicit actions preempt the stream.
                 loco_plugin=loco_plugin,
-            ))
+            )
+            self._plugins.append(loco_servo_plugin)
             print("[bundle] LocoServoPlugin loaded")
 
         if plugins_cfg.get("mic", {}).get("enabled", False) and media_ctrl is not None:
@@ -190,6 +192,35 @@ class BumiDeviceBundle:
                     plugins_cfg["visual_odometry"], namespace, executor,
                     high_ctrl=high_ctrl))
                 print("[bundle] VisualOdometryPlugin loaded")
+
+        if plugins_cfg.get("upper_body_track", {}).get("enabled", False):
+            # Not gated on the camera plugin: this card is handed its input topic
+            # by the canvas, so a build where the camera card is off can still
+            # subscribe to whatever stream the operator wires in. It commands no
+            # joint, so there is nothing here to gate on a controller either.
+            from upper_body_track_card import UpperBodyTrackPlugin
+            self._plugins.append(UpperBodyTrackPlugin(
+                plugins_cfg["upper_body_track"], namespace, executor))
+            print("[bundle] UpperBodyTrackPlugin loaded")
+
+        if plugins_cfg.get("upper_body_mimic", {}).get("enabled", False):
+            # Unlike the tracking card above, this one *writes* motors, so it is
+            # gated on the controller existing — the guidance that a card which
+            # reports a subsystem must not be gated on it, but a card that acts
+            # on a subsystem must be. Without a controller there is nothing to
+            # command, and the card would report "ready" while doing nothing.
+            if high_ctrl is None:
+                print("[bundle] UpperBodyMimicPlugin skipped: no high controller")
+            else:
+                from upper_body_mimic_card import UpperBodyMimicPlugin
+                self._plugins.append(UpperBodyMimicPlugin(
+                    plugins_cfg["upper_body_mimic"], namespace, executor, high_ctrl,
+                    # Both chassis writers are built before this card. Wiring
+                    # them in gives all three the same mutual-exclusion graph:
+                    # a motion or a velocity stream blocks start, and an
+                    # explicit motion preempts this loop.
+                    loco_plugin=loco_plugin, loco_servo=loco_servo_plugin))
+                print("[bundle] UpperBodyMimicPlugin loaded")
 
         if plugins_cfg.get("motion_state", {}).get("enabled", False) and high_ctrl is not None:
             from device import MotionStatePlugin

@@ -412,10 +412,17 @@ class LocoPlugin:
         # Set by LocoServoPlugin at construction. `loco` is built first, so the
         # link cannot be a constructor argument in this direction.
         self._servo = None
+        # Same for upper_body_mimic: it takes all 21 motors, so every explicit
+        # action here must stop it before moving the robot.
+        self._mimic = None
 
     def attach_servo(self, servo) -> None:
         """Let the streaming chassis card be paused before we drive it ourselves."""
         self._servo = servo
+
+    def attach_mimic(self, mimic) -> None:
+        """Let the upper-body actuator be preempted before we drive the robot."""
+        self._mimic = mimic
 
     def _distance_full_scale(self):
         """Measured normalised-command-to-m/s calibration from the servo card.
@@ -449,7 +456,7 @@ class LocoPlugin:
         self._publish_cmd(x, y, z, _get_default_cmd(), 0)
 
     def _preempt_servo(self, reason: str) -> bool:
-        """An explicit action outranks a streaming policy.
+        """An explicit action outranks a streaming policy or the mimic card.
 
         This direction is not negotiable: a person or the LLM saying "stop" or
         "dance" must win over a policy that is mid-plan, and the reverse would
@@ -459,12 +466,18 @@ class LocoPlugin:
         Called from **every** action on this plugin that moves the robot, not
         just `loco.move`. The posture, preset and teaching actions all change
         `workmode` out from under a running stream, and a stream that keeps
-        publishing velocities into a robot that is being told to lie down is the
-        one combination none of the individual cards can see.
+        writing motors into a robot being told to lie down is the one
+        combination none of the individual cards can see. `upper_body_mimic`
+        writes all 21 motors through LowController, so it must be stopped by
+        the same call that pauses the velocity stream.
         """
-        if self._servo is None:
-            return False
-        return bool(self._servo.pause_for_explicit_command(reason))
+        preempted = False
+        if self._servo is not None:
+            preempted = bool(self._servo.pause_for_explicit_command(reason))
+        if (self._mimic is not None
+                and getattr(self._mimic, "pause_for_explicit_command", None)):
+            preempted = bool(self._mimic.pause_for_explicit_command(reason)) or preempted
+        return preempted
 
     def _set_servo_velocity_owner(self, owned: bool) -> None:
         """Transfer the shared velocity publisher after/before loco.move."""

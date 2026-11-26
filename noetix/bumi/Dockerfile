@@ -101,6 +101,27 @@ RUN apt-get update && \
 RUN pip3 install --no-cache-dir -i ${PYPI_MIRROR} \
     pyyaml netifaces numpy opencv-python-headless pyrealsense2 pybind11
 
+# `upper_body_track` card: optional YOLO11-pose inference. ultralytics pulls
+# torch and torchvision, which adds several hundred MB to the image. Docker
+# layers cannot be conditional at runtime, so keeping that cost out of default
+# Bumi images requires a build-time switch: pass --build-arg INSTALL_POSE_DEPS=1
+# to build an image that can run this card. torch, torchvision and ultralytics
+# are pinned in pose-requirements.txt: those three dominate the image and are
+# what the recorded ARM64 size evidence measures. Their transitive dependencies
+# still resolve at build time, so a rebuild can shift a few tens of MiB in
+# packages this file does not name — a hash-checked lock file would be needed to
+# close that, and the size evidence says so too. The headless opencv above needs
+# no GUI libs; the pose weight is fetched on first run and cached, or
+# `model_path` points at a pre-downloaded copy on an offline robot.
+COPY pose-requirements.txt /work/pose-requirements.txt
+ARG INSTALL_POSE_DEPS=0
+RUN if [ "$INSTALL_POSE_DEPS" = "1" ]; then \
+      pip3 install --no-cache-dir -i ${PYPI_MIRROR} -r /work/pose-requirements.txt && \
+      python3 -c 'import ultralytics, torch, torchvision; from ultralytics import YOLO'; \
+    else \
+      echo "upper_body_track pose deps not installed (INSTALL_POSE_DEPS != 1)"; \
+    fi
+
 # The bundle image must be able to start the estimator child and this card's
 # Python imports; fail the build here rather than on a robot. Docker's default
 # shell is /bin/sh (dash), where `source` does not exist — use bash explicitly
@@ -127,11 +148,14 @@ RUN cd /work/noetix_sdk_bumi && \
     cmake .. \
         -DCMAKE_CXX_STANDARD=17 \
         -Dpybind11_DIR=$(python3 -c "import pybind11; print(pybind11.get_cmake_dir())") && \
-    make -j$(nproc) highcontrol_py mediacontrol_py && \
+    make -j$(nproc) highcontrol_py lowcontrol_py mediacontrol_py && \
     echo "[build] pybind modules built successfully"
 
-# Verify .so files exist
+# Verify .so files exist. `lowcontrol_py` is what `upper_body_mimic` needs to
+# command the motors; without it that card starts and immediately reports
+# "low-level SDK unavailable", which is a card that can never move the robot.
 RUN ls /work/noetix_sdk_bumi/build/highcontrol_py*.so && \
+    ls /work/noetix_sdk_bumi/build/lowcontrol_py*.so && \
     ls /work/noetix_sdk_bumi/build/mediacontrol_py*.so
 
 # ROS2 domain isolation
@@ -154,6 +178,10 @@ COPY visual_odometry_probe.py /work/visual_odometry_probe.py
 COPY odom_spec.py /work/odom_spec.py
 COPY sound_direction.py /work/sound_direction.py
 COPY direction_card.py /work/direction_card.py
+COPY upper_body_track_spec.py /work/upper_body_track_spec.py
+COPY upper_body_track_card.py /work/upper_body_track_card.py
+COPY upper_body_mimic_spec.py /work/upper_body_mimic_spec.py
+COPY upper_body_mimic_card.py /work/upper_body_mimic_card.py
 COPY live_stream.py /work/live_stream.py
 COPY config.yaml /work/config.yaml
 COPY deploy/     /deploy/

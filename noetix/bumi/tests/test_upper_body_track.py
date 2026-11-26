@@ -1,0 +1,917 @@
+"""The upper-body retarget's rules, exercised off a robot.
+
+`upper_body_track_spec` imports no ROS, no OpenCV and no numpy, so these run on
+a laptop with nothing installed. What is worth pinning down is not that the
+dictionary has the expected keys, but the decisions that would fail silently:
+
+  * a sideways arm must not read as "arm swung behind the robot";
+  * the two arms have asymmetric roll limits, so a clamp that looks right on one
+    side is wrong on the other;
+  * the dashboard renders a nested payload as raw JSON text, so flatness is a
+    contract, not a style choice;
+  * a joint disappears when the operator turns away — it must hold, not jump.
+"""
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import upper_body_track_spec as spec  # noqa: E402
+
+
+def _person(keypoints, confidence=0.9, bbox=(10.0, 10.0, 110.0, 210.0)):
+    return {"keypoints": keypoints, "confidence": confidence, "bbox": list(bbox)}
+
+
+def _blank_points():
+    """17 keypoints that are confidently on-screen but carry no geometry."""
+    return [[100.0, 100.0, 1.0] for _ in range(17)]
+
+
+# ── the retarget itself ──────────────────────────────────────────────────────
+
+def test_an_arm_hanging_straight_down_is_all_zeros():
+    angles = spec.arm_angles((0, 0, 1.0), (0, 0, 0.7), (0, 0, 0.4))
+    assert angles["pitch_deg"] == pytest.approx(0.0, abs=1e-6)
+    assert angles["roll_deg"] == pytest.approx(0.0, abs=1e-6)
+    assert angles["elbow_deg"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_an_arm_reaching_forward_is_ninety_degrees_of_pitch():
+    angles = spec.arm_angles((0, 0, 1.0), (0.3, 0, 1.0), (0.6, 0, 1.0))
+    assert angles["pitch_deg"] == pytest.approx(-90.0, abs=1e-6)
+    assert angles["roll_deg"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_a_sideways_arm_is_pure_abduction_not_a_hundred_and_eighty():
+    """Regression: `atan2(0, -0.0)` answers 180 here, which clamps to "behind"."""
+    angles = spec.arm_angles((0, 0, 1.0), (0, -0.3, 1.0), (0, -0.6, 1.0))
+    assert angles["roll_deg"] == pytest.approx(90.0, abs=1e-6)
+    assert angles["pitch_deg"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_a_bent_elbow_reads_as_negative_flexion():
+    angles = spec.arm_angles((0, 0, 1.0), (0.3, 0, 1.0), (0.3, 0, 1.3))
+    assert angles["elbow_deg"] == pytest.approx(-90.0, abs=1e-6)
+
+
+def test_a_straight_up_arm_asks_for_more_than_the_shoulder_has():
+    """Honest answer: 180 degrees of flexion, which the 135 limit must then cap.
+
+    Which way round the 180 comes out depends on the sign of zero in `atan2`;
+    both readings mean "as far as it goes", so only the magnitude is pinned.
+    """
+    angles = spec.arm_angles((0, 0, 1.0), (0, 0, 1.3), (0, 0, 1.6))
+    limited, clamped = spec.limit_angles(angles, "left")
+    assert clamped["pitch"] == 1
+    assert abs(limited["pitch_deg"]) == pytest.approx(135.0, abs=1e-6)
+
+
+def test_coincident_shoulder_and_elbow_is_an_error_not_a_zero():
+    with pytest.raises(ValueError):
+        spec.arm_angles((0, 0, 1.0), (0, 0, 1.0), (0, 0, 0.7))
+
+
+# ── limits ───────────────────────────────────────────────────────────────────
+
+def test_the_two_arms_have_mirrored_roll_limits():
+    """-8 on the left is a clamp; -8 on the right is a legal angle."""
+    left, left_clamped = spec.limit_angles(
+        {"pitch_deg": 0.0, "roll_deg": -30.0, "elbow_deg": 0.0}, "left")
+    right, right_clamped = spec.limit_angles(
+        {"pitch_deg": 0.0, "roll_deg": -30.0, "elbow_deg": 0.0}, "right")
+
+    assert left["roll_deg"] == pytest.approx(-8.0)
+    assert left_clamped["roll"] == 1
+    assert right["roll_deg"] == pytest.approx(-30.0)
+    assert right_clamped["roll"] == 0
+
+
+def test_an_angle_inside_the_range_is_reported_as_unclamped():
+    limited, clamped = spec.limit_angles(
+        {"pitch_deg": 10.0, "roll_deg": 20.0, "elbow_deg": -30.0}, "left")
+    assert clamped == {"pitch": 0, "roll": 0, "elbow": 0}
+    assert limited["pitch_deg"] == pytest.approx(10.0)
+
+
+def test_signs_flip_every_axis_independently():
+    angles = {"pitch_deg": 10.0, "roll_deg": 20.0, "elbow_deg": -30.0}
+    flipped = spec.apply_signs(angles, pitch_sign=-1.0, roll_sign=1.0, elbow_sign=-1.0)
+    assert flipped == {"pitch_deg": -10.0, "roll_deg": 20.0, "elbow_deg": 30.0}
+
+
+# ── projection ───────────────────────────────────────────────────────────────
+
+def test_a_point_straight_ahead_is_straight_ahead_in_the_body_frame():
+    point = spec.backproject(320, 240, 2.0, 460.0, 640, 480)
+    assert point == pytest.approx((2.0, 0.0, 0.0), abs=1e-9)
+
+
+def test_a_point_right_of_centre_lands_on_the_robot_right():
+    point = spec.backproject(640, 240, 2.0, 460.0, 640, 480)
+    assert point[1] < 0.0
+
+
+def test_a_point_below_centre_lands_below_the_robot_origin():
+    point = spec.backproject(320, 480, 2.0, 460.0, 640, 480)
+    assert point[2] < 0.0
+
+
+def test_zero_depth_is_an_absent_measurement_not_a_point_at_the_origin():
+    assert spec.backproject(320, 240, 0.0, 460.0, 640, 480) is None
+
+
+def test_the_median_ignores_the_zeros_realsense_writes_for_no_return():
+    assert spec.median([0.0, 0.0, 2.0, 2.2, 1.8]) == pytest.approx(2.0)
+
+
+def test_a_patch_with_no_usable_echo_has_no_depth():
+    assert spec.median([0.0, 0.0, None]) is None
+
+
+def test_focal_length_falls_out_of_shoulder_width_and_depth():
+    focal = spec.estimate_focal_px(120.0, 2.0, 0.38)
+    assert focal == pytest.approx(120.0 * 2.0 / 0.38)
+
+
+# ── selection ────────────────────────────────────────────────────────────────
+
+def test_the_nearest_person_wins_over_the_first_one_listed():
+    near = _person(_blank_points(), bbox=(0.0, 0.0, 200.0, 300.0))
+    far = _person(_blank_points(), bbox=(0.0, 0.0, 50.0, 80.0))
+    assert spec.pick_person([far, near]) is near
+
+
+def test_a_low_confidence_detection_is_not_a_person_to_mirror():
+    weak = _person(_blank_points(), confidence=0.2)
+    assert spec.pick_person([weak], min_confidence=0.5) is None
+
+
+def test_an_occluded_arm_is_detected_as_not_visible():
+    points = _blank_points()
+    points[spec.R_WRIST] = [0.0, 0.0, 0.0]
+    assert not spec.upper_body_visible(points, (spec.R_SHOULDER, spec.R_ELBOW, spec.R_WRIST), 0.4)
+    assert spec.upper_body_visible(points, (spec.L_SHOULDER, spec.L_ELBOW, spec.L_WRIST), 0.4)
+
+
+def test_hips_below_shoulders_reads_as_standing():
+    points = _blank_points()
+    points[spec.L_SHOULDER] = [100.0, 100.0, 1.0]
+    points[spec.R_SHOULDER] = [150.0, 100.0, 1.0]
+    points[spec.L_HIP] = [100.0, 200.0, 1.0]
+    points[spec.R_HIP] = [150.0, 200.0, 1.0]
+    assert spec.posture_name(points) == "standing"
+
+
+# ── payloads ─────────────────────────────────────────────────────────────────
+
+def test_the_angle_payload_is_flat_because_the_panel_prints_nested_objects():
+    payload = spec.build_angles_payload(
+        tracked=True, person_count=1, target_id=0,
+        angles_by_side={
+            "left": {"pitch_deg": 1.0, "roll_deg": 2.0, "elbow_deg": -3.0},
+            "right": {"pitch_deg": 4.0, "roll_deg": 5.0, "elbow_deg": -6.0},
+        },
+        clamped_by_side={"left": {"roll": 1}, "right": {}},
+        depth_used=True, depth_coverage=1.0, focal_px=460.0,
+        latency_ms=12.5, frame_age_ms=30.0, reach=1.6,
+        pitch_sign=1.0, roll_sign=1.0, elbow_sign=1.0, degraded="")
+
+    for key, value in payload.items():
+        assert isinstance(value, (int, float, str, bool)), f"{key} is not scalar"
+    assert payload["l_roll_deg"] == pytest.approx(2.0)
+    assert payload["l_roll_clamped"] == 1
+    assert payload["r_elbow_deg"] == pytest.approx(-6.0)
+
+
+def test_an_untracked_frame_still_answers_with_numbers_not_with_omissions():
+    """A missing key reads as 'no data' on the panel; -999 reads as 'not measured'."""
+    payload = spec.build_angles_payload(
+        tracked=False, person_count=0, target_id=None,
+        angles_by_side=None, clamped_by_side=None, depth_used=False,
+        depth_coverage=0.0, focal_px=460.0, latency_ms=1.0, frame_age_ms=2.0,
+        reach=None, pitch_sign=1.0, roll_sign=1.0, elbow_sign=1.0,
+        degraded="no_person")
+
+    assert payload["tracked"] is False
+    assert payload["target_id"] == -1
+    assert payload["l_pitch_deg"] == pytest.approx(-999.0)
+    assert payload["degraded"] == "no_person"
+
+
+def test_the_pose_payload_carries_the_image_size_so_the_overlay_does_not_drift():
+    payload = spec.build_pose2d_payload([_person(_blank_points())], 640, 480)
+    assert payload["image_size"] == [640, 480]
+    assert payload["count"] == 1
+    assert len(payload["keypoint_names"]) == 17
+    assert payload["persons"][0]["keypoints"][spec.R_WRIST][:2] == [100.0, 100.0]
+
+
+def test_nobody_in_frame_is_an_empty_list_not_a_missing_key():
+    assert spec.build_pose2d_payload([], 640, 480)["persons"] == []
+
+
+# ── smoothing ────────────────────────────────────────────────────────────────
+
+def test_the_first_filtered_sample_passes_through_untouched():
+    filt = spec.OneEuroFilter()
+    assert filt(12.0, 0.0) == pytest.approx(12.0)
+
+
+def test_smoothing_lags_a_step_but_does_not_ignore_it():
+    filt = spec.OneEuroFilter(min_cutoff=1.0, beta=0.0)
+    filt(0.0, 0.0)
+    value = filt(30.0, 0.1)
+    assert 0.0 < value < 30.0
+
+
+def test_a_bank_holds_the_last_value_for_a_joint_that_disappeared():
+    bank = spec.AngleBank()
+    bank.update({"left": {"pitch_deg": 10.0, "roll_deg": 20.0, "elbow_deg": -30.0},
+                 "right": {"pitch_deg": 0.0, "roll_deg": 0.0, "elbow_deg": 0.0}}, 0.0)
+    held = bank.update({"left": {"pitch_deg": 11.0, "roll_deg": 21.0, "elbow_deg": -29.0}}, 0.1)
+    assert held["r_pitch"] == pytest.approx(0.0)
+    assert "l_pitch" in held
+
+
+# ── the image must actually contain the module ───────────────────────────────
+
+def test_both_modules_reach_the_image():
+    """Local tests pass with a missing COPY line; the robot then loses the card."""
+    dockerfile = (Path(__file__).resolve().parent.parent / "Dockerfile").read_text(encoding="utf-8")
+    for name in ("upper_body_track_spec.py", "upper_body_track_card.py"):
+        assert f"COPY {name} /work/{name}" in dockerfile
+
+
+def test_pose_runtime_is_an_opt_in_pinned_build_arg():
+    """A default Bumi image must not silently carry torch for a disabled card."""
+    root = Path(__file__).resolve().parent.parent
+    dockerfile = (root / "Dockerfile").read_text(encoding="utf-8")
+    reqs = (root / "pose-requirements.txt").read_text(encoding="utf-8")
+    assert "ARG INSTALL_POSE_DEPS=0" in dockerfile
+    # The runtime is pinned in a requirements file so the recorded ARM64 size
+    # is reproducible; installing bare `ultralytics` would drift on rebuild.
+    assert "COPY pose-requirements.txt /work/pose-requirements.txt" in dockerfile
+    assert "-r /work/pose-requirements.txt" in dockerfile
+    assert "pip3 install --no-cache-dir -i ${PYPI_MIRROR} ultralytics==" not in dockerfile
+    for pinned in ("torch==2.8.0", "torchvision==0.23.0", "ultralytics==8.4.216"):
+        assert pinned in reqs
+    # torchvision 0.23.0 requires exactly torch 2.8.0; the pinned pair is valid.
+    assert "torch==2.8.0" in reqs and "torchvision==0.23.0" in reqs
+
+
+# ── end-to-end through the card's own `_measure` ──────────────────────────────
+
+def _load_card_module(monkeypatch):
+    """Import the card with its ROS/OpenCV/numpy dependencies stubbed out.
+
+    `_measure` — where the payload is actually assembled — is a pure function
+    of keypoints plus the AngleBank. The spec tests above cannot see a held
+    angle being dropped at that layer, so this stub lets the regression run on
+    a laptop without ROS, cv2 or numpy installed.
+    """
+    import importlib.util
+    import sys
+    import types
+
+    cv2 = types.ModuleType("cv2")
+    cv2.imdecode = lambda *a, **k: None
+    cv2.IMREAD_COLOR = 1
+    np = types.ModuleType("numpy")
+    np.uint8 = object
+    np.uint16 = object
+    np.frombuffer = lambda *a, **k: None
+    # pytest.approx consults numpy if it is importable, so the stub must answer
+    # its scalar check or the assertion itself errors before comparing.
+    # (pytest.approx needs more numpy internals than are worth faking here;
+    #  the assertions below use plain float comparison instead.)
+    rclpy = types.ModuleType("rclpy")
+    node_mod = types.ModuleType("rclpy.node")
+    node_mod.Node = object
+    qos_mod = types.ModuleType("rclpy.qos")
+    qos_mod.QoSProfile = lambda **kw: None
+    qos_mod.ReliabilityPolicy = types.SimpleNamespace(BEST_EFFORT=1)
+    qos_mod.HistoryPolicy = types.SimpleNamespace(KEEP_LAST=1)
+    qos_mod.DurabilityPolicy = types.SimpleNamespace(VOLATILE=1)
+    sensor_msgs = types.ModuleType("sensor_msgs")
+    sensor_msg = types.ModuleType("sensor_msgs.msg")
+    sensor_msg.CompressedImage = object
+    std_msgs = types.ModuleType("std_msgs")
+    std_msg = types.ModuleType("std_msgs.msg")
+    std_msg.String = lambda data="": types.SimpleNamespace(data=data)
+    for name, module in (
+        ("cv2", cv2), ("numpy", np), ("rclpy", rclpy),
+        ("rclpy.node", node_mod), ("rclpy.qos", qos_mod),
+        ("sensor_msgs", sensor_msgs), ("sensor_msgs.msg", sensor_msg),
+        ("std_msgs", std_msgs), ("std_msgs.msg", std_msg),
+    ):
+        monkeypatch.setitem(sys.modules, name, module)
+
+    path = Path(__file__).resolve().parent.parent / "upper_body_track_card.py"
+    loader = importlib.util.spec_from_file_location("ubt_card_under_test", path)
+    module = importlib.util.module_from_spec(loader)
+    loader.loader.exec_module(module)
+    return module
+
+
+def _bare_plugin(module):
+    """A plugin with only the state `_measure` actually reads."""
+    import types
+
+    plugin = object.__new__(module.UpperBodyTrackPlugin)
+    plugin._min_kp_conf = 0.4
+    plugin._focal_setting = 460.0
+    plugin._signs = {"pitch_sign": 1.0, "roll_sign": 1.0, "elbow_sign": 1.0}
+    plugin._bank = spec.AngleBank()
+    plugin._depth_cache = types.SimpleNamespace(
+        decode=lambda: (None, None, None), age_s=lambda: None)
+    return plugin
+
+
+def _arms_person():
+    """Keypoints with both arms visible on a flat plane (no depth needed)."""
+    points = _blank_points()
+    # Person's LEFT arm drives the robot's right — this is the one we occlude.
+    points[spec.L_SHOULDER] = [360.0, 200.0, 0.9]
+    points[spec.L_ELBOW] = [400.0, 200.0, 0.9]
+    points[spec.L_WRIST] = [440.0, 200.0, 0.9]
+    # Person's RIGHT arm drives the robot's left.
+    points[spec.R_SHOULDER] = [280.0, 200.0, 0.9]
+    points[spec.R_ELBOW] = [240.0, 200.0, 0.9]
+    points[spec.R_WRIST] = [200.0, 200.0, 0.9]
+    points[spec.L_HIP] = [350.0, 400.0, 0.9]
+    points[spec.R_HIP] = [290.0, 400.0, 0.9]
+    return points
+
+
+def test_an_occluded_arm_holds_its_last_angle_in_the_payload(monkeypatch):
+    """Regression: a blink of missing keypoints must not read as 'not measured'.
+
+    The bank still holds the last filtered angle, but the payload used to be
+    built only from sides visible *this* frame, so an occluded arm emitted
+    -999 — a discontinuity exactly when the filter should be holding.
+    """
+    import time
+
+    card = _load_card_module(monkeypatch)
+    plugin = _bare_plugin(card)
+
+    first = plugin._measure([_person(_arms_person())], 640, 480, time.monotonic(), 0.0)
+    assert first["tracked"] is True
+    assert first["l_pitch_deg"] != -999.0
+    assert first["r_pitch_deg"] != -999.0
+    held = (first["r_pitch_deg"], first["r_roll_deg"], first["r_elbow_deg"])
+
+    occluded = _arms_person()
+    occluded[spec.L_WRIST] = [440.0, 200.0, 0.0]  # robot-right loses its wrist
+    second = plugin._measure([_person(occluded)], 640, 480, time.monotonic(), 0.0)
+
+    assert abs(second["r_pitch_deg"] - held[0]) < 1e-6
+    assert abs(second["r_roll_deg"] - held[1]) < 1e-6
+    assert abs(second["r_elbow_deg"] - held[2]) < 1e-6
+    assert second["r_pitch_deg"] != -999.0
+    assert second["degraded"] != ""  # the gap is still reported honestly
+
+
+def test_both_arms_occluded_holds_the_last_pose(monkeypatch):
+    """PR #585 review P1: a fully occluded upper body must not read as -999."""
+    import time
+
+    plugin = _bare_plugin(_load_card_module(monkeypatch))
+    good = plugin._measure([_person(_arms_person())], 640, 480, time.monotonic(), 0.0)
+    held = tuple(good[f"{s}_{a}_deg"] for s in ("l", "r")
+                 for a in ("pitch", "roll", "elbow"))
+
+    # Both arms' keypoints below confidence: upper_body_visible fails for both.
+    # _blank_points gives every point confidence 1.0, so lower the six arm joints.
+    occluded = _arms_person()
+    for index in (spec.L_SHOULDER, spec.L_ELBOW, spec.L_WRIST,
+                  spec.R_SHOULDER, spec.R_ELBOW, spec.R_WRIST):
+        occluded[index][2] = 0.0
+    second = plugin._measure([_person(occluded)], 640, 480, time.monotonic(), 0.0)
+
+    assert second["tracked"] is False
+    assert second["degraded"] == "upper_body_occluded"
+    assert tuple(second[f"{s}_{a}_deg"] for s in ("l", "r")
+                 for a in ("pitch", "roll", "elbow")) == held
+
+
+def test_no_person_holds_the_last_pose(monkeypatch):
+    """Same hold contract applies when the person leaves the frame."""
+    import time
+
+    plugin = _bare_plugin(_load_card_module(monkeypatch))
+    good = plugin._measure([_person(_arms_person())], 640, 480, time.monotonic(), 0.0)
+    held = tuple(good[f"{s}_{a}_deg"] for s in ("l", "r")
+                 for a in ("pitch", "roll", "elbow"))
+
+    empty = plugin._measure([], 640, 480, time.monotonic(), 0.0)
+
+    assert empty["tracked"] is False
+    assert empty["degraded"] == "no_person"
+    assert tuple(empty[f"{s}_{a}_deg"] for s in ("l", "r")
+                 for a in ("pitch", "roll", "elbow")) == held
+
+
+def test_degenerate_projection_holds_the_last_pose(monkeypatch):
+    """Third degraded branch: keypoints present but geometry cannot be solved."""
+    import time
+
+    plugin = _bare_plugin(_load_card_module(monkeypatch))
+    good = plugin._measure([_person(_arms_person())], 640, 480, time.monotonic(), 0.0)
+    held = tuple(good[f"{s}_{a}_deg"] for s in ("l", "r")
+                 for a in ("pitch", "roll", "elbow"))
+
+    # Shoulders coincide with elbows: arm_angles raises ValueError for both
+    # arms, so the loop produces no angles_by_side and takes the 3rd return.
+    collapsed = _arms_person()
+    collapsed[spec.L_ELBOW] = list(collapsed[spec.L_SHOULDER])
+    collapsed[spec.R_ELBOW] = list(collapsed[spec.R_SHOULDER])
+    second = plugin._measure([_person(collapsed)], 640, 480, time.monotonic(), 0.0)
+
+    assert second["tracked"] is False
+    assert second["degraded"] == "degenerate_projection"
+    assert tuple(second[f"{s}_{a}_deg"] for s in ("l", "r")
+                 for a in ("pitch", "roll", "elbow")) == held
+
+
+def test_frame_failures_are_throttled(monkeypatch):
+    """One corrupt stream is one outage, not a warning per frame."""
+    import threading
+    import time
+    import types
+
+    card = _load_card_module(monkeypatch)
+    plugin = object.__new__(card.UpperBodyTrackPlugin)
+    warnings, infos = [], []
+
+    class _Event:
+        def __init__(self):
+            self.n = 0
+
+        def is_set(self):
+            return self.n >= 101
+
+        def wait(self, _timeout=0):
+            self.n += 1
+            return False
+
+    def _fail(_jpeg, _received_at, _token):
+        raise ValueError("bad frame")
+
+    token = object()
+    plugin._stop_event = _Event()
+    plugin._generation = 0
+    plugin._run_token = token
+    plugin._rate_hz = 30.0
+    plugin._frame_lock = threading.Lock()
+    plugin._latest_jpeg = b"x"
+    plugin._latest_jpeg_at = time.monotonic()  # fresh: exercise the failure path
+    plugin._frame_failures = 0
+    plugin._stale_frames = 0
+    plugin._process = _fail
+    plugin._node = types.SimpleNamespace(get_logger=lambda: types.SimpleNamespace(
+        warning=warnings.append, info=infos.append))
+    plugin._worker_loop(0, token)
+
+    assert len(warnings) == 2  # first failure and the 100th, not 101
+    assert "bad frame" in warnings[0]
+    assert "100" in warnings[1]
+
+
+def test_start_subscribes_and_stop_releases_them(monkeypatch):
+    """The canvas contract: dispatch start builds subscriptions, stop tears them down.
+
+    This exercises the real plugin constructor, dispatch and teardown paths with
+    only a ROS stub — no hardware, model download or GPU. `start`/`stop` on the
+    bundle are lifecycle hooks that must not begin inference until the canvas
+    resolves the camera topic in dispatch("start").
+    """
+    import types
+
+    card = _load_card_module(monkeypatch)
+
+    class _FakeNode:
+        def __init__(self, *_args, **_kwargs):
+            self.subs = []
+            self.destroyed = []
+            self._logger = types.SimpleNamespace(
+                info=lambda *_: None, warning=lambda *_: None)
+
+        def create_publisher(self, *_args, **_kwargs):
+            return types.SimpleNamespace(publish=lambda *_: None)
+
+        def create_subscription(self, _msg_type, topic, _cb, _qos):
+            sub = types.SimpleNamespace(topic=topic)
+            self.subs.append(sub)
+            return sub
+
+        def destroy_subscription(self, sub):
+            self.destroyed.append(sub.topic)
+            if sub in self.subs:
+                self.subs.remove(sub)
+
+        def get_logger(self):
+            return self._logger
+
+    monkeypatch.setattr(card, "Node", _FakeNode)
+    executor = types.SimpleNamespace(add_node=lambda *_: None)
+
+    plugin = card.UpperBodyTrackPlugin({}, "bumi", executor)
+    node = plugin._node
+    # Constructing and bundle-starting must not subscribe: the camera topic is
+    # supplied by the canvas only at dispatch("start").
+    plugin.start()
+    assert node.subs == []
+    assert plugin.dispatch("info", {})["state"] == "idle"
+
+    result = plugin.dispatch("start", {"input_topic": "/camera/color/image_raw/compressed"})
+    assert result["state"] == "running"
+    assert [s.topic for s in node.subs] == ["/camera/color/image_raw/compressed"]
+    info = plugin.dispatch("info", {})
+    assert info["state"] == "running"
+    assert info["topic_in"][0]["topic"] == "/camera/color/image_raw/compressed"
+
+    # A depth topic adds a second subscription; both are released on stop.
+    result = plugin.dispatch("start", {
+        "input_topic": "/camera/color/image_raw/compressed",
+        "depth_topic": "/camera/depth/image_raw/compressed",
+    })
+    assert [s.topic for s in node.subs] == [
+        "/camera/color/image_raw/compressed",
+        "/camera/depth/image_raw/compressed",
+    ]
+    assert len(result["topic_in"]) == 2
+
+    assert plugin.dispatch("stop", {}) == {"state": "idle"}
+    # First color sub was replaced by the second start; stop releases the
+    # current color and depth subs. All three releases are accounted for.
+    assert node.destroyed == [
+        "/camera/color/image_raw/compressed",
+        "/camera/color/image_raw/compressed",
+        "/camera/depth/image_raw/compressed",
+    ]
+    assert plugin._color_sub is None and plugin._depth_sub is None
+    assert plugin.dispatch("info", {})["state"] == "idle"
+
+    # The bundle stop hook reaches the same teardown, and is safe twice.
+    plugin.dispatch("start", {"input_topic": "/camera/color/image_raw/compressed"})
+    plugin.stop()
+    plugin.stop()
+    assert plugin._color_sub is None
+
+
+def test_stop_during_slow_predict_publishes_nothing(monkeypatch):
+    """PR #585 review P2: a predict() that outlives stop() must not emit a frame.
+
+    Teardown joins with a bounded timeout, so an in-flight YOLO call may finish
+    after stop() returns. The per-run token fences both publishes, ensuring a
+    stopped/restarted run never leaks stale pose or angles onto the topics.
+    """
+    import threading
+    import time
+
+    card = _load_card_module(monkeypatch)
+    plugin = object.__new__(card.UpperBodyTrackPlugin)
+
+    # _process decodes the JPEG before predict; give the stubs a frame that has
+    # a shape so control actually reaches the (blocking) detect call.
+    import types as _types
+
+    class _Frame:
+        shape = (480, 640, 3)
+
+    monkeypatch.setattr(card, "np", _types.SimpleNamespace(
+        uint8=object, frombuffer=lambda *_a, **_k: b"raw"))
+    monkeypatch.setattr(card, "cv2", _types.SimpleNamespace(
+        imdecode=lambda *_a, **_k: _Frame(), IMREAD_COLOR=1))
+
+    detect_entered = threading.Event()
+    release_detect = threading.Event()
+    published = []
+
+    class _SlowEngine:
+        conf = 0.5
+        imgsz = 640
+
+        def detect(self, _frame):
+            detect_entered.set()
+            release_detect.wait(5.0)  # bounded so a failed test cannot hang
+            return []
+
+    class _Pub:
+        def publish(self, _msg):
+            published.append(_msg)
+
+    import types
+    plugin._engine = _SlowEngine()
+    plugin._pose2d_pub = _Pub()
+    plugin._angles_pub = _Pub()
+    plugin._node = types.SimpleNamespace(get_logger=lambda: types.SimpleNamespace(
+        info=lambda *_: None, warning=lambda *_: None))
+    plugin._stop_event = threading.Event()
+    plugin._frame_lock = threading.Lock()
+    plugin._latest_jpeg = b"jpeg"
+    plugin._latest_jpeg_at = time.monotonic()
+    plugin._rate_hz = 10.0
+    plugin._generation = 1
+    plugin._frame_failures = 0
+    plugin._stale_frames = 0
+    plugin._min_kp_conf = 0.4
+    plugin._bank = card.spec.AngleBank()
+    # _measure still needs the rest of its state, but detect returns no persons,
+    # so it takes the `no_person` branch after the fence has already fired.
+    plugin._focal_setting = 460.0
+    plugin._signs = {"pitch_sign": 1.0, "roll_sign": 1.0, "elbow_sign": 1.0}
+    plugin._depth_cache = types.SimpleNamespace(
+        decode=lambda: (None, 0, 0), received_at=lambda: None, age_s=lambda: None)
+    plugin._last_payload = None
+    plugin._last_error = None
+    plugin._last_inference_ms = 0.0
+
+    token = object()
+    plugin._run_token = token
+    plugin._color_sub = None
+    plugin._depth_sub = None
+    plugin._worker = threading.Thread(
+        target=plugin._worker_loop, args=(1, token), daemon=True)
+    worker = plugin._worker
+    worker.start()
+    assert detect_entered.wait(5.0), "worker never reached detect"
+
+    # stop() clears the token before the bounded join; detect is still blocked.
+    plugin._teardown()
+    release_detect.set()
+    worker.join(5.0)
+    assert not worker.is_alive(), "worker did not exit after release"
+
+    # The frame that finished after teardown must not reach either output topic.
+    assert published == []
+
+
+def test_depth_is_paired_to_the_rgb_frame_not_to_inference_time(monkeypatch):
+    """PR #585 review P2: depth freshness must be relative to the RGB frame.
+
+    Pairing on 'now - depth_received' rejects a correct pair after a slow YOLO
+    predict(), and accepts a fresh depth slapped onto an old JPEG being
+    reprocessed. Pairing the two frames' receive times fixes both.
+    """
+    card = _load_card_module(monkeypatch)
+    paired = card._depth_is_paired
+
+    t = 0.0  # exact binary values keep the window edge test deterministic
+    assert paired(t, t) is True                    # same instant
+    assert paired(t + 0.1, t) is True              # depth lands just after RGB
+    assert paired(t - 0.1, t) is True              # depth landed just before RGB
+
+    # A fresh depth with an old JPEG (reprocessing) is a different scene.
+    assert paired(t + 3.0, t) is False             # newer-than-RGB depth
+    assert paired(t - 3.0, t) is False             # older-than-RGB depth
+
+    # Both frames at the edge of the window are still one capture.
+    assert paired(t + card._DEPTH_PAIR_S, t) is True
+    assert paired(t + card._DEPTH_PAIR_S + 0.001, t) is False
+
+    # Missing timestamps never claim a depth match.
+    assert paired(None, t) is False
+    assert paired(t, None) is False
+
+    # Delayed inference: what matters is the two receive times, not when the
+    # result is consumed. t and t+0.05 stay paired even if processed at t+8s.
+    assert paired(t + 0.05, t) is True
+
+
+def test_depth_cache_reports_receive_time_for_pairing(monkeypatch):
+    """The cache exposes the depth frame's own receive clock for the pairing test."""
+    import time
+
+    card = _load_card_module(monkeypatch)
+    cache = card._DepthCache()
+    assert cache.received_at() is None
+    before = time.monotonic()
+    cache.put(b"compressed", 640, 480)
+    after = time.monotonic()
+    received = cache.received_at()
+    assert received is not None and before <= received <= after
+
+
+def test_teardown_drops_frames_from_the_stopped_run(monkeypatch):
+    """PR #585 review P1: stop->start must not publish the prior run's frames."""
+    import threading
+    import types
+
+    card = _load_card_module(monkeypatch)
+    plugin = object.__new__(card.UpperBodyTrackPlugin)
+
+    old_cache = card._DepthCache()
+    old_cache.put(b"old-depth", 640, 480)
+    plugin._depth_cache = old_cache
+    plugin._frame_lock = threading.Lock()
+    plugin._latest_jpeg = b"old-jpeg"
+    plugin._latest_jpeg_at = 12345.0
+    plugin._bank = card.spec.AngleBank()
+    plugin._bank.update({"l_pitch": 12.0, "l_roll": 0.0, "l_elbow": 0.0}, 1.0)
+    plugin._run_token = object()
+    plugin._stop_event = threading.Event()
+    plugin._worker = None
+    plugin._color_sub = None
+    plugin._depth_sub = None
+    plugin._node = types.SimpleNamespace(get_logger=lambda: types.SimpleNamespace(
+        info=lambda *_: None, warning=lambda *_: None))
+
+    plugin._teardown()
+
+    assert plugin._latest_jpeg is None
+    assert plugin._latest_jpeg_at == 0.0
+    assert plugin._depth_cache is not old_cache
+    assert plugin._depth_cache.received_at() is None
+    # The filter's held state is dropped too: a new camera is a new person.
+    assert plugin._bank.update(None, 2.0) == {}
+    assert plugin._run_token is None
+
+
+def test_stale_frame_is_skipped_before_processing(monkeypatch):
+    """PR #585 review P1: an old cached JPEG must not be republished.
+
+    A disconnected camera leaves `_latest_jpeg` unchanged while the worker
+    keeps looping. Judging freshness at pick time drops that frame; a frame
+    that arrived just before this tick is processed normally.
+    """
+    import threading
+    import time
+    import types
+
+    card = _load_card_module(monkeypatch)
+    plugin = object.__new__(card.UpperBodyTrackPlugin)
+    processed = []
+    warnings, infos = [], []
+
+    class _Event:
+        def __init__(self):
+            self.n = 0
+
+        def is_set(self):
+            return self.n >= 3
+
+        def wait(self, _timeout=0):
+            self.n += 1
+            return False
+
+    plugin._stop_event = _Event()
+    plugin._generation = 0
+    token = object()
+    plugin._run_token = token
+    plugin._rate_hz = 10.0
+    plugin._frame_lock = threading.Lock()
+    plugin._latest_jpeg = b"stale"
+    # Arrived well before _FRAME_FRESH_S ago: this is a stalled camera.
+    plugin._latest_jpeg_at = time.monotonic() - card._FRAME_FRESH_S - 5.0
+    plugin._frame_failures = 0
+    plugin._stale_frames = 0
+    plugin._process = lambda *_a: processed.append(_a)
+    plugin._node = types.SimpleNamespace(get_logger=lambda: types.SimpleNamespace(
+        warning=warnings.append, info=infos.append))
+    plugin._worker_loop(0, token)
+
+    assert processed == [], "stale frame must not reach _process"
+    assert warnings and "stale frame" in warnings[0]
+
+
+# ── weight integrity: the download must be checked before YOLO loads it ──────
+
+def _engine_with_fake_yolo(monkeypatch):
+    """Load the card with a recording YOLO stand-in (no torch, no network)."""
+    import sys
+    import types
+
+    card = _load_card_module(monkeypatch)
+    calls = []
+
+    def fake_yolo(path):
+        calls.append(path)
+        return object()
+
+    monkeypatch.setitem(sys.modules, "ultralytics",
+                        types.SimpleNamespace(YOLO=fake_yolo))
+    return card, calls
+
+
+def test_a_tampered_local_weight_never_reaches_yolo(monkeypatch, tmp_path):
+    card, calls = _engine_with_fake_yolo(monkeypatch)
+    weight = tmp_path / "tampered.pt"
+    weight.write_bytes(b"not the official weight")
+
+    engine = card._PoseEngine(model_path=str(weight))
+    with pytest.raises(ValueError, match="digest mismatch"):
+        engine.load()
+
+    assert calls == [], "YOLO must not open a file that failed verification"
+
+
+def test_a_verified_local_weight_is_passed_through(monkeypatch, tmp_path):
+    """Offline robots can still use a pre-downloaded absolute path."""
+    import hashlib
+
+    card, calls = _engine_with_fake_yolo(monkeypatch)
+    data = b"weight bytes supplied by the operator"
+    weight = tmp_path / "offline.pt"
+    weight.write_bytes(data)
+
+    engine = card._PoseEngine(
+        model_path=str(weight),
+        model_sha256=hashlib.sha256(data).hexdigest())
+    engine.load()
+
+    assert calls == [str(weight)]
+    assert engine.loaded
+
+
+def test_auto_download_is_hash_checked_before_yolo(monkeypatch, tmp_path):
+    """The default bare filename must not go through ultralytics' unchecked path."""
+    import hashlib
+
+    card, calls = _engine_with_fake_yolo(monkeypatch)
+    data = b"official weight bytes" * 100
+    digest = hashlib.sha256(data).hexdigest()
+    seen = {"url": None, "position": 0}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size):
+            start = seen["position"]
+            seen["position"] += min(1000, len(data) - start)
+            return data[start:seen["position"]]
+
+    def fake_urlopen(url, **_kwargs):
+        seen["url"] = url
+        return _Response()
+
+    monkeypatch.setattr(card.os.path, "expanduser", lambda _p: str(tmp_path))
+    monkeypatch.setattr(card.urllib.request, "urlopen", fake_urlopen)
+
+    engine = card._PoseEngine(model_sha256=digest)
+    engine.load()
+
+    cached = tmp_path / ".cache" / "bumi-upper-body-track" / "yolo11n-pose.pt"
+    assert calls == [str(cached)]
+    assert cached.read_bytes() == data
+    assert seen["url"].endswith("/v8.3.0/yolo11n-pose.pt")
+    # A second load reuses the verified cache instead of downloading again.
+    seen["url"] = None
+    engine._model = None
+    engine.load()
+    assert seen["url"] is None
+
+
+def test_a_bad_download_is_rejected_and_leaves_no_cache(monkeypatch, tmp_path):
+    import hashlib
+
+    card, calls = _engine_with_fake_yolo(monkeypatch)
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _size):
+            if getattr(self, "_done", False):
+                return b""
+            self._done = True
+            return b"evil"
+
+    monkeypatch.setattr(card.os.path, "expanduser", lambda _p: str(tmp_path))
+    monkeypatch.setattr(card.urllib.request, "urlopen", lambda *_a, **_k: _Response())
+
+    engine = card._PoseEngine(
+        model_sha256=hashlib.sha256(b"the real bytes").hexdigest())
+    with pytest.raises(ValueError, match="digest mismatch"):
+        engine.load()
+
+    assert calls == []
+    cache_dir = tmp_path / ".cache" / "bumi-upper-body-track"
+    assert not (cache_dir / "yolo11n-pose.pt").exists()
+    assert list(cache_dir.glob(".weights-*")) == []
+
+
+def test_an_explicit_opt_out_keeps_custom_weight_resolution(monkeypatch):
+    """Operators with a private model can disable the pinned-digest check."""
+    card, calls = _engine_with_fake_yolo(monkeypatch)
+    engine = card._PoseEngine(model_path="my-private-model.pt", model_sha256="")
+    engine.load()
+    assert calls == ["my-private-model.pt"]
+
+
+def test_the_default_config_pins_the_official_digest():
+    root = Path(__file__).resolve().parent.parent
+    config = (root / "config.yaml").read_text(encoding="utf-8")
+    assert ("model_sha256: "
+            "869e83fcdffdc7371fa4e34cd8e51c838cc729571d1635e5141e3075e9319dc0") in config

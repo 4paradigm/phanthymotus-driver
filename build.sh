@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # build.sh — 构建硬件驱动镜像并推送到镜像仓库
 #
-# 用法：bash build.sh [--mirror tuna|tencent|none] [--no-cache] [driver_dir...]
+# 用法：bash build.sh [--mirror tuna|tencent|none] [--no-cache] [--build-arg KEY=VALUE] [driver_dir...]
 #   不传参数时显示交互式多选框
 #   直接传目录名时跳过选择（CI 用）
+#   --build-arg 只放行白名单中的 key，可重复：
+#     INSTALL_POSE_DEPS=1  构建含 upper_body_track 运行时的 Bumi 镜像（默认镜像不含）
 #
 # 依赖：
 #   - 每个驱动目录下需有 driver.yaml 和 Dockerfile
@@ -21,11 +23,23 @@ fi
 # ── 解析参数 ──────────────────────────────────────────────────────────────
 MIRROR="${MIRROR:-}"
 NO_CACHE=""
+# Only named build args are forwarded; an arbitrary --build-arg would let a
+# caller override pinned base images or other security-relevant Dockerfile ARGs.
+ALLOWED_BUILD_ARGS=" INSTALL_POSE_DEPS "
+EXTRA_BUILD_ARGS=()
 REMAINING_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --mirror) MIRROR="$2"; shift 2 ;;
         --no-cache) NO_CACHE="--no-cache"; shift ;;
+        --build-arg)
+            arg_key="${2%%=*}"
+            if [[ "${arg_key}" == "$2" ]] || [[ "${ALLOWED_BUILD_ARGS}" != *" ${arg_key} "* ]]; then
+                echo "错误：不支持的 build-arg: $2（允许：${ALLOWED_BUILD_ARGS// /}）"
+                exit 1
+            fi
+            EXTRA_BUILD_ARGS+=(--build-arg "$2")
+            shift 2 ;;
         *) REMAINING_ARGS+=("$1"); shift ;;
     esac
 done
@@ -321,6 +335,7 @@ for idx in "${SELECTED_INDICES[@]}"; do
         --platform linux/arm64 \
         ${NO_CACHE} \
         --build-arg "PYPI_MIRROR=${PYPI_MIRROR}" \
+        ${EXTRA_BUILD_ARGS[@]+"${EXTRA_BUILD_ARGS[@]}"} \
         --file "${dir}Dockerfile" \
         --tag "${FULL_IMAGE}" \
         $(${PUSH_ENABLED} && echo "--push" || echo "--output=type=docker") \

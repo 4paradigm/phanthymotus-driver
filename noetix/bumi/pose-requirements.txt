@@ -1,0 +1,14 @@
+# Pinned inference runtime for the opt-in upper_body_track processor.
+#
+# Only installed when the image is built with --build-arg INSTALL_POSE_DEPS=1;
+# default Bumi images do not include any of these packages. These three pins
+# fix the dominant ARM64 wheels behind the size record in
+# review-evidence/image-size-upper-body-track.md (torch ~97 MiB, torchvision
+# ~2.3 MiB, ultralytics ~1.4 MiB). torchvision 0.23.0 requires exactly
+# torch==2.8.0, so the pair is consistent; ultralytics 8.4.216 accepts both.
+# Remaining small transitive packages (matplotlib, pillow, polars, psutil,
+# requests, ultralytics-thop, nvidia-ml-py, opencv-python) are resolved by pip
+# from the pinned ultralytics and contribute only tens of MiB in total.
+torch==2.8.0
+torchvision==0.23.0
+ultralytics==8.4.216

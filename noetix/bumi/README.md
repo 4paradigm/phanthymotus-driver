@@ -539,3 +539,126 @@ media cards and motion cards keep running.
 
 The output contract, quality states, assumed body-axis calibration, validation
 status and the ROS probe live in [VISUAL_ODOMETRY.md](VISUAL_ODOMETRY.md).
+
+## Upper-body motion tracking (`upper_body_track`)
+
+A read-only processor card that answers one question: is a person's upper body
+in view, and where would that person's arms land on **this** robot? It consumes
+the RGB stream (and the depth stream registered to it, when wired), runs
+YOLO11-pose on a worker thread, and publishes two topics:
+
+| Topic | Format | Content |
+| --- | --- | --- |
+| `/NS/upper_body_track/pose2d` | `sensor/pose2d` | COCO-17 keypoints in pixels for the dashboard to draw the skeleton |
+| `/NS/upper_body_track/angles` | `data/json` | the six retargeted arm joint angles plus confidence/quality flags |
+
+The six angles are left/right shoulder pitch, shoulder roll and elbow flexion,
+derived from **bone directions** (not copied hand positions — the robot's
+shoulder-to-wrist reach is ~312 mm against a human's ~550-600 mm). The person's
+right arm maps to the robot's left and vice versa, because they face each other.
+Each angle is clamped to the robot's mechanical limits and smoothed with a 1€
+filter; the payload reports `tracked`, `target_id`, per-axis `*_clamped` flags,
+`degraded` reasons and `*_deg: -999` for "not measured". Humeral rotation (palm
+orientation) is not observable from 2D keypoints and is reported as zero.
+
+**It commands nothing.** There is no joint-command call in the card: driving the
+arms is a separate card, because on Bumi that must take over all 21 motors
+(`LowController.set_joint` rejects any other length) and hold its own balance.
+
+The card is **disabled by default** (`plugins.upper_body_track.enabled: false`)
+because inference needs an ultralytics/torch runtime and continuous CPU load.
+That runtime is **not in the default image**: Docker layers cannot be switched
+at runtime, so building an image that can run this card requires the build-time
+flag `--build-arg INSTALL_POSE_DEPS=1` (the dependency is pinned in the
+`Dockerfile`). With the repository's build script:
+`./build.sh --build-arg INSTALL_POSE_DEPS=1 noetix/bumi`. A default build stays
+free of torch and cannot run the card. The card module itself still loads —
+`ultralytics` is imported lazily on the first frame, not at load time — so
+enabling the plugin on a default image is not fatal, but inference raises on
+that first frame and the import error then shows up in `info` as `model.error`
+and `last_error`. There is no point enabling it without rebuilding. To use it,
+build with that flag, enable the plugin, and wire the camera's RGB topic into
+the card's `start` action via the canvas; depth is optional — without it the
+card falls back to a flat-plane assumption and says so in `degraded`. The sign
+of each axis can be corrected per robot in `config.yaml` or overridden at
+`start` without rebuilding.
+
+The official `yolo11n-pose.pt` weight is pinned to SHA-256
+`869e83fcdffdc7371fa4e34cd8e51c838cc729571d1635e5141e3075e9319dc0` in
+`config.yaml`. The card verifies that digest **before** YOLO opens the file —
+both for the auto-downloaded copy and for a pre-downloaded absolute path — so a
+tampered cache or an intercepted download cannot reach torch. An offline robot
+with its own weight should set `model_sha256` to that file's digest, or set it
+to `''` to deliberately disable the check.
+
+The [pose-dependency size record](review-evidence/image-size-upper-body-track.md)
+documents the pinned ARM64 wheels behind the enabled image's growth (about
+101 MiB across torch, torchvision and ultralytics; the default image is
+unchanged), why the ARM64 torch wheel is already the smallest official build,
+and the commands to measure the full-image delta on an ARM64 builder. **That
+whole-image delta has not been measured yet: do not publish a
+`INSTALL_POSE_DEPS=1` image until the ARM64 `docker inspect` numbers are
+recorded in that file.** Publishing the default image is unaffected.
+
+### `upper_body_mimic` — driving the arms
+
+The second card closes the loop: it subscribes to the angles topic above and
+commands the arms. It is **disabled by default**, and it is **not** an
+arm-only card.
+
+`LowController.set_joint` accepts exactly 21 motor commands — any other length
+raises — so every tick this card sends all 21: the thirteen leg/waist joints
+and the two shoulder-yaw joints (humeral rotation is invisible to a monocular
+camera) hold their measured position, and the six observable arm joints follow
+the operator. Sending 21 commands means taking the motors from whatever drove
+them before, so the card says plainly what it is: a whole-body takeover that
+keeps the legs still and implements no balance controller. Arm swings still
+move the centre of mass; the first runs belong on a supported robot.
+
+What it does to stay inside that envelope:
+
+- mechanical stops are read from the shipped `resource/bumi_model.urdf` (all
+  eight arm joints, yaw included). Moving targets keep a 10° inward margin so
+  the elbow never straightens under command; the measured pose the card starts
+  from is held as-is, never rewritten to the margin on the first tick;
+- motion follows PR #485's preview bounds: **2 rad/s velocity and 6 rad/s²
+  acceleration** per joint, applied to the commanded pose with a trapezoidal
+  profile that brakes before the stop instead of reversing instantly;
+- the first command starts from the measured pose at zero velocity, so
+  enabling the card never snaps the arms to zero;
+- `tracked: false`, a missing or non-finite axis, or a stream older than
+  `lost_timeout_s` returns the arms to the **safe pose** (arms down, elbow
+  slightly bent). The last human command is never held. A card armed before
+  the first tracked frame is the one exception: it holds the measured pose,
+  because "no operator seen yet" is not "the operator walked away", and the
+  camera may simply not be wired yet;
+- only workmode 2 (`walking`) is allowed, checked on every tick. Any exit —
+  protection (26), disabled (30), unreadable mode — stops commanding and needs
+  a fresh `start`;
+- `dds_contention_verified: true` is mandatory before `start`. The operator
+  must first confirm on the real robot that `LowController` and
+  `HighController` do not fight over DDS; software cannot prove this, so the
+  switch is deliberately manual and defaults to false;
+- the card is marked `x-is-dangerous` and `start` requires an explicit
+  `confirm: true` — a missing, false or non-boolean value is refused before
+  any motor is touched, so neither a stray call nor an unattended agent can
+  arm the loop;
+- it shares the same in-process arbitration as `loco` and `loco_servo`: `start`
+  is refused while a `loco` motion or a `loco_servo` velocity stream owns the
+  chassis, the ownership check repeats every tick so a card started later also
+  stops this loop, and any explicit action on `loco` preempts it through the
+  same `_preempt_servo` path. `x-resource` alone cannot do this — it orders
+  Agent Core's scheduling, not two writers reaching the DDS bus by different
+  routes. The card declares every channel it occupies (`base`, `arm_l`,
+  `arm_r`, `leg`, `waist`), not just the arms;
+- `x-hooks` map `on_interrupt_motion` and `on_interrupt_all` to `stop`, so an
+  interrupt cannot leave a 21-motor loop writing;
+- a missing controller and an SDK failure refuse to command rather than
+  retrying into a robot that has said no.
+
+Velocity, acceleration, timeout, margin and the four gains live in
+`config.yaml`. The angle source defaults to `/{namespace}/upper_body_track/angles`;
+`start` takes an `angles_topic` override for wiring a different source. Setting
+`send_commands: false` runs the whole pipeline and skips only `set_joint`:
+recorded angles-topic frames can be republished to that topic as a **DryRun
+replay** to check mapping, limits and trajectories without moving the robot.
