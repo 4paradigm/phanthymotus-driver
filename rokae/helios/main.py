@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from common.vendor_runtime import DriverBundle, load_config, make_handler, resolve_namespace, start_registration
 from .device import HeliosJoints
 from .battery import HeliosBattery
+from .lidar import HeliosLidar
 
 
 def main():
@@ -25,8 +26,10 @@ def main():
     rclpy.init(context=context, domain_id=int(os.environ.get("ROS_DOMAIN_ID", "42")))
     executor = SingleThreadedExecutor(context=context)
     ros2 = SimpleNamespace(ctx_core=context, executor_core=executor)
-    plugins = [HeliosJoints(config, resolve_namespace(config), ros2),
-               HeliosBattery(config, resolve_namespace(config), ros2)]
+    namespace = resolve_namespace(config)
+    plugins = [HeliosJoints(config, namespace, ros2),
+               HeliosBattery(config, namespace, ros2),
+               HeliosLidar(config, namespace, ros2)]
     bundle = DriverBundle(plugins)
     port = int(config["mcp_port"])
     server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(lambda: bundle, "rokae-helios", "rokae-helios-driver"))
@@ -45,7 +48,7 @@ def main():
         spin = threading.Thread(target=executor.spin, daemon=True)
         spin.start()
         start_registration(port, config, "rokae-helios-driver")
-        print(f"[helios] read-only joints/battery MCP listening on 127.0.0.1:{port}", flush=True)
+        print(f"[helios] read-only joints/battery/lidar MCP listening on 127.0.0.1:{port}", flush=True)
         server.serve_forever()
     finally:
         executor.shutdown()

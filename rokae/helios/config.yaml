@@ -5,6 +5,8 @@ state_url: ws://192.168.0.161:8888/ws
 battery_state_url: ws://192.168.0.100/ws/AGVInfo
 battery_publish_hz: 1
 battery_stale_timeout_s: 3.0
+lidar_sdk_host: 192.168.0.100
+lidar_sdk_port: 9003
 publish_hz: 10
 stale_timeout_s: 1.0
 connect_timeout_s: 3.0
