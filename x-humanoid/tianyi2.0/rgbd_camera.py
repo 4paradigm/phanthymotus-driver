@@ -119,6 +119,7 @@ class _MountNode:
 
 _MIN_IMAGE_AGE_NS = -50_000_000
 _MAX_IMAGE_AGE_NS = 500_000_000
+_STARTUP_CLOCK_MIN_FRAMES = 15
 
 
 def _fresh_images(*images, reserve_ns=0):
@@ -647,8 +648,13 @@ class RgbdCameraPlugin:
             if not self.running:
                 return
             stream = self.image_streams[kind]
-            stream.update(received=stream['received']+1, last_capture_ns=_stamp(msg), last_arrival_ns=time.time_ns())
-            if not _fresh_images(msg):
+            capture, arrival = _stamp(msg), time.time_ns()
+            age = arrival - capture
+            future_streak = (stream.get('future_streak', 0) + 1
+                             if capture > 0 and age < _MIN_IMAGE_AGE_NS else 0)
+            stream.update(received=stream['received']+1, last_capture_ns=capture,
+                          last_arrival_ns=arrival, future_streak=future_streak)
+            if capture <= 0 or not _MIN_IMAGE_AGE_NS <= age <= _MAX_IMAGE_AGE_NS:
                 return
             if not self.registered or set(self.infos) != {'color', 'depth'}:
                 return
@@ -686,35 +692,49 @@ class RgbdCameraPlugin:
                     self.running = False
                     self.stop_event.set()
 
-    def _startup_images_outside_capture_window(self):
+    def _startup_capture_problem(self):
         if (not self.running or self.stop_event.is_set() or not self.registered
                 or self.count or self.imu_publication_attempts
                 or set(self.infos) != {'color', 'depth'}):
-            return False
+            return None
         now = time.time_ns()
         ages = []
         for stream in self.image_streams.values():
             capture, arrival = stream['last_capture_ns'], stream['last_arrival_ns']
-            if stream['received'] < 15 or not capture or not 0 <= now - arrival <= 250_000_000:
-                return False
+            if (stream['received'] < _STARTUP_CLOCK_MIN_FRAMES or not capture
+                    or not 0 <= now - arrival <= 250_000_000):
+                return None
             ages.append(arrival - capture)
-        return (all(age > _MAX_IMAGE_AGE_NS for age in ages)
-                or all(age < _MIN_IMAGE_AGE_NS for age in ages))
+        if all(stream.get('future_streak', 0) >= _STARTUP_CLOCK_MIN_FRAMES
+               for stream in self.image_streams.values()):
+            return 'future'
+        if all(age > _MAX_IMAGE_AGE_NS for age in ages):
+            return 'stale'
+        return None
 
     def _recover_startup_clock(self):
         with self.lock, self.imu_lock:
             now = time.monotonic()
-            if (self._startup_clock_restart_requested or now < self._startup_clock_retry_at
-                    or not self._startup_images_outside_capture_window()):
+            if self._startup_clock_restart_requested or now < self._startup_clock_retry_at:
+                return
+            problem = self._startup_capture_problem()
+            if problem is None:
                 return
             self._startup_clock_retry_at = now + 1.
         from device import CameraPlugin
-        step = CameraPlugin._orbbec_host_clock_step_ns()
-        if step is None or abs(step) <= _MAX_IMAGE_AGE_NS:
-            return
+        if problem == 'stale':
+            # Old frames can also be caused by delivery backlog. Check the host
+            # clocks before attributing them to the camera clock mapping.
+            step = CameraPlugin._orbbec_host_clock_step_ns()
+            if step is None or abs(step) <= _MAX_IMAGE_AGE_NS:
+                return
+            reason = f'host clock shifted {step / 1e6:+.0f} ms since Orbbec startup'
+        else:
+            # Delivery delay cannot account for captures timestamped after receipt.
+            reason = 'both Orbbec streams report future capture timestamps'
         with self.lock, self.imu_lock:
             # A fresh frame or a stop can arrive while querying systemd.
-            if not self._startup_images_outside_capture_window():
+            if self._startup_capture_problem() != problem:
                 return
             self._startup_clock_restart_requested = self._startup_clock_restarting = True
             self.registered = False
@@ -729,7 +749,7 @@ class RgbdCameraPlugin:
         try:
             if not self.stop_event.is_set():
                 error = CameraPlugin._restart_orbbec_service(startup_recovery=True)
-                print(f'[RGB-D] host clock shifted {step / 1e6:+.0f} ms since Orbbec startup: '
+                print(f'[RGB-D] {reason}: '
                       + (f'camera restart failed: {error}' if error else 'restarted camera service'), flush=True)
         finally:
             with self.lock:

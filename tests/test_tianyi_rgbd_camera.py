@@ -164,16 +164,20 @@ def test_image_ingress_rejects_invalid_capture_age_before_pairing(monkeypatch, a
     assert source.image_streams[kind]['received'] == 1
 
 
-@pytest.mark.parametrize(("ages_ms", "clock_steps_ms", "first_color", "restart"), [
-    ((704, 705), (-1792,), False, True),
-    ((704, 705), (-1792,), True, True),
-    ((-710, -710), (1792,), False, True),
-    ((704, 705), (None, -1792), False, True),
-    ((704, 705), (0,), False, False),
-    ((704, 425), (-1792,), False, False),
+@pytest.mark.parametrize(("ages_ms", "clock_steps_ms", "first_color", "future_frames", "restart"), [
+    ((704, 705), (-1792,), False, 20, True),
+    ((704, 705), (-1792,), True, 20, True),
+    ((-710, -710), (1792,), False, 20, True),
+    ((704, 705), (None, -1792), False, 20, True),
+    ((704, 705), (0,), False, 20, False),
+    ((704, 425), (-1792,), False, 20, False),
+    ((-114, -108), (0,), True, 20, True),
+    ((-101, -100), (None,), False, 20, True),
+    ((-101, -100), (0,), False, 14, False),
+    ((-101, -40), (0,), False, 20, False),
 ])
-def test_startup_repairs_only_a_verified_clock_step_with_two_stale_streams(
-        monkeypatch, ages_ms, clock_steps_ms, first_color, restart):
+def test_startup_recovers_shared_rgbd_clock_faults(
+        monkeypatch, ages_ms, clock_steps_ms, first_color, future_frames, restart):
     import queue
     import sys
     import threading
@@ -223,8 +227,11 @@ def test_startup_repairs_only_a_verified_clock_step_with_two_stale_streams(
         assert source.geometry is not None
         # By the time both streams are stale, the lone pre-step frame expired.
         now += 600_000_000
-    for _ in range(20):
+    for frame in range(20):
         for kind, age in zip(('color', 'depth'), ages_ms):
+            if age < -50 and frame == 20 - future_frames - 1:
+                # Break any future-frame streak without building a fresh pair.
+                age = 520
             send(kind, now - age * 1_000_000)
         now += 33_333_333
 
@@ -248,6 +255,7 @@ def test_startup_repairs_only_a_verified_clock_step_with_two_stale_streams(
     assert source.pending.empty()
     assert len(restarts) == int(restart)
 
+    now += 100_000_000
     capture_ns = now - 30_000_000
     if restart:
         assert not source.registered and not source.infos
