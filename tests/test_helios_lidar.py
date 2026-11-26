@@ -19,6 +19,7 @@ def test_cloud_registration_without_sdk(monkeypatch, tmp_path):
     assert status["preview_sources"] == []
     assert {source["available"] for source in status["sources"].values()} == {False}
     preview = [{"topic": "/rokae_helios/lidar/preview", "format": "sensor/pointcloud"}]
+    assert plugin.get_tool()["name"] == "lidar_cloud"
     assert status["topic_out"] == plugin.get_tool()["topic_out"] == preview
     info = plugin.dispatch("info", {})
     assert info["topic_out"] == preview
@@ -40,8 +41,8 @@ def test_preview_sampling_and_timestamp_alignment():
 
     assert tuple(pair) == (-4, -8)
     assert len(preview) == 8 + 6_000 * lidar.XYZI.size
-    assert lidar.XYZI.unpack_from(preview, 8) == (1.0, 2.0, 3.0, 0.0)
-    assert lidar.XYZI.unpack_from(preview, 8 + 3_000 * lidar.XYZI.size) == (4.0, 5.0, 6.0, 0.0)
+    assert lidar.XYZI.unpack_from(preview, 8) == (-1.0, 2.0, -3.0, 0.0)
+    assert lidar.XYZI.unpack_from(preview, 8 + 3_000 * lidar.XYZI.size) == (-4.0, 5.0, -6.0, 0.0)
     outside_window = lidar.Cloud(1_900_000_000, left.count, left.xyz, 0)
     assert lidar.preview_frames({-4: outside_window, -8: right}) == {-8: right}
 

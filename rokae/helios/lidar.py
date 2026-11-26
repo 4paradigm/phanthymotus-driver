@@ -55,7 +55,8 @@ def pack_preview(clouds):
         for index in range(count):
             point = index * cloud.count // count
             x, y, z = XYZ.unpack_from(cloud.xyz, point * XYZ.size)
-            XYZI.pack_into(data, offset, x, y, z, 0.0)
+            # Core's default scene mapping is (Y, -Z, -X).
+            XYZI.pack_into(data, offset, -x, y, -z, 0.0)
             offset += XYZI.size
     return data
 
@@ -142,7 +143,7 @@ class SdkLidarClient:
 
 
 class HeliosLidar:
-    NAME = "lidar_pointcloud"
+    NAME = "lidar_cloud"
 
     def __init__(self, config, namespace, ros2, client=None):
         self._ros2 = ros2

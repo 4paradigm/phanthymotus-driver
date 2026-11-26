@@ -6,7 +6,7 @@
 |---|---|---|
 | `joints` | sensor | 关节骨架和逐轴状态，默认 10 Hz |
 | `battery` | sensor | 两块电池状态，默认 1 Hz |
-| `lidar_pointcloud` | sensor | 双路三维点云预览及两路原生 `PointCloud2` |
+| `lidar_cloud` | sensor | 双路三维点云预览及两路原生 `PointCloud2` |
 | `model` | resource | 运行时读取本机 iNex 的 URDF，骨架渲染器自动调用 |
 
 ## 数据与单位
@@ -53,7 +53,7 @@
 
 ## 三维激光雷达
 
-`lidar_pointcloud` 读取厂家 SDK 左前（位置 ID `-4`）和右后（`-8`）三维点云。以下路径使用默认命名空间 `rokae_helios`。
+`lidar_cloud` 读取厂家 SDK 左前（位置 ID `-4`）和右后（`-8`）三维点云。以下路径使用默认命名空间 `rokae_helios`。
 
 | 话题 | 类型 / 用途 |
 |---|---|
@@ -62,6 +62,8 @@
 | `/rokae_helios/lidar/right_rear/points` | 右后 `sensor_msgs/msg/PointCloud2` |
 
 卡片的 `topic_out` 只登记拼接预览，供 Core 监控显示。`info` 的 `native_topics` 列出两路原生输出的 `topic` 和 `message_type`，供下游直接订阅 ROS 2 话题。
+
+预览适配 Core 默认点云轴向，机头前方对应蓝色正轴，竖直向上对应绿色正轴。已有画布可将旧卡片更新为 `lidar_cloud`，并恢复该卡片的默认预览轴向。
 
 原生输出保留每帧有效 XYZ，单位为米，沿用厂家底盘坐标与采样时间戳。使用传感器数据 QoS（Best Effort，队列深度 1）。Core 预览叠加采样时间相差不超过 250 ms 的两帧，时间差更大时显示较新的一路。SDK 每 1.48 秒重新订阅以跳过积压，刷新率随链路和点量变化。
 

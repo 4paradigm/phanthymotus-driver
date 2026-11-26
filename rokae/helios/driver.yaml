@@ -12,5 +12,5 @@ build_context_extras:
 cards:
   - {name: joints, type: sensor}
   - {name: battery, type: sensor}
-  - {name: lidar_pointcloud, type: sensor}
+  - {name: lidar_cloud, type: sensor}
   - {name: model, type: resource}
