@@ -63,7 +63,7 @@ def descriptor(config, drive_config):
     return result
 
 
-def _receive(topic, domain, profile, inbox, ready, closing):
+def _receive(topic, domain, profile, inbox, ready, closing, node_name="panther_base_servo_input", max_bytes=65536):
     from common import logsafe
     logsafe.install(check_fd=False)
     os.environ["ROS_DOMAIN_ID"] = str(domain)
@@ -74,9 +74,9 @@ def _receive(topic, domain, profile, inbox, ready, closing):
     from rclpy.qos import qos_profile_sensor_data
     from std_msgs.msg import String
     rclpy.init(domain_id=domain)
-    node = Node("panther_base_servo_input", enable_rosout=False, start_parameter_services=False)
+    node = Node(node_name, enable_rosout=False, start_parameter_services=False)
     def received(message):
-        if len(message.data) > 65536:
+        if len(message.data) > max_bytes or len(message.data.encode("utf-8")) > max_bytes:
             return
         try:
             item = (json.loads(message.data), time.monotonic())

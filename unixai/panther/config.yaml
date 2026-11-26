@@ -40,6 +40,14 @@ plugins:
       rpy_rad: [0.0, 0.0, 0.0]
   camera_color: {enabled: true}
   camera_depth: {enabled: true}
+  vision_pick_and_drop:
+    enabled: true
+    allow_motion: false
+    planner_python: /opt/panther-pink/bin/python
+    calibration_file: /opt/phanthy-motus/data/panther/vision_pick_and_drop.json
+    base_frame: base_link
+    xy_compensation_m: [0.0, 0.0]
+    observe_after_transfer: false
   camera_left: {enabled: true}
   camera_right: {enabled: true}
   stereo_camera:

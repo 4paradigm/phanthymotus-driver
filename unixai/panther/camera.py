@@ -157,6 +157,8 @@ class PantherCameraRuntime:
         with self._lock:
             self._active.discard(kind)
             self._frames[kind] = None
+            if kind in getattr(self, "_pick_frames", {}):
+                self._pick_frames[kind].clear()
         return self.info(kind)
 
     def close(self) -> None:
@@ -380,6 +382,42 @@ class PantherCameraRuntime:
             raise ValueError("image capture timestamp unavailable")
         return geometry
 
+    def require_pick_camera(self):
+        with self._lock:
+            history = getattr(self, "_pick_frames", {})
+            if not {"rgb", "depth"}.issubset(self._active) or self._geometry is None or any(
+                    not history.get(kind) or history[kind][-1][1] is not self._geometry
+                    or not -.05 <= time.time() - stamp_ns(history[kind][-1][0]) / 1e9 <= 1.
+                    for kind in ("rgb", "depth")):
+                raise RuntimeError("fresh registered Panther RGB and depth card frames are required")
+
+    def pick_snapshot(self, after, inference_started, parent):
+        """Copy one current, registered pair from the existing card pipeline."""
+        with self._lock:
+            history = getattr(self, "_pick_frames", {})
+            rgb = list(history.get("rgb", ())) if "rgb" in self._active else []
+            depth = list(history.get("depth", ())) if "depth" in self._active else []
+            geometry = self._geometry
+        now = time.time()
+        pairs = [(abs(stamp_ns(r) / 1e9 - inference_started), abs(stamp_ns(r) - stamp_ns(d)), rp, dp, d)
+                 for r, rg, rp in rgb for d, dg, dp in depth
+                 if geometry is not None and rg is geometry and dg is geometry
+                 and all(after <= stamp_ns(m) / 1e9 <= now + .05 and now - stamp_ns(m) / 1e9 <= 1.0
+                         for m in (r, d)) and abs(stamp_ns(r) - stamp_ns(d)) <= 200_000_000
+                 and abs(stamp_ns(r) / 1e9 - inference_started) <= .25]
+        if not pairs:
+            return None
+        _, _, jpg, image, msg = min(pairs, key=lambda item: item[:2])
+        return {"rgb": jpg, "depth": image, "K": geometry["K"], "stamp": stamp_ns(msg) / 1e9,
+                "transform": self._lookup_matrix(parent, msg.header.frame_id, msg)}
+
+    def _remember_pick_frame(self, kind, message, geometry, payload):
+        from types import SimpleNamespace
+        from collections import deque
+        if not hasattr(self, "_pick_frames"):
+            self._pick_frames = {key: deque(maxlen=10) for key in ("rgb", "depth")}
+        self._pick_frames[kind].append((SimpleNamespace(header=message.header), geometry, payload))
+
     def _on_camera_imu(self, message):
         with self._lock:
             if "imu" not in self._active or self._geometry is None:
@@ -483,6 +521,7 @@ class PantherCameraRuntime:
                     if "rgb" in self._active and geometry is self._geometry and not self._closed:
                         self._publish_mount(message)
                         self._bridge.publish("camera_color", payload)
+                        self._remember_pick_frame("rgb", message, geometry, payload["data"])
             except Exception as exc:
                 self._log_frame_failure("rgb", "camera_color", exc)
 
@@ -511,6 +550,7 @@ class PantherCameraRuntime:
                     if "depth" in self._active and geometry is self._geometry and not self._closed:
                         self._publish_mount(message)
                         self._bridge.publish("camera_depth", payload)
+                        self._remember_pick_frame("depth", message, geometry, depth)
             except Exception as exc:
                 self._log_frame_failure("depth", "camera_depth", exc)
 
