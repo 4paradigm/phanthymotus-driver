@@ -338,16 +338,16 @@ def english_parameters(parameters, snapshot):
     return result
 
 
-class _RosPublisher:
+class RosMonitorPublisher:
     """Lazy ROS transport, using the shared Core domain/executor only."""
-    def __init__(self, ros2, namespace, topic_out, period, callback):
+    def __init__(self, ros2, namespace, topic_out, period, callback, *, node_prefix="piper_monitor_"):
         from rclpy.node import Node
         from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
         from std_msgs.msg import String
 
         self._ros2 = ros2
         self._message_type = String
-        self._node = Node("piper_monitor_" + namespace.replace("/", "_"), context=ros2.ctx_core)
+        self._node = Node(node_prefix + namespace.replace("/", "_"), context=ros2.ctx_core)
         self._attached = False
         try:
             qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -397,7 +397,7 @@ class PiperMonitorPlugin:
         self._language = language
         self._namespace, self._device_name = namespace, device_name
         self._ros2, self._publish_hz, self._clock = ros2, float(publish_hz), clock
-        self._publisher_factory = publisher_factory or _RosPublisher
+        self._publisher_factory = publisher_factory or RosMonitorPublisher
         self._lock, self._sample_lock = threading.RLock(), threading.Lock()
         self._transport = None
         self._running = False

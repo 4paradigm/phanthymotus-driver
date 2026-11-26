@@ -13,6 +13,9 @@ import time
 import threading
 
 
+MOTOR_FEEDBACK_IDS = tuple(range(0x261, 0x267))
+
+
 @dataclass(frozen=True)
 class ArmState:
     joints_deg: tuple[float, ...]
@@ -32,6 +35,15 @@ class GripperState:
     enabled: bool
     error_code: int
     feedback_time: float
+
+
+@dataclass(frozen=True)
+class MotorTelemetry:
+    motor_temperature_c: int
+    driver_temperature_c: int
+    driver_voltage_v: float
+    driver_current_a: float
+    received_at_unix_s: float
 
 
 class PiperDriver:
@@ -60,12 +72,21 @@ class PiperDriver:
                 super().__init__(*args, **kwargs)
 
             def ParseCANFrame(self, frame):
+                if frame is not None and frame.arbitration_id in MOTOR_FEEDBACK_IDS:
+                    # Keep each motor's SDK values and host receive stamp together.
+                    with self.frame_lock:
+                        result = super().ParseCANFrame(frame)
+                        self._record_frame(frame.arbitration_id)
+                        return result
                 result = super().ParseCANFrame(frame)
                 if frame is not None:
                     with self.frame_lock:
-                        self.frame_times[frame.arbitration_id] = time.time()
-                        self.frame_counts[frame.arbitration_id] = self.frame_counts.get(frame.arbitration_id,0)+1
+                        self._record_frame(frame.arbitration_id)
                 return result
+
+            def _record_frame(self, can_id):
+                self.frame_times[can_id] = time.time()
+                self.frame_counts[can_id] = self.frame_counts.get(can_id, 0) + 1
 
         if PiperDriver._sdk_type is None:
             PiperDriver._sdk_type = ObservedInterface
@@ -105,7 +126,7 @@ class PiperDriver:
         status = self.arm.GetArmStatus()
         motors = self.arm.GetArmLowSpdInfoMsgs()
         now = time.time()
-        required = (0x2A1, 0x2A5, 0x2A6, 0x2A7, *range(0x261, 0x267))
+        required = (0x2A1, 0x2A5, 0x2A6, 0x2A7, *MOTOR_FEEDBACK_IDS)
         frame_times = None
         if hasattr(self.arm, "frame_times"):
             with self.arm.frame_lock:
@@ -134,6 +155,29 @@ class PiperDriver:
     def get_state(self):
         """Return fresh feedback, without sending a movement command."""
         return self._raw_state()[1]
+
+    def get_motor_telemetry(self) -> tuple[MotorTelemetry | None, ...]:
+        """Copy the low-speed SDK cache, preserving each joint's receive time."""
+        arm = self.arm
+        if arm is None or not hasattr(arm, "frame_times"):
+            return ()
+        with arm.frame_lock:
+            motors = arm.GetArmLowSpdInfoMsgs()
+            samples = []
+            for joint, can_id in enumerate(MOTOR_FEEDBACK_IDS, 1):
+                motor = getattr(motors, f"motor_{joint}")
+                received_at = arm.frame_times.get(can_id)
+                if received_at is None or motor.can_id != can_id:
+                    samples.append(None)
+                    continue
+                samples.append(MotorTelemetry(
+                    motor_temperature_c=motor.motor_temp,
+                    driver_temperature_c=motor.foc_temp,
+                    driver_voltage_v=motor.vol / 10,
+                    driver_current_a=motor.bus_current / 1000,
+                    received_at_unix_s=received_at,
+                ))
+        return tuple(samples)
 
     def firmware(self, query=False):
         """Only explicit query sends an information request, never a control frame."""

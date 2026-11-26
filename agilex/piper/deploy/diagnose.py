@@ -75,7 +75,7 @@ def diagnose(endpoint, photos=0):
     def check_cards():
         cards = [t["name"] for t in rpc(endpoint,"tools/list")["tools"]]
         expected = {"arm_control", "joints", "model", "piper_photo", "piper_camera_live"}
-        if set(cards) != expected:
+        if set(cards) - {"piper_joint_motor_telemetry"} != expected:
             raise RuntimeError(f"Production tools mismatch: expected {sorted(expected)}, received {sorted(cards)}")
         return cards
     cards = check("cards", check_cards)

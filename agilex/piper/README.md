@@ -1,8 +1,8 @@
-# PiPER Arm control, Joints and On camera
+# PiPER Arm control, Joints, Joint Motor Telemetry and On camera
 
-The current bundle provides three canvas cards: **Arm control** (`arm_control`),
-**Joints** (`joints`) and **On camera** (`piper_camera_live`). Joints and On camera
-are independent read-only sensors. They share the existing driver lifecycle and
+The current bundle provides **Arm control** (`arm_control`), **Joints** (`joints`),
+**Joint Motor Telemetry** (`piper_joint_motor_telemetry`) and **On camera**
+(`piper_camera_live`). The sensor cards use the existing driver lifecycle and
 keep monitoring when the control card stops. No Parameters or
 `state/parameters` stream is published; **Get status** returns feedback, limits,
 motor state, faults, capabilities and actual task outcomes.
@@ -48,6 +48,27 @@ stale-feedback freezing. `model` returns `{"urdf":"..."}`. Finger translation is
 not animated by the current Core; real opening width is available in Get status.
 On camera publishes the existing JPEG topic when its configured live stream and
 camera permission are enabled. Optional photo capture/import remains available.
+
+### Joint Motor Telemetry
+
+This read-only sensor brings the per-joint motor readings from RealMan's
+[`arm_all_state` card](../../realman/rm75_6f_v/driver.yaml) to PiPER. Add
+**Joint Motor Telemetry** to the canvas and select its stream in **Monitor**.
+The `data/json` stream is `/<namespace>/piper/state/joint_motor_telemetry`
+at 5 Hz. It reports J1–J6 motor and driver temperatures (°C), driver voltage
+(V), driver current (A), and the host receive timestamp for each fresh sample.
+
+The card uses the driver's configured CAN interface and shared feedback cache.
+Deploy one runtime per arm with distinct CAN interfaces and ROS namespaces
+when monitoring both follower arms. The card's Start and Stop operate only on
+the stream. Info reads the current cache. All three operations are read-only
+with respect to the arm.
+
+A joint with no frame or a frame older than 0.5 seconds has null readings.
+The overall feedback status is `fresh`, `partial` or `unavailable`. To verify
+the card onsite, check all six readings while the arm is stationary, then
+check that Stop and Start affect only this stream. Verify stale handling by
+replaying a missing-frame case in a test environment.
 
 Long-running requests return a unique `action_id`; their real completed, error
 or cancelled result is POSTed to Core. Receipt timeout is 90 seconds, allowing

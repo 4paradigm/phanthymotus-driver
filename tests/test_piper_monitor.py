@@ -12,7 +12,7 @@ from unittest.mock import patch
 import xml.etree.ElementTree as ET
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from agilex.piper.monitor import PiperMonitorPlugin, monitor_frame, _RosPublisher, JOINT_NAMES, RESOURCE_DIR, load_model
+from agilex.piper.monitor import PiperMonitorPlugin, monitor_frame, RosMonitorPublisher, JOINT_NAMES, RESOURCE_DIR, load_model
 from common.vendor_runtime import DriverBundle
 
 
@@ -364,7 +364,7 @@ class RosTransportTests(unittest.TestCase):
         self.addCleanup(self.patcher.stop)
 
     def test_real_transport_uses_core_context_qos_and_releases_node_once(self):
-        transport = _RosPublisher(self.ros, "agilex/piper", [{"format": "data/json", "topic": "/piper/parameters"}], .1, lambda: None)
+        transport = RosMonitorPublisher(self.ros, "agilex/piper", [{"format": "data/json", "topic": "/piper/parameters"}], .1, lambda: None)
         node = self.nodes[0]
         self.assertIs(node.context, self.ros.ctx_core)
         self.assertEqual(node.period, .1)
@@ -382,7 +382,7 @@ class RosTransportTests(unittest.TestCase):
             with self.subTest(fail=fail):
                 setattr(self, fail, True)
                 with self.assertRaises(RuntimeError):
-                    _RosPublisher(self.ros, "piper", [{"format": "data/json", "topic": "/piper/parameters"}], .1, lambda: None)
+                    RosMonitorPublisher(self.ros, "piper", [{"format": "data/json", "topic": "/piper/parameters"}], .1, lambda: None)
                 setattr(self, fail, False)
                 self.assertEqual(self.nodes[-1].destroyed, 1)
         self.assertEqual(self.added, [])
