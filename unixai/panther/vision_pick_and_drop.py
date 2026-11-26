@@ -112,6 +112,7 @@ class VisionPickAndDrop:
         self._blocked = False
         self._stop_requested = False
         self._ctx = mp.get_context("spawn")
+        self._has_vop = False
 
     def get_tool(self):
         topics = self.device.topics
