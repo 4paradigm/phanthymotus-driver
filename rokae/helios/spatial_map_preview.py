@@ -13,7 +13,7 @@ from urllib.request import Request, urlopen
 from zipfile import ZipFile
 
 from google.protobuf.message import DecodeError
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 import yaml
 
 from .chassis_battery_pb2 import UiDatagram
@@ -73,8 +73,8 @@ def read_floor_map(blob, name):
         with Image.open(io.BytesIO(package.read(path))) as grid:
             size = grid.size
             zoom = min(2.0, 800 / max(size))
-            raster = grid.convert("RGB").resize(tuple(max(1, round(i * zoom)) for i in size),
-                                                Image.Resampling.NEAREST)
+            raster = ImageOps.invert(grid.convert("L")).resize(
+                tuple(max(1, round(i * zoom)) for i in size), Image.Resampling.NEAREST)
     origin = tuple(float(v) for v in meta["origin"])
     resolution = float(meta["resolution"])
     if len(origin) != 3 or not all(map(math.isfinite, origin)) or not math.isfinite(resolution) or resolution <= 0:
@@ -103,7 +103,7 @@ def _font():
 
 def render_preview(floor, pose, status=""):
     width, height = floor.image.size if floor else (480, 180)
-    canvas = Image.new("RGB", (width, height + 30), "#edf2f5")
+    canvas = Image.new("RGB", (width, height + 30), "black")
     draw = ImageDraw.Draw(canvas)
     if floor:
         canvas.paste(floor.image)
@@ -122,7 +122,7 @@ def render_preview(floor, pose, status=""):
                 status = f'x {pose["x"]:.2f} m    y {pose["y"]:.2f} m    yaw {math.degrees(pose["theta"]):.1f} deg'
             else:
                 status = "Position outside map"
-    draw.text((10, height+5), status, font=_font(), fill="#15384f")
+    draw.text((10, height+5), status, font=_font(), fill="#d9e4ec")
     output = io.BytesIO()
     canvas.save(output, format="JPEG", quality=90)
     return output.getvalue()
