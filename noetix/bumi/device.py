@@ -387,6 +387,7 @@ class LocoPlugin:
         self._last_cmd_time: float = 0.0
         self._move_thread: threading.Thread | None = None
         self._move_stop_event = threading.Event()
+        self._walking_workmode = None
         # loco_relative_move rotate bookkeeping, read by _rotate_status.
         self._rotate_lock = threading.Lock()
         self._rotate_stop_event = threading.Event()
@@ -1014,6 +1015,7 @@ class LocoPlugin:
     def _rotate_mode_error(self) -> dict | None:
         """Shared mode check for velocity moves, target moves and rotations."""
         mode = int(self._high_ctrl.get_mode())
+        self._walking_workmode = mode
         if mode == 26:
             return {"state": "error", "error": "Robot in protection mode, cannot move"}
         if mode not in (2, 3):
@@ -1078,7 +1080,12 @@ class LocoPlugin:
         problem = self._rotate_mode_error()
         if problem is not None:
             return None, problem
-        from imu_distance_control import decode_imu
+        from imu_distance_control import WHOLE_BODY_STOP_ADVANCE_M, decode_imu
+        if (self._walking_workmode == 3
+                and math.hypot(x, y) <= WHOLE_BODY_STOP_ADVANCE_M):
+            return None, {"state": "error", "error": (
+                f"Whole-body targets must exceed {WHOLE_BODY_STOP_ADVANCE_M:g} m; "
+                "shorter target moves are not calibrated.")}
         decode_imu(self._read_distance_imu())
         return math.hypot(x, y), None
 
@@ -1092,7 +1099,8 @@ class LocoPlugin:
         self._set_servo_velocity_owner(True)
         result = run_target(self, float(args['x_m']), float(args['y_m']),
                             full_scale=self._distance_full_scale(),
-                            slip_scale=self._slip_scales['forward'])
+                            slip_scale=self._slip_scales['forward'],
+                            whole_body=self._walking_workmode == 3)
         result['estimated_quality'] = 'experimental_unvalidated'
         return result
 
