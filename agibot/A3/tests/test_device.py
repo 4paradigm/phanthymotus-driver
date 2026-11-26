@@ -982,6 +982,90 @@ class RpcDispatchTests(unittest.TestCase):
         self.assertIn("10.42.10.12:56322", url)
         self.assertEqual(body["command"], command)
 
+    def _start_walk_before_damping(self):
+        self._capture_notifications()
+        self._set_mc_state("MOTION")
+        self.transport.responses["MotionControlActionService/GetNextActions"] = {
+            "commands": [{"action": "MotionControlAction_DAMPING"}]}
+        loco = find_plugin(self.plugins, "loco")
+        walk = loco.dispatch("walk", {"forward": 0.2, "duration": 30})
+        self.assertEqual(walk["state"], "accepted")
+        self._wait_until(lambda: any(p["data"]["forward_velocity"] > 0 for p in self._loco_payloads()))
+        return find_plugin(self.plugins, "mc_mode"), loco
+
+    def test_mc_mode_damping_waits_for_published_zero_frames(self):
+        mc_mode, loco = self._start_walk_before_damping()
+        transport = self.transport
+
+        def check_stop_at_set_action(url, payload, timeout):
+            response = transport(url, payload, timeout)
+            if url.endswith("/SetAction"):
+                self.assertIsNone(loco._thread)
+                frames = self._loco_payloads()[-loco.STOP_FRAMES:]
+                self.assertEqual(len(frames), loco.STOP_FRAMES)
+                for frame in frames:
+                    self.assertTrue(all(frame["data"][axis + "_velocity"] == 0.0 for axis in loco.AXES))
+                self.assertEqual(loco.dispatch("walk", {"forward": 0.1, "duration": 1})["code"], "BUSY")
+                self._set_mc_state("DAMPING")
+                return {"state": "CommonState_SUCCESS"}
+            return response
+
+        with patch.object(self.nodes.rpc, "transport", check_stop_at_set_action):
+            result = mc_mode.dispatch("damping", {"confirm": True})
+        self.assertEqual(result, {"state": "done", "current": "DAMPING", "changed": True})
+        self.assertEqual(len(transport.calls_to("MotionControlActionService", "SetAction")), 1)
+
+    def test_mc_mode_damping_rejected_if_zero_publish_fails(self):
+        mc_mode, loco = self._start_walk_before_damping()
+        publish = self.nodes.publish_wrapper
+
+        def fail_on_zero(name, frame):
+            if frame["data"]["forward_velocity"] == 0.0:
+                raise RuntimeError("stop frame not published")
+            return publish(name, frame)
+
+        with patch.object(self.nodes, "publish_wrapper", side_effect=fail_on_zero):
+            result = mc_mode.dispatch("damping", {"confirm": True})
+        self.assertEqual(result["code"], "LOCO_NOT_STOPPED")
+        self.assertEqual(self.transport.calls_to("MotionControlActionService", "SetAction"), [])
+        self.assertIsNone(loco._blocked)
+
+    def test_mc_mode_damping_rejected_if_stop_frame_is_still_in_flight(self):
+        mc_mode, loco = self._start_walk_before_damping()
+        loco.BLOCK_STOP_TIMEOUT_S = 0.15
+        release = threading.Event()
+        publish = self.nodes.publish_wrapper
+
+        def delay_stop_frame(name, frame):
+            if frame["data"]["forward_velocity"] == 0.0:
+                release.wait(3)
+            return publish(name, frame)
+
+        with patch.object(self.nodes, "publish_wrapper", side_effect=delay_stop_frame):
+            try:
+                result = mc_mode.dispatch("damping", {"confirm": True})
+                self.assertEqual(result["code"], "LOCO_NOT_STOPPED")
+            finally:
+                release.set()
+                loco.stop()
+        self.assertEqual(self.transport.calls_to("MotionControlActionService", "SetAction"), [])
+        self.assertIsNone(loco._blocked)
+
+    def test_mc_mode_damping_respects_firmware_revocation_while_braking(self):
+        mc_mode, loco = self._start_walk_before_damping()
+        publish = self.nodes.publish_wrapper
+
+        def revoke_at_zero(name, frame):
+            if frame["data"]["forward_velocity"] == 0.0:
+                self.transport.responses["MotionControlActionService/GetNextActions"] = {"commands": []}
+            return publish(name, frame)
+
+        with patch.object(self.nodes, "publish_wrapper", side_effect=revoke_at_zero):
+            result = mc_mode.dispatch("damping", {"confirm": True})
+        self.assertEqual(result["code"], "NOT_ALLOWED")
+        self.assertEqual(self.transport.calls_to("MotionControlActionService", "SetAction"), [])
+        self.assertIsNone(loco._blocked)
+
     def test_mc_mode_damping_rejects_unconfirmed_set_action(self):
         self._set_mc_state("MOTION")
         self.transport.responses["MotionControlActionService/GetNextActions"] = {

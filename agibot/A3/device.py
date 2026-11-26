@@ -2391,9 +2391,9 @@ class McModePlugin:
       厂商序列驱动 MC：起立 [PD_STAND →] GET_UP → MOTION，躺下 LIE_DOWN → PASSIVE。
     - 多秒级整机动作，走 ACP，按 GetAction 轮询确认到位后才回报 completed；
       进行中拒绝新的切换（中途打断起身/躺下会摔），不绑定 interrupt hook；
-      切换期间 loco 拒绝 walk，切换前先让 loco 减速并确认零速帧已送达、推流已停，
+      切换期间 loco 拒绝 walk，切换前先让 loco 减速并确认零速帧已发布、推流已停，
       停不稳则不发切换。
-    - damping 立即卸力，必须显式 confirm=true（固件急停语义，不经 skillpilot）。
+    - damping 必须显式 confirm=true，确认行走推流停止后才向 MC 发送卸力命令。
     """
 
     STAND_TIMEOUT_S = 40.0
@@ -2416,8 +2416,8 @@ class McModePlugin:
                       "[PD_STAND →] GET_UP → MOTION）；完成后 ACP 回报，已在 MOTION 时直接返回 done"),
         "lie_down": ([], "从站立态躺下（经 skillpilot：LIE_DOWN → PASSIVE 零力矩），完成后 ACP 回报；"
                          "已躺下时直接返回 done"),
-        "damping": (["confirm"], "进入阻尼模式（关节立即卸力，机器人会倒下）；必须 confirm=true，"
-                                 "仅用于人工确认的紧急场景"),
+        "damping": (["confirm"], "确认行走推流停止后进入阻尼模式（关节卸力，机器人会倒下）；"
+                                 "仅用于人工确认的紧急场景，必须传入 confirm=true"),
     }
 
     def __init__(self, nodes, loco=None):
@@ -2437,7 +2437,7 @@ class McModePlugin:
                                   "timeout": self.COMPLETION_TIMEOUT_S}
         return tool("mc_mode", "actuator",
                     "整机姿态：stand 起立到可控站立态 MOTION（其他运动卡的前提），lie_down 躺下，"
-                    "两者与遥控器同走 skillpilot；damping 紧急卸力（需 confirm）；get_state 查看当前姿态与可执行动作",
+                    "两者与遥控器同走 skillpilot；damping 停止行走推流后卸力（需 confirm）；get_state 查看当前姿态与可执行动作",
                     schema)
 
     def start(self):
@@ -2470,18 +2470,29 @@ class McModePlugin:
                 return _rejected("NOT_READY", f"运动控制正在切换（{info['action']}/PREPARE）",
                                  "稍后重试", current=info["action"])
             if action == "damping":
-                return self._damping(args, info, nxt)
-            plan = self._plan(action, info, nxt)
-            if "call" not in plan:         # rejected / already done
-                return plan
+                if args.get("confirm") is not True:
+                    return _rejected("CONFIRM_REQUIRED", "damping 会让关节卸力、机器人倒下",
+                                     "确认安全后以 confirm=true 重新调用")
+                reply = self._check_damping(info, nxt)
+                if reply is not None:
+                    return reply
+            else:
+                plan = self._plan(action, info, nxt)
+                if "call" not in plan:     # rejected / already done
+                    return plan
             action_id = f"mc_{action}_{uuid4().hex[:8]}"
             self._active = (action_id, action)
         # Block new walks first, then require the stream to be fully stopped (zero
-        # frames delivered, publisher exited) before skillpilot moves the legs.
+        # frames published, publisher exited) before either posture RPC is sent.
         if self.loco is not None and not self.loco.block(f"mc_mode {action}"):
             self._release(action_id)
-            return _rejected("LOCO_NOT_STOPPED", "行走未能确认停稳（零速帧未送达或停止超时），未发送姿态切换",
+            return _rejected("LOCO_NOT_STOPPED", "行走推流未能确认停止（零速帧发布失败或停止超时），未发送姿态切换",
                              "用 loco status 确认已停下后重试", current=info["action"])
+        if action == "damping":
+            try:
+                return self._damping()
+            finally:
+                self._release(action_id)
         if plan["call"]:
             rejection = self._request_skillpilot(action, info)
             if rejection is not None:
@@ -2547,36 +2558,41 @@ class McModePlugin:
                              "检查 MDU skillpilot（:52893）是否在运行", current=info["action"])
         return None
 
-    def _damping(self, args, info, nxt):
-        if args.get("confirm") is not True:
-            return _rejected("CONFIRM_REQUIRED", "damping 会让关节立即卸力、机器人倒下",
-                             "确认安全后以 confirm=true 重新调用")
+    def _check_damping(self, info, nxt):
+        if info["status"] == "PREPARE":
+            return _rejected("NOT_READY", "运动控制正在切换，暂不接受 damping", current=info["action"])
         if _mc_settled(info, "DAMPING"):
             return {"state": "done", "current": "DAMPING", "changed": False}
-        command = nxt.get("DAMPING")
-        if command is None:
+        if "DAMPING" not in nxt:
             return _rejected("NOT_ALLOWED", f"当前 {info['action']} 下固件不允许 DAMPING",
                              current=info["action"], next_actions=sorted(nxt))
-        if self.loco is not None:
-            self.loco.block("mc_mode damping", wait=False)
+        return None
+
+    def _damping(self):
+        # The controller can change state or revoke the command while loco brakes.
+        rpc = self.nodes.rpc
         try:
-            self.nodes.rpc.set_action(command)
-            deadline = time.monotonic() + self.DAMPING_TIMEOUT_S
-            last = info
-            while time.monotonic() < deadline:
-                try:
-                    last = _mc_info(self.nodes.rpc)
-                except Exception:
-                    pass
-                if _mc_settled(last, "DAMPING"):
-                    return {"state": "done", "current": "DAMPING", "changed": True}
-                time.sleep(self.POLL_S)
-            return _rejected("TIMEOUT", "已发送 DAMPING，但未在时限内确认进入", current=last["action"])
+            info, nxt = _mc_info(rpc), _mc_next(rpc)
+        except Exception as exc:
+            return _rejected("NOT_READY", f"无法在停止行走后确认 DAMPING 可用: {exc}")
+        reply = self._check_damping(info, nxt)
+        if reply is not None:
+            return reply
+        try:
+            rpc.set_action(nxt["DAMPING"])
         except RpcError as exc:
             return _rejected("ROBOT_REJECTED", str(exc), current=info["action"])
-        finally:
-            if self.loco is not None:
-                self.loco.unblock()
+        deadline = time.monotonic() + self.DAMPING_TIMEOUT_S
+        last = info
+        while time.monotonic() < deadline:
+            try:
+                last = _mc_info(rpc)
+            except Exception:
+                pass
+            if _mc_settled(last, "DAMPING"):
+                return {"state": "done", "current": "DAMPING", "changed": True}
+            time.sleep(self.POLL_S)
+        return _rejected("TIMEOUT", "已发送 DAMPING，但未在时限内确认进入", current=last["action"])
 
     # -- worker -----------------------------------------------------------------
 
@@ -2783,26 +2799,23 @@ class LocoPlugin:
             thread.join(timeout=3.0)
         return task["id"] if task else None
 
-    def block(self, reason, wait=True) -> bool:
+    def block(self, reason) -> bool:
         """Refuse new walks (BUSY) until unblock(), and stop the current stream.
 
         True once the stream that was running has exited after delivering its
         zero frames (or none was running); False if it is still running after
-        BLOCK_STOP_TIMEOUT_S or died on a publish error. Damping uses wait=False
-        to start braking without delaying the explicit damping command.
+        BLOCK_STOP_TIMEOUT_S or died on a publish error.
         """
         with self._lock:
             self._motion_revision += 1
             self._blocked = reason
             if self._thread is None:
-                if not wait or self._publish_error is None:
-                    return self._publish_error is None
+                if self._publish_error is None:
+                    return True
                 # A previous stream died without confirming a stop. Retry its zero
-                # frames while walks are blocked before allowing SkillPilot to move.
+                # frames while walks are blocked before allowing a posture change.
                 self._start_stream()
         self.halt(reason)
-        if not wait:
-            return False
         deadline = time.monotonic() + self.BLOCK_STOP_TIMEOUT_S
         while True:
             with self._lock:
