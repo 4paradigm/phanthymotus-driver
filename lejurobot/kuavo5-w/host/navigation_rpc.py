@@ -714,6 +714,20 @@ def main(request):
     if request['operation'] == 'stationary':
         confirm_stationary(rospy, Odometry)
         return {'success': True, 'stationary': True, 'completion_basis': 'fresh_distinct_odometry'}
+    if request['operation'] == 'manual_idle_stationary':
+        from jaten_msgs.msg import RobotChassisState, MotionState
+        def idle():
+            state = rospy.wait_for_message('/jaten_behavior_manager/robot_state', RobotChassisState, timeout=2.)
+            if (state.manual_mode is not True or state.mapping or state.estop
+                    or state.bumper or state.driver_error or not state.driver_enable):
+                raise RuntimeError('chassis_manual_idle_state_invalid')
+            motion = rospy.wait_for_message('/mpc_path_track/motion_state', MotionState, timeout=2.)
+            if not tracker_live_message(motion) or motion.motion_type != 2:
+                raise RuntimeError('native_tracker_not_finished')
+        idle()
+        confirm_stationary(rospy, Odometry)
+        idle()
+        return {'success': True, 'stationary': True, 'manual_mode': True, 'native_tracker_idle': True}
     if request['operation'] == 'manual_auto_guard':
         from jaten_msgs.msg import RobotChassisState, MotionState
         state = rospy.wait_for_message('/jaten_behavior_manager/robot_state', RobotChassisState, timeout=2.)

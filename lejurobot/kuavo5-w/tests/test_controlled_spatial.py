@@ -1456,6 +1456,24 @@ class NativePreparationTests(unittest.TestCase):
         self.assertLess(self.events.index('upper_mux'),self.events.index(1))
         self.assertFalse(guard.call_args.kwargs['require_joy'])
 
+    def test_manual_idle_probe_is_read_only_without_requiring_software_stop(self):
+        self.state.manual_mode, self.state.mapping, self.state.driver_enable = True, False, True
+        self.state.soft_estop, self.state.motion_type = False, 2
+        with patch.object(sys.modules['jaten_msgs.msg'], 'MotionState', object, create=True), \
+                patch.object(self.module, 'tracker_live_message', return_value=True):
+            result = self.call('manual_idle_stationary')
+            self.assertTrue(result['manual_mode'])
+            self.assertTrue(result['native_tracker_idle'])
+            self.assertEqual(self.events, ['stationary'])
+            self.events.clear()
+            self.state.motion_type = 8
+            with self.assertRaisesRegex(RuntimeError, 'native_tracker_not_finished'):
+                self.call('manual_idle_stationary')
+            self.assertFalse(self.events)
+            self.state.motion_type, self.state.mapping = 2, True
+            with self.assertRaisesRegex(RuntimeError, 'chassis_manual_idle_state_invalid'):
+                self.call('manual_idle_stationary')
+
     def test_held_stationary_probe_is_read_only_and_requires_finished_tracker(self):
         message = types.SimpleNamespace(motion_type=2,
             _connection_header={'callerid':'/lqr_path_track','latching':'0'})

@@ -106,6 +106,85 @@ class ControlOwnershipTests(unittest.TestCase):
         self.assertFalse(self.bundle.state.read('upper_velocity_enabled')[0])
         self.release_all()
 
+    def test_manual_startup_recovers_only_a_resolved_preparation_without_enabling(self):
+        spatial = self.bundle.spatial
+        self.ros.emit('/enable_control_state', False)
+        self.bundle.state.verify_enable()
+        self.ros.emit('/enable_vel_control_state', False)
+        self.bundle.state.motion_blocked = True
+        spatial._preparation = {'delivery_uncertain':False}
+        spatial._persist()
+        observation = {'agvState':{'runningMode':'MANUAL','isMapping':False,
+            'softwareEstop':False,'estopButtonEvent':False,'bumperEvent':False,'driverError':False},
+            'state':{'driving':False,'nodeStates':[],'edgeStates':[],'actionStates':[]}}
+        calls = []
+        def native(operation, **args):
+            calls.append(operation)
+            if operation == 'held_stationary':
+                raise RuntimeError('no software stop in manual')
+            if operation == 'manual_stop':
+                return {'success':True,'stationary':True,'manual_zero_sent':True,
+                    'completion_basis':'factory_manual_zero_and_fresh_stationary_odometry'}
+            if operation == 'manual_idle_stationary':
+                return {'success':True,'stationary':True,'manual_mode':True,'native_tracker_idle':True}
+            self.assertEqual(operation, 'stationary')
+            return {'success':True,'stationary':True}
+        before = list(self.ros.sent_services)
+        with patch.object(spatial.client, 'observe', return_value=observation), \
+                patch.object(spatial.client, 'native', side_effect=native), \
+                patch.object(spatial.client, 'command', side_effect=AssertionError('no mode/map writes')):
+            result = spatial.prepare_chassis()
+        self.assertTrue(result['auto_transition_deferred'])
+        self.assertIsNone(spatial._preparation)
+        self.assertIsNone(spatial.store.state('pending')['chassis_preparation'])
+        self.assertIn('manual_stop', calls)
+        self.assertIn('manual_idle_stationary', calls)
+        self.assertEqual(self.ros.sent_services, before)
+        self.assertFalse(self.bundle.state.confirmed_enable())
+        self.assertTrue(self.bundle.state.motion_blocked)
+        self.assertFalse(spatial.store.state('last_preparation_recovery')['enabled_motion'])
+
+    def test_manual_recovery_never_clears_uncertain_or_owned_operations(self):
+        spatial = self.bundle.spatial
+        self.ros.emit('/enable_control_state', False)
+        self.bundle.state.verify_enable()
+        self.ros.emit('/enable_vel_control_state', False)
+        for field, value in (('_preparation',{'delivery_uncertain':True}), ('_task',{'task_id':'old'}),
+                             ('_map_pending',{'operation':'stop_mapping'}), ('_keyboard_pending',True)):
+            with self.subTest(field=field):
+                spatial._preparation = {'delivery_uncertain':False}
+                original = getattr(spatial, field)
+                setattr(spatial, field, value)
+                expected = spatial._preparation
+                with patch.object(spatial.client, 'native', side_effect=AssertionError('no RPC')), \
+                        patch.object(spatial.client, 'observe', side_effect=AssertionError('no IO')):
+                    self.assertFalse(spatial._recover_manual_preparation(self.bundle._stop_epoch))
+                self.assertEqual(spatial._preparation, expected)
+                setattr(spatial, field, original)
+        spatial._preparation = None
+
+    def test_manual_recovery_stop_supersedes_zero_ack_before_clearing_record(self):
+        spatial = self.bundle.spatial
+        self.ros.emit('/enable_control_state', False)
+        self.bundle.state.verify_enable()
+        self.ros.emit('/enable_vel_control_state', False)
+        spatial._preparation = {'delivery_uncertain':False}
+        observation = {'agvState':{'runningMode':'MANUAL','isMapping':False,
+            'estopButtonEvent':False,'bumperEvent':False,'driverError':False},
+            'state':{'driving':False,'nodeStates':[],'edgeStates':[],'actionStates':[]}}
+        def zero(*args, **kwargs):
+            self.bundle._stop_epoch += 1
+            self.bundle._transition['cancelled'].set()
+            return {'success':True,'stationary':True,'manual_zero_sent':True,
+                'completion_basis':'factory_manual_zero_and_fresh_stationary_odometry'}
+        with patch.object(spatial.client, 'observe', return_value=observation), \
+                patch.object(spatial.client, 'native', side_effect=zero):
+            with self.assertRaises(InterruptedError):
+                spatial._recover_manual_preparation(self.bundle._stop_epoch)
+        self.assertEqual(spatial._preparation, {'delivery_uncertain':False})
+        self.assertIsNone(spatial.store.state('last_preparation_recovery'))
+        spatial._preparation = None
+
     def test_failed_chassis_handoff_does_not_publish_target(self):
         self.bundle._upper_route_key=None
         sent=[]

@@ -525,6 +525,8 @@ class ControlledSpatialPlugin:
                 raise RuntimeError('manual_mapping_owns_chassis_no_startup_preparation')
             self._settle_held_preparation()
             if self.unresolved():
+                self._recover_manual_preparation(epoch)
+            if self.unresolved():
                 raise RuntimeError('previous_chassis_operation_unresolved_stop_first')
             if not self.bundle.ros1.connection[0]:
                 raise RuntimeError('control_connection_is_disconnected')
@@ -720,6 +722,7 @@ class ControlledSpatialPlugin:
                     'factory_maps': '/home/jt/jmap_config/jmaps',
                     'archive': self.archive.snapshot() if self.archive else {'state': 'disabled'}}
                 result['last_map_operation'] = self.store.state('last_map_operation')
+                result['last_preparation_recovery'] = self.store.state('last_preparation_recovery')
                 if self._map_pending and self._map_pending.get('stage_started_at'):
                     result['map_stage_elapsed_s'] = max(0., time.time()-self._map_pending['stage_started_at'])
                 if mapping and mapping.get('phase') == 'saving':
@@ -1004,6 +1007,74 @@ class ControlledSpatialPlugin:
                     self.bundle.ros1.connection))
             return {'mapping_state': 'starting' if waiting else 'mapping' if authorized else 'unavailable',
                     'console_authorized': bool(waiting or authorized)}
+
+    def _recover_manual_preparation(self, epoch):
+        """Explicit startup may stop/prove idle after a resolved MANUAL failure.
+
+        Unlike info's passive settlement, this sends a zero-only request.
+        Never retires uncertain writes, task/map/keyboard ownership or enables.
+        """
+        token = None
+        with self._native_lock:
+            with self.bundle.tracker.lock:
+                preparation = self._preparation
+                def eligible():
+                    return (preparation is not None and preparation.get('delivery_uncertain') is False
+                        and self._preparation == preparation and epoch == self.bundle._stop_epoch
+                        and self.bundle.ros1.connection[0] and not self._closed.is_set()
+                        and not self.bundle.tracker._active and not self._task and not self._uncertain
+                        and self._map_pending is None and not self.store.state('mapping')
+                        and not self._keyboard_pending and self.keyboard.session is None
+                        and not self.bundle.state.motion_send_uncertain
+                        and not self.bundle._resume_unresolved() and not self.bundle._mode_unresolved())
+                if self.bundle._transition is not None or not eligible():
+                    return False
+                try:
+                    if (self.bundle.state.confirmed_enable() is not False
+                            or self.bundle.state.read('upper_velocity_enabled')[0] is not False):
+                        return False
+                except RuntimeError:
+                    return False
+                token = self.bundle._new_transition('recover_preparation')
+            def check():
+                with self.bundle.tracker.lock:
+                    self.bundle._check_transition(token)
+                    if not eligible() or self.bundle.state.confirmed_enable() is not False or self.bundle.state.read('upper_velocity_enabled')[0] is not False:
+                        raise RuntimeError('manual_preparation_recovery_state_changed')
+            def observed_idle():
+                check()
+                observation = self.client.observe(required=('agvState', 'state'))
+                check()
+                self._check_chassis_faults(observation)
+                state, agv = observation['state'], observation['agvState']
+                return (agv.get('runningMode') == 'MANUAL' and agv.get('isMapping') is False
+                        and state.get('driving') is False
+                        and all(state.get(key) == [] for key in ('nodeStates', 'edgeStates', 'actionStates')))
+            try:
+                if not observed_idle():
+                    return False
+                stopped = self.client.native('manual_stop')
+                check()
+                if stopped.get('success') is not True or not confirmed_stop(dict(stopped, state='stopped')):
+                    raise RuntimeError('manual_preparation_recovery_stop_unconfirmed')
+                idle = self.client.native('manual_idle_stationary')
+                check()
+                if (any(idle.get(key) is not True for key in ('success', 'stationary', 'manual_mode', 'native_tracker_idle'))
+                        or not observed_idle()):
+                    raise RuntimeError('manual_preparation_recovery_idle_unconfirmed')
+                with self.bundle.tracker.lock:
+                    check()
+                    self.store.state('last_preparation_recovery', {
+                        'at': time.time(), 'previous': preparation, 'chassis_mode': 'MANUAL',
+                        'basis': 'confirmed_stop_finished_tracker_and_fresh_stationary_odometry',
+                        'stop_basis': stopped.get('completion_basis'),
+                        'enabled_motion': False, 'changed_mode': False})
+                    self._preparation = None
+                    self._persist()
+                    self.base_preparation_required = True
+                return True
+            finally:
+                self.bundle._end_control(token)
 
     def _settle_held_preparation(self):
         """Clear only a resolved preparation after passive held/idle evidence."""
