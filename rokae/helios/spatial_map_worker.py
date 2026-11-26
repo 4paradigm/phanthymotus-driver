@@ -86,16 +86,22 @@ async def serve_commands(manager, location, scans, snapshots, resume_mapping):
         point_cloud.point_cloud_pub(scans.receive)
         subscribed = scans.enabled = True
 
-    def finished(command):
+    def finished(future):
         nonlocal handle
         try:
-            result = command.future.result()
+            result = future.result()
             state = "completed" if result.err_code == 0 else "error"
+            if state == "error":
+                message = result.err_message.casefold()
+                if "cancelled" in message or "canceled" in message or "已取消" in message:
+                    state = "cancelled"
             navigation.update(state=state, code=result.err_code, message=result.err_message)
+        except asyncio.CancelledError:
+            navigation.update(state="cancelled", message="VMR navigation cancelled")
         except Exception as exc:
             navigation.update(state="error", message=str(exc))
-        finally:
-            handle = None
+        handle = None
+        emit(snapshots, {"navigation_finished": navigation})
 
     try:
         while raw := await reader.readline():
@@ -143,12 +149,12 @@ async def serve_commands(manager, location, scans, snapshots, resume_mapping):
                     target.x, target.y, target.theta = req["x"], req["y"], req["yaw"]
                     params.target_position = target
                     handle = nav.async_NavigateTo(params)
-                    command = handle
-                    navigation = {"state": "navigating", "id": str(command.id), "map_name": name}
-                    command.future.add_done_callback(lambda _, cmd=command: finished(cmd))
+                    navigation = {"state": "navigating", "id": str(handle.id),
+                                  "action_id": req["id"], "map_name": name}
+                    handle.future.add_done_callback(finished)
                     data = dict(navigation)
                 elif action == "stop_nav":
-                    if handle:
+                    if handle and not handle.future.done() and navigation["state"] != "cancel_requested":
                         handle.cancel()
                         navigation["state"] = "cancel_requested"
                     data = dict(navigation)

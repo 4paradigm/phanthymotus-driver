@@ -13,7 +13,7 @@ Edge 监控页为两路话题创建了带跟随视角切换的 MAPPING 面板，
 
 ## 自动验证
 
-55 项 Helios 本地测试通过，覆盖 PCD 解包与二进制地图帧、保留扫描高度及定位时差、标签按图持久化、同名地图拒绝、建图和结束、加载地图、导航成功及取消反馈。控制动作使用模拟 VMR 接口。正式服务清单通过 `scripts/check_service_yml.py rokae/helios` 检查。
+57 项 Helios 本地测试通过，覆盖 PCD 解包、点云坐标与定位时差、按图保存标签、建图和加载地图。模拟 VMR 通过卡片入口执行导航，本机 HTTP 接收端核对了与 `action_id` 对应的到达、失败、取消以及 SDK 进程退出时的错误回调。关闭控制卡时，已受理的导航仍能回传取消结果。正式服务清单通过 `scripts/check_service_yml.py rokae/helios` 检查。
 
 2026-11-19，初版关节、电池、力矩回归共 37 项通过；本次另增加运行时模型发现、大小限制、同源检查及错误模型回归，`scripts/check_service_yml.py rokae/helios` 通过。执行命令见 README。测试使用本地模拟 WebSocket、固定协议样本和真实 Driver 代码，不需要连接或移动机器人。
 

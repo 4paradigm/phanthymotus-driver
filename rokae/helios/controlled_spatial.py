@@ -1,9 +1,16 @@
 """Map-scoped named poses and Helios canvas actions."""
 
+import json
 import math
+import os
 from pathlib import Path
 import re
 import sqlite3
+import ssl
+import sys
+import time
+from urllib.parse import urlsplit
+from urllib.request import Request, urlopen
 
 from common.vendor_runtime import tool
 
@@ -20,10 +27,34 @@ def definition(topic):
     schema = {"type": "object", "properties": props, "required": ["action"],
               "x-action-params": {k: {"params": p, "required": [i for i in p if i != "description"]}
                                   for k, p in PARAMS.items()},
+              "x-completion": {"actions": ["navigate_to_tag", "navigate_to_pose"], "timeout": 300},
               "x-resource": "base", "x-hooks": {"on_interrupt_motion": {"action": "stop_nav"},
                                                 "on_interrupt_all": {"action": "stop_nav"}}}
     return tool("controlled_spatial", "actuator", "手动建图、加载地图、记录当前位置，按标签或地图坐标导航。"
                 "status 查询导航结果，stop_nav 取消当前导航。", schema, topic_out=[topic])
+
+
+def notify_navigation(result):
+    """Deliver a terminal VMR navigation result to the Core motion barrier."""
+    endpoint = os.getenv("AGENT_CORE_URL", "https://127.0.0.1:15678").rstrip("/")
+    payload = {"action_id": result["action_id"], "status": result["state"],
+               "result": result, "tool": "controlled_spatial", "ts": time.time()}
+    request = Request(endpoint + "/api/acp/complete", data=json.dumps(payload).encode(),
+                      headers={"Content-Type": "application/json"})
+    context = ssl.create_default_context()
+    if urlsplit(endpoint).hostname in ("127.0.0.1", "localhost", "::1"):
+        # The host-local Core serves its own self-signed certificate.
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    for attempt in range(3):
+        try:
+            with urlopen(request, timeout=3, context=context):
+                return
+        except OSError as exc:
+            if attempt == 2:
+                print(f"[helios] ACP completion {result['action_id']} failed: {exc}", file=sys.stderr)
+            else:
+                time.sleep(0.5)
 
 
 class ControlledSpatial:

@@ -16,7 +16,7 @@
 
 1. 运行 `controlled_spatial.start` 可查看当前点云。选择 `start_mapping(map_name)` 开始一张新地图，现场人员按厂家流程手动走一圈并回到起点，选择 `stop_mapping` 结束并由底盘保存地图。采集期间根据时间相近的 VMR 定位，将底盘实时三维点云变换到地图坐标。保存后控制卡显示该地图的原厂 PCD。
 2. `list_maps` 列出底盘地图，`load_map(map_name)` 加载指定地图。定位后用 `tag_place(name, description)` 保存当前位置和朝向；`list_tags` / `untag_place(name)` 可查看或移除本图标签。标签按地图保存在挂载目录内的 SQLite 数据库，点云上用立柱和朝向线标出。
-3. `navigate_to_tag(tag_name)` 导航到本图标签，或用 `navigate_to_pose(x, y, yaw)` 指定地图坐标（米、弧度）。`status` 查询 VMR 导航终态及错误信息，`stop_nav` 请求取消。打开或查看卡片只订阅地图。
+3. `navigate_to_tag(tag_name)` 导航到本图标签，或用 `navigate_to_pose(x, y, yaw)` 指定地图坐标（米、弧度）。导航受理后返回唯一的 `action_id`。VMR 报告到达、失败或取消时，Driver 通过 ACP 将终态回传给 Core，供依赖该导航的后续动作等待。`status` 查询导航结果，`stop_nav` 请求取消。打开或查看卡片只订阅地图。
 
 Dashboard 部署时从镜像读取 [deploy/service.yml](deploy/service.yml)，将机器人上 `/home/admin/helios-dev/native-odom-runtime/` 下的 `sdk-python` 和 `vmr-sdk` 分别只读挂载到 `/opt/sdk-python` 和 `/opt/vmr-sdk`。若安装位置不同，在主机的 Compose 项目 `.env` 中设置 `HELIOS_SDK_PYTHON_DIR`（含 `bin/python3.12` 的目录）和 `HELIOS_VMR_SDK_DIR`（含 `lib/` 的目录），然后重新部署驱动。
 

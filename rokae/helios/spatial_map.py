@@ -2,7 +2,7 @@
 
 from array import array
 import base64
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 import json
 import math
 import os
@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 import uuid
 
 from common.vendor_runtime import tool
-from .controlled_spatial import ControlledSpatial, definition
+from .controlled_spatial import ControlledSpatial, definition, notify_navigation
 from .spatial_state import ChassisMapState
 from .spatial_cloud import MAX_POINTS, XYZ, SavedCloud, mapping_frame
 
@@ -39,6 +39,8 @@ class HeliosSpatialMap:
         self.control = ControlledSpatial(config.get("spatial_db", "/var/lib/helios-spatial/tags.db"))
         self.voxels = {}
         self._pending = {}
+        self._navigation = None
+        self._callbacks = ThreadPoolExecutor(max_workers=1, thread_name_prefix="helios-acp")
         self._operations = threading.RLock()
         self._python = Path(os.getenv("HELIOS_SDK_PYTHON_DIR", "/opt/sdk-python")) / "bin/python3.12"
         self._sdk = Path(os.getenv("HELIOS_VMR_SDK_DIR", "/opt/vmr-sdk")) / "lib"
@@ -118,7 +120,14 @@ class HeliosSpatialMap:
                 with self._lock:
                     if proc is not self._process:
                         return
+                    if "navigation_finished" in data:
+                        self._finish_navigation(data["navigation_finished"])
+                        continue
                     if "reply" in data:
+                        result = data.get("result", {})
+                        # Only the navigation acceptance has its own request UUID as action_id.
+                        if result.get("action_id") == data["reply"]:
+                            self._navigation = result
                         future = self._pending.pop(data["reply"], None)
                         if future:
                             if "error" in data:
@@ -136,8 +145,16 @@ class HeliosSpatialMap:
                     self._data = data
                     self._last_read = time.monotonic()
 
+    def _finish_navigation(self, result):
+        if self._navigation and self._navigation["action_id"] == result["action_id"]:
+            self._navigation = None
+            self._callbacks.submit(notify_navigation, result)
+
     def _end_process(self):
         proc, self._process = self._process, None
+        if self._navigation:
+            self._finish_navigation({**self._navigation, "state": "error",
+                                     "message": "VMR connection closed before the navigation outcome was known"})
         for future in self._pending.values():
             future.set_exception(RuntimeError("VMR connection closed; check chassis state before retrying"))
         self._pending.clear()
@@ -151,7 +168,9 @@ class HeliosSpatialMap:
 
     def _tick(self):
         with self._lock:
-            if not self._users and not self.control.building:
+            if not self._users and not self.control.building and self._navigation is None:
+                if self._process is not None:
+                    self._release_capture()
                 return
             now = time.monotonic()
             if self._process is not None:
@@ -248,14 +267,18 @@ class HeliosSpatialMap:
             if key == "spatial_map" and self._publisher:
                 self._publisher.publish(self._message(data=json.dumps({"state": "idle", "map_name": None,
                                                                         "stations": None, "localization": None})))
-            if not self._users and not self.control.building:
-                self._end_process()
-                self.chassis.stop()
-                self.control.close()
-                self.control.selected = None
-                self.cloud.clear()
-                self.selected_cloud.clear()
-                self._data = {"state": "idle"}
+            # Keep receiving the final VMR result after the last card requests cancellation.
+            if not self._users and not self.control.building and self._navigation is None:
+                self._release_capture()
+
+    def _release_capture(self):
+        self._end_process()
+        self.chassis.stop()
+        self.control.close()
+        self.control.selected = None
+        self.cloud.clear()
+        self.selected_cloud.clear()
+        self._data = {"state": "idle"}
 
     def stop(self):
         with self._operations, self._lock:
@@ -270,6 +293,7 @@ class HeliosSpatialMap:
                 self._node.destroy_node()
                 self._node = self._publisher = None
                 self._map_publishers.clear()
+        self._callbacks.shutdown(wait=True)
 
     def dispatch(self, action, args):
         key = args.get("_tool_name", "spatial_map")
@@ -281,7 +305,7 @@ class HeliosSpatialMap:
                 return {"state": "configured", "topic_out": topics}
             if action == "start":
                 self._enable(key)
-                return {"state": "running", "topic_out": topics}
+                return {"state": "ready" if key == "controlled_spatial" else "running", "topic_out": topics}
             if action == "stop":
                 if key == "controlled_spatial" and key in self._users:
                     self.command("stop_nav")
