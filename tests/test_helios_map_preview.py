@@ -40,3 +40,53 @@ def test_display_pose_matches_hmi_validity_and_ignores_replayed_stamp():
     assert client._parse(message.SerializeToString()) is None
     loc.locate = 0
     assert client._parse(message.SerializeToString()) == {"located": False}
+
+
+def scan_frame(location, stamp, points):
+    message = UiDatagram()
+    scan = message.laser_scan
+    scan.location, scan.timestamp_ms = location, stamp
+    for x, y in points:
+        scan.scan.add(x=x, y=y)
+    return message.SerializeToString()
+
+
+def test_independent_scans_clear_on_empty_stale_or_lost_pose(monkeypatch):
+    now = [10.0]
+    monkeypatch.setattr("rokae.helios.spatial_map_preview.time.monotonic", lambda: now[0])
+    client = DisplayPoseClient("ws://localhost/ws/AGVInfo")
+    message = UiDatagram()
+    loc = message.robot_base.locate
+    loc.update_time, loc.locate, loc.current_state.x = 5000, 1, 0
+    client._parse(message.SerializeToString())
+    for source in (-4, -8, -1):
+        client._parse(scan_frame(source, 4990, [(1, 2)]))
+    client._parse(scan_frame(-1, 5001, []))
+    assert client.fresh_scans() == {-4: ((1, 2),), -8: ((1, 2),), -1: ()}
+    now[0] += 1.6
+    client._parse(scan_frame(-4, 4990, [(1, 2)]))
+    assert client.fresh_scans() == {}
+    client._parse(scan_frame(-2, 5400, [(2, 0)]))
+    loc.locate = 0
+    client._parse(message.SerializeToString())
+    assert client.fresh_scans() == {}
+
+
+def test_sensor_points_follow_robot_heading_and_have_distinct_colors():
+    floor = raster()
+    pose = {"located": True, "x": 1, "y": 1, "theta": math.pi/2}
+    marker = floor.marker(pose)
+    assert list(floor.scan_pixels(marker, [(1, 0), (0, 1), (0, -1)])) == [(80, 80), (60, 100), (100, 100)]
+    # A small cluster makes JPEG chroma stable enough to compare source colours.
+    def cluster(x, y):
+        return [(x+i/30, y+j/30) for i in range(-5, 6) for j in range(-5, 6)]
+    layers = {-4:cluster(1, 0), -8:cluster(0, 1), -1:cluster(0, -1)}
+    image = Image.open(io.BytesIO(render_preview(floor, pose, scans=layers))).convert("RGB")
+    r, g, b = image.getpixel((80, 80))
+    assert g > r + 80 and b > r + 55
+    r, g, b = image.getpixel((60, 100))
+    assert r > b + 80 and g > b + 40
+    r, g, b = image.getpixel((100, 100))
+    assert r > g + 70 and b > g + 60
+    hidden = Image.open(io.BytesIO(render_preview(floor, None, scans=layers))).convert("RGB")
+    assert max(hidden.getpixel((100, 100))) < 10
