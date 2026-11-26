@@ -64,6 +64,38 @@ those fixes for the complete canvas experience. A `trigger` activity label is
 presentation; Get status is a synchronous query and its completion does not
 change the previous movement result.
 
+## Grasp check
+
+**夹持确认** (`piper_grasp_check`) is a read-only sensor.
+Use **读取反馈（无需填写）** with the jaws empty and closed, then with a known
+part held steadily. Record several opening (`width_mm`) and signed torque
+(`effort_nm`) readings in each
+case. Once the gripper has settled, select **判断是否夹住** and fill the five
+fields with the workcell's measured values.
+
+| Canvas field | What to enter |
+| --- | --- |
+| 目标开度下限（mm） / 目标开度上限（mm） | Lowest and highest stable openings around the known part. The lower bound must exceed the empty opening plus its tolerance. |
+| 空夹开度（mm） | Reference opening with the empty jaws closed. If the feedback is slightly below zero, use zero and include the offset in the measured tolerance. |
+| 空夹容差（mm） | Positive allowance for the measured variation around that reference. |
+| 保持力矩阈值（N·m） | Nonzero threshold calibrated from the held part. Use the observed holding direction and keep the sign. |
+
+For example, if stable held openings range from 19.8 to 20.3 mm, the empty
+reference is 0.2 mm with a 0.4 mm allowance, and holding torque is around
+−0.35 N·m, a calibrated negative threshold might be −0.25 N·m.
+These numbers illustrate the fields; measure the actual jaws and target part.
+
+The result is `grasped` (`is_grasped: true`) when at least three distinct,
+fresh frames spanning 120 ms show openings in the expected range with at
+most 0.5 mm of variation and holding torque at or beyond the threshold in
+the calibrated direction.
+`empty` (`false`) means the opening is stable in the calibrated empty band.
+`indeterminate` (`null`) covers overlapping ranges, weak or opposite torque,
+unstable opening, missing feedback, faults, and in-progress motion. The
+estimate identifies contact consistent with the calibrated part width. Object
+identity and retention during motion require separate checks. No canvas data
+connection is required.
+
 ## Build and packaging
 
 ```bash

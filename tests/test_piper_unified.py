@@ -70,7 +70,8 @@ class UnifiedTests(unittest.TestCase):
     def test_three_card_schema_topics_and_legacy_request_rejection(self):
         self.config['camera'] = {'live': {'enabled': True}}
         tools = {t['name']: t for t in self.bundle.get_all_tools()}
-        self.assertEqual(set(tools), {'arm_control', 'joints', 'model', 'piper_photo', 'piper_camera_live'})
+        self.assertEqual(set(tools), {'arm_control', 'joints', 'model', 'piper_photo',
+                                     'piper_camera_live', 'piper_grasp_check'})
         arm = tools['arm_control']
         self.assertEqual(arm['title'], 'Arm control')
         schema = arm['inputSchema']
@@ -98,6 +99,18 @@ class UnifiedTests(unittest.TestCase):
         definition = yaml.safe_load((Path(__file__).resolve().parents[1] / 'agilex/piper/driver.yaml').read_text())
         self.assertEqual({(card['name'], card['type']) for card in definition['cards']},
                          {(tool['name'], tool['type']) for tool in self.bundle.get_all_tools()})
+
+    def test_grasp_feedback_uses_shared_receiver_without_reconnecting(self):
+        with patch.object(self.runtime, 'connected', side_effect=AssertionError('connect')):
+            tool = 'piper_grasp_check'
+            result = self.bundle.dispatch(tool, {'action': 'read_feedback'})
+            self.assertEqual(result['state'], 'ok')
+            self.assertEqual(result['gripper']['width_mm'], self.sdk.width)
+            self.runtime.disconnect()
+            result = self.bundle.dispatch(tool, {'action': 'read_feedback'})
+            self.assertEqual(result['state'], 'unavailable')
+            self.assertIsNone(result['gripper'])
+            self.assertEqual(self.sdk.calls, [])
 
     def test_start_status_and_default_selection_are_passive(self):
         self.call('start')
