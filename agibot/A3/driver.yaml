@@ -36,6 +36,7 @@ cards:
   # --- resources / catalogs ---
   - { name: model,         type: resource }
   # --- actuators ---
+  - { name: vision_capture, type: actuator }
   - { name: mc_mode,         type: actuator }
   - { name: loco,           type: actuator }
   - { name: arm_control,     type: actuator }

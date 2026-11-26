@@ -68,6 +68,11 @@ plugins:
     enabled: true
   estop:
     enabled: true
+  vision_capture:
+    enabled: true
+    # 快照存档卡：抓最新预览帧存 JPEG 到宿主机目录（一期仅胸前 D457 RGB，无录像——
+    # 镜像有意不装 ffmpeg，二期连 Dockerfile 一起提）。
+    output_dir: "/opt/phanthy-motus/data/vision_capture"
   # --- actuators ---
   mc_mode:
     enabled: true

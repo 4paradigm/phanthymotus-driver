@@ -722,6 +722,9 @@ class A3Nodes:
         self._media_failures = set()
         self._media_received = {}
         self._stream_errors = {}
+        # vision_capture 的快照帧源：stream key -> (jpeg bytes, monotonic ts)。
+        # 两条编码路径（relay 转发 / 容器内重编码）都在发布前写入，快照卡只读。
+        self.latest_frames = {}
         self.clock = getattr(self.robot, 'get_clock', lambda: _FakeClock())()
         self._pb_topic = ''
         self._jazzy_relay = os.environ.get("A3_JAZZY_RELAY") == "1"
@@ -779,6 +782,7 @@ class A3Nodes:
                             pub.publish(output)
                     return
                 if self._jazzy_relay and key.startswith("camera_"):
+                    self._stash_latest(key, msg)
                     pub.publish(msg)
                     return
                 if re_encode is not None:
@@ -791,7 +795,7 @@ class A3Nodes:
                             if key not in self._encoding_keys:
                                 self._encoding_keys.add(key)
                                 future = self._media_executor.submit(
-                                    self._encode_and_publish, re_encode, msg, pub, robot_topic)
+                                    self._encode_and_publish, re_encode, msg, pub, robot_topic, key)
                                 future.add_done_callback(
                                     lambda _future, stream_key=key: self._clear_encoding(stream_key))
                     return
@@ -1606,10 +1610,26 @@ class A3Nodes:
         output.data = json.dumps(payload, ensure_ascii=False)
         self._imu_pub.publish(output)
 
-    def _encode_and_publish_frame(self, encoder, msg, pub, topic):
+    def _stash_latest(self, key, payload):
+        """Keep the newest frame per camera stream for vision_capture snapshots.
+
+        payload is a CompressedImage in relay mode or the re-encoded output in
+        the container path; both carry JPEG bytes in `.data`. rclpy deserializes
+        `uint8[]` as `array.array('B')` (what the relay subscription actually
+        hands us), while the in-container encoder assigns `.data = bytes`;
+        accept both rather than let the relay path silently starve snapshots.
+        Assignment of a fresh tuple is atomic under the GIL — readers take the
+        reference and go, no lock needed."""
+        data = getattr(payload, "data", payload)
+        if isinstance(data, (bytes, bytearray, memoryview, array)):
+            self.latest_frames[key] = (bytes(data), time.monotonic())
+
+    def _encode_and_publish_frame(self, encoder, msg, pub, topic, stream_key=None):
         try:
             out = encoder(msg)
             if out is not None:
+                if stream_key is not None:
+                    self._stash_latest(stream_key, out)
                 pub.publish(out)
             elif topic not in self._media_failures:
                 self._media_failures.add(topic)
@@ -4617,6 +4637,9 @@ def build_plugins(config, namespace, ros2):
         plugins["battery"] = BatteryPlugin(nodes)
     if enabled("estop"):
         plugins["estop"] = EstopPlugin(nodes)
+    if enabled("vision_capture"):
+        from vision_capture import VisionCapturePlugin
+        plugins["vision_capture"] = VisionCapturePlugin(nodes, plugins_cfg.get("vision_capture", {}))
     if enabled("mc_mode"):
         plugins["mc_mode"] = McModePlugin(nodes)
     # loco/waist_control/face_play publish RosMsgWrapper commands and are withheld
