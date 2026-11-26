@@ -1,6 +1,7 @@
 """PiPER telemetry tests with an SDK cache and a recording ROS publisher."""
 
 import threading
+import runpy
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -104,6 +105,13 @@ class MotorTelemetryTests(unittest.TestCase):
         first.close.assert_called_once_with()
         second.close.assert_called_once_with()
         self.assertEqual(plugin.info()["state"], "idle")
+
+    def test_separate_bundle_can_advertise_a_distinct_mcp_server_name(self):
+        for configured, expected in (("", "agilex-piper"), ("piper-aloha-telemetry", "piper-aloha-telemetry")):
+            with self.subTest(configured=configured), patch.dict("os.environ", {"PIPER_MCP_SERVER_NAME": configured}), \
+                    patch("common.vendor_runtime.run_driver") as run_driver:
+                runpy.run_module("agilex.piper.main", run_name="__main__")
+                self.assertEqual(run_driver.call_args.args[2], expected)
 
     def test_missing_stale_and_future_frames_do_not_reuse_readings(self):
         times = self.driver.arm.frame_times

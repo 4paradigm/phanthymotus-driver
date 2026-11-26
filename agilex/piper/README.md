@@ -79,6 +79,9 @@ arm has its own readings, receive timestamps and `feedback_status` under
 SocketCAN connections for both interfaces. The card opens its dedicated
 receivers when started and closes them when stopped. Info reads the current
 cache. None of these sensor operations sends CAN commands.
+When running a separate telemetry-only instance alongside another PiPER MCP
+server, set `PIPER_MCP_SERVER_NAME` to a unique value for the telemetry instance
+so Core keeps their registrations separate.
 
 A joint with no frame or a frame older than 0.5 seconds has null readings.
 The overall feedback status is `fresh`, `partial` or `unavailable`. To verify
