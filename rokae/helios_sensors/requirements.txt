@@ -1,2 +1,0 @@
-# NumPy is provided by the ROS base image.
-Pillow==12.3.0

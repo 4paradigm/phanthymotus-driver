@@ -5,8 +5,7 @@
 | 卡片 | 格式 | 数据 |
 |---|---|---|
 | `imu` | `/rokae_helios/state/imu` · `data/json` | 同步采样的三轴加速度 m/s²、角速度 rad/s 和估算姿态四元数 XYZW。采集 50 Hz，发布约 10 Hz |
-| `camera_depth` | `/rokae_helios/camera/depth` · `image/depth-zlib` | 原生 640×480、30 fps 深度图。用 SDK 每帧比例换算成毫米，保留无效像素的零值 |
-| `camera_depth` 预览 | `/rokae_helios/camera/depth/preview` · `image/jpeg` | 320×240 彩色预览与原始深度使用同一帧。支持 `preview_topic` 的 Core 画布在查看数据流时打开该预览 |
+| `camera_depth` | `/rokae_helios/camera/depth/visual_depth` · `image/depth-zlib` | 原生 640×480 毫米深度图，可接入 ActuCore `navi`。用 SDK 每帧比例换算成毫米，保留无效像素的零值 |
 
 IMU 加速度和角速度使用传感器坐标系。姿态是从传感器坐标系旋转到重力对齐的局部坐标系的单位四元数。陀螺仪按设备时间积分，加速度幅值接近 1g 时参与倾角修正。初始化需连续约 0.3 秒满足低角速率和加速度幅值条件。初始化航向作为偏航零点，偏航随时间可能漂移，持续线加速度也可能影响倾角。数据间隔超过 0.25 秒后重新初始化，准备期间四元数留空。`orientation_source` 和 `orientation_reference` 标明数据来源及参考系。
 
@@ -51,15 +50,13 @@ sudo systemctl enable --now helios-depth-source@admin.service
 
 将驱动 Compose 的 `HELIOS_DEPTH_SOCKET_DIR` 设为 `/run/motus-helios-depth`，`HELIOS_DEPTH_SOCKET_GID` 设为主机 `video` 组的 GID。服务监听该目录中的 `depth.sock`，异常退出后自动重启。同一台相机使用一个主机深度源。
 
-### 深度预览
+### 导航深度
 
-`camera_depth` 的 `info` 返回 `preview_topic`。应用 [Core 前端补丁](core-preview.patch) 后，画布的「查看数据流」优先打开 JPEG 预览，监控页也只订阅同一驱动成对发布的 JPEG 预览。原始毫米深度仍是卡片的第一输出，已有接线继续使用原话题。补丁已在 Helios 的 Core `release.261118.56edda4` 上验证，并可应用于 Phanthy Motus 源码 `d7dab1461`。
+在画布上将 `camera_depth` 的 `image/depth-zlib` 输出连到 ActuCore `navi` 的深度输入。「查看数据流」显示同一路毫米深度的距离色图。`/visual_depth` 后缀兼容按话题名识别深度输入的 ActuCore 版本。
 
-#### JPEG 编码依赖与镜像体积
+Core 的监控标题显示 `visual_depth`。升级后刷新 `camera_depth` 的端口，将使用旧深度话题的连线重新接到新端口。
 
-- 核对 ARM64 `ros-base`（`sha256:82d45949e7c3…`）的文件系统后确认，预览复用镜像自带的 NumPy 完成下采样和着色。`sensor_msgs/CompressedImage` 用于传输已编码数据。基础镜像含原生 `libjpeg.so.8`，而 Python 层没有 Pillow、`cv2`、`cv_bridge` 或可调用的 `cjpeg`。直接复用 `libjpeg.so.8` 需要额外的绑定或编码程序。
-- 保留 `Pillow==12.3.0`，在进程内把 320×240 RGB 数组编码成 JPEG。原始毫米深度仅用 NumPy 和 zlib 编码。要保留 JPEG 预览并移除 Pillow，需要实现并维护原生编码绑定，或另行安装编码工具。本次 ARM64 构建安装的是固定版本的 Pillow wheel，关闭了 pip 缓存和依赖安装。
-- 在 PR 镜像 `release.261126.1b53f70` 上实测，Docker manifest 中 Pillow 安装层为 **6,833,602 字节（6.52 MiB 压缩）**。展开镜像后，`PIL`、`pillow.libs` 和 `pillow-12.3.0.dist-info` 的普通文件合计 **23,790,526 字节（22.69 MiB）**。压缩层用于估算额外拉取流量，展开文件用于估算安装内容大小。
+Gemini 335Lg 使用 640×480、30 fps 的采集模式。现场 Core `release.261118.56edda4` 应用了 [深度 WebSocket 补丁](core-depth-websocket.patch)，对每个浏览器最多推送 15 帧/秒，等待发送时只保留最新深度帧。此上限属于 Core 的网页推送，实际浏览器收帧率取决于网络。需要复现现场推送行为时，从 Phanthy Motus Core 源码根目录应用该补丁并构建 Core 镜像。ActuCore `navi` 直接订阅驱动发布的 ROS 2 话题。
 
 #### 基础设施文件
 
@@ -68,15 +65,12 @@ sudo systemctl enable --now helios-depth-source@admin.service
 | `Dockerfile` | 基于现有 ROS 镜像打包传感器代码、共享运行模块和部署模板，并在构建时验证导入。 |
 | `deploy/service.yml` | 声明主机网络、ROS 2 domain 42、只读 FastDDS 配置和有上限的容器日志轮转。 |
 | `driver.yaml` | 声明驱动标识、MCP 端口、两张传感器卡和共享模块的构建路径，供 Core 发现和构建流程使用。 |
-| `requirements.txt` | 固定 JPEG 编码依赖版本。Pillow 是新增的运行时软件包，体积见上文。 |
-
-同一镜像相对 `ros-base` 的其余压缩层合计 **27,027 字节（26.39 KiB）**，包含驱动源码、部署文件和构建层元数据。
 
 ## 验证
 
 在仓库根目录执行 `python -m pytest -q tests/test_helios_camera_sensors.py` 和 `python scripts/check_service_yml.py rokae/helios_sensors`。
 
-在机载 Core 的侧栏找到「ROKAE Helios-2.1 Camera Sensors」，手动把两张卡拖入画布。直接打开「查看数据流」核对 IMU 数值和深度色图。移除后重新拖入并查看数据流时，可以恢复预览。正式验收使用 PR 触发的 bot 镜像，并记录镜像号和真机截图。
+在机载 Core 的侧栏找到「ROKAE Helios-2.1 Camera Sensors」，手动把两张卡拖入画布。直接打开「查看数据流」核对 IMU 数值和深度色图。正式验收使用 PR 触发的 bot 镜像，并记录镜像号和真机截图。
 
 2026-11-24 使用真机 ARM64 调试镜像验证了机载 Core 注册、两路自动采集、深度内参与浏览器数据流解码。现场 IMU 由容器直接采集，深度使用机载主机 socket。该记录对应开发调试镜像。
 

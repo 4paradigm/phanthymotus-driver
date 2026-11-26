@@ -1,0 +1,72 @@
+diff --git a/agent-core/src/api/inspection.py b/agent-core/src/api/inspection.py
+index 02eb760..c7651ee 100644
+--- a/agent-core/src/api/inspection.py
++++ b/agent-core/src/api/inspection.py
+@@ -268,6 +268,22 @@ async def topics_subscriptions():
+
+ # ── WebSocket relay ────────────────────────────────────────────────────────────
+
++_DEPTH_WS_INTERVAL_S = 1 / 15
++
++
++class _LatestFrameQueue(asyncio.Queue):
++    """Hold one pending frame per browser and replace it on backpressure."""
++
++    def __init__(self):
++        super().__init__(maxsize=1)
++
++    def put_nowait(self, frame):
++        if self.full():
++            self.get_nowait()
++            self.task_done()
++        super().put_nowait(frame)
++
++
+ @ws_router.websocket('/ws/bus/{topic:path}')
+ async def bus_ws(websocket: fastapi.WebSocket, topic: str):
+     await websocket.accept()
+@@ -296,9 +312,14 @@ async def bus_ws(websocket: fastapi.WebSocket, topic: str):
+         'format': fmt,
+     }))
+
+-    # Push cached snapshot immediately (so page refresh shows current map)
++    # Depth snapshots use the same queue so new frames can replace pending ones
++    # even while the initial snapshot is being sent to a slow browser.
++    latest_only = fmt == 'image/depth-zlib'
++    q = _LatestFrameQueue() if latest_only else asyncio.Queue(maxsize=4096)
+     snapshot = _last_frame.get(topic)
+-    if snapshot:
++    if latest_only and snapshot:
++        q.put_nowait(snapshot)
++    elif snapshot:
+         if fmt in ('sensor/pointcloud', 'sensor/mapping'):
+             await websocket.send_bytes(snapshot)
+         elif fmt.startswith('data/') or fmt.startswith('text/') or fmt.startswith('sensor/'):
+@@ -306,16 +327,25 @@ async def bus_ws(websocket: fastapi.WebSocket, topic: str):
+         else:
+             await websocket.send_bytes(snapshot)
+
+-    q: asyncio.Queue = asyncio.Queue(maxsize=4096)
+     _topic_queues.setdefault(topic, []).append(q)
+
++    next_depth_send = 0.0
+     try:
+         while True:
+             try:
++                # Wait before taking the frame so the queue can replace it
++                # during the wait. Anchor each interval to the last send
++                # start so a delayed send does not trigger a catch-up burst.
++                if latest_only and (delay := next_depth_send - loop.time()) > 0:
++                    await asyncio.sleep(delay)
+                 data = await asyncio.wait_for(q.get(), timeout=5.0)
++                q.task_done()
+                 if data is None:
+                     break  # signal to stop
+-                if fmt in ('sensor/pointcloud', 'sensor/mapping'):
++                if latest_only:
++                    next_depth_send = loop.time() + _DEPTH_WS_INTERVAL_S
++                    await websocket.send_bytes(data)
++                elif fmt in ('sensor/pointcloud', 'sensor/mapping'):
+                     await websocket.send_bytes(data)
+                 elif fmt.startswith('data/') or fmt.startswith('text/') or fmt.startswith('sensor/'):
+                     await websocket.send_text(data.decode('utf-8', errors='replace'))

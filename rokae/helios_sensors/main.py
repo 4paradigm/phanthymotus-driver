@@ -16,7 +16,6 @@ from common import logsafe
 from common.camera_info import build as camera_info
 from common.vendor_runtime import DriverBundle, make_handler, start_registration, tool
 
-from .depth_preview import depth_preview_jpeg
 from .depth_socket import from_depth_socket
 from .orbbec import DEPTH_FORMAT, DEPTH_FPS, HEIGHT, IMU_HZ, WIDTH, capture
 
@@ -37,7 +36,7 @@ class _SensorCard:
     """Shared capture and lifecycle behavior for the two sensor plugins."""
 
     def __init__(self, serial, directory, node, namespace, frame_id, depth_socket=""):
-        from rclpy.qos import QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
+        from rclpy.qos import qos_profile_sensor_data
         from sensor_msgs.msg import CompressedImage
         from std_msgs.msg import String
 
@@ -45,16 +44,10 @@ class _SensorCard:
         self.depth_socket = depth_socket
         self.node, self.frame_id = node, frame_id
         is_imu = self.CAPTURE_KIND == "imu"
-        topic = f"/{namespace}/state/imu" if is_imu else f"/{namespace}/camera/depth"
+        topic = f"/{namespace}/{self.TOPIC_PATH}"
         self.topic = {"topic": topic, "format": "data/json" if is_imu else DEPTH_HINT}
         self.message_type = String if is_imu else CompressedImage
         self.publisher = node.create_publisher(self.message_type, topic, qos_profile_sensor_data)
-        self.preview_topic = None
-        if not is_imu:
-            self.preview_topic = {"topic": f"{topic}/preview", "format": "image/jpeg"}
-            self.preview = node.create_publisher(
-                CompressedImage, self.preview_topic["topic"],
-                QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT))
         self.lock = threading.RLock()
         self.thread = None
         self.stop_capture = threading.Event()
@@ -76,17 +69,15 @@ class _SensorCard:
         else:
             description = (
                 "Helios 相机深度。读取 Gemini 335Lg 原生深度图，"
-                f"分辨率 {WIDTH}×{HEIGHT}，{DEPTH_FPS} 帧/秒，每个像素的深度单位为毫米。"
-                "彩色 JPEG 用于低带宽预览，毫米深度数据中的 0 表示无有效测量。"
+                f"按 {WIDTH}×{HEIGHT}、{DEPTH_FPS} 帧/秒的相机模式采集。"
+                "发布一路 zlib 压缩的毫米深度，可接入 navi，0 表示无有效测量。"
+                "画布帧率取决于 Core 的推送设置和网络。"
                 "深度图采用相机光学坐标系，内参缺失时留空。"
             )
         return tool(self.PREFIX, "sensor", description,
                     {"type": "object", "properties": {
                         "action": {"type": "string", "enum": ["start", "stop", "info"]}}},
-                    topic_out=self.output_topics())
-
-    def output_topics(self):
-        return [self.topic, self.preview_topic] if self.preview_topic else [self.topic]
+                    topic_out=[self.topic])
 
     def payload(self):
         with self.lock:
@@ -106,7 +97,7 @@ class _SensorCard:
                       "age_ms": None if age is None else round(age * 1000),
                       "device_stamp_us": self.device_stamp if state == "online" else None,
                       "timestamp_ms": int(time.time() * 1000),
-                      "error": self.error, "topic_out": self.output_topics()}
+                      "error": self.error, "topic_out": [self.topic]}
             if self.CAPTURE_KIND == "imu":
                 result.update(IMU_FIELDS)
                 if state == "online":
@@ -125,13 +116,12 @@ class _SensorCard:
             return {"state": "idle"}
         if action == "info":
             # The canvas asks for an instance's topic before opening the data
-            # view. Resume passive preview if Core stopped the previous card.
+            # view. Resume capture if Core stopped the previous card.
             if args.get("instance_id"):
                 self.start()
             with self.lock:
                 result = {**self.get_tool(), **self.payload()}
                 if self.CAPTURE_KIND == "depth":
-                    result["preview_topic"] = self.preview_topic["topic"]
                     result["camera_info"] = [camera_info(
                         topic=self.topic["topic"], id="rokae/helios-2.1/gemini335lg-depth",
                         format=DEPTH_HINT, width=WIDTH, height=HEIGHT,
@@ -201,11 +191,6 @@ class _SensorCard:
                 msg.format = DEPTH_FORMAT
                 msg.data = array("B", data)
                 self.publisher.publish(msg)
-                jpeg = self.message_type()
-                jpeg.header = msg.header
-                jpeg.format = "jpeg"
-                jpeg.data = array("B", depth_preview_jpeg(data))
-                self.preview.publish(jpeg)
 
     def run_capture(self):
         child_stop = self.worker_context.Event()
@@ -265,11 +250,13 @@ class _SensorCard:
 class ImuSensorCard(_SensorCard):
     PREFIX = "imu"
     CAPTURE_KIND = "imu"
+    TOPIC_PATH = "state/imu"
 
 
 class DepthSensorCard(_SensorCard):
     PREFIX = "camera_depth"
     CAPTURE_KIND = "depth"
+    TOPIC_PATH = "camera/depth/visual_depth"
 
 
 def camera_serial(name):
