@@ -105,7 +105,7 @@ class ActionCompletions:
                 return
 
 
-def run_async(runtime, name, action, args, *, error_text=str):
+def run_async(runtime, name, action, args, *, error_text=str, perform_action=None):
     """Reserve once, publish one outcome, then deliver it outside the motion lock."""
     reservation = runtime.operation(name, action)
     reservation.__enter__()
@@ -126,7 +126,10 @@ def run_async(runtime, name, action, args, *, error_text=str):
     def perform():
         runtime.worker_context.reserved = (name, action)
         try:
-            outcome.update(status='completed', result=runtime.dispatch_sync(action, dict(args)))
+            dispatch = perform_action
+            if dispatch is None:
+                dispatch = runtime.dispatch_sync
+            outcome.update(status='completed', result=dispatch(action, dict(args)))
         except BaseException as exc:
             cancelled = runtime.cancel.is_set()
             outcome.update(status='cancelled' if cancelled else 'error',

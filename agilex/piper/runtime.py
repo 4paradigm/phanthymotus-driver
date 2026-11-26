@@ -186,8 +186,10 @@ class PiperRuntime:
             else:
                 self.stopped_cards.discard(name)
 
-    def request_stop(self, name=None):
+    def request_stop(self, name=None, *, only_if_active=False):
         with self.lifecycle:
+            if only_if_active and (not self.gate.locked() or self.active_card != name):
+                return None
             if name is None:
                 self.closed = True
             else:
@@ -260,6 +262,7 @@ class PiperRuntime:
                     fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     candidate = self.factory(self.config.get("can_interface", "can0"))
                     candidate.can_transport = self.config.get("can_transport", "socketcan")
+                    candidate.sdk_protocol = self.config.get("sdk_protocol", "v2")
                     candidate.usb_index = self.config.get("usb_index", 0)
                     candidate.joint_limits_deg = self.config.get("joint_limits_deg")
                     candidate.gripper_limits_mm = tuple(self.config.get("gripper_limits_mm", (0.,70.)))
@@ -314,6 +317,17 @@ class PiperRuntime:
         except (RuntimeError, AttributeError) as exc:
             result["gripper"] = {"available": False, "reason": str(exc)}
         return result
+
+    def read_cached_joint_feedback(self):
+        """Use the existing CAN connection without waiting for a reconnection."""
+        if not self.connection_lock.acquire(blocking=False):
+            return None
+        try:
+            if self.driver is None or self.closed:
+                return None
+            return self.driver.read_joint_feedback()
+        finally:
+            self.connection_lock.release()
 
     def read_monitor_snapshot(self):
         """Passive shared-connection snapshot. Never connects or sends commands.
@@ -394,7 +408,10 @@ class PiperRuntime:
             with self.lifecycle:
                 self.motion_enabled = self.manual_motion_permission = False
                 self.previews.invalidate()
-                affected = self.gate.locked() and self.active_card in {"arm_control", "piper_arm", "piper_joint", "piper_gripper", "piper_mode", "piper_enable", "piper_disable", "piper_standby", "piper_can"}
+                affected = self.gate.locked() and self.active_card in {
+                    "arm_control", "piper_arm", "piper_joint", "piper_gripper", "piper_mode",
+                    "piper_enable", "piper_disable", "piper_standby", "piper_can", "vision_pick_and_drop",
+                }
                 if affected:
                     self.cancel.set()
                     if self.driver is not None:
