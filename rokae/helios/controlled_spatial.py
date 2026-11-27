@@ -1,6 +1,6 @@
 """Map-scoped named poses and Helios canvas actions."""
 
-import json
+import asyncio
 import math
 import os
 from pathlib import Path
@@ -10,7 +10,8 @@ import ssl
 import sys
 import time
 from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
+
+import aiohttp
 
 from common.vendor_runtime import tool
 
@@ -36,27 +37,39 @@ def definition(topic):
                 "status 查询导航结果，stop_nav 取消当前导航。", schema, topic_out=[topic])
 
 
-def notify_navigation(result):
-    """Deliver a terminal VMR navigation result to the Core motion barrier."""
-    endpoint = os.getenv("AGENT_CORE_URL", "https://127.0.0.1:15678").rstrip("/")
-    payload = {"action_id": result["action_id"], "status": result["state"],
-               "result": result, "tool": "controlled_spatial", "ts": time.time()}
-    request = Request(endpoint + "/api/acp/complete", data=json.dumps(payload).encode(),
-                      headers={"Content-Type": "application/json"})
-    context = ssl.create_default_context()
-    if urlsplit(endpoint).hostname in ("127.0.0.1", "localhost", "::1"):
-        # The host-local Core serves its own self-signed certificate.
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
-    for attempt in range(3):
-        try:
-            with urlopen(request, timeout=3, context=context):
-                return
-        except OSError as exc:
-            if attempt == 2:
-                print(f"[helios] ACP completion {result['action_id']} failed: {exc}", file=sys.stderr)
-            else:
-                time.sleep(0.5)
+class NavigationCompletion:
+    """Authenticated Core callback for navigation accepted by the VMR worker."""
+
+    def __init__(self):
+        endpoint = os.getenv("AGENT_CORE_URL", "https://127.0.0.1:15678").rstrip("/")
+        core = urlsplit(endpoint)
+        if core.scheme != "https" or not core.hostname:
+            raise ValueError("Helios navigation completion requires an HTTPS AGENT_CORE_URL")
+        self.url = endpoint + "/api/acp/complete"
+        # Core's self-signed certificate names phanthy-motus on the loopback transport.
+        self.server_hostname = ("phanthy-motus" if core.hostname in ("localhost", "127.0.0.1", "::1")
+                                else core.hostname)
+        cert = os.getenv("AGENT_CORE_CA_CERT")
+        if not cert:
+            raise ValueError("AGENT_CORE_CA_CERT is required for Helios navigation completion")
+        self.context = ssl.create_default_context(cafile=cert)
+
+    async def send(self, result):
+        payload = {"action_id": result["action_id"], "status": result["state"],
+                   "result": result, "tool": "controlled_spatial", "ts": time.time()}
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3)) as client:
+            for attempt in range(3):
+                try:
+                    async with client.post(self.url, json=payload, ssl=self.context,
+                                           server_hostname=self.server_hostname, allow_redirects=False) as response:
+                        if 200 <= response.status < 300:
+                            return
+                        error = f"HTTP {response.status}"
+                except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                    error = str(exc)
+                if attempt < 2:
+                    await asyncio.sleep(0.5)
+        print(f"[helios] ACP completion {result['action_id']} failed: {error}", file=sys.stderr)
 
 
 class ControlledSpatial:

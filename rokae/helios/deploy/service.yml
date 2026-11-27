@@ -8,6 +8,7 @@ rokae-helios:
   tmpfs:
     - /tmp:rw,nosuid,nodev,size=16m
   volumes:
+    - ${HELIOS_CORE_CERT_FILE:-/opt/phanthy-motus/data/certs/cert.pem}:/opt/helios-core-cert.pem:ro
     - /opt/phanthy-motus/data/helios-spatial:/var/lib/helios-spatial
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
     - ${HELIOS_SDK_PYTHON_DIR:-/home/admin/helios-dev/native-odom-runtime/sdk-python}:/opt/sdk-python:ro
@@ -20,6 +21,7 @@ rokae-helios:
     - PYTHONDONTWRITEBYTECODE=1
     - PYTHONUNBUFFERED=1
     - RCUTILS_COLORIZED_OUTPUT=0
+    - AGENT_CORE_CA_CERT=/opt/helios-core-cert.pem
     - AGENT_CORE_URL=${HELIOS_AGENT_CORE_URL:-https://127.0.0.1:15678}
     - HELIOS_STATE_URL=${HELIOS_STATE_URL:-ws://192.168.0.161:8888/ws}
     - HELIOS_BATTERY_STATE_URL=${HELIOS_BATTERY_STATE_URL:-ws://192.168.0.100/ws/AGVInfo}

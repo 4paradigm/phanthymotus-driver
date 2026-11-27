@@ -1,6 +1,7 @@
 """Helios map preview and chassis controls. The SDK worker runs only while the card is active."""
 
 from array import array
+import asyncio
 import base64
 from concurrent.futures import Future, ThreadPoolExecutor
 import json
@@ -15,7 +16,7 @@ from urllib.parse import urlsplit
 import uuid
 
 from common.vendor_runtime import tool
-from .controlled_spatial import ControlledSpatial, definition, notify_navigation
+from .controlled_spatial import ControlledSpatial, NavigationCompletion, definition
 from .spatial_state import ChassisMapState
 from .spatial_cloud import MAX_POINTS, XYZ, SavedCloud, mapping_frame
 
@@ -41,6 +42,7 @@ class HeliosSpatialMap:
         self.voxels = {}
         self._pending = {}
         self._navigation = None
+        self._completion = None
         self._callbacks = ThreadPoolExecutor(max_workers=1, thread_name_prefix="helios-acp")
         self._operations = threading.RLock()
         self._python = Path(os.getenv("HELIOS_SDK_PYTHON_DIR", "/opt/sdk-python")) / "bin/python3.12"
@@ -162,7 +164,7 @@ class HeliosSpatialMap:
     def _finish_navigation(self, result):
         if self._navigation and self._navigation["action_id"] == result["action_id"]:
             self._navigation = None
-            self._callbacks.submit(notify_navigation, result)
+            self._callbacks.submit(asyncio.run, self._completion.send(result))
 
     def _end_process(self):
         proc, self._process = self._process, None
@@ -211,6 +213,8 @@ class HeliosSpatialMap:
             proc = self._process
             if proc is None or proc.poll() is not None:
                 raise ConnectionError("VMR worker unavailable")
+            if action == "navigate" and self._completion is None:
+                self._completion = NavigationCompletion()
             ident = uuid.uuid4().hex
             future = Future()
             self._pending[ident] = future

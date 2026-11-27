@@ -24,6 +24,8 @@
 
 Dashboard 部署时从镜像读取 [deploy/service.yml](deploy/service.yml)，将机器人上 `/home/admin/helios-dev/native-odom-runtime/` 下的 `sdk-python` 和 `vmr-sdk` 分别只读挂载到 `/opt/sdk-python` 和 `/opt/vmr-sdk`。若安装位置不同，在主机的 Compose 项目 `.env` 中设置 `HELIOS_SDK_PYTHON_DIR`（含 `bin/python3.12` 的目录）和 `HELIOS_VMR_SDK_DIR`（含 `lib/` 的目录），然后重新部署驱动。
 
+导航终态通过 HTTPS 上报给 Core。部署清单将主机的 Core 公开证书（默认 `/opt/phanthy-motus/data/certs/cert.pem`，可在 Compose 的 `.env` 设置 `HELIOS_CORE_CERT_FILE`）只读挂载到 Driver 的 `AGENT_CORE_CA_CERT` 路径。使用 loopback 地址时校验证书名 `phanthy-motus`；指定其他主机时校验 URL 中的主机名。
+
 画布启动地图卡后，SDK 才连接底盘，默认地址为 `192.168.0.100:9003`，可在 `config.yaml` 修改。
 
 每两秒查询当前地图和两类站点，通过 `/<namespace>/state/spatial_map/status` 发布 `data/json`。`map_name` 是 VMR 返回的地图标识。每个 `stations` 条目保留原始 `id`、`name`，`type` 由对应的 SDK 查询区分为 `work` 或 `charge`。成功读到零个点时返回 `[]`。无法提供当前地图快照时，地图和站点均为 `null`。

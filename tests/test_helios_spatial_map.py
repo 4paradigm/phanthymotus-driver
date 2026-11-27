@@ -1,11 +1,14 @@
 """Contracts for the two SDK station classes and the Helios sensor lifecycle."""
 
+import asyncio
 import base64
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 from queue import Queue
+import ssl
 import struct
+import subprocess
 import sys
 import threading
 from types import SimpleNamespace
@@ -16,6 +19,7 @@ import pytest
 from common import logsafe
 from common.vendor_runtime import DriverBundle
 from rokae.helios import spatial_map_worker as worker
+from rokae.helios.controlled_spatial import NavigationCompletion
 from rokae.helios.spatial_map import HeliosSpatialMap
 from test_helios_joints import wait_for
 
@@ -114,8 +118,21 @@ def test_worker_logs_and_full_station_snapshot_use_separate_pipes(tmp_path, monk
         sensor.stop()
 
 
+@pytest.fixture(scope="module")
+def core_certs(tmp_path_factory):
+    directory = tmp_path_factory.mktemp("core-certs")
+    pairs = {}
+    for name in ("phanthy-motus", "other-core"):
+        cert, key = directory / f"{name}.pem", directory / f"{name}.key"
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                        "-subj", f"/CN={name}", "-out", str(cert), "-keyout", str(key)],
+                       check=True, capture_output=True, timeout=15)
+        pairs[name] = cert, key
+    return pairs
+
+
 @pytest.fixture
-def acp_posts(monkeypatch):
+def acp_posts(monkeypatch, core_certs, request):
     received = Queue()
 
     class Handler(BaseHTTPRequestHandler):
@@ -127,7 +144,12 @@ def acp_posts(monkeypatch):
             self.wfile.write(b'{"ok":true}')
 
     with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
-        monkeypatch.setenv("AGENT_CORE_URL", f"http://127.0.0.1:{server.server_port}")
+        cert, key = core_certs[getattr(request, "param", "phanthy-motus")]
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(cert, key)
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+        monkeypatch.setenv("AGENT_CORE_URL", f"https://127.0.0.1:{server.server_port}")
+        monkeypatch.setenv("AGENT_CORE_CA_CERT", str(cert))
         thread = threading.Thread(target=server.serve_forever)
         thread.start()
         try:
@@ -135,6 +157,34 @@ def acp_posts(monkeypatch):
         finally:
             server.shutdown()
             thread.join()
+
+
+@pytest.mark.parametrize("acp_posts, trusted", [("phanthy-motus", "other-core"), ("other-core", "other-core")],
+                         indirect=["acp_posts"], ids=["untrusted-certificate", "wrong-hostname"])
+def test_acp_rejects_unverified_peer(acp_posts, trusted, core_certs, monkeypatch, capsys):
+    monkeypatch.setenv("AGENT_CORE_CA_CERT", str(core_certs[trusted][0]))
+    asyncio.run(NavigationCompletion().send({"action_id": "tls-check", "state": "completed"}))
+    assert acp_posts.empty()
+    assert "CERTIFICATE_VERIFY_FAILED" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("setting", ["unset", "missing-file", "invalid-pem", "http"])
+def test_navigation_rejects_invalid_callback_configuration(vmr_sensor, monkeypatch, tmp_path, setting):
+    sensor = vmr_sensor
+    bundle = DriverBundle([sensor])
+    bundle.dispatch("controlled_spatial", {"action": "start"})
+    wait_for(lambda: sensor.payload()["state"] == "online")
+    monkeypatch.delenv("AGENT_CORE_CA_CERT", raising=False)
+    if setting == "http":
+        monkeypatch.setenv("AGENT_CORE_URL", "http://127.0.0.1:15678")
+    elif setting != "unset":
+        cert = tmp_path / "ca.pem"
+        if setting == "invalid-pem":
+            cert.write_text("not a certificate")
+        monkeypatch.setenv("AGENT_CORE_CA_CERT", str(cert))
+    with pytest.raises((ValueError, OSError)):
+        bundle.dispatch("controlled_spatial", {"action": "navigate_to_pose", "confirm": True, "x": 1, "y": 0, "yaw": 0})
+    assert bundle.dispatch("controlled_spatial", {"action": "status"})["navigation"]["state"] == "idle"
 
 
 @pytest.fixture
