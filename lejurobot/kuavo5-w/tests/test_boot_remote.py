@@ -509,6 +509,29 @@ class G12GuardTests(fixtures.unittest.TestCase):
             factory.return_value.__enter__.return_value = proxy
             self.assertIsNone(controller.g12_owner([[('/joy', ['/sdk'])], [], []], master, '/sdk'))
 
+    def test_catkin_g12_relay_requires_exact_template_and_allowlisted_source(self):
+        master = types.SimpleNamespace(lookupNode=lambda *a: (1, '', 'http://localhost:1'))
+        proxy = types.SimpleNamespace(getPid=lambda *a: (1, '', 123))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root/'src/humanoid-control/h12pro_controller_node/src/h12pro_node/ocs2_h12pro_node.py'
+            relay = root/'devel/.private/h12pro_controller_node/lib/h12pro_controller_node/ocs2_h12pro_node.py'
+            relay.parent.mkdir(parents=True)
+            template = """python_script = TARGET
+with open(python_script, 'r') as fh:
+    context = {'__builtins__': __builtins__, '__doc__': None, '__file__': python_script,
+               '__name__': __name__, '__package__': None}
+    exec(compile(fh.read(), python_script, 'exec'), context)
+"""
+            for target, suffix, accepted in ((source, '', True),
+                    (Path('/tmp/untrusted.py'), '', False), (source, '\nprint(123)', False)):
+                relay.write_text(template.replace('TARGET', repr(str(target))) + suffix)
+                with patch.object(controller.xmlrpc.client, 'ServerProxy') as factory, \
+                        patch.object(controller.Path, 'read_bytes', return_value=('python3\0'+str(relay)+'\0').encode()):
+                    factory.return_value.__enter__.return_value = proxy
+                    actual = controller.g12_owner([[('/joy', ['/joy_node'])], [], []], master, directory)
+                    self.assertEqual(actual, '/joy_node' if accepted else None)
+
     def test_controller_exit_is_persisted_as_terminal_failure_before_ros_publish(self):
         sequence = controller.BootSequence(63, lambda action: None)
         with tempfile.TemporaryDirectory() as directory, \

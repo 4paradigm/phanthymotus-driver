@@ -5,6 +5,7 @@ Installed explicitly on the commissioned ROS1 controller host, not in the
 driver container. Never sends enable_control=true or retries initialization.
 """
 import argparse
+import ast
 import json
 import math
 import os
@@ -46,9 +47,40 @@ def g12_owner(system_state, master, workspace):
         code, _, pid = node.getPid('/kuavo5w_controller_boot')
     if code != 1 or type(pid) is not int or pid <= 0:
         return None
-    expected = (Path(workspace) / 'src/humanoid-control/h12pro_controller_node/src/h12pro_node/h12ChannelToJoymsg.py').resolve()
+    root = Path(workspace).resolve()
+    source = root / 'src/humanoid-control/h12pro_controller_node/src/h12pro_node'
+    expected = {(source / name).resolve() for name in
+                ('h12ChannelToJoymsg.py', 'ocs2_h12pro_node.py')}
     args = Path(f'/proc/{pid}/cmdline').read_bytes().decode().split('\0')
-    return owner if any(arg.startswith('/') and Path(arg).resolve() == expected for arg in args) else None
+    for arg in args:
+        if not arg.startswith('/'):
+            continue
+        path = Path(arg).resolve()
+        if path in expected:
+            return owner
+        # Catkin installs an executable Python relay, not necessarily a symlink.
+        # Accept only its exact generated AST and an allowlisted source target.
+        if (root / 'devel') not in path.parents or path.name not in {p.name for p in expected}:
+            continue
+        try:
+            tree = ast.parse(path.read_text())
+            first = tree.body[0]
+            if (not isinstance(first, ast.Assign) or len(first.targets) != 1
+                    or not isinstance(first.targets[0], ast.Name) or first.targets[0].id != 'python_script'
+                    or not isinstance(first.value, ast.Constant) or not isinstance(first.value.value, str)
+                    or Path(first.value.value).resolve() not in expected):
+                continue
+            template = """python_script = TARGET
+with open(python_script, 'r') as fh:
+    context = {'__builtins__': __builtins__, '__doc__': None, '__file__': python_script,
+               '__name__': __name__, '__package__': None}
+    exec(compile(fh.read(), python_script, 'exec'), context)
+""".replace('TARGET', repr(first.value.value))
+            if ast.dump(tree) == ast.dump(ast.parse(template)):
+                return owner
+        except (OSError, SyntaxError, ValueError):
+            continue
+    return None
 
 
 def check_no_controller(system_state):
