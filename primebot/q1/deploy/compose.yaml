@@ -15,3 +15,4 @@ services:
     environment:
       AGENT_CORE_URL: ${Q1_CORE_URL}
       FASTRTPS_DEFAULT_PROFILES_FILE: /opt/phanthy-motus/dds-local.xml
+      PULSE_SERVER: "${Q1_PULSE_SERVER:-unix:/run/q1-pulse/native}"

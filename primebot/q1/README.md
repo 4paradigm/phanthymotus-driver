@@ -18,6 +18,10 @@
 
 ## ARM64 Docker 部署
 
+`mic` 是内置麦克风传感器。默认输出 `/primebot_q1/mic/audio`，可以在 Motus 画布连到 Perception ASR。驱动通过 PulseAudio 读取 48 kHz 八声道 S16LE，将第 5、6 路混成单声道并重采样。发布的 `audio_msgs/msg/AudioChunk` 为 16 kHz 单声道 S16LE，每帧 1024 字节，端口格式为 `audio/pcm-16k`。
+
+板载 Linux 部署默认将宿主机的 `/run/user/1000/pulse` 挂载到容器的 `/run/q1-pulse`。若实际路径不同，在 Compose 环境中设置 `Q1_PULSE_RUNTIME_DIR`。宿主机需已有对应的录音源和 PulseAudio 访问权限。若音频服务在另一块板且已配置官方 TCP 录音模块，设置 `Q1_PULSE_SERVER=tcp:<音频板地址>:4713`。卡片的 `info` 可查看等待、采集、停止或错误状态。 [Q1 官方录音说明](https://github.com/QyroTech/qyro-q1-sdk/blob/main/docs/zh/接口说明.md#tcp音频录制)
+
 Apple 芯片 Mac 和 Linux ARM64（Jetson／板载机）使用同一套 Ubuntu 22.04 / ROS 2 Humble 驱动镜像。先启动同一台部署主机上的 Motus Core，并接通 Q1 的机器人网段。主机需要 Python 3、Docker 和 Docker Compose v2。在驱动仓库根目录运行：
 
 ```bash

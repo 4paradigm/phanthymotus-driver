@@ -38,8 +38,9 @@ def build(args):
         (context / "common").mkdir()
         for name in ("__init__.py", "vendor_runtime.py", "logsafe.py"):
             shutil.copyfile(common / name, context / "common" / name)
-        for name in ("Dockerfile", "main.py", "robot.py", "battery.py", "config.yaml"):
+        for name in ("Dockerfile", "main.py", "robot.py", "battery.py", "imu.py", "mic.py", "asr.py", "config.yaml"):
             shutil.copyfile(DRIVER / name, context / name)
+        shutil.copytree(DRIVER / "vendor/audio_msgs", context / "vendor/audio_msgs")
         (context / "deploy").mkdir()
         shutil.copyfile(DEPLOY / "service.yml", context / "deploy/service.yml")
         command("docker", "build", "--platform", TARGET, "--build-arg",
@@ -148,8 +149,8 @@ def main():
                Q1_DDS_LINK=str(DDS_LINK),
                Q1_DOCKER_NETWORK=args.docker_network or "fourparadigm-intern_default")
     compose = ["docker", "compose", "-p", "primebot-q1", "-f", str(DEPLOY / "compose.yaml")]
-    if mac:
-        compose += ["-f", str(DEPLOY / "compose.mac.yaml")]
+    platform_compose = "compose.mac.yaml" if mac else "compose.linux.yaml"
+    compose += ["-f", str(DEPLOY / platform_compose)]
 
     if args.action == "stop":
         if mac:

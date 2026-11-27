@@ -5,8 +5,10 @@ primebot-q1:
   ipc: host
   volumes:
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+    - "${Q1_PULSE_RUNTIME_DIR:-/run/user/1000/pulse}:/run/q1-pulse:ro"
   environment:
     FASTRTPS_DEFAULT_PROFILES_FILE: /opt/phanthy-motus/dds-local.xml
+    PULSE_SERVER: "${Q1_PULSE_SERVER:-unix:/run/q1-pulse/native}"
   restart: always
   logging:
     driver: local
