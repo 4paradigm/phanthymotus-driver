@@ -44,15 +44,16 @@ stopping latency require separate supervised acceptance.
 ## Three-view capture on ALOHA
 
 Set `enabled` to `true` under `three_view_capture` in the PiPER driver
-configuration to expose **三视角工位取证** (`piper_three_view_capture`). The card reads
+configuration to expose **Three-View Capture** (`piper_three_view_capture`). The card reads
 `/aloha_lab/camera/{front,left,right}/jpeg` from the existing ALOHA camera
 bridge. Start forwarding on all three camera cards before capturing.
 
-Choose **取证** (`capture`) on the canvas. The card selects the closest group
+Choose **Capture** on the canvas. The card selects the closest group
 from the recent frames. A successful capture reports `ready`, the three
-timestamps and their maximum difference. Open the card's data streams to view
-the three captured JPEGs. If a view has no frame within the two-second age
-limit, the response lists it in `missing_views`. A group more than 100 ms apart
+timestamps and their maximum difference. The monitor shows the captured images
+as `front_jpeg`, `left_wrist_jpeg`, and `right_wrist_jpeg`. If a view has no frame
+within the two-second age limit, the response lists it in `missing_views`.
+A group more than 100 ms apart
 returns `out_of_sync`. The capture uses only image data.
 
 ## Monitoring and ACP

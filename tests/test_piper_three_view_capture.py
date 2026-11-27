@@ -70,10 +70,15 @@ class ThreeViewCaptureTests(unittest.TestCase):
     def test_tool_manifest_and_lifecycle(self):
         [definition] = self.bundle.get_all_tools()
         self.assertEqual(definition["name"], TOOL_NAME)
+        self.assertEqual(definition["title"], "Three-View Capture")
         self.assertEqual(definition["type"], "actuator")
         self.assertFalse(definition["inputSchema"]["x-is-dangerous"])
         self.assertIn("capture", definition["inputSchema"]["properties"]["action"]["enum"])
-        self.assertEqual(len(definition["topic_out"]), 3)
+        self.assertEqual([port["topic"] for port in definition["topic_out"]], [
+            "/piper_test/piper/three_view/front_jpeg",
+            "/piper_test/piper/three_view/left_wrist_jpeg",
+            "/piper_test/piper/three_view/right_wrist_jpeg",
+        ])
         self.assertTrue(all(port["format"] == "image/jpeg" for port in definition["topic_out"]))
         manifest = yaml.safe_load(PIPER_MANIFEST.read_text(encoding="utf-8"))
         self.assertIn({"name": TOOL_NAME, "type": "actuator"}, manifest["cards"])

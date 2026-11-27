@@ -5,11 +5,11 @@ from itertools import product
 from threading import RLock
 from time import time_ns
 
-from agilex.piper.three_view_capture import VIEWS, check_frame_group
 from common.vendor_runtime import action_schema, tool
 
 
 TOOL_NAME = "piper_three_view_capture"
+OUTPUT_NAMES = {"front": "front_jpeg", "left": "left_wrist_jpeg", "right": "right_wrist_jpeg"}
 MAX_SKEW_MS = 100
 MAX_AGE_MS = 2000
 MAX_JPEG_BYTES = 4 * 1024 * 1024
@@ -18,36 +18,38 @@ MAX_JPEG_BYTES = 4 * 1024 * 1024
 class ThreeViewCapture:
     def __init__(self, namespace, ros2):
         self.ros2 = ros2
-        self.sources = {view: f"/aloha_lab/camera/{view}/jpeg" for view in VIEWS}
-        self.outputs = {view: f"/{namespace}/piper/three_view/{view}/jpeg" for view in VIEWS}
+        self.sources = {view: f"/aloha_lab/camera/{view}/jpeg" for view in OUTPUT_NAMES}
+        self.outputs = {
+            view: f"/{namespace}/piper/three_view/{name}" for view, name in OUTPUT_NAMES.items()
+        }
         self.node_name = f"piper_three_view_{namespace}"
         self._lock = RLock()
         self._node = None
         self._publishers = {}
-        self._frames = {view: deque(maxlen=12) for view in VIEWS}
+        self._frames = {view: deque(maxlen=12) for view in self.sources}
         self._last_capture = {}
 
     def _ports(self):
-        return [{"topic": self.outputs[view], "format": "image/jpeg", "description": view}
-                for view in VIEWS]
+        return [{"topic": topic, "format": "image/jpeg", "description": view}
+                for view, topic in self.outputs.items()]
 
     def get_tool(self):
         schema = action_schema({
-            "capture": ([], "采集一组时间接近的前方、左腕、右腕照片"),
-            "info": ([], "查看取证状态"),
-            "start": ([], "订阅三路相机"),
-            "stop": ([], "停止订阅并清除取证预览"),
+            "capture": ([], "Capture time-matched JPEGs from the front and both wrist cameras."),
+            "info": ([], "Show capture status."),
+            "start": ([], "Subscribe to the three camera streams."),
+            "stop": ([], "Unsubscribe and clear the capture preview."),
         }, {})
         schema["properties"]["action"]["default"] = "capture"
         schema["properties"]["action"]["oneOf"] = [
             {"const": name, "title": label} for name, label in (
-                ("capture", "取证"), ("info", "查看状态"), ("start", "开始订阅"), ("stop", "停止订阅")
+                ("capture", "Capture"), ("info", "Status"), ("start", "Start"), ("stop", "Stop")
             )
         ]
         schema["x-is-dangerous"] = False
-        definition = tool(TOOL_NAME, "actuator", "复用 ALOHA 三路 JPEG 图像，按时间戳完成工位取证。",
+        definition = tool(TOOL_NAME, "actuator", "Capture synchronized JPEGs from the three ALOHA cameras.",
                           schema, topic_out=self._ports())
-        definition["title"] = "三视角工位取证"
+        definition["title"] = "Three-View Capture"
         return definition
 
     def start(self):
@@ -63,9 +65,9 @@ class ThreeViewCapture:
                 preview_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                                          durability=DurabilityPolicy.TRANSIENT_LOCAL)
                 publishers = {}
-                for view in VIEWS:
+                for view, source in self.sources.items():
                     node.create_subscription(
-                        CompressedImage, self.sources[view],
+                        CompressedImage, source,
                         lambda message, view=view: self._receive(node, view, message),
                         qos_profile_sensor_data,
                     )
@@ -106,8 +108,11 @@ class ThreeViewCapture:
     def _preview(self, node):
         with self._lock:
             if self._node is node:
-                for view, message in self._last_capture.items():
-                    self._publishers[view].publish(message)
+                self._publish_capture()
+
+    def _publish_capture(self):
+        for view, message in self._last_capture.items():
+            self._publishers[view].publish(message)
 
     def _fresh_frames(self, now_ms):
         return {
@@ -118,26 +123,29 @@ class ThreeViewCapture:
     @staticmethod
     def _group_order(group):
         stamps = [frame[0] for frame in group]
-        return max(stamps) - min(stamps), -min(stamps)
+        first = min(stamps)
+        return max(stamps) - first, -first
 
     def _capture(self):
         with self._lock:
             if self._node is None:
-                return {"status": "inactive", "message": "请先开始订阅相机。"}
+                return {"status": "inactive", "message": "Start the camera subscriptions first."}
 
             fresh = self._fresh_frames(time_ns() // 1_000_000)
-            if not all(fresh.values()):
-                return check_frame_group({view: frames[-1][0] for view, frames in fresh.items() if frames})
+            missing = [view for view, frames in fresh.items() if not frames]
+            if missing:
+                return {"status": "missing_frames", "missing_views": missing, "skew_ms": None}
 
-            matches = min(product(*(fresh[view] for view in VIEWS)), key=self._group_order)
-            timestamps = {view: frame[0] for view, frame in zip(VIEWS, matches)}
-            result = check_frame_group(timestamps, MAX_SKEW_MS)
-            result["timestamps_ms"] = timestamps
-            if result["status"] == "ready":
-                capture = {view: frame[1] for view, frame in zip(VIEWS, matches)}
-                for view, message in capture.items():
-                    self._publishers[view].publish(message)
-                self._last_capture = capture
+            matches = dict(zip(fresh, min(product(*fresh.values()), key=self._group_order)))
+            timestamps = {view: frame[0] for view, frame in matches.items()}
+            skew_ms = max(timestamps.values()) - min(timestamps.values())
+            result = {
+                "status": "out_of_sync", "missing_views": [], "skew_ms": skew_ms, "timestamps_ms": timestamps,
+            }
+            if skew_ms <= MAX_SKEW_MS:
+                self._last_capture = {view: frame[1] for view, frame in matches.items()}
+                self._publish_capture()
+                result["status"] = "ready"
                 result["topic_out"] = self._ports()
             return result
 
