@@ -28,6 +28,17 @@ def latest_put(channel, value):
             pass
 
 
+def status_belongs_to_upper(stamp, sample_owner, owner, acknowledged, control, velocity,
+                            selected_at, now):
+    # The vendor MPC treats a rejected base velocity as /stop_robot, even when
+    # velocity control is disabled. A native task's expected rejection must not
+    # be delivered as feedback for an upper-controller command. Do not turn it
+    # into synthetic success: remain silent until upper ownership is established.
+    return (owner in (1, 2) and sample_owner == owner == acknowledged
+            and control is True and velocity is True
+            and stamp >= selected_at and 0 <= now-stamp <= .3)
+
+
 def upper_observer(request, velocities, statuses, stopping, ownership, acknowledged, remote_ready):
     # SSH process loss must not leave the observer child orphaned.
     import ctypes
@@ -63,6 +74,8 @@ def upper_observer(request, velocities, statuses, stopping, ownership, acknowled
     def enable(field, message):
         if (message._connection_header or {}).get('callerid') == '/nodelet_manager':
             with lock:
+                if state.get(field) is not (message.data is True):
+                    state['status_after'] = time.monotonic()
                 state[field] = message.data is True
     def velocity(message):
         if (message._connection_header or {}).get('callerid') != '/nodelet_manager':
@@ -112,7 +125,9 @@ def upper_observer(request, velocities, statuses, stopping, ownership, acknowled
                 if changed:
                     acknowledged.value=-1
                     remote_ready.value=0
-                    with lock:state.pop('quiet_since',None)
+                    with lock:
+                        state.pop('quiet_since',None)
+                        state['status_after'] = time.monotonic()
                     quiet=False
                 gate.select(desired)
                 acknowledged.value={'hold':0,'card':1,'remote':2}[desired]
@@ -120,10 +135,14 @@ def upper_observer(request, velocities, statuses, stopping, ownership, acknowled
                 remote_ready.value=1
             if desired!='remote':remote_ready.value=0
             try:
-                stamp, message = statuses.get_nowait()
+                stamp, message, sample_owner = statuses.get_nowait()
             except queue.Empty:
                 continue
-            if time.monotonic()-stamp <= .3:
+            with lock:
+                forward = status_belongs_to_upper(stamp, sample_owner, ownership.value,
+                    acknowledged.value, state.get('control'), state.get('velocity'),
+                    state.get('status_after', float('inf')), time.monotonic())
+            if forward:
                 publisher.publish(message)
     finally:
         stopping.set()
@@ -192,7 +211,7 @@ def run_owned_bridge(request):
             latest[0] = (message, time.monotonic())
     def status(message):
         if (message._connection_header or {}).get('callerid') == '/leju_node':
-            latest_put(statuses, (time.monotonic(), message))
+            latest_put(statuses, (time.monotonic(), message, ownership.value))
     subscribers = [rospy.Subscriber('/jaten_behavior_manager/robot_state', RobotChassisState, feedback, queue_size=1),
         rospy.Subscriber('/move_base/base_cmd_vel_status', BaseCmdVelStatus, status, queue_size=1)]
     def publish(values):

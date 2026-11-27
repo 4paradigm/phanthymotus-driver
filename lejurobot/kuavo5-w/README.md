@@ -1154,3 +1154,27 @@ operator cancellation, process-lock exclusivity, executable payload assembly
 and failure of the final remote acknowledgement. These checks do not establish
 successful physical cold-boot behavior or resolve the separate vendor EtherCAT
 initialization race; a complete real reboot validation remains required.
+
+### 坐标导航的厂家入口
+
+`navigate_to_pose` / `navigate_to_tag` 使用厂家直接坐标规划入口
+`/path_sequence_executor/dispatch_direct_move_target`，避免路网入口的 PRE_MOVE 阶段把坐标目标
+先引向无关或被障碍阻挡的路网点。仍经 `/move_base/move_to_target` 包装层取得任务 ID，
+并沿用 `check_arrived`、取消任务、避障、限速和真实里程计停车确认。
+导航准备在取消旧任务、确认底盘保持停车后，核实服务类型/ABI/所有者，并按需重启唯一的
+`leju_node` 包装节点以使下游参数生效；不修改厂家文件，不重启电机、定位、规划器或遥控节点。
+绑定确认与 ROS 启动 ID、包装进程 PID/URI 关联，重启后由下次导航重新核验；开机遥控及
+`base_drive` 不运行这段配置流程。`info.last_navigation_completion` 保留正常到达的任务 ID、
+动作 ID、位置/朝向误差和完成时间，便于区分正常完成与后续人工停止。
+
+双主站桥接的 `BaseCmdVelStatus` 仅在上身已取得速度控制权且控制/速度均使能时转发，
+并丢弃交接或使能前排队的状态。底盘原生导航期间的 `move_to_target is executing`
+属于拒绝上身速度输入的预期反馈，不能送入上身控制器触发其 `/stop_robot` 退出逻辑；
+上身实际控制期间仍转发真实拒绝，不伪造成功状态。SSH 辅助脚本使用标准库 zlib 压缩传输，
+避免组合脚本超过 Linux 单个命令参数 128 KiB 限制而无法启动桥接。
+
+2026-11-27 真机回归：整机重启后自动遥控 ready；最高 0.1 m/s 从距 P1 约 0.25 m
+位置导航至 P1，厂家任务 `1795784161.618845` 自动到达，驱动核对地图位姿和新鲜静止里程计后
+正常完成，位置误差约 0.045 m、朝向误差约 0.0013 rad；未调用测试收尾 `stop_nav`。
+完成后遥控自动回到 ready，上身仍使能、底盘 softwareEstop=false，无残余任务或交接错误。
+离线组件回归 803 项，1 项跳过。该验证覆盖本机该地图短程工况，不代表所有地图/障碍工况。

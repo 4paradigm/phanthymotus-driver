@@ -459,6 +459,10 @@ class SpatialTests(unittest.TestCase):
         self.assertEqual(details['task_id'], 'native-task-1')
         self.assertIn(('check', {'task_id': 'native-task-1'}), self.client.calls)
         self.assertFalse(self.plugin.unresolved())
+        completion = self.plugin.store.state('last_navigation_completion')
+        self.assertEqual(completion['action_id'], result['action_id'])
+        self.assertEqual(completion['task_id'], 'native-task-1')
+        self.assertFalse(any(op in ('cancel', 'soft_stop') for op, _ in self.client.calls))
 
     def test_native_handoff_rejects_unchanged_latched_move_base_source(self):
         self.bundle.state.read = lambda key: (
@@ -472,6 +476,35 @@ class SpatialTests(unittest.TestCase):
         self.assertEqual(status, 'error')
         self.assertIn('chassis_selected_nav_mpc_move_base', result['reason'])
         wait(lambda: ('cancel', {}) in self.client.calls)
+
+    def test_already_arrived_held_task_completes_without_stop_or_old_path_resume(self):
+        original = self.client.native
+        def native(operation, **args):
+            result = original(operation, **args)
+            if operation == 'navigate':
+                self.client.feedback['agvState']['softwareEstop'] = True
+                return dict(result, arrived_while_held=True)
+            return result
+        self.client.native = native
+        self.assertEqual(self.navigate()['state'], 'executing')
+        self.assertEqual(self.completed()[0], 'completed')
+        self.assertFalse(self.bundle.pauses)
+        self.assertFalse(self.plugin.unresolved())
+
+    def test_held_arrival_still_rejects_pose_mismatch(self):
+        original = self.client.native
+        def native(operation, **args):
+            result = original(operation, **args)
+            if operation == 'navigate':
+                self.client.feedback['agvState']['softwareEstop'] = True
+                self.client.feedback['pose2d']['x'] = 2.
+                return dict(result, arrived_while_held=True)
+            return result
+        self.client.native = native
+        self.assertEqual(self.navigate()['state'], 'executing')
+        status, result = self.completed()
+        self.assertEqual(status, 'error')
+        self.assertIn('arrival_pose_mismatch', result['reason'])
 
     def test_failure_after_native_acceptance_still_cancels_the_goal(self):
         self.client.navigate = {'success': False, 'stage': 'resume_new_tracker',
@@ -1434,7 +1467,10 @@ class NativePreparationTests(unittest.TestCase):
             if self.fail_after_release and 1 in self.events:
                 raise TimeoutError('feedback lost')
             return copy.copy(self.state)
+        self.arrived_reply = types.SimpleNamespace(success=True, arrived=True, status=2)
         def proxy(name, _type):
+            if name == '/move_base/check_arrived':
+                return lambda **kwargs: self.arrived_reply
             if name != '/move_base/move_to_target':
                 return command
             def move(**kwargs):
@@ -1475,6 +1511,8 @@ class NativePreparationTests(unittest.TestCase):
         self.path_feedback_patch.start(); self.addCleanup(self.path_feedback_patch.stop)
         self.process_patch = patch.object(self.module, 'tracker_process_identity', return_value=('http://lqr', 123))
         self.process_patch.start(); self.addCleanup(self.process_patch.stop)
+        point_patch = patch.object(self.module, 'ensure_point_navigation')
+        point_patch.start(); self.addCleanup(point_patch.stop)
 
     def call(self, operation='prepare'):
         return self.module.main({'master': 'http://test:11311', 'ros_ip': '127.0.0.1', 'operation': operation})
@@ -1495,6 +1533,33 @@ class NativePreparationTests(unittest.TestCase):
         self.assertEqual(self.events[7:], ['new_path', ('tracker', 4), 'mux', 1])
         self.assertEqual(kwargs['options'].linear_velocity, .5)
         self.assertTrue(kwargs['options'].avoid_enabled)
+
+    def test_missing_path_accepts_only_same_task_confirmed_arrival_while_held(self):
+        request = {'master': 'http://test:11311', 'ros_ip': '127.0.0.1', 'operation': 'navigate',
+                   'args': {'x': 1., 'y': 2., 'yaw': .3, 'speed': .1}}
+        with patch.object(self.module, 'confirm_tracker_target',
+                          side_effect=RuntimeError('native_tracker_target_unconfirmed')):
+            result = self.module.main(request)
+        self.assertTrue(result['arrived_while_held'])
+        self.assertEqual(result['task_id'], 'task-1')
+        self.assertTrue(self.state.soft_estop)
+        self.assertNotIn(1, self.events)
+        self.assertNotIn(('tracker', 4), self.events)
+        self.assertEqual(self.events[-1], 'stationary')
+
+    def test_missing_path_cannot_use_unconfirmed_or_failed_arrival(self):
+        request = {'master': 'http://test:11311', 'ros_ip': '127.0.0.1', 'operation': 'navigate',
+                   'args': {'x': 1., 'y': 2., 'yaw': .3, 'speed': .1}}
+        for reply in ((True, False, 1), (True, True, 3), (False, True, 2)):
+            self.arrived_reply = types.SimpleNamespace(success=reply[0], arrived=reply[1], status=reply[2])
+            self.events.clear()
+            with patch.object(self.module, 'confirm_tracker_target',
+                              side_effect=RuntimeError('native_tracker_target_unconfirmed')):
+                with self.assertRaisesRegex(RuntimeError, 'target_unconfirmed'):
+                    self.module.main(dict(request))
+            self.assertTrue(self.state.soft_estop)
+            self.assertNotIn(1, self.events)
+            self.assertNotIn(('tracker', 4), self.events)
 
     def test_rpc_distinguishes_completed_rejection_from_uncertain_transport(self):
         import io

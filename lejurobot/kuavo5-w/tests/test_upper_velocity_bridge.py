@@ -18,6 +18,25 @@ remote.math=math
 
 
 class BridgeGateTests(unittest.TestCase):
+    def test_native_task_rejection_is_not_feedback_for_disabled_upper_controller(self):
+        gate = remote.status_belongs_to_upper
+        self.assertFalse(gate(10., 0, 0, 0, True, False, 9., 10.1))
+        self.assertFalse(gate(10., 1, 1, 1, True, False, 9., 10.1))
+        self.assertFalse(gate(10., 2, 2, 2, False, True, 9., 10.1))
+
+    def test_upper_owner_still_receives_real_rejections_while_enabled(self):
+        for owner in (1, 2):
+            self.assertTrue(remote.status_belongs_to_upper(
+                10., owner, owner, owner, True, True, 9., 10.1))
+
+    def test_rejection_buffered_across_handoff_or_enable_cannot_shutdown_upper(self):
+        gate = remote.status_belongs_to_upper
+        self.assertFalse(gate(10., 0, 2, 2, True, True, 9., 10.1))
+        self.assertFalse(gate(10., 1, 2, 2, True, True, 9., 10.1))
+        self.assertFalse(gate(10., 2, 2, -1, True, True, 9., 10.1))
+        self.assertFalse(gate(10., 2, 2, 2, True, True, 10.05, 10.1))
+        self.assertFalse(gate(9., 2, 2, 2, True, True, 8., 10.1))
+
     def test_ready_wait_checks_current_control_and_actual_bridge_ack(self):
         b = types.SimpleNamespace()
         bridge = UpperVelocityBridge(b)

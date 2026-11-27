@@ -68,6 +68,26 @@ class BootstrapTests(unittest.TestCase):
                                                       {'host': {'password': 'test-secret'}})
         self.assertEqual(run.call_args.kwargs['env']['SSHPASS'], 'test-secret')
 
+    def test_real_bridge_payload_fits_linux_argv_and_roundtrips_exactly(self):
+        import shlex
+        from mapping_keyboard import stream_source
+        source = stream_source((ROOT/'host/navigation_rpc.py').read_text(), bridge=True)
+        command, _, _ = bootstrap.SshTransport(self.directory)._prepare(
+            'chassis', bootstrap.DEFAULTS['chassis'], {}, source, {})
+        self.assertLess(len(command[-1].encode()), 120_000)
+        namespace = {}
+        # Execute the exact launcher while preventing the helper entry point.
+        with patch('builtins.exec') as execute:
+            eval(compile(shlex.split(command[-1])[2], '<launcher>', 'exec'), namespace)
+        self.assertEqual(namespace['BOOTSTRAP_SOURCE'], source)
+        execute.assert_called_once()
+
+    def test_incompressible_oversized_payload_is_rejected_before_spawn(self):
+        source = base64.b64encode(os.urandom(150_000)).decode()
+        with self.assertRaisesRegex(bootstrap.ProvisionError, 'payload_too_large'):
+            bootstrap.SshTransport(self.directory)._prepare(
+                'chassis', bootstrap.DEFAULTS['chassis'], {}, source, {})
+
     def test_operator_requested_defaults_and_explicit_opt_out(self):
         result = types.SimpleNamespace(returncode=0, stdout=b'{"ok":true}')
         for role in bootstrap.DEFAULTS:

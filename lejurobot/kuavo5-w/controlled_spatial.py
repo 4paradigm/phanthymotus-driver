@@ -736,6 +736,7 @@ class ControlledSpatialPlugin:
                 result['last_map_operation'] = self.store.state('last_map_operation')
                 result['last_map_localization'] = self.store.state('last_map_localization')
                 result['last_navigation_stop'] = self.store.state('last_navigation_stop')
+                result['last_navigation_completion'] = self.store.state('last_navigation_completion')
                 result['last_preparation_recovery'] = self.store.state('last_preparation_recovery')
                 result['last_preparation_failure'] = self.store.state('last_preparation_failure')
                 if self._map_pending and self._map_pending.get('stage_started_at'):
@@ -881,7 +882,7 @@ class ControlledSpatialPlugin:
                         if response.get('stage') == 'dispatch_handoff':
                             raise RuntimeError('native_navigation_dispatch_handoff_rejected')
                         stage = response.get('stage')
-                        if stage in ('hold_and_cancel', 'pause_old_tracker', 'mux_handoff',
+                        if stage in ('hold_and_cancel', 'pause_old_tracker', 'configure_point_navigation', 'mux_handoff',
                                      'goal_submit', 'confirm_new_path', 'resume_new_tracker', 'confirm_mux_handoff',
                                      'release_software_stop', 'validate_runtime'):
                             detail = response.get('error_code')
@@ -895,6 +896,7 @@ class ControlledSpatialPlugin:
                         raise RuntimeError('native_navigation_task_id_missing')
                     accepted_at = time.monotonic()
                     record['task_id'] = task_id
+                    arrived_while_held = response.get('arrived_while_held') is True
                     self._uncertain = False
                     self._persist()
                 while not cancelled.wait(.2):
@@ -913,7 +915,7 @@ class ControlledSpatialPlugin:
                     if self._identity() != identity:
                         raise RuntimeError('map_identity_changed_during_navigation')
                     try:
-                        self._observation(navigable=True, identity=identity)
+                        self._observation(navigable=True, identity=identity, held=arrived_while_held)
                     except NavigationStateUnavailable:
                         check_velocity_source(accepted_at)
                         raise
@@ -932,7 +934,7 @@ class ControlledSpatialPlugin:
                     if code == 3:
                         raise RuntimeError('native_navigation_failed')
                     if code == 2 and status.get('arrived') is True:
-                        pose, observation = self._observation(navigable=True, identity=identity)
+                        pose, observation = self._observation(navigable=True, identity=identity, held=arrived_while_held)
                         if observation['state'].get('driving') is not False:
                             continue
                         error = math.hypot(pose['x'] - target['x'], pose['y'] - target['y'])
@@ -945,11 +947,15 @@ class ControlledSpatialPlugin:
                             continue
                         with self.bundle.tracker.lock:
                             if not cancelled.is_set() and self.bundle.tracker.current('base', aid):
+                                completion = {'task_id': task_id, 'map': identity[0], 'position_error_m': error,
+                                    'yaw_error_rad': yaw_error,
+                                    'completion_basis': 'native_task_id_arrival_map_pose_and_fresh_stationary_odometry'}
+                                self.store.state('last_navigation_completion', dict(completion,
+                                    action_id=aid, completed_at=time.time()))
                                 self._task = None
                                 self._persist()
                                 self.bundle.tracker.finish('base', aid, self.PREFIX, 'completed',
-                                    {'task_id': task_id, 'map': identity[0], 'position_error_m': error,
-                                     'completion_basis': 'native_task_id_arrival_map_pose_and_fresh_stationary_odometry'})
+                                    completion)
                         return
             except Exception as exc:
                 detail = str(exc)[:160].encode('unicode_escape').decode('ascii')[:200]

@@ -333,5 +333,118 @@ class StationaryGuardTests(unittest.TestCase):
         self.assertEqual(self.ros.wait_for_message.call_count, 2)
 
 
+class PointNavigationBindingTests(unittest.TestCase):
+    def setUp(self):
+        import xml.etree.ElementTree as ET
+        self.module = helper()
+        self.direct = '/path_sequence_executor/dispatch_direct_move_target'
+        self.key = '/leju_node/service_move_to_target_driver'
+        self.marker = '/motus_kuavo/direct_navigation_binding'
+        self.params = {self.key: '/path_sequence_executor/dispatch_move_target', '/run_id': 'boot-one'}
+        self.pid = 10
+        self.events = []
+        self.names = {a: '/move_base/' + n for a, n in (
+            ('navigate', 'move_to_target'), ('check', 'check_arrived'), ('cancel', 'set_dispatch_mode'))}
+        self.types = {a: types.SimpleNamespace(_type='test/' + a, _md5sum=a) for a in self.names}
+        self.direct_type = types.SimpleNamespace(_type='jaten_msgs/leju_MoveToTarget', _md5sum='direct')
+        self.headers = {n: {'type': self.types[a]._type, 'md5sum': a} for a, n in self.names.items()}
+        self.headers[self.direct] = {'type': self.direct_type._type, 'md5sum': 'direct'}
+        self.owners = {n: ['/leju_node'] for n in self.names.values()}
+        self.owners[self.direct] = ['/path_sequence_executor']
+        def set_param(k, v):
+            self.events.append(('param', k)); self.params[k] = v
+        self.master = types.SimpleNamespace(lookupNode=lambda n: 'http://wrapper:' + str(self.pid),
+            lookupService=lambda n: n, getParam=lambda n: self.params[n],
+            hasParam=lambda n: n in self.params, setParam=set_param,
+            getSystemState=lambda: [[], [], list(self.owners.items())])
+        self.respawn = True
+        self.shutdown_code = 1
+        def shutdown(*args):
+            self.events.append('shutdown')
+            if self.respawn: self.pid += 1
+            return self.shutdown_code, '', 0
+        proxy = Mock()
+        proxy.__enter__ = Mock(return_value=proxy)
+        proxy.__exit__ = Mock(return_value=False)
+        proxy.getPid.side_effect = lambda *a: (1, '', self.pid)
+        proxy.shutdown.side_effect = shutdown
+        self.launch = ET.ElementTree(ET.fromstring('<launch><node name="leju_node" '
+            'pkg="leju_mobile_base_msgs" type="leju_node" respawn="true"/></launch>'))
+        patches = [patch.dict(sys.modules, {
+            'rosgraph': types.SimpleNamespace(Master=lambda *a: self.master),
+            'rosservice': types.SimpleNamespace(get_service_headers=lambda n, uri: self.headers[n]),
+            'jaten_msgs.srv': types.SimpleNamespace(leju_MoveToTarget=self.direct_type),
+            'nav_msgs.msg': types.SimpleNamespace(Odometry=object)}),
+            patch('xmlrpc.client.ServerProxy', return_value=proxy),
+            patch('xml.etree.ElementTree.parse', return_value=self.launch),
+            patch.object(self.module, 'confirm_software_stop', side_effect=lambda *a, **k: self.events.append('held')),
+            patch.object(self.module, 'confirm_stationary', side_effect=lambda *a: self.events.append('stationary')),
+            patch.object(self.module.time, 'monotonic', side_effect=itertools.count(0, 1)),
+            patch.object(self.module.time, 'sleep')]
+        for p in patches: p.start(); self.addCleanup(p.stop)
+
+    def call(self):
+        self.module.ensure_point_navigation(object(), self.names, self.types)
+
+    def test_binding_restarts_only_wrapper_while_held_and_keeps_wrapper_task_contract(self):
+        self.call()
+        self.assertEqual(self.events[:4], ['held', 'stationary', ('param', self.key), 'shutdown'])
+        self.assertEqual(self.params[self.key], self.direct)
+        self.assertEqual(self.params[self.marker]['pid'], 11)
+        self.events.clear()
+        self.call()
+        self.assertEqual(self.events, [])  # No restart for the verified live process.
+
+    def test_respawn_or_boot_change_invalidates_binding_marker(self):
+        self.call()
+        self.pid += 1
+        self.events.clear()
+        self.call()
+        self.assertIn('shutdown', self.events)
+        self.params['/run_id'] = 'boot-two'
+        self.events.clear()
+        self.call()
+        self.assertIn('shutdown', self.events)
+
+    def test_parameter_write_without_process_confirmation_is_insufficient(self):
+        self.params[self.key] = self.direct
+        self.call()
+        self.assertIn('shutdown', self.events)
+
+    def test_wrong_direct_abi_or_service_owner_never_restarts(self):
+        for headers, owner in (({'type': 'wrong', 'md5sum': 'direct'}, ['/path_sequence_executor']),
+                               (self.headers[self.direct], ['/unknown'])):
+            self.headers[self.direct] = headers
+            self.owners[self.direct] = owner
+            with self.assertRaisesRegex(RuntimeError, 'direct_contract'):
+                self.call()
+            self.assertNotIn('shutdown', self.events)
+
+    def test_unknown_binding_and_nonrespawning_wrapper_are_preserved(self):
+        self.params[self.key] = '/custom_service'
+        with self.assertRaisesRegex(RuntimeError, 'unrecognized_point_binding'): self.call()
+        self.params[self.key] = '/path_sequence_executor/dispatch_move_target'
+        self.launch.getroot()[0].set('respawn', 'false')
+        with self.assertRaisesRegex(RuntimeError, 'respawn_required'): self.call()
+        self.assertNotIn('shutdown', self.events)
+
+    def test_respawn_failure_never_records_binding_success(self):
+        self.respawn = False
+        with self.assertRaisesRegex(RuntimeError, 'restart_unconfirmed'): self.call()
+        self.assertNotIn(self.marker, self.params)
+
+    def test_rejected_shutdown_restores_parameter(self):
+        self.shutdown_code = -1
+        with self.assertRaisesRegex(RuntimeError, 'restart_rejected'): self.call()
+        self.assertEqual(self.params[self.key], '/path_sequence_executor/dispatch_move_target')
+        self.assertNotIn(self.marker, self.params)
+
+    def test_hold_failure_prevents_reconfiguration(self):
+        with patch.object(self.module, 'confirm_software_stop', side_effect=RuntimeError('not_held')):
+            with self.assertRaisesRegex(RuntimeError, 'not_held'): self.call()
+        self.assertNotIn('shutdown', self.events)
+        self.assertNotIn(self.marker, self.params)
+
+
 if __name__ == '__main__':
     unittest.main()

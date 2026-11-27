@@ -489,6 +489,90 @@ def confirm_software_stop(rospy, expected, require_healthy=False):
     raise RuntimeError('chassis_software_stop_feedback_unconfirmed')
 
 
+def ensure_point_navigation(rospy, names, service_types):
+    """Select the factory direct-point adapter without bypassing task/cancel APIs.
+
+    The leju wrapper constructs its downstream client once. A parameter write
+    alone does not change that client; restart only this respawned wrapper while
+    held, after cancelling its old task. Motor, mapping and planner owners stay up.
+    Nothing here runs during boot/remote/base_drive preparation.
+    """
+    import rosgraph
+    import rosservice
+    import xmlrpc.client
+    import xml.etree.ElementTree as ET
+    from jaten_msgs.srv import leju_MoveToTarget
+    from nav_msgs.msg import Odometry
+    caller = '/motus_navigation_rpc'
+    master = rosgraph.Master(caller)
+    direct = '/path_sequence_executor/dispatch_direct_move_target'
+    key = '/leju_node/service_move_to_target_driver'
+    marker = '/motus_kuavo/direct_navigation_binding'
+
+    class Transport(xmlrpc.client.Transport):
+        def make_connection(self, host):
+            connection = super().make_connection(host)
+            connection.timeout = 1.
+            return connection
+
+    def node():
+        uri = master.lookupNode('/leju_node')
+        with xmlrpc.client.ServerProxy(uri, transport=Transport()) as proxy:
+            code, _, pid = proxy.getPid(caller)
+        if code != 1 or type(pid) is not int or pid <= 0:
+            raise RuntimeError('native_navigation_wrapper_unavailable')
+        return {'uri': uri, 'pid': pid, 'run_id': master.getParam('/run_id')}
+
+    def services():
+        owners = dict(master.getSystemState()[2])
+        for action, name in names.items():
+            headers = rosservice.get_service_headers(name, master.lookupService(name))
+            if (owners.get(name) != ['/leju_node']
+                    or headers.get('type') != service_types[action]._type
+                    or headers.get('md5sum') != service_types[action]._md5sum):
+                raise RuntimeError('native_navigation_wrapper_contract_mismatch')
+        headers = rosservice.get_service_headers(direct, master.lookupService(direct))
+        if (owners.get(direct) != ['/path_sequence_executor']
+                or headers.get('type') != leju_MoveToTarget._type
+                or headers.get('md5sum') != leju_MoveToTarget._md5sum):
+            raise RuntimeError('native_navigation_direct_contract_mismatch')
+
+    services()
+    previous = master.getParam(key)
+    if previous not in ('/path_sequence_executor/dispatch_move_target', direct):
+        raise RuntimeError('native_navigation_unrecognized_point_binding')
+    original = node()
+    if previous == direct and master.hasParam(marker) and master.getParam(marker) == original:
+        return
+    # Refuse to stop an unmanaged/non-respawning wrapper on other vendor builds.
+    launch = ET.parse('/opt/jaten/share/leju_mobile_base_msgs/launch/leju_node.launch')
+    if not any(n.get('name') == 'leju_node' and n.get('pkg') == 'leju_mobile_base_msgs'
+               and n.get('type') == 'leju_node' and n.get('respawn') == 'true'
+               for n in launch.iter('node')):
+        raise RuntimeError('native_navigation_wrapper_respawn_required')
+    confirm_software_stop(rospy, True, require_healthy=True)
+    confirm_stationary(rospy, Odometry)
+    master.setParam(key, direct)
+    with xmlrpc.client.ServerProxy(original['uri'], transport=Transport()) as proxy:
+        code, _, _ = proxy.shutdown(caller, 'Select direct point navigation while held')
+    if code != 1:
+        master.setParam(key, previous)
+        raise RuntimeError('native_navigation_wrapper_restart_rejected')
+    end = time.monotonic() + 8.
+    while time.monotonic() < end:
+        try:
+            current = node()
+            if current != original and master.getParam(key) == direct:
+                services()
+                confirm_software_stop(rospy, True, require_healthy=True)
+                master.setParam(marker, current)
+                return
+        except Exception:
+            pass  # ROS services disappear briefly while roslaunch respawns it.
+        time.sleep(.1)
+    raise RuntimeError('native_navigation_wrapper_restart_unconfirmed')
+
+
 def tracker_process_identity():
     """A respawned LQR process cannot confirm the previous goal's path."""
     import rosgraph
@@ -1017,6 +1101,11 @@ def main(request):
             request['_navigation_stage'] = 'pause_old_tracker'
             tracker_command(rospy, 3, request)
             confirm_stationary(rospy, Odometry)
+            request['_navigation_stage'] = 'configure_point_navigation'
+            ensure_point_navigation(rospy, names, types)
+            # The wrapper may have respawned with a new service URI.
+            dispatch = rospy.ServiceProxy(names['cancel'], types['cancel'])
+            proxy = rospy.ServiceProxy(names['navigate'], types['navigate'])
             request['_navigation_stage'] = 'dispatch_handoff'
             if not mutate(lambda: dispatch(control_mode=4)).success:  # STATUS_IDLE is not a mux switch.
                 return {'success': False, 'stage': 'dispatch_handoff'}
@@ -1031,7 +1120,22 @@ def main(request):
             if not getattr(response, 'task_id', ''):
                 raise RuntimeError('native_navigation_task_id_missing')
             request['_navigation_stage'] = 'confirm_new_path'
-            confirm_tracker_target(rospy, args, planner_process)
+            try:
+                confirm_tracker_target(rospy, args, planner_process)
+            except RuntimeError as exc:
+                if str(exc) != 'native_tracker_target_unconfirmed':
+                    raise
+                # At an already-reached point the factory completes without
+                # publishing a replacement path. Never resume the previous path.
+                arrived = rospy.ServiceProxy(names['check'], types['check'])(
+                    task_id=response.task_id, blocking=False, timeout=0.)
+                if not (arrived.success is True and arrived.arrived is True and arrived.status == 2):
+                    raise
+                confirm_software_stop(rospy, True, require_healthy=True)
+                confirm_stationary(rospy, Odometry)
+                result = {name: getattr(response, name) for name in response.__slots__}
+                result['arrived_while_held'] = True
+                return result  # Driver must still verify map pose and this task's arrival.
             request['_navigation_stage'] = 'resume_new_tracker'
             tracker_command(rospy, 4, request)
             # Goal submission can itself change ownership on factory images.
