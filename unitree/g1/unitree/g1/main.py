@@ -1,0 +1,675 @@
+#!/usr/bin/env python3
+"""
+drivers/unitree/g1/main.py — Unitree G1 设备 bundle 统一入口。
+
+读取 config.yaml，按插件配置加载插件，聚合成一个 MCP HTTP server 对外暴露。
+驱动启动时自动 start 所有插件，关闭时自动 stop。
+
+MCP 工具命名规则：直接使用 tool name（mic, tts, led, loco, loco_state, arm, state）
+
+用法：
+    python3 main.py <networkInterface>
+
+环境变量：
+    CONFIG_PATH — config.yaml 路径（默认同目录下）
+"""
+
+
+
+from __future__ import annotations
+
+# Make every log line one atomic, control-character-free write, so concurrent
+# writers cannot tear a Docker log record. Must run before anything prints.
+try:
+    from common import logsafe
+    logsafe.install()
+except ImportError as _e:  # running outside the container image
+    import sys as _sys
+    _sys.stderr.write(f"[bundle] logsafe unavailable ({_e}); stdout unprotected\n")
+
+import json
+import math
+import time
+import os
+import re
+import signal
+import socket
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+import yaml
+
+import rclpy
+import rclpy.executors
+
+from unitree_sdk2py.core.channel import ChannelFactoryInitialize
+from unitree_sdk2py.g1.audio.g1_audio_client import AudioClient
+from rpc_proxy import RpcProxy
+from unitree_sdk2py.g1.arm.g1_arm_action_client import G1ArmActionClient
+from unitree_sdk2py.g1.slam.slam_client import SlamClient
+try:
+    from common import lifecycle as _lifecycle
+except ImportError:  # a checkout rather than the container image, where
+    # common/ is copied in beside this file. Load-bearing, so it resolves the
+    # repo root rather than degrading to a no-op the way logsafe does.
+    import sys as _sys, pathlib as _pathlib
+    _sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parents[2]))
+    from common import lifecycle as _lifecycle
+
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+def _load_config() -> dict:
+    config_path = os.environ.get("CONFIG_PATH", str(Path(__file__).parent / "config.yaml"))
+    with open(config_path) as f:
+        return yaml.safe_load(f)
+
+
+def _resolve_namespace(cfg: dict) -> str:
+    ns = cfg.get("ros_namespace", "").strip()
+    if ns:
+        return re.sub(r"[^a-zA-Z0-9_]", "_", ns)
+    return re.sub(r"[^a-zA-Z0-9_]", "_", socket.gethostname())
+
+
+# ── Bundle ────────────────────────────────────────────────────────────────────
+
+class G1DeviceBundle:
+    def __init__(self, cfg: dict, namespace: str, executor,
+                 audio_client: AudioClient,
+                 loco_client: RpcProxy,
+                 arm_client: G1ArmActionClient,
+                 slam_client: SlamClient,
+                 smart_motion=None,
+                 network_iface: str = "eth0"):
+        self._plugins: list = []
+        self._smart_motion = smart_motion
+        plugins_cfg = cfg.get("plugins", {})
+        pointing_cfg = plugins_cfg.get('g1_directional_pointing', {})
+        self._directional_monitor = None
+        if pointing_cfg.get('enabled', False):
+            if (not plugins_cfg.get('arm', {}).get('enabled', False)
+                    or not plugins_cfg.get('loco', {}).get('enabled', False)
+                    or not cfg.get('teleop_control', {}).get('enabled', False)):
+                raise ValueError('g1_directional_pointing requires arm, loco and shared teleop_control')
+            if any(plugins_cfg.get(name, {}).get('enabled', False) for name in ('servo', 'servo_eef')):
+                raise ValueError('g1_directional_pointing cannot coexist with independent servo/servo_eef writers')
+        self._low_state = None
+        if plugins_cfg.get('state', {}).get('enabled', False) or cfg.get('teleop_control', {}).get('enabled', False):
+            from low_state import LowStateSource
+            self._low_state = LowStateSource()
+        camera_plugin = None
+
+        if plugins_cfg.get("mic", {}).get("enabled", False):
+            from device import MicPlugin
+            self._plugins.append(MicPlugin(plugins_cfg["mic"], namespace, executor))
+            print("[bundle] MicPlugin loaded")
+
+        if plugins_cfg.get("tts", {}).get("enabled", False):
+            from device import NativeTtsPlugin
+            self._plugins.append(NativeTtsPlugin(plugins_cfg["tts"], namespace, executor, audio_client))
+            print("[bundle] NativeTtsPlugin loaded")
+
+        if plugins_cfg.get("speaker", {}).get("enabled", False):
+            speaker_cfg = plugins_cfg["speaker"]
+            if speaker_cfg.get("isolated_process", False):
+                from device import SpeakerIsolatedProxy
+                self._plugins.append(SpeakerIsolatedProxy(speaker_cfg, namespace, executor, audio_client, network_iface=network_iface))
+                print("[bundle] SpeakerPlugin loaded (isolated process)")
+            else:
+                from device import SpeakerPlugin
+                self._plugins.append(SpeakerPlugin(speaker_cfg, namespace, executor, audio_client))
+                print("[bundle] SpeakerPlugin loaded")
+
+        if plugins_cfg.get("led", {}).get("enabled", False):
+            from device import LedPlugin
+            self._plugins.append(LedPlugin(plugins_cfg["led"], namespace, executor, audio_client))
+            print("[bundle] LedPlugin loaded")
+
+        if plugins_cfg.get("loco", {}).get("enabled", False):
+            from device import LocoStatePlugin, LocoPlugin, StatePlugin
+            loco_state = LocoStatePlugin(plugins_cfg["loco"], namespace, executor)
+            self._plugins.append(loco_state)
+            # LocoPlugin reuses StatePlugin's posture computed from the shared source.
+            posture_source = None
+            if plugins_cfg.get("state", {}).get("enabled", False):
+                state_plugin = StatePlugin(plugins_cfg["state"], namespace, executor, low_state=self._low_state)
+                self._plugins.append(state_plugin)
+                posture_source = state_plugin.node
+                print("[bundle] StatePlugin loaded (posture source for LocoPlugin)")
+            self._plugins.append(LocoPlugin(plugins_cfg["loco"], namespace, executor, loco_client,
+                                            slam_client=slam_client, smart_motion=smart_motion,
+                                            state_node=loco_state.node,
+                                            posture_node=posture_source))
+            print("[bundle] LocoStatePlugin + LocoPlugin loaded")
+
+        if plugins_cfg.get("loco_relative_move", {}).get("enabled", False):
+            if not plugins_cfg.get("loco", {}).get("enabled", False):
+                raise ValueError("loco_relative_move requires the loco_state publisher (enable loco)")
+            from loco_relative_move import LocoRelativeMovePlugin, PointBackend
+            from relative_feedback import PoseFeedback, create_feedback_node
+            from device import _loco_acp_notify
+            from unitree_sdk2py.g1.loco.g1_loco_client import LocoClient
+            relative_client = LocoClient()
+            relative_client.SetTimeout(0.05)  # Bound local DDS writes; never await RPC responses.
+            relative_client.Init()
+            safety_cfg = plugins_cfg.get("loco_relative_move", {}).get("safety", {})
+            feedback = PoseFeedback(timeout=safety_cfg.get("feedback_timeout_s", .5))
+            feedback_node = create_feedback_node(namespace, feedback)
+            executor.add_node(feedback_node)
+            def close_relative_feedback():
+                executor.remove_node(feedback_node)
+                feedback_node.destroy_node()
+            from sport_mode_state import LOCO_STATES
+            def relative_locomotion_admission():
+                # rt/sportmodestate is authoritative: idle ownership is not posture admission.
+                fsm = loco_state.node.get_fsm()
+                stamp = fsm.get('ts')
+                valid_stamp = (isinstance(stamp, (int, float)) and not isinstance(stamp, bool)
+                               and math.isfinite(stamp))
+                age = time.time() - stamp if valid_stamp else None
+                admitted = (age is not None and 0 <= age < 1.0
+                            and type(fsm.get('fsm_id')) is int and fsm['fsm_id'] in LOCO_STATES)
+                return dict(admitted=admitted, fsm=fsm, age_s=age,
+                            source='rt/sportmodestate', max_age_s=1.0)
+            def relative_base_available():
+                if smart_motion is not None:
+                    current = smart_motion.get_state()
+                    return {**current, "available": current.get("base_available") is True}
+                return loco_client.MotionIdle()
+            self._point_card = LocoRelativeMovePlugin(
+                plugins_cfg.get("loco_relative_move", {}),
+                PointBackend(relative_client, feedback, close_relative_feedback), _loco_acp_notify,
+                can_start=relative_base_available, admission=relative_locomotion_admission)
+            self._plugins.append(self._point_card)
+            print("[bundle] LocoRelativeMovePlugin loaded (direct SDK)")
+
+        if plugins_cfg.get("arm", {}).get("enabled", False):
+            from device import ArmActionPlugin
+            self._plugins.append(ArmActionPlugin(plugins_cfg["arm"], namespace, executor, arm_client))
+            print("[bundle] ArmActionPlugin loaded")
+
+        self._motion_bus = None
+        if cfg.get('motion_control', {}).get('enabled', False):
+            raise ValueError('motion_control is removed; use teleop_control')
+        control_cfg = cfg.get('teleop_control', {})
+        if control_cfg.get('enabled', False):
+            from arm_stream import ArmStreamExecutor
+            from motion_control import MotionControl
+            from teleop_control import TeleopControl
+            from teleop_bus import TeleopBus
+            from device import _loco_acp_notify
+            arm = next((p for p in self._plugins if getattr(p, 'PREFIX', '') == 'arm'), None)
+            if arm is None:
+                raise ValueError('teleop_control requires arm plugin')
+            effective = dict(control_cfg)
+            effective['servo_position'] = True
+            stream = ArmStreamExecutor(effective, namespace, arm_client, low_state=self._low_state)
+            motion = MotionControl(dict(effective), stream)
+            stream.motion_control = motion
+            arm._stream = stream
+            control = TeleopControl(dict(control_cfg), motion,
+                notify=lambda ident, status, result: _loco_acp_notify(ident, status, result, tool='teleop_control'))
+            arm._teleop_control = control
+            stream.public_motion_topics = False
+            self._motion_bus = TeleopBus(executor, control)
+            self._plugins.append(control)
+            from teaching import teaching_plugin
+            self._plugins.append(teaching_plugin(control))
+
+        if pointing_cfg.get('enabled', False):
+            from directional_pointing import DirectionalPointing
+            from directional_backend import DirectionalBackend
+            from directional_stationary import DirectionalStationaryGuard, create_stationary_node
+            guard = DirectionalStationaryGuard(self._low_state, pointing_cfg.get('stationary', {}))
+            backend = DirectionalBackend(motion, stationary=guard.check, config=pointing_cfg)
+            card = DirectionalPointing(backend, notify=_loco_acp_notify)
+            monitor = create_stationary_node(namespace, guard)
+            try:
+                executor.add_node(monitor)
+            except Exception:
+                guard.close()
+                monitor.destroy_node()
+                raise
+            self._directional_monitor = (guard, monitor, executor)
+            self._plugins.append(card)
+            print('[bundle] DirectionalPointing loaded (shared arm executor)')
+
+        # servo 默认**关闭**，和 arm 不同。arm 放的是厂商预设手势，经过内置控制器；
+        # servo 直接往 rt/arm_sdk 写关节指令，是这个驱动第一次驱动电机本身。
+        # 一个默认开启的执行器卡片，等于容器一重启就可以被 start —— 开关留给人。
+        if plugins_cfg.get("servo", {}).get("enabled", False):
+            from servo import G1ServoPlugin
+            self._plugins.append(G1ServoPlugin(plugins_cfg["servo"], namespace, executor))
+            print("[bundle] G1ServoPlugin loaded")
+
+        # servo_eef 同样默认关闭，理由比 servo 还多一条：它一次真机都没跑过。
+        if plugins_cfg.get("servo_eef", {}).get("enabled", False):
+            from servo_eef import G1ServoEefPlugin
+            self._plugins.append(
+                G1ServoEefPlugin(plugins_cfg["servo_eef"], namespace, executor))
+            print("[bundle] G1ServoEefPlugin loaded")
+
+        if plugins_cfg.get("asr", {}).get("enabled", False):
+            from device import AsrPlugin
+            self._plugins.append(AsrPlugin(plugins_cfg["asr"], namespace, executor))
+            print("[bundle] AsrPlugin loaded")
+
+        if plugins_cfg.get("state", {}).get("enabled", False):
+            from device import StatePlugin
+            # Already built above when loco is enabled, to hand LocoPlugin its
+            # posture source — a second instance would duplicate the rt/lowstate
+            # subscription and clash on the ROS node name.
+            if not any(isinstance(p, StatePlugin) for p in self._plugins):
+                self._plugins.append(StatePlugin(plugins_cfg["state"], namespace, executor, low_state=self._low_state))
+                print("[bundle] StatePlugin loaded")
+
+        if plugins_cfg.get("camera", {}).get("enabled", False):
+            from device import RealSensePlugin
+            camera_plugin = RealSensePlugin(plugins_cfg["camera"], namespace, executor)
+            self._plugins.append(camera_plugin)
+            print("[bundle] RealSensePlugin loaded")
+
+        if plugins_cfg.get("vision_capture", {}).get("enabled", False):
+            from device import VisionCapturePlugin
+            self._plugins.append(VisionCapturePlugin(
+                plugins_cfg["vision_capture"], namespace, executor, camera_plugin))
+            print("[bundle] VisionCapturePlugin loaded")
+
+        if plugins_cfg.get("lidar", {}).get("enabled", False):
+            from device import LidarPlugin
+            self._plugins.append(LidarPlugin(plugins_cfg["lidar"], namespace, executor))
+            print("[bundle] LidarPlugin loaded")
+
+        if plugins_cfg.get("slam", {}).get("enabled", False):
+            from device import SpatialPlugin
+            self._plugins.append(SpatialPlugin(plugins_cfg["slam"], namespace, executor, slam_client, smart_motion=smart_motion))
+            print("[bundle] SpatialPlugin loaded")
+
+        if plugins_cfg.get("controlled_spatial", {}).get("enabled", False):
+            controlled_cfg = dict(plugins_cfg["controlled_spatial"])
+            controlled_cfg["network_iface"] = network_iface
+            if controlled_cfg.get("isolated_process", False):
+                from controlled_spatial import ControlledSpatialIsolatedProxy
+                self._plugins.append(ControlledSpatialIsolatedProxy(controlled_cfg, namespace, executor, slam_client, smart_motion=smart_motion))
+                print("[bundle] ControlledSpatialPlugin loaded (isolated process)")
+            else:
+                from controlled_spatial import ControlledSpatialPlugin
+                self._plugins.append(ControlledSpatialPlugin(controlled_cfg, namespace, executor, slam_client, smart_motion=smart_motion))
+                print("[bundle] ControlledSpatialPlugin loaded")
+
+        if plugins_cfg.get("controlled_spatial_map", {}).get("enabled", False):
+            try:
+                from controlled_spatial_map import ControlledSpatialMapPlugin
+                map_cfg = dict(plugins_cfg["controlled_spatial_map"])
+                map_cfg["network_iface"] = network_iface
+                self._plugins.append(ControlledSpatialMapPlugin(map_cfg, namespace, executor))
+                print("[bundle] ControlledSpatialMapPlugin loaded")
+            except Exception as e:
+                print(f"[bundle] ControlledSpatialMapPlugin load skipped: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
+
+        if plugins_cfg.get("ext_mic", {}).get("enabled", False):
+            from ext_devices import ExtMicPlugin
+            self._plugins.append(ExtMicPlugin(plugins_cfg["ext_mic"], namespace, executor))
+            print("[bundle] ExtMicPlugin loaded")
+
+        if plugins_cfg.get("ext_camera", {}).get("enabled", False):
+            from ext_devices import ExtCameraPlugin
+            self._plugins.append(ExtCameraPlugin(plugins_cfg["ext_camera"], namespace, executor))
+            print("[bundle] ExtCameraPlugin loaded")
+
+        # SmartMotion 统一打断控制（放在最后，需要引用其他 plugin）
+        if plugins_cfg.get("smart_motion", {}).get("enabled", True):
+            from device import SmartMotionPlugin
+            speaker_plugin = next((p for p in self._plugins if getattr(p, 'PREFIX', '') == 'speaker'), None)
+            loco_plugin = next((p for p in self._plugins if getattr(p, 'PREFIX', '') == 'loco'), None)
+            self._plugins.append(SmartMotionPlugin(
+                plugins_cfg.get("smart_motion", {}), namespace, executor,
+                speaker_plugin=speaker_plugin,
+                loco_plugin=loco_plugin,
+            ))
+            print(f"[bundle] SmartMotionPlugin loaded (speaker={'yes' if speaker_plugin else 'no'}, loco={'yes' if loco_plugin else 'no'})")
+
+    def start_all(self) -> None:
+        if self._low_state is not None:
+            self._low_state.start()
+        for i, p in enumerate(self._plugins):
+            try:
+                p.start()
+            except Exception as e:
+                print(f"[bundle] Plugin {i} ({type(p).__name__}) start() FAILED: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
+        print(f"[bundle] All {len(self._plugins)} plugins started", flush=True)
+
+    def stop_all(self) -> None:
+        # Cancel capture consumers before stopping the shared RealSense producer.
+        capture_plugins = [
+            p for p in self._plugins if getattr(p, "PREFIX", "") == "vision_capture"]
+        other_plugins = [
+            p for p in self._plugins if getattr(p, "PREFIX", "") != "vision_capture"]
+        # Finish direct tasks before tearing down their shared control owners.
+        point_plugins = [p for p in other_plugins if getattr(p, "PREFIX", "") in
+                         ("loco_relative_move", "g1_directional_pointing")]
+        remaining_plugins = [p for p in other_plugins if p not in point_plugins]
+        for p in capture_plugins + point_plugins + remaining_plugins:
+            p.stop()
+        monitor = getattr(self, '_directional_monitor', None)
+        if monitor is not None:
+            guard, node, executor = monitor
+            guard.close()
+            executor.remove_node(node)
+            node.destroy_node()
+            self._directional_monitor = None
+        # Keep feedback alive until every control owner has completed its stop.
+        if self._low_state is not None:
+            self._low_state.stop()
+        print("[bundle] All plugins stopped")
+
+    def get_all_tools(self) -> list:
+        tools = []
+        for p in self._plugins:
+            if hasattr(p, 'get_tools'):
+                tools.extend(p.get_tools())
+            else:
+                tools.append(p.get_tool())
+        return tools
+
+    def dispatch(self, tool_name: str, args: dict) -> dict | None:
+        for p in self._plugins:
+            plugin_tools = p.get_tools() if hasattr(p, 'get_tools') else [p.get_tool()]
+            for tool_def in plugin_tools:
+                if tool_def["name"] == tool_name:
+                    if tool_def["type"] == "resource":
+                        return p.dispatch(tool_name, args)
+                    action = args.pop("action", tool_name)
+                    args['_tool_name'] = tool_name  # let multi-tool plugins know which tool was called
+                    if tool_name == "g1_directional_pointing":
+                        # Preserve scoped stop failures and this card's asynchronous
+                        # lifecycle acknowledgements. Point owns arms, not the base.
+                        return p.dispatch(action, args)
+                    point = getattr(self, "_point_card", None)
+                    resource = tool_def.get("inputSchema", {}).get("x-resource")
+                    is_base = (resource == "base" or isinstance(resource, list) and "base" in resource
+                               or tool_name in ("loco", "switch_mode", "switch_mode_expert", "spatial"))
+                    interrupts_motion = tool_name == "smart_motion" and action == "interrupt_motion"
+                    if point and tool_name != "loco_relative_move" and (is_base or interrupts_motion) and tool_def["type"] == "actuator":
+                        result = point.dispatch_base(p, action, args)
+                    else:
+                        result = p.dispatch(action, args)
+                    # A plugin that only knows its own verbs declines these
+                    # rather than failing at them — see common/lifecycle.py.
+                    if action in _lifecycle.LIFECYCLE_ACTIONS and _lifecycle.is_declined(result):
+                        return _lifecycle.reply(action)
+                    return result
+        return None
+
+
+# ── MCP HTTP server ───────────────────────────────────────────────────────────
+
+_bundle: G1DeviceBundle | None = None
+
+
+def make_handler():
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            # Suppress routine request logs (info/heartbeat); only log errors and tool calls
+            msg = fmt % args
+            if '"POST /mcp' in msg and '200' in msg:
+                return
+            # Escape and cap: msg embeds the raw request line, which on host
+            # networking is remote-controlled bytes going straight into the
+            # Docker log framer (log injection / control-byte corruption).
+            safe = msg.encode("unicode_escape").decode("ascii")[:200]
+            print(f"[mcp] {self.address_string()} {safe}")
+
+        def _send(self, status: int, body: str):
+            encoded = body.encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Accept")
+            self.end_headers()
+            self.wfile.write(encoded)
+
+        def do_GET(self):
+            self.send_response(404)
+            self.end_headers()
+
+        def do_OPTIONS(self):
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Accept")
+            self.end_headers()
+
+        def do_POST(self):
+            # Receive a file into this container: `POST /file/upload`, the way a
+            # `format: file` tool argument reaches a service that shares no
+            # filesystem with agent-core. See common/file_intake.py.
+            #
+            # Two ordering requirements, both silent when violated: this must
+            # precede `self.rfile.read(...)`, which would consume the body the
+            # upload needs, and any `self.path not in ("/mcp", ...)` check, which
+            # would 404 the upload before it is recognised.
+            #
+            # Imported here rather than at module level on purpose: several tests
+            # lift this handler out of main.py by AST and exec only the selected
+            # definitions, so a module global would be undefined there -- a
+            # NameError on every POST, including ordinary JSON-RPC.
+            try:
+                from common import file_intake as _file_intake
+            except ImportError:  # a checkout without common/ on the path
+                _file_intake = None
+            if _file_intake is not None and _file_intake.serve_upload(self):
+                return
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length)
+            try:
+                rpc = json.loads(raw)
+            except Exception:
+                self._send(400, json.dumps({"jsonrpc": "2.0", "id": None,
+                                             "error": {"code": -32700, "message": "Parse error"}}))
+                return
+
+            rid    = rpc.get("id")
+            method = rpc.get("method", "")
+            params = rpc.get("params") or {}
+
+            if rid is None:
+                self.send_response(202)
+                self.end_headers()
+                return
+
+            def ok(result):
+                self._send(200, json.dumps({"jsonrpc": "2.0", "id": rid, "result": result}))
+
+            def err(code, msg):
+                self._send(200, json.dumps({"jsonrpc": "2.0", "id": rid,
+                                             "error": {"code": code, "message": msg}}))
+
+            try:
+                if method == "initialize":
+                    ok({
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "g1-device-bundle", "version": "2.0.0"},
+                    })
+                elif method == "tools/list":
+                    ok({"tools": _bundle.get_all_tools()})
+                elif method == "tools/call":
+                    name   = params.get("name", "")
+                    args   = params.get("arguments") or {}
+                    if name in ('motion_control', 'teleop_control', 'g1_teaching'):
+                        import ipaddress
+                        if self.headers.get('Origin') or not ipaddress.ip_address(self.client_address[0]).is_loopback:
+                            err(-32600, 'teleop control requires loopback')
+                            return
+                    result = _bundle.dispatch(name, args)
+                    if result is None:
+                        err(-32601, f"Unknown tool: {name}")
+                    else:
+                        ok({"content": [{"type": "text", "text": json.dumps(result)}]})
+                else:
+                    err(-32601, f"Method not found: {method}")
+            except Exception as e:
+                err(-32603, str(e))
+
+    return Handler
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+
+def _start_registration(mcp_port: int, name: str, category: str):
+    """Register this driver with agent-core in a background thread, then heartbeat every 30s."""
+    import urllib.request as _urllib
+    import ssl as _ssl
+    agent_core_url = os.environ.get("AGENT_CORE_URL", "https://localhost:15678")
+    payload = json.dumps({
+        "name": name,
+        "url":  f"http://localhost:{mcp_port}/mcp",
+        "category": category,
+    }).encode()
+    # agent-core uses self-signed cert, skip verification for localhost
+    _ctx = _ssl.create_default_context()
+    _ctx.check_hostname = False
+    _ctx.verify_mode = _ssl.CERT_NONE
+    def _run():
+        import time as _t
+        while True:
+            try:
+                req = _urllib.Request(
+                    f"{agent_core_url}/api/mcp", data=payload,
+                    headers={"Content-Type": "application/json"}, method="POST",
+                )
+                with _urllib.urlopen(req, timeout=3, context=_ctx):
+                    pass  # heartbeat ok, suppress log
+                _t.sleep(30)
+            except Exception as e:
+                print(f"[register] failed: {e}, retrying in 5s")
+                _t.sleep(5)
+    threading.Thread(target=_run, daemon=True, name="register").start()
+
+
+def main():
+    global _bundle
+
+    if len(sys.argv) < 2:
+        print(f"Usage: python3 {sys.argv[0]} <networkInterface>")
+        sys.exit(1)
+
+    network_iface = sys.argv[1]
+    cfg           = _load_config()
+    namespace     = _resolve_namespace(cfg)
+    mcp_port      = int(cfg.get("mcp_port", 15701))
+
+    print(f"[bundle] namespace={namespace} mcp_port={mcp_port}")
+
+    # DDS init
+    ChannelFactoryInitialize(0, network_iface)
+    print(f"[bundle] DDS initialized on interface: {network_iface}")
+
+    # NOTE: a fd-1 -> /dev/null shuffle used to live here to "suppress C++ layer
+    # stdout". The noise was actually Python `print()` in the vendored SDK, and
+    # the shuffle broke the "fd 1 is the docker log" invariant: two buffered
+    # writers on one pipe (non-atomic above PIPE_BUF -> torn log records) and
+    # every spawned subprocess silently lost stdout. SDK prints are now gated at
+    # source (UNITREE_RPC_DEBUG), so no redirection is needed.
+
+    # AudioClient (shared by tts + led)
+    audio_client = AudioClient()
+    audio_client.SetTimeout(10.0)
+    audio_client.Init()
+    print("[bundle] AudioClient ready")
+
+    # LocoClient (locomotion control) — via subprocess proxy to avoid GIL contention
+    loco_client = RpcProxy(network_iface)
+    print("[bundle] LocoClient ready (subprocess proxy)")
+
+    # G1ArmActionClient (arm gestures)
+    arm_client = G1ArmActionClient()
+    arm_client.SetTimeout(10.0)
+    arm_client.Init()
+    print("[bundle] G1ArmActionClient ready")
+
+    # SlamClient (SLAM navigation)
+    slam_client = SlamClient()
+    slam_client.SetTimeout(5.0)
+    slam_client.Init()
+    print("[bundle] SlamClient ready")
+
+    # ROS2
+    rclpy.init()
+    executor = rclpy.executors.MultiThreadedExecutor()
+
+    # Safety Harness (SmartMotion) — independent subprocess
+    smart_motion = None
+    harness_cfg = cfg.get("safety_harness", {})
+    if harness_cfg.get("enabled", True):
+        from safety_harness import SmartMotionProxy
+        smart_motion = SmartMotionProxy(namespace, harness_cfg, network_iface)
+        print("[bundle] SmartMotion safety harness active (subprocess)")
+
+    _bundle = G1DeviceBundle(cfg, namespace, executor, audio_client, loco_client, arm_client, slam_client, smart_motion=smart_motion, network_iface=network_iface)
+    _bundle.start_all()
+
+    from ros_spin import SpinHealth, supervised_spin
+    from rclpy.impl.implementation_singleton import rclpy_implementation
+    InvalidHandle = rclpy_implementation.InvalidHandle
+    from rclpy.executors import ExternalShutdownException, ShutdownException
+    executor._driver_spin_health = SpinHealth()
+
+    def _spin():
+        supervised_spin(executor, rclpy.ok, executor._driver_spin_health,
+                        InvalidHandle, (ExternalShutdownException, ShutdownException))
+
+    spin_thread = threading.Thread(target=_spin, daemon=True, name="bundle_spin")
+    spin_thread.start()
+
+    _start_registration(mcp_port, cfg.get("name", "Unitree G1"), "driver")
+
+    server = ThreadingHTTPServer(("", mcp_port), make_handler())
+    print(f"[bundle] MCP server → http://localhost:{mcp_port}")
+
+    def _shutdown(signum, frame):
+        print(f"[bundle] signal {signum}, shutting down")
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+
+    try:
+        server.serve_forever()
+    finally:
+        # Keep the safety peer alive while cards cancel and release sequences.
+        try:
+            _bundle.stop_all()
+        finally:
+            try:
+                # Join the teleop owner before shutting down its ROS context.
+                bus = _bundle._motion_bus
+                if bus is not None and getattr(bus, 'shared_executor', None) is executor:
+                    bus.close()
+            finally:
+                try:
+                    if smart_motion:
+                        smart_motion.shutdown()
+                finally:
+                    try:
+                        loco_client.stop()
+                    finally:
+                        try:
+                            executor.shutdown()
+                        finally:
+                            rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

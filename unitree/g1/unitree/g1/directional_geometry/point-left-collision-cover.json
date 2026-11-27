@@ -1,0 +1,178 @@
+{
+  "schema": "g1.point.left-collision-cover/1",
+  "source_repository": "unitreerobotics/unitree_ros",
+  "source_commit": "157ff950351e5f535e03c5d85a16b7d594b3dbcc",
+  "units": "m",
+  "method": "Triangle AABB intersection with closed slabs, outward rounded to whole millimetres; no triangle omitted.",
+  "meshes": [
+    {
+      "filename": "left_shoulder_yaw_link.STL",
+      "sha256": "1aa97e9748e924336567992181f78c7cd0652fd52a4afcca3df6b2ef6f9e712e",
+      "triangles": 4982,
+      "actual_minimum": [
+        -0.032810695469379425,
+        -0.04141250625252724,
+        -0.11369692534208298
+      ],
+      "actual_maximum": [
+        0.048374809324741364,
+        0.03310637176036835,
+        0.031574152410030365
+      ],
+      "slice_axis": 2,
+      "slab_edges_m": [
+        -0.114,
+        -0.06,
+        -0.02,
+        0.032
+      ],
+      "boxes_mm": [
+        [
+          -32,
+          -42,
+          -114,
+          49,
+          23,
+          -60
+        ],
+        [
+          -33,
+          -42,
+          -60,
+          45,
+          31,
+          -20
+        ],
+        [
+          -33,
+          -33,
+          -20,
+          33,
+          34,
+          32
+        ]
+      ],
+      "contributing_triangles": [
+        2521,
+        1613,
+        1213
+      ]
+    },
+    {
+      "filename": "left_elbow_link.STL",
+      "sha256": "fa752198accd104d5c4c3a01382e45165b944fbbc5acce085059223324e5bed3",
+      "triangles": 1774,
+      "actual_minimum": [
+        -0.029775112867355347,
+        -0.03125531226396561,
+        -0.04543027654290199
+      ],
+      "actual_maximum": [
+        0.10000001639127731,
+        0.03477716073393822,
+        0.029775114730000496
+      ],
+      "slice_axis": 0,
+      "slab_edges_m": [
+        -0.03,
+        0.01,
+        0.053,
+        0.101
+      ],
+      "boxes_mm": [
+        [
+          -30,
+          20,
+          -36,
+          10,
+          35,
+          30
+        ],
+        [
+          10,
+          -32,
+          -46,
+          53,
+          35,
+          29
+        ],
+        [
+          53,
+          -32,
+          -46,
+          101,
+          35,
+          25
+        ]
+      ],
+      "contributing_triangles": [
+        429,
+        776,
+        823
+      ]
+    },
+    {
+      "filename": "left_wrist_roll_rubber_hand.STL",
+      "sha256": "e81030abd023bd9e4a308ef376d814a2c12d684d8a7670c335bbd5cd7809c909",
+      "triangles": 69696,
+      "actual_minimum": [
+        9.795303049031645e-05,
+        -0.04240712523460388,
+        -0.041526541113853455
+      ],
+      "actual_maximum": [
+        0.2533150613307953,
+        0.02996004745364189,
+        0.06495612114667892
+      ],
+      "slice_axis": 0,
+      "slab_edges_m": [
+        0,
+        0.06,
+        0.125,
+        0.19,
+        0.254
+      ],
+      "boxes_mm": [
+        [
+          0,
+          -31,
+          -31,
+          60,
+          30,
+          31
+        ],
+        [
+          60,
+          -26,
+          -26,
+          125,
+          29,
+          28
+        ],
+        [
+          125,
+          -15,
+          -37,
+          190,
+          25,
+          62
+        ],
+        [
+          190,
+          -43,
+          -42,
+          254,
+          20,
+          65
+        ]
+      ],
+      "contributing_triangles": [
+        981,
+        3722,
+        17813,
+        48373
+      ]
+    }
+  ]
+}
