@@ -14,7 +14,7 @@ from common.vendor_runtime import (
     DriverBundle, action_schema, load_config, make_handler, start_registration, tool,
 )
 from head_control import CONTROL_PERIOD, HEAD_JOINTS, SAMPLE_AGE, HeadFollower, UnixHeadBridge
-from tracking import MAX_AGE, FollowPolicy, _Detector, finite, image_stamp
+from tracking import MAX_AGE, FollowPolicy, _Detector, decode_depth, finite, image_stamp
 
 DRIVER_ID = "rokae-helios-face-follow"
 MODES = ("person", "nearest_face", "speaker", "object")
@@ -24,17 +24,21 @@ DEFAULT_SPEECH = "/rokae_helios/speech/localized"
 JOINTS = "/rokae_helios/state/joints"
 
 
-def start_vop(topic):
+def start_perception(name, topic):
     request = Request("http://127.0.0.1:15720/mcp", data=json.dumps({
         "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
-            "name": "vop", "arguments": {"action": "start", "input_topic": topic},
+            "name": name, "arguments": {"action": "start", "input_topic": topic},
         },
     }).encode(), headers={"Content-Type": "application/json"})
     with urlopen(request, timeout=3) as response:
         payload = json.load(response)
     result = json.loads(payload["result"]["content"][0]["text"])
     if result.get("state") not in ("running", "loading"):
-        raise ValueError(result.get("message", "VOP did not start"))
+        raise ValueError(result.get("message", f"{name} did not start"))
+
+
+def start_vop(topic):
+    start_perception("vop", topic)
 
 
 class HeliosFaceFollow:
@@ -52,6 +56,8 @@ class HeliosFaceFollow:
         self.topics = {}
         self.policy = FollowPolicy("person", "person")
         self.depth_frames = deque(maxlen=8)
+        self.person_depth = None
+        self.rgb_size = None
         self.head = None
         self.base = base
         self.motion = base if base is not None else HeadFollower(head_bridge)
@@ -136,6 +142,7 @@ class HeliosFaceFollow:
             "depth": args.get("depth_topic") or DEFAULT_DEPTH,
             "speech": args.get("speech_topic") or DEFAULT_SPEECH,
             "objects": args.get("object_topic") or f"{rgb}/objects",
+            "person_depth": f"{rgb}/visual_depth",
         }
         if self.session is not None:
             if topics != self.topics:
@@ -144,10 +151,18 @@ class HeliosFaceFollow:
         for topic in topics.values():
             validate_full_topic_name(topic)
         self.ensure_vop(topics)
+        if self.node.count_publishers(topics["person_depth"]) == 0:
+            try:
+                start_perception("visual_depth", rgb)
+            except (OSError, ValueError, KeyError, IndexError, TypeError):
+                # A single visible person can still be followed. With several
+                # people, the selector waits for distance estimates.
+                pass
         session = object()
         for key, callback, kind in (
             ("rgb", self.on_rgb, CompressedImage), ("depth", self.on_depth, CompressedImage),
             ("speech", self.on_speech, self.message_type), ("objects", self.on_objects, self.message_type),
+            ("person_depth", self.on_person_depth, CompressedImage),
         ):
             try:
                 self.subscriptions.append(self.node.create_subscription(
@@ -159,9 +174,13 @@ class HeliosFaceFollow:
         self.topics = topics
         self.session = session
         self.motion.reset()
+        cameras = args.get("camera_info")
+        camera = cameras.get(rgb) if isinstance(cameras, dict) else None
+        if isinstance(camera, dict) and camera.get("topic") == rgb:
+            size = (camera.get("width"), camera.get("height"))
+            if all(type(value) is int and value > 0 for value in size):
+                self.rgb_size = size
         if self.base is not None:
-            cameras = args.get("camera_info")
-            camera = cameras.get(rgb) if isinstance(cameras, dict) else None
             self.base.camera_ok = (isinstance(camera, dict) and camera.get("topic") == rgb
                                    and camera.get("id") == CHEST_CAMERA)
         self.motion_rgb_until = 0.0
@@ -178,6 +197,7 @@ class HeliosFaceFollow:
                 self.node.destroy_subscription(sub)
             self.subscriptions.clear()
             self.depth_frames.clear()
+            self.person_depth = self.rgb_size = None
             self.topics = {}
             self.policy = FollowPolicy("person", "person")
             if was_active:
@@ -279,13 +299,27 @@ class HeliosFaceFollow:
                 if self.policy.speech_event(payload, time.time()) and payload["active"] is False:
                     self.emit(None, "waiting_for_speech")
 
+    def on_person_depth(self, session, message):
+        if message.format != "16UC1; compressedDepth zlib":
+            return
+        import numpy as np
+
+        received = time.monotonic()
+        depth = decode_depth(message.data, np)
+        with self.lock:
+            if session is self.session and depth is not None:
+                self.person_depth = (received, depth)
+
     def on_objects(self, session, message):
         with self.lock:
             now = time.monotonic()
             if session is self.session and self.policy.mode in VOP_MODES and now - self.last_rgb <= MAX_AGE:
                 payload = self.parse(message)
                 wall = time.time()
-                target, reason = self.policy.objects(payload, wall, now)
+                depth = None
+                if self.person_depth and now - self.person_depth[0] <= 0.35:
+                    depth = self.person_depth[1]
+                target, reason = self.policy.objects(payload, wall, now, depth, self.rgb_size)
                 if reason == "stale_object_frame":
                     return  # A delayed or duplicate packet cannot invalidate a newer observation.
                 observation = now - (wall - payload["timestamp"]) - payload.get("latency_ms", 0) / 1000 if target else None

@@ -115,23 +115,48 @@ def nearest_face(boxes, size, rgb, depth, np):
             or not image_stamp(rgb) or not image_stamp(depth)
             or abs(image_stamp(rgb) - image_stamp(depth)) > 0.085):
         return None
+    pixels = decode_depth(depth.data, np)
+    if pixels is None:
+        return None
+    candidates = []
+    for box in boxes:
+        x, y, w, h = box
+        distance = patch_distance(pixels[max(0, y + h//3):y + 2*h//3, max(0, x + w//3):x + 2*w//3], np, 8000)
+        if distance is not None:
+            candidates.append((distance, box))
+    return min(candidates) if candidates else None
+
+
+def decode_depth(data, np):
     expected = WIDTH * HEIGHT * 2
     decoder = zlib.decompressobj()
     try:
-        raw = decoder.decompress(bytes(depth.data), expected + 1)
+        raw = decoder.decompress(bytes(data), expected + 1)
     except zlib.error:
         return None
     if len(raw) != expected or not decoder.eof or decoder.unused_data:
         return None
-    pixels = np.frombuffer(raw, dtype="<u2").reshape(HEIGHT, WIDTH)
-    candidates = []
-    for box in boxes:
-        x, y, w, h = box
-        patch = pixels[max(0, y + h//3):y + 2*h//3, max(0, x + w//3):x + 2*w//3]
-        valid = patch[(patch >= 200) & (patch <= 8000)]
-        if valid.size >= max(5, patch.size // 3):
-            candidates.append((float(np.median(valid)), box))
-    return min(candidates) if candidates else None
+    return np.frombuffer(raw, dtype="<u2").reshape(HEIGHT, WIDTH)
+
+
+def patch_distance(patch, np, maximum=20000):
+    valid = patch[(patch >= 200) & (patch <= maximum)]
+    return float(np.median(valid)) if valid.size >= max(5, patch.size // 3) else None
+
+
+def person_distance(obj, depth, size):
+    box = obj.get("bbox")
+    if depth is None or not size or not isinstance(box, list) or len(box) != 4 or not all(map(finite, box)):
+        return None
+    import numpy as np
+
+    x1, y1, x2, y2 = box
+    w, h = size
+    if not (0 <= x1 < x2 <= w and 0 <= y1 < y2 <= h):
+        return None
+    left, right = (round(x * WIDTH / w) for x in (x1 + (x2-x1)*0.3, x1 + (x2-x1)*0.7))
+    top, bottom = (round(y * HEIGHT / h) for y in (y1 + (y2-y1)*0.28, y1 + (y2-y1)*0.65))
+    return patch_distance(depth[top:bottom, left:right], np)
 
 
 def finite(value):
@@ -204,7 +229,7 @@ class FollowPolicy:
         self.utterance = utterance
         return True
 
-    def objects(self, payload, wall, now):
+    def objects(self, payload, wall, now, depth=None, size=None):
         stamp = payload.get("timestamp")
         latency = payload.get("latency_ms", 0)
         if (not finite(stamp) or not finite(latency) or latency < 0
@@ -215,7 +240,7 @@ class FollowPolicy:
         if not isinstance(values, list) or payload.get("error") or payload.get("available") is False:
             return None, "unavailable_object_frame"
         self.object_stamp = stamp
-        points = []
+        candidates = []
         for value in values:
             if not isinstance(value, dict) or str(value.get("name", "")).casefold() != self.label:
                 continue
@@ -223,6 +248,17 @@ class FollowPolicy:
             if (isinstance(point, list) and len(point) == 2
                     and all(finite(x) and -1 <= x <= 1 for x in point)
                     and finite(confidence) and 0.5 <= confidence <= 1):
-                points.append(tuple(point))
-        target = self.tracker.update_points(points, now)
+                candidates.append((tuple(point), value))
+        if self.mode == "person" and candidates:
+            ranked = [(person_distance(value, depth, size), point) for point, value in candidates]
+            if len(ranked) > 1 and any(distance is None for distance, _ in ranked):
+                return None, "waiting_for_person_depth"
+            distance, point = min(ranked) if len(ranked) > 1 else ranked[0]
+            if self.tracker.point is not None and math.dist(self.tracker.point, point) > 0.25:
+                self.tracker.point = None
+            target = self.tracker.update_points([point], now)
+            if target is not None:
+                target["distance_estimate_mm"] = distance
+            return target, "tracking" if target else "waiting_for_person"
+        target = self.tracker.update_points([point for point, _ in candidates], now)
         return target, "tracking" if target else f"waiting_for_{self.mode}"

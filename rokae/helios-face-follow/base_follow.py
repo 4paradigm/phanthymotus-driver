@@ -9,6 +9,7 @@ from tracking import finite
 CHEST_CAMERA = "rokae/helios/chest_rgb"
 START_OFFSET = 0.12
 CENTER_OFFSET = 0.07
+MIN_RATE = 3.5
 MAX_RATE = 8.0
 START_ALLOWANCE = 3.0
 
@@ -99,7 +100,8 @@ class BaseFollower:
             self.halt("centered")
             return
 
-        rate = min(MAX_RATE, max(-MAX_RATE, -14 * x))
+        magnitude = min(MAX_RATE, max(MIN_RATE, 14 * abs(x)))
+        rate = -magnitude if x > 0 else magnitude
         candidate = (target["track_id"], rate > 0)
         try:
             if self.action_id:

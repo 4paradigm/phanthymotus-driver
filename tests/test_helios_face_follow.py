@@ -83,6 +83,24 @@ def test_vop_selects_label_and_rejects_stale_low_confidence_and_duplicate_packet
     assert policy.objects(packet, 2.3, 2.3)[0] is None
 
 
+def test_person_tracks_closest_by_same_camera_depth():
+    policy = tracking.FollowPolicy("person", "person")
+    pixels = np.full((480, 640), 3100, dtype="<u2")
+    pixels[:, 420:600] = 1400
+    objects = [
+        {"name": "person", "position": [-0.1, 0], "confidence": 1, "bbox": [220, 80, 350, 300]},
+        {"name": "person", "position": [0.6, 0], "confidence": 1, "bbox": [450, 80, 575, 300]},
+    ]
+    assert policy.objects(dict(timestamp=1, objects=objects), 1, 1) == (None, "waiting_for_person_depth")
+    target, reason = policy.objects(dict(timestamp=2, objects=objects), 2, 2, pixels, (640, 400))
+    assert reason == "tracking" and target["offset"] == (0.6, 0)
+    assert target["distance_estimate_mm"] == 1400
+    pixels[:, 220:350] = 800
+    closer, reason = policy.objects(dict(timestamp=2.1, objects=objects), 2.1, 2.1, pixels, (640, 400))
+    assert reason == "tracking" and closer["offset"] == (-0.1, 0)
+    assert closer["track_id"] != target["track_id"]
+
+
 def test_canvas_lifecycle_and_object_mode(monkeypatch):
     import json
     import sys
@@ -108,6 +126,7 @@ def test_canvas_lifecycle_and_object_mode(monkeypatch):
     monkeypatch.setattr(driver, "_Detector", unexpected_face_detector)
     calls, subscriptions, publications = [], {}, []
     monkeypatch.setattr(driver, "start_vop", calls.append)
+    monkeypatch.setattr(driver, "start_perception", lambda *_: None)
     clock = NS(monotonic=lambda: 10, time=lambda: 100)
     monkeypatch.setattr(driver, "time", clock)
 
