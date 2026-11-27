@@ -265,6 +265,13 @@ class BootRemote:
                     raise RuntimeError('boot_remote_previous_release_not_fenced')
                 with b.tracker.lock:
                     self._check(token)
+                    token['boot_zero_input'] = True
+                # HOLD disconnects ROS velocity publishers from MPC. Open the
+                # card input only after confirmed chassis hold, and wait for
+                # the actual gate acknowledgement before publishing zero.
+                # The bridge still forwards no motion during this transition.
+                self.stage = 'connect_zero_velocity_input'
+                b.upper_bridge.wait_input_owner('card', lambda: self._check(token))
                 self.stage = 'disable_upper_velocity'
                 b.confirm_control(token, '/enable_vel_control', 'std_srvs/SetBool',
                     {'data': False}, 'success', 'upper_velocity_enabled', False)
@@ -280,9 +287,6 @@ class BootRemote:
                     raise RuntimeError('boot_remote_requires_initialized_base_arm')
                 with b.tracker.lock:
                     self._check(token)
-                self.stage = 'enable_upper_velocity'
-                b.confirm_control(token, '/enable_vel_control', 'std_srvs/SetBool',
-                    {'data': True}, 'success', 'upper_velocity_enabled', True)
                 with b.tracker.lock:
                     self._check(token)
                     b.twist('/cmd_vel')
@@ -304,6 +308,12 @@ class BootRemote:
                 if not (result.get('success') is True and result.get('stationary') is True
                         and result.get('software_estop') is False and result.get('old_task_cancelled') is True):
                     raise RuntimeError('boot_remote_chassis_release_unconfirmed')
+                # Factory MPC suppresses velocity output while chassis status
+                # says soft-stop. Release with verified velocity-disable + zero
+                # first; the bridge still blocks all motion in this transition.
+                self.stage = 'enable_upper_velocity'
+                b.confirm_control(token, '/enable_vel_control', 'std_srvs/SetBool',
+                    {'data': True}, 'success', 'upper_velocity_enabled', True)
                 with b.tracker.lock:
                     self._check(token)
                     if b.state.confirmed_enable() is not True or b.state.read('upper_velocity_enabled')[0] is not True:

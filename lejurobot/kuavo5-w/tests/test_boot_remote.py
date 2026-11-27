@@ -39,6 +39,10 @@ class BootRemoteTests(fixtures.unittest.TestCase):
         self.node.destroy_subscription = lambda subscription: None
         self.bundle.spatial.client = self.client
         self.remote = self.bundle.boot_remote
+        self.input_ready_patch = patch.object(self.bundle.upper_bridge, 'wait_input_owner',
+                                              side_effect=lambda owner, check: check())
+        self.input_ready_patch.start()
+        self.addCleanup(self.input_ready_patch.stop)
         self.read_unavailable = self.remote.attempt.__globals__['NavigationStateUnavailable']
         self.remote.enabled = True
         self.remote.status = {'state': 'waiting'}
@@ -157,6 +161,50 @@ class BootRemoteTests(fixtures.unittest.TestCase):
         self.assertEqual(info['native_failure'], {k: failure[k] for k in
                          ('stage', 'error_code', 'delivery_uncertain')})
         self.assertFalse(self.bundle.state.confirmed_enable())
+
+    def test_boot_zero_reaches_input_only_after_confirmed_hold_and_gate_ack(self):
+        bridge = self.bundle.upper_bridge
+        acknowledged = []
+        original_twist = self.bundle.twist
+        def gate(owner, check):
+            check()
+            self.assertEqual(self.client.calls[-1][0], 'soft_stop')
+            self.assertFalse(self.ros.sent_services)
+            self.assertEqual(owner, 'card')
+            self.assertEqual(bridge.owner(), 'card')
+            self.assertFalse(bridge.allowed())
+            acknowledged.append(True)
+        def zero(*args, **kwargs):
+            self.assertTrue(acknowledged)
+            self.assertEqual(bridge.owner(), 'card')
+            self.assertFalse(bridge.allowed())
+            return original_twist(*args, **kwargs)
+        with patch.object(bridge, 'wait_input_owner', side_effect=gate), \
+                patch.object(self.bundle, 'twist', side_effect=zero):
+            self.remote.attempt()
+        self.assertEqual(self.remote.info()['state'], 'ready', self.remote.info())
+
+    def test_missing_input_gate_ack_never_enables_control_or_releases_chassis(self):
+        with patch.object(self.bundle.upper_bridge, 'wait_input_owner',
+                          side_effect=RuntimeError('upper_bridge_input_owner_unconfirmed')):
+            self.remote.attempt()
+        self.assertEqual(self.remote.info()['stage'], 'connect_zero_velocity_input')
+        self.assertFalse(any(call[2].get('data') is True for call in self.ros.sent_services))
+        self.assertNotIn('remote_ready', [call[0] for call in self.client.calls])
+
+    def test_factory_soft_stop_output_suppression_keeps_velocity_disabled_until_release(self):
+        original = self.client.native
+        def native(operation, **args):
+            if operation == 'remote_ready':
+                self.assertIs(self.bundle.state.read('upper_velocity_enabled')[0], False)
+                self.assertTrue(self.bundle.state.motion_blocked)
+                self.assertFalse(self.bundle.upper_bridge.allowed())
+                self.assertEqual(self.bundle.upper_bridge.owner(), 'card')
+            return original(operation, **args)
+        with patch.object(self.client, 'native', side_effect=native):
+            self.remote.attempt()
+        self.assertEqual(self.remote.info()['state'], 'ready', self.remote.info())
+        self.assertIs(self.bundle.state.read('upper_velocity_enabled')[0], True)
 
     def test_new_boot_reconciles_persisted_boot_preparation_before_enable(self):
         self.bundle.spatial._preparation = {'owner': 'boot_remote_ready', 'delivery_uncertain': True}
@@ -726,6 +774,39 @@ class G12GuardTests(fixtures.unittest.TestCase):
                     subscriptions[0].failed.clear()
                     enable(False);zero();clock[0]+=.31
                     check()
+            close()
+
+    def test_disabled_output_with_required_joy_still_requires_fresh_neutral(self):
+        clock, callbacks = [10.], {}
+        def subscribe(topic, kind, callback, **kwargs):
+            callbacks[topic] = callback
+            return types.SimpleNamespace(unregister=lambda: None)
+        def sleep(_):
+            if clock[0] == 10.:
+                callbacks['/move_base/base_cmd_vel'](types.SimpleNamespace(
+                    linear=types.SimpleNamespace(x=0., y=0., z=0.),
+                    angular=types.SimpleNamespace(x=0., y=0., z=0.),
+                    _connection_header={'callerid': '/nodelet_manager'}))
+                callbacks['/enable_vel_control_state'](types.SimpleNamespace(data=False,
+                    _connection_header={'callerid': '/nodelet_manager'}))
+            callbacks['/joy'](self.message(owner='/sdk'))
+            clock[0] += .05
+        ros = types.SimpleNamespace(Subscriber=subscribe)
+        with patch.dict(sys.modules, {'sensor_msgs.msg': types.SimpleNamespace(Joy=object),
+                                     'geometry_msgs.msg': types.SimpleNamespace(Twist=object),
+                                     'std_msgs.msg': types.SimpleNamespace(Bool=object)}), \
+                patch.object(native.time, 'monotonic', side_effect=lambda: clock[0]), \
+                patch.object(native.time, 'sleep', side_effect=sleep):
+            check, close = native.remote_idle_guard(ros, '/sdk', require_joy=True, allow_disabled_output=True)
+            check()
+            clock[0] += .31
+            with self.assertRaisesRegex(RuntimeError, 'neutral_or_zero_output_unconfirmed'):
+                check()
+            callbacks['/joy'](self.message(owner='/sdk'))
+            check()
+            callbacks['/joy'](self.message(owner='/wrong'))
+            with self.assertRaises(RuntimeError):
+                check()
             close()
 
     def test_missing_disable_feedback_cannot_accept_a_single_zero(self):

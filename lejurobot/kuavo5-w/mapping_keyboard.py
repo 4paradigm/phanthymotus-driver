@@ -315,6 +315,8 @@ class UpperVelocityBridge:
         self.error = None
         self.forwarded = 0
         self.remote_state = 'unavailable'
+        self.input_owner = None
+        self.input_ack_count = 0
         self.return_requested = False
         self.return_thread = None
         self.monitor_thread = None
@@ -401,6 +403,18 @@ class UpperVelocityBridge:
             self.closed.wait(.05)
         raise RuntimeError('upper_bridge_remote_ready_unconfirmed')
 
+    def wait_input_owner(self, expected, check, timeout=5.):
+        initial = self.input_ack_count
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            check()
+            if self.error or self.thread is None or not self.thread.is_alive():
+                raise RuntimeError('upper_velocity_bridge_failed_during_input_handoff')
+            if self.input_ack_count > initial and self.input_owner == expected:
+                return
+            self.closed.wait(.05)
+        raise RuntimeError('upper_bridge_input_owner_unconfirmed')
+
     def allowed(self):
         with self.bundle.tracker.lock:
             active = self.bundle.tracker._active.get('base')
@@ -420,6 +434,9 @@ class UpperVelocityBridge:
                           and not b.state.motion_blocked
                           and b._upper_route_key == (b._stop_epoch,b.ros1.connection))
             if transition is not None and not boot_final:
+                if (transition.get('tool') == 'boot_remote_ready'
+                        and transition.get('boot_zero_input') is True):
+                    return 'card'  # Input only; allowed() still blocks output.
                 return 'card' if transition.get('tool') in ('base_drive','base_servo','remote_control') else 'hold'
             if active:
                 return 'card' if active[1] in ('base_drive','base_servo') else 'hold'
@@ -451,6 +468,8 @@ class UpperVelocityBridge:
                     raise RuntimeError('upper_bridge_lease_failed')
                 if reply.get('forwarded_nonzero'):self.forwarded += 1
                 self.remote_state=reply.get('remote_state','unavailable')
+                self.input_owner=reply.get('input_owner')
+                self.input_ack_count += 1
                 if reply.get('input_owner')==owner:
                     self.ready.set()
                 seq += 1

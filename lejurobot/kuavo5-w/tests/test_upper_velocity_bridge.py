@@ -164,6 +164,33 @@ class BridgeGateTests(unittest.TestCase):
         bundle.state.motion_blocked=False;enabled[0]=False;self.assertEqual(bridge.owner(),'hold')
         enabled[0]=True;bundle.spatial.mapping_active=lambda:True;self.assertEqual(bridge.owner(),'hold')
 
+    def test_boot_zero_input_opens_card_gate_without_forwarding_motion(self):
+        bundle, _ = self.remote_bundle()
+        bridge = UpperVelocityBridge(bundle)
+        bundle.state.motion_blocked = True
+        bundle._upper_route_key = None
+        bundle._transition = {'tool': 'boot_remote_ready'}
+        self.assertEqual(bridge.owner(), 'hold')
+        bundle._transition['boot_zero_input'] = True
+        self.assertEqual(bridge.owner(), 'card')
+        self.assertFalse(bridge.allowed())
+        bundle._transition = {'tool': 'controlled_spatial', 'boot_zero_input': True}
+        self.assertEqual(bridge.owner(), 'hold')
+
+    def test_input_handoff_requires_new_ack_and_checks_cancellation(self):
+        bundle, _ = self.remote_bundle()
+        bridge = UpperVelocityBridge(bundle)
+        bridge.thread = Mock()
+        bridge.thread.is_alive.return_value = True
+        bridge.input_owner = 'card'
+        with self.assertRaisesRegex(RuntimeError, 'input_owner_unconfirmed'):
+            bridge.wait_input_owner('card', lambda: None, timeout=.01)
+        def acknowledge():
+            bridge.input_ack_count += 1
+        bridge.wait_input_owner('card', acknowledge)
+        with self.assertRaisesRegex(RuntimeError, 'cancelled'):
+            bridge.wait_input_owner('card', Mock(side_effect=RuntimeError('cancelled')))
+
     def test_completed_native_navigation_requests_handoff_without_resuming_a_paused_body(self):
         bundle,enabled=self.remote_bundle();bridge=UpperVelocityBridge(bundle)
         bundle.start_motion=Mock(return_value=('id',None))

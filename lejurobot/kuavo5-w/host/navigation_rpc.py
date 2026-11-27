@@ -704,7 +704,7 @@ def remote_idle_guard(rospy, owner, upper_master=None, require_joy=True, allow_d
             # Disabled MPC publishes its final latched zero only once. Require
             # a verified live disable-state connection and a quiet observation
             # window; any nonzero output or enable callback revokes this path.
-            disabled_idle = (allow_disabled_output and not require_joy
+            disabled_idle = (allow_disabled_output
                 and sample.get('disabled') is True and sample.get('quiet') is True
                 and now-max(sample.get('since', now), sample.get('disabled_since', now)) >= .3)
             if ((require_joy and (sample.get('neutral') is not True or now-sample.get('joy_at', 0) > .3))
@@ -943,7 +943,7 @@ def main(request):
                     raise RuntimeError('boot_remote_requires_healthy_auto_nonmapping')
                 guard, close_guard = remote_idle_guard(rospy, args.get('g12_owner'), request.get('upper_master'),
                                                        require_joy=operation == 'remote_ready',
-                                                       allow_disabled_output=operation == 'upper_handoff')
+                                                       allow_disabled_output=True)
                 select_navigation_source(rospy, 'nav_mpc_move_base')
                 guard()
                 current = state()
