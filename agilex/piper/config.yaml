@@ -42,6 +42,15 @@ camera:
   device: ""
   warmup_seconds: 3
   min_contrast: 8
+follow_consistency:
+  enabled: false
+  # Set only after verifying which physical pair shares each bus.
+  # Example for a verified single pair: {left: can0}
+  pairs: {}
+  tolerance_deg: 3
+  persistence_ms: 250
+  stale_ms: 350
+  max_alignment_gap_ms: 80
 ros:
   robot_domain_id: 42
   core_domain_id: 42
