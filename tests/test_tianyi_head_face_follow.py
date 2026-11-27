@@ -90,6 +90,7 @@ def setup(monkeypatch):
     monkeypatch.setattr(sys.modules["head_face_follow"], "_Detector",
                         lambda: NS(detect=detect, cv2=NS(error=DecodeError)))
     started = call("start")
+    assert started["state"] == "ready"
     assert started["armed"] is False
     assert started["topic_in"][0]["topic"] == "/tianyi/camera/head"
     callback = follow._node.subscriptions[0][2]

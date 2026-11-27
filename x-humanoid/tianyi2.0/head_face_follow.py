@@ -360,8 +360,11 @@ class HeadFaceFollowPlugin:
                 self._armed_at, self._last_sample
             ) > FRAME_MAX_AGE:
                 reason = "camera_timeout"
+            state = "idle"
+            if self._node is not None:
+                state = "running" if self._armed else "ready"
             return {
-                "state": "running" if self._node else "idle",
+                "state": state,
                 "armed": self._armed,
                 "mode": self._mode,
                 "speech_topic": self._speaker_topic,

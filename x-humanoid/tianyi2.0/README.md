@@ -918,7 +918,10 @@ health check restarts it.
 
 Add `head_face_follow`, call `start`, configure the mode, and call `arm`
 to enable head motion. `info` reports the selected mode and the reason
-the head is waiting. `stop` releases head control.
+the head is waiting. `stop` releases head control. The built-in face detector
+uses Haar cascades via `cv2.CascadeClassifier`, which was absent in the
+OpenCV 5 wheel tested for this card. The driver keeps its existing
+`opencv-python-headless` dependency on the OpenCV 4 series.
 
 - `set_mode(mode="nearest_face")` measures the median depth of the inner face
   region and follows the closest visible target with a valid measurement.
