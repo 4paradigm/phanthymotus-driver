@@ -292,6 +292,15 @@ class BootRemote:
                 self.stage = 'verify_neutral_zero_and_release_chassis'
                 result = b.spatial.client.native('remote_ready',
                     g12_owner=b.state.snapshot()['controller_boot'].get('g12_owner'))
+                if result.get('success') is False:
+                    code = result.get('error_code')
+                    if (isinstance(code, str) and len(code) <= 160
+                            and code.replace('_', '').isalnum()
+                            and code.startswith(('native_', 'chassis_', 'boot_remote_'))):
+                        self.status['native_failure'] = {
+                            'stage': result.get('stage'), 'error_code': code,
+                            'delivery_uncertain': result.get('delivery_uncertain') is True}
+                        raise RuntimeError(code)
                 if not (result.get('success') is True and result.get('stationary') is True
                         and result.get('software_estop') is False and result.get('old_task_cancelled') is True):
                     raise RuntimeError('boot_remote_chassis_release_unconfirmed')
@@ -316,6 +325,7 @@ class BootRemote:
                     check_remote_ready()
                     self.status = {'state': 'ready', 'controller': 'g12_upper_mpc', 'motion_target_sent': False}
         except Exception as exc:
+            detail = self.status.get('native_failure')
             if writes_attempted:
                 b.pause('boot_remote_preparation_failed', expected_transition=token)
             with b.tracker.lock:
@@ -323,6 +333,8 @@ class BootRemote:
                     b.state.motion_blocked = token['was_blocked']
                 self.status = {'state': 'error', 'stage': self.stage, 'control_writes_attempted': writes_attempted,
                                'error': str(exc)[:200], 'automatic_retry': False}
+                if detail is not None:
+                    self.status['native_failure'] = detail
         finally:
             with b.tracker.lock:
                 b._end_control(token)

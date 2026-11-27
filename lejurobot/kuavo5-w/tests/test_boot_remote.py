@@ -143,6 +143,21 @@ class BootRemoteTests(fixtures.unittest.TestCase):
         self.assertEqual(self.remote.info()['state'], 'skipped')
         self.assertFalse(self.ros.sent_services)
 
+    def test_native_release_failure_preserves_its_stage_and_error_code(self):
+        original = self.client.native
+        failure = {'success': False, 'stage': 'cancel_old_task',
+                   'error_code': 'boot_remote_fresh_neutral_or_zero_output_unconfirmed',
+                   'delivery_uncertain': False}
+        def native(operation, **args):
+            return failure if operation == 'remote_ready' else original(operation, **args)
+        with patch.object(self.client, 'native', side_effect=native):
+            self.remote.attempt()
+        info = self.remote.info()
+        self.assertEqual(info['error'], failure['error_code'])
+        self.assertEqual(info['native_failure'], {k: failure[k] for k in
+                         ('stage', 'error_code', 'delivery_uncertain')})
+        self.assertFalse(self.bundle.state.confirmed_enable())
+
     def test_new_boot_reconciles_persisted_boot_preparation_before_enable(self):
         self.bundle.spatial._preparation = {'owner': 'boot_remote_ready', 'delivery_uncertain': True}
         self.bundle.spatial._persist()
