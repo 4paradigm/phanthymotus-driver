@@ -223,6 +223,8 @@ class PatrolBaselinePlugin:
     driver; tool calls can neither select another file nor rewrite this snapshot.
     """
 
+    PREFIX = NAME
+
     def __init__(self, plugin_config, namespace, executor):
         if not isinstance(plugin_config, dict):
             raise ValueError('patrol_baseline plugin configuration must be an object')

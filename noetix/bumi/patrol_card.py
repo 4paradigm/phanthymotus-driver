@@ -124,6 +124,8 @@ class ROSPatrolInputs:
 
 
 class PatrolPlugin:
+    PREFIX = CARD
+
     def __init__(self, plugin_config, namespace, executor, capture_plugin=None,
                  *, telemetry=None, input_factory=ROSPatrolInputs):
         self._baseline = PatrolBaselinePlugin(plugin_config, namespace, executor)

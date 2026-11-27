@@ -167,6 +167,7 @@ def test_duplicate_points_and_checks_are_rejected(profile):
 def test_plugin_lifecycle_and_operator_path_snapshot(tmp_path, profile):
     path = write_profile(tmp_path, profile)
     card = patrol_module.PatrolBaselinePlugin({'baseline_path': str(path)}, 'test', object())
+    assert card.PREFIX == card.get_tool()['name'] == 'patrol_baseline'
     assert card.dispatch('info', {})['state'] == 'idle'
     assert card.start()['state'] == 'ready'
     assert card.dispatch('info', {})['hardware_command'] is False

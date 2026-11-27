@@ -243,7 +243,7 @@ def test_report_save_failure_cleans_temporary_file_and_can_retry(setup_card, mon
 def test_only_one_patrol_card_and_internal_status_actions_are_declared(setup_card):
     card, telemetry, capture, clock = setup_card
     spec = card.get_tool()
-    assert spec["name"] == "patrol"
+    assert card.PREFIX == spec["name"] == "patrol"
     assert "preflight" in spec["inputSchema"]["x-action-params"]
     assert "inspect" in spec["inputSchema"]["x-action-params"]
     assert "evidence" not in spec["inputSchema"]["properties"]
