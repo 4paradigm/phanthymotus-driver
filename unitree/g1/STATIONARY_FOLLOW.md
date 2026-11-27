@@ -2,6 +2,8 @@
 
 `stationary_follow.py` 包含跟随决策层和 `g1_stationary_follow` Motus 卡片。画布连接 `camera_rgb` → `pose` → `g1_stationary_follow`，第二条线必须使用 `pose` 的 `sensor/pose2d`（`poses/skeleton`）输出。卡片把判断与运动接口结果发布为 `data/json`，也可通过 `info` 查看。
 
+下视相机只露出腿部时，仍使用 `pose` 给出的人物 ID 和骨架：左右膝或脚踝关键点置信度均达到 0.3 时，以两侧腿部的水平中心控制原地转向；否则回退到同一人物的 bbox。缺少人物 ID 的帧被拒绝，避免把无 ID 的不同人当作同一目标。`pose` 识别失败时不使用仅凭深度几何形状猜人的方案。
+
 运行离线检查：
 
 ```sh

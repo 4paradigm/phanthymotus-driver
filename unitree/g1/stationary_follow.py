@@ -18,12 +18,32 @@ def pose2d_to_follow_frame(payload, received_at):
     for person in persons:
         if not isinstance(person, dict):
             raise ValueError("invalid_person")
+        person_id = person.get("id")
+        if not isinstance(person_id, (int, str)) or isinstance(person_id, bool) or person_id == "":
+            raise ValueError("missing_person_id")
+        points = person.get("keypoints")
+        leg_center = None
+        if isinstance(points, list) and len(points) >= 17:
+            def side_x(indices):
+                xs = []
+                for index in indices:
+                    point = points[index]
+                    if (isinstance(point, list) and len(point) >= 3 and
+                            isinstance(point[0], (int, float)) and math.isfinite(point[0]) and
+                            isinstance(point[2], (int, float)) and math.isfinite(point[2]) and
+                            point[2] >= .3):
+                        xs.append(point[0])
+                return sum(xs) / len(xs) if xs else None
+            left, right = side_x((13, 15)), side_x((14, 16))
+            if left is not None and right is not None:
+                leg_center = (left + right) / 2
         box = person.get("bbox")
-        if isinstance(box, list) and len(box) == 4 and all(
+        if leg_center is not None:
+            center = leg_center
+        elif isinstance(box, list) and len(box) == 4 and all(
                 isinstance(v, (int, float)) and math.isfinite(v) for v in box):
             center = (box[0] + box[2]) / 2
         else:
-            points = person.get("keypoints")
             if not isinstance(points, list):
                 raise ValueError("missing_person_position")
             xs = [p[0] for p in points if isinstance(p, list) and len(p) >= 2
@@ -35,7 +55,7 @@ def pose2d_to_follow_frame(payload, received_at):
         x = 2 * center / size[0] - 1
         if not -1 <= x <= 1:
             raise ValueError("position_out_of_range")
-        converted.append({"id": person.get("id", 0), "position": [x, 0]})
+        converted.append({"id": person_id, "position": [x, 0]})
     return {"timestamp": received_at, "persons": converted}
 
 

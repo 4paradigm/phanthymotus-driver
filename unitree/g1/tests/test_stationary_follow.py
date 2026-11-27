@@ -20,10 +20,24 @@ class TestMotusFollow(unittest.TestCase):
 
     def test_pose2d_keypoints_fallback_and_invalid_input(self):
         out = pose2d_to_follow_frame({"image_size": [100, 100],
-            "persons": [{"keypoints": [[10, 20, 1], [30, 20, 1]]}]}, 1.0)
+            "persons": [{"id": 4, "keypoints": [[10, 20, 1], [30, 20, 1]]}]}, 1.0)
         self.assertEqual(out["persons"][0]["position"][0], -.6)
         with self.assertRaises(ValueError):
             pose2d_to_follow_frame({"persons": [{}]}, 1.0)
+
+    def test_lower_leg_keypoints_take_priority_and_preserve_person_id(self):
+        points = [[0, 0, 0] for _ in range(17)]
+        points[13] = [70, 60, .9]
+        points[14] = [90, 60, .9]
+        points[15] = [72, 85, .8]
+        points[16] = [88, 85, .8]
+        out = pose2d_to_follow_frame({"image_size": [100, 100],
+            "persons": [{"id": 12, "bbox": [0, 0, 30, 90], "keypoints": points}]}, 2.0)
+        self.assertEqual(out["persons"][0]["id"], 12)
+        self.assertAlmostEqual(out["persons"][0]["position"][0], .6)
+        with self.assertRaisesRegex(ValueError, "missing_person_id"):
+            pose2d_to_follow_frame({"image_size": [100, 100],
+                "persons": [{"bbox": [10, 0, 30, 40]}]}, 2.0)
 
     def test_registered_card_requires_pose_input(self):
         plugin = StationaryFollowPlugin({}, "g1", object())
@@ -69,7 +83,7 @@ class TestMotusFollow(unittest.TestCase):
             self.assertEqual(plugin.dispatch("start", {"input_topic": "/pose"})["state"], "running")
             self.assertEqual(subscriptions[0][0], "/pose")
             subscriptions[0][1](SimpleNamespace(data=json.dumps({"image_size": [100, 100],
-                "persons": [{"bbox": [65, 0, 85, 90]}]})))
+                "persons": [{"id": 8, "bbox": [65, 0, 85, 90]}]})))
             info = plugin.dispatch("info", {})
             self.assertEqual(info["last_decision"]["command"], "move")
             self.assertEqual(info["topic_out"][0]["format"], "data/json")
