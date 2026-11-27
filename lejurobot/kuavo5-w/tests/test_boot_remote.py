@@ -143,6 +143,49 @@ class BootRemoteTests(fixtures.unittest.TestCase):
         self.assertEqual(self.remote.info()['state'], 'skipped')
         self.assertFalse(self.ros.sent_services)
 
+    def test_new_boot_reconciles_persisted_boot_preparation_before_enable(self):
+        self.bundle.spatial._preparation = {'owner': 'boot_remote_ready', 'delivery_uncertain': True}
+        self.bundle.spatial._persist()
+        original = self.client.native
+        def native(operation, **args):
+            result = original(operation, **args)
+            if operation == 'soft_stop':
+                self.assertFalse(self.ros.sent_services)
+                result['older_release_fenced'] = True
+            return result
+        with patch.object(self.client, 'native', side_effect=native):
+            self.assertTrue(self.remote.attempt())
+        self.assertEqual(self.remote.info()['state'], 'ready', self.remote.info())
+        self.assertIsNone(self.bundle.spatial._preparation)
+        self.assertIsNone(self.bundle.spatial.store.state('pending')['chassis_preparation'])
+
+    def test_old_boot_preparation_without_release_fence_never_enables(self):
+        self.bundle.spatial._preparation = {'owner': 'boot_remote_ready', 'delivery_uncertain': True}
+        self.remote.attempt()
+        self.assertEqual(self.remote.info()['error'], 'boot_remote_previous_release_not_fenced')
+        self.assertFalse(any(call[2].get('data') is True for call in self.ros.sent_services))
+
+    def test_boot_preparation_does_not_override_other_unresolved_operations(self):
+        spatial = self.bundle.spatial
+        for field, value in (('_task', {'action_id': 'old'}), ('_uncertain', True),
+                             ('_map_pending', {'operation': 'load_map'}), ('_keyboard_pending', True)):
+            with self.subTest(field=field):
+                spatial._preparation = {'owner': 'boot_remote_ready', 'delivery_uncertain': True}
+                original = getattr(spatial, field)
+                setattr(spatial, field, value)
+                self.assertTrue(self.remote._unresolved_blocks_boot())
+                setattr(spatial, field, original)
+        spatial._preparation = {'owner': 'mode_transition', 'delivery_uncertain': True}
+        self.assertTrue(self.remote._unresolved_blocks_boot())
+
+    def test_consumed_boot_permit_does_not_replay_to_clear_preparation(self):
+        self.bundle.spatial.store.claim_boot_remote(self.boot['boot_id'])
+        self.bundle.spatial._preparation = {'owner': 'boot_remote_ready', 'delivery_uncertain': True}
+        self.remote.attempt()
+        self.assertEqual(self.remote.info()['reason'], 'boot_permit_already_consumed')
+        self.assertFalse(self.client.calls)
+        self.assertFalse(self.ros.sent_services)
+
     def test_transient_chassis_read_failure_retries_before_control_writes(self):
         original = self.client.observe
         calls = []

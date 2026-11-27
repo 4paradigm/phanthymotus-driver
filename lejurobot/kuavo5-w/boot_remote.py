@@ -107,6 +107,17 @@ class BootRemote:
             return 'waiting_for_verified_neutral_g12'
         return None
 
+    def _unresolved_blocks_boot(self):
+        spatial = self.bundle.spatial
+        if not spatial.unresolved():
+            return False
+        # A previous boot handoff can be fenced by this boot's native stop.
+        # Never treat navigation, mapping, keyboard or mode writes this way.
+        preparation = spatial._preparation
+        return not (preparation is not None and preparation.get('owner') == 'boot_remote_ready'
+                    and spatial._task is None and not spatial._uncertain
+                    and spatial._map_pending is None and not spatial._keyboard_pending)
+
     def _await_prewrite(self, token):
         b = self.bundle
         while True:
@@ -154,7 +165,7 @@ class BootRemote:
             if (not self.cancelled and not self.closed.is_set()
                     and type(age) in (int, float) and 0 <= age <= self.WINDOW_S
                     and (self.deadline is None or time.monotonic() <= self.deadline)
-                    and b._transition is None and not b.spatial.unresolved()
+                    and b._transition is None and not self._unresolved_blocks_boot()
                     and not b.spatial.mapping_active() and not b.tracker._active):
                 stage = self._readiness(boot)
                 if stage:
@@ -169,7 +180,7 @@ class BootRemote:
             if (self.cancelled or self.closed.is_set() or type(age) not in (int, float)
                     or not 0 <= age <= self.WINDOW_S or boot['age_s'] > 1.
                     or (self.deadline is not None and time.monotonic() > self.deadline)
-                    or b._transition is not None or b.spatial.unresolved()
+                    or b._transition is not None or self._unresolved_blocks_boot()
                     or b.spatial.mapping_active() or b.tracker._active):
                 self.status = {'state': 'skipped', 'reason': 'boot_window_expired_or_control_already_used'}
                 return True
@@ -242,12 +253,16 @@ class BootRemote:
                     self._check(token)
                     writes_attempted = True
                     self.stage = 'hold_and_cancel_old_chassis_task'
-                    b.spatial._preparation = {'delivery_uncertain': True, 'owner': 'boot_remote_ready'}
+                    previous_preparation = b.spatial._preparation
+                    b.spatial._preparation = {'delivery_uncertain': True, 'owner': 'boot_remote_ready',
+                                              'boot_id': identity}
                     b.spatial._persist()
                 held = b.spatial.client.native('soft_stop')
                 if not (held.get('success') is True and held.get('stationary') is True
                         and held.get('software_estop') is True):
                     raise RuntimeError('boot_remote_chassis_hold_unconfirmed')
+                if previous_preparation is not None and held.get('older_release_fenced') is not True:
+                    raise RuntimeError('boot_remote_previous_release_not_fenced')
                 with b.tracker.lock:
                     self._check(token)
                 self.stage = 'disable_upper_velocity'
