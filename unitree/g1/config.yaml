@@ -31,6 +31,8 @@ plugins:
       overspeed_hold_s: 0.2
       position_jump_slack_m: 0.1
       angle_jump_slack_deg: 10
+  stationary_follow:
+    enabled: true  # Canvas start required; bounded in-place turning via SmartMotion
   arm:
     enabled: true
   # 双臂 + 双夹爪的连续控制（motus.control/1，16 维）。给执行模型用。
