@@ -457,7 +457,7 @@ class DriverContractTests(unittest.TestCase):
                 continue
             schema = tool["inputSchema"]
             lifecycle = {"start", "stop", "info"}
-            advertised = set(schema['x-action-params']) | set(schema.get('x-workbench', {}).get('actions', []))
+            advertised = set(schema['x-action-params'])
             self.assertEqual(set(schema["properties"]["action"]["enum"]) - lifecycle,
                              advertised - lifecycle)
             self.assertTrue(all(set(a["params"]) <= set(schema["properties"])

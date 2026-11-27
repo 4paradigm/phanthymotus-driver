@@ -211,11 +211,7 @@ class ControlledSpatialPlugin:
             'keyboard_release': (['session_id'], '释放指定键盘会话并确认底盘停止'),
             'keyboard_status': ([], '读取键盘会话、控制权和停止确认状态'),
         }
-        actions = {**self.ACTIONS, **keyboard_actions}
-        props = {'action': {'type': 'string', 'enum': list(actions)},
-                 'session_id': {'type': 'string'}, 'seq': {'type': 'integer', 'minimum': 0},
-                 'values': {'type': 'array', 'items': {'type': 'number'}, 'minItems': 2, 'maxItems': 2,
-                            'description': '≤0.15 m/s、0.3 rad/s；面板内部使用[vx,vw]，无侧移'},
+        props = {'action': {'type': 'string', 'enum': list(self.ACTIONS)},
                  **{k: {'type': 'string'} for k in ('map_name', 'name', 'description', 'tag_name')},
                  **{k: {'type': 'number', 'description': 'map坐标系位置，米'} for k in ('x', 'y')},
                  'confirm_delete': {'type': 'boolean', 'description': '确认永久删除地图及关联点位'},
@@ -227,8 +223,6 @@ class ControlledSpatialPlugin:
         required = {'start_mapping': ['map_name'], 'tag_place': ['name'], 'untag_place': ['name'],
                     'load_map': ['map_name'], 'delete_map': ['map_name', 'confirm_delete'],
                     'reconcile_mapping': ['map_name', 'confirm_abandon'],
-                    'keyboard_command': ['session_id', 'seq', 'values'],
-                    'keyboard_release': ['session_id'],
                     'navigate_to_pose': ['x', 'y', 'yaw'],
                     'navigate_to_tag': ['tag_name']}
         return {'name': self.PREFIX, 'type': 'actuator', 'multiInstance': False,

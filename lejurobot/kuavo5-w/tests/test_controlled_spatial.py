@@ -337,7 +337,7 @@ class SpatialTests(unittest.TestCase):
         self.assertEqual(schema['x-resource'], 'base')
         self.assertEqual(schema['x-hooks']['on_interrupt_motion'], {'action': 'stop_nav'})
         self.assertEqual(set(schema['properties']['action']['enum']),
-                         set(schema['x-action-params']) | (set(schema['x-workbench']['actions']) - {'info', 'stop'}))
+                         set(schema['x-action-params']))
         self.assertIn('load_map', schema['x-completion']['actions'])
         self.assertEqual(self.call('start')['state'], 'running')
         self.assertEqual(self.call('stop')['state'], 'idle')

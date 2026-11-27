@@ -157,8 +157,10 @@ class MappingKeyboardTests(unittest.TestCase):
         for action, params in {'keyboard_open': [], 'keyboard_command': ['session_id', 'seq', 'values'],
                                'keyboard_release': ['session_id'], 'keyboard_status': []}.items():
             self.assertNotIn(action, schema['x-action-params'])
+            self.assertNotIn(action, schema['properties']['action']['enum'])
             self.assertIn(action, schema['x-workbench']['actions'])
-            self.assertTrue(set(params) <= set(schema['properties']))
+        for field in ('session_id', 'seq', 'values'):
+            self.assertNotIn(field, schema['properties'])
 
     def test_stopped_or_reconnected_panel_cannot_reopen_an_old_grant(self):
         self.bundle._stop_epoch += 1
