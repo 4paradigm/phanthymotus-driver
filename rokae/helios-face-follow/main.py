@@ -200,7 +200,8 @@ class HeliosFaceFollow:
     def emit(self, target, reason, observation_time=None):
         self.reason, self.result = reason, target
         self.target_sample += 1
-        self.motion_target_until = 0.0 if observation_time is None else observation_time + SAMPLE_AGE
+        target_age = MAX_AGE if self.base is not None else SAMPLE_AGE
+        self.motion_target_until = 0.0 if observation_time is None else observation_time + target_age
         if target is not None:
             self.last_target = time.monotonic()
         self.publish()
@@ -285,6 +286,8 @@ class HeliosFaceFollow:
                 payload = self.parse(message)
                 wall = time.time()
                 target, reason = self.policy.objects(payload, wall, now)
+                if reason == "stale_object_frame":
+                    return  # A delayed or duplicate packet cannot invalidate a newer observation.
                 observation = now - (wall - payload["timestamp"]) - payload.get("latency_ms", 0) / 1000 if target else None
                 self.emit(target, reason, observation)
 

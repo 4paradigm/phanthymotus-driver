@@ -240,17 +240,37 @@ def test_base_turns_in_place_with_fresh_targets_and_respects_existing_motion(mon
     base.step(target, 7, 10.3)
     base.step(target, 8, 10.3)
     assert drive.calls[-1] == (15782, "base_drive", "move",
-                                {"vx": 0.0, "vy": 0.0, "vyaw": -6.0, "duration_s": 0.2})
+                                {"vx": 0.0, "vy": 0.0, "vyaw": -8.0, "duration_s": 1.2})
     assert base.state == "controlling"
-    base.step(None, 9, 10.3)
+    clock.now = 11.8  # The first segment may still be waking the chassis.
+    base.step(target, 9, 12.0)
+    assert base.state == "controlling"
+    drive.active = None  # A completed segment is followed by another if still off center.
+    closer = {"track_id": 1, "offset": (0.25, -0.5)}
+    base.step(closer, 10, 12.0)
+    assert base.state == "settling"
+    base.step(closer, 11, 12.0)
+    base.step(closer, 12, 12.0)
+    assert drive.calls[-1][3]["vyaw"] == -3.5
+    centered = {"track_id": 1, "offset": (0.06, -0.5)}
+    base.step(centered, 13, 12.0)
+    assert drive.calls[-1][2] == "stop_move" and base.state == "centered"
+    calls = len(drive.calls)
+    jitter = {"track_id": 1, "offset": (0.09, -0.5)}
+    base.step(jitter, 14, 12.0)
+    assert len(drive.calls) == calls and base.state == "centered"
+
+    base.step(target, 15, 12.0)
+    base.step(target, 16, 12.0)
+    base.step(None, 17, 12.0)
     assert drive.calls[-1][2] == "stop_move" and base.state == "waiting_for_target"
 
     other_side = {"track_id": 1, "offset": (-0.4, 0)}
-    base.step(other_side, 10, 10.3)
-    base.step(other_side, 11, 10.3)
-    assert drive.calls[-1][3]["vyaw"] == 4.0
-    clock.now = 10.81
-    base.step(other_side, 12, 11.1)
+    base.step(other_side, 18, 12.0)
+    base.step(other_side, 19, 12.0)
+    assert drive.calls[-1][3]["vyaw"] == 14 * 0.4
+    clock.now = 15.6
+    base.step(other_side, 20, 15.9)
     assert drive.calls[-1][2] == "stop_move" and base.state == "fault" and base.error
 
 

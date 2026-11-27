@@ -7,10 +7,10 @@ import time
 from tracking import finite
 
 CHEST_CAMERA = "rokae/helios/chest_rgb"
-DEADBAND = 0.10
-MAX_RATE = 6.0
-PULSE_SECONDS = 0.20
-STOP_AFTER = 0.80
+START_OFFSET = 0.12
+CENTER_OFFSET = 0.07
+MAX_RATE = 8.0
+START_ALLOWANCE = 3.0
 
 
 def _call(port, tool, action, **args):
@@ -90,15 +90,16 @@ class BaseFollower:
         if not self.camera_ok:
             self.halt("waiting_for_chest_rgb")
             return
-        if target is None:
+        if target is None or self.clock() >= valid_until:
             self.halt("waiting_for_target")
             return
         x = target["offset"][0]
-        if abs(x) <= DEADBAND:
+        threshold = START_OFFSET if self.state == "centered" else CENTER_OFFSET
+        if abs(x) <= threshold:
             self.halt("centered")
             return
 
-        rate = min(MAX_RATE, max(-MAX_RATE, -10 * x))
+        rate = min(MAX_RATE, max(-MAX_RATE, -14 * x))
         candidate = (target["track_id"], rate > 0)
         try:
             if self.action_id:
@@ -107,6 +108,8 @@ class BaseFollower:
                         self.error = "base turn did not finish within the supervision window"
                 elif candidate != self.candidate or not self._navigation_idle():
                     self.halt("waiting_for_target")
+                elif abs(self.yaw_rate) > abs(rate) + 2:
+                    self.halt("settling")
                 else:
                     info = self._base("info")
                     if "active_move" not in info:
@@ -150,12 +153,15 @@ class BaseFollower:
             if now >= valid_until:
                 self.halt("waiting_for_target")
                 return
-            reply = self._base("move", vx=0.0, vy=0.0, vyaw=rate, duration_s=PULSE_SECONDS)
+            duration = min(1.2, max(0.35, 1.8 * abs(x)))
+            reply = self._base("move", vx=0.0, vy=0.0, vyaw=rate, duration_s=duration)
             action_id = reply.get("action_id")
             if reply.get("state") != "running" or not isinstance(action_id, str) or not action_id:
                 raise ValueError("base did not return a timed turn ID")
             self.action_id, self.yaw_rate = action_id, rate
-            self.stop_at = now + STOP_AFTER
+            # The installed SDK starts timing duration after the wheels wake.
+            # This deadline only applies while fresh observations keep arriving.
+            self.stop_at = now + START_ALLOWANCE + duration
             self.state = "controlling"
             if self.clock() >= valid_until:
                 self.halt("waiting_for_target")
