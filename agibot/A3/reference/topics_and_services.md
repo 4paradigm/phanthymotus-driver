@@ -50,7 +50,7 @@ copied from HDU `/agibot/software/v0/entry/cfg/`):
 | MappingService@ADU:50807 | StartMapping / StopMapping | `controlled_spatial` (`start_mapping`/`stop_save`/`stop_discard`) | StopMapping with `map_name` = SAVING_MAP |
 | MappingService@ADU:50807 | Get2DWholeMap | `controlled_spatial` (`get_map`) / `spatial_map` | resolution/origin/occupancy grid; `spatial_map` republishes it as a `sensor/mapping` point cloud |
 | MappingService@ADU:50807 | GetStoredMapNames / GetCurrentWorkingMap / RenameMap | `controlled_spatial` (`list_maps`/`current_map`/`rename_map`) | |
-| LocalizationService@ADU:50807 | GetTopoMsgs | — | not exposed as a card (the 2D grid covers it) |
+| LocalizationService@ADU:50807 | GetTopoMsgs | `controlled_spatial` (`list_waypoints`, `navi_to_waypoint`, `tag_place`) | List native waypoints and resolve their names to IDs. `tag_place` checks native names before saving a driver waypoint. |
 | PncService@ADU:53176 | ActionNaviToPose / ActionNaviToPoint / … | `controlled_spatial` (`navi_to_goal`/`navi_to_pose`/`linear_to_goal`/`linear_to_pose`/`move_forward`/`spin_turn`) | `task_id=0` auto-assigns; driver remembers the assigned id |
 | PncService@ADU:53176 | ActionGetState | `controlled_spatial` (`nav_state`) | |
 | PncService@ADU:53176 | ActionCancelTask / ActionEmergencyStop / … | `controlled_spatial` (`cancel`/`pause`/`resume`) | |
@@ -72,6 +72,7 @@ copied from HDU `/agibot/software/v0/entry/cfg/`):
 | `/motion/control/arm_joint_state` | sensor_msgs/JointState | `joints` (`arm`) | mirrored to core as JSON |
 | `/motion/control/hand_joint_state` | sensor_msgs/JointState | `joints` (`hand`) | frame_id carries hand type |
 | `/motion/control/neck_joint_state` | sensor_msgs/JointState | `joints` (`neck`) | |
+| `/slam/localization/odometry` | `nav_msgs/Odometry` | `controlled_spatial` (`tag_place`) | Records a fresh robot pose in the map frame |
 | `/hal/neck_middle_livox_lidar/pointcloud` | sensor_msgs/PointCloud2 | `lidar_cloud` | neck Livox |
 | `/ros2/body_drive/pelvis_imu/data` | sensor_msgs/Imu | `imu` | pelvis IMU |
 | `/ros2/body_drive/torso_imu/data` | sensor_msgs/Imu | `imu` | torso IMU (merged into one card) |
@@ -129,3 +130,29 @@ and §7.1.4/§7.1.6/§7.1.7 topic tables — AgiBot publishes no A3 URDF downloa
 (unlike X2's `X2_URDF` zip). Joint tree + limits only; no visual/collision
 meshes. Note the `/motion/control/arm_joint_command` limits enforced in
 `device.py` `ARM_JOINT_LIMITS` are stricter than §1.3 for some joints.
+
+### Recording a waypoint
+
+Use `set_current_map` to select the saved map. Call `start_global_relocalization`
+and wait for `localization_status` to return `ready` with the expected map ID.
+`relocalization_state` queries the SLAM task, and `stop_global_relocalization`
+cancels a global attempt. For manual localization, use `start_relocalization`
+with the map directory and `stop_relocalization` with all of `x`, `y` and
+`angle` (optionally `z`) to submit the initial pose. Omit the pose to cancel.
+
+Call `controlled_spatial` with
+`{"action":"tag_place","waypoint_name":"Entrance"}` to save the next fresh map-frame
+sample from `/slam/localization/odometry`. The driver reads the current map before
+capturing and again before saving. A duplicate name on the same map is rejected.
+On deployed A3 systems the host Jazzy relay subscribes to the localization topic
+using the vendor DDS profile and discovery servers set in the driver service
+fragment. Its messages retain the original frame and timestamp.
+
+`list_waypoints` returns native and recorded points for the selected map. Recorded
+points have `source: recorded`, `point_id: null`, a persistent `waypoint_id`,
+and a saved map-frame pose. Use `rename_waypoint`, `update_waypoint`, or
+`delete_waypoint` to maintain recorded points by name. They
+persist in `/opt/phanthy-motus/data/a3/waypoints.sqlite3` on the mounted host data
+directory. `navi_to_waypoint` uses pose navigation for recorded points and the
+vendor point ID for native points. Navigation requires current map localization
+and reports device task completion or failure through ACP.

@@ -14,6 +14,7 @@ import array
 import json
 import math
 import os
+import sqlite3
 import struct
 import sys
 import tempfile
@@ -146,6 +147,8 @@ def _install_ros_stubs():
     module("sensor_msgs")
     module("sensor_msgs.msg", Image=FakeMsg, CompressedImage=FakeMsg, Imu=FakeMsg,
            JointState=FakeMsg, PointCloud2=FakeMsg)
+    module("nav_msgs")
+    module("nav_msgs.msg", Odometry=FakeMsg)
     module("std_msgs")
     # UInt8MultiArray carries the spatial_map sensor/mapping binary payload.
     module("std_msgs.msg", String=FakeMsg, UInt8MultiArray=FakeMsg)
@@ -1885,6 +1888,14 @@ class RpcDispatchTests(unittest.TestCase):
 
     # -- ADU controlled_spatial (mapping + navigation + relocalization + map query) --
 
+    def _localized_spatial(self, map_id):
+        self.transport.responses["MappingService/GetCurrentWorkingMap"] = {"data": {"map_id": str(map_id)}}
+        # A dedicated odometry test covers the real subscription and freshness.
+        patcher = patch.object(self.nodes, "wait_for_localization", return_value={})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return find_plugin(self.plugins, "controlled_spatial")
+
     def test_controlled_spatial_mapping_start_and_save(self):
         spatial = find_plugin(self.plugins, "controlled_spatial")
         spatial.dispatch("start_mapping", {})
@@ -1896,8 +1907,165 @@ class RpcDispatchTests(unittest.TestCase):
         self.assertEqual(save_body["command"], "MappingCommand_SAVING_MAP")
         self.assertEqual(save_body["map_name"], "lobby")
 
-    def test_controlled_spatial_navi_to_pose_payload(self):
+    def test_controlled_spatial_lists_waypoints(self):
+        bundle = DriverBundle(self.plugins)
+        pose = {"position": {"x": 11.6, "y": -2.45, "z": 0}}
+        self.transport.responses["MappingService/GetCurrentWorkingMap"] = {"data": {"map_id": "1764059676131"}}
+        self.transport.responses["LocalizationService/GetTopoMsgs"] = {"data": {"points": [
+            {"point_id": "1", "name": "展厅入口", "pose": pose, "pixel_pose": {"angle": 0}},
+        ]}}
+        result = bundle.dispatch("controlled_spatial", {"action": "list_waypoints"})
+        self.assertEqual(result, {"map_id": 1764059676131, "waypoints": [
+            {"point_id": 1, "name": "展厅入口", "pose": pose},
+        ]})
+        (url, body), = self.transport.calls_to("LocalizationService", "GetTopoMsgs")
+        self.assertIn("10.42.10.11:50807", url)
+        self.assertEqual(body, {"command": "TopoCommand_GET_TOPO_MSG", "map_id": 1764059676131})
+        self.assertEqual(self.transport.calls_to("MotionControlActionService", "GetAction"), [])
+
+    def test_controlled_spatial_lists_empty_map_and_reports_missing_current_map(self):
         spatial = find_plugin(self.plugins, "controlled_spatial")
+        self.transport.responses["LocalizationService/GetTopoMsgs"] = {"data": {"paths": [], "regions": []}}
+        self.assertEqual(spatial.dispatch("list_waypoints", {"map_id": 3}), {"map_id": 3, "waypoints": []})
+        self.assertEqual(self.transport.calls_to("MappingService", "GetCurrentWorkingMap"), [])
+
+        with self.assertRaisesRegex(ValueError, "没有当前工作地图"):
+            spatial.dispatch("list_waypoints", {})
+        self.assertEqual(len(self.transport.calls_to("LocalizationService", "GetTopoMsgs")), 1)
+
+    def test_controlled_spatial_navigates_to_exact_waypoint_name_with_acp_completion(self):
+        spatial = self._localized_spatial(3)
+        spatial._NAV_POLL_INTERVAL_S = 0.01
+        self.transport.responses["MappingService/GetCurrentWorkingMap"] = {"data": {"map_id": "3"}}
+        self.transport.responses["LocalizationService/GetTopoMsgs"] = {"data": {"points": [
+            {"point_id": 10, "name": "展厅入口旁"}, {"point_id": 1, "name": "展厅入口"},
+        ]}}
+        self.transport.responses["PncService/PlanningNaviToGoal"] = {"task_id": 7}
+        self.transport.responses["PncService/ActionGetState"] = {"data": {"state": "finished"}}
+        finished = threading.Event()
+        with patch.object(device, "_acp_notify", side_effect=lambda *_: finished.set()) as notify:
+            result = DriverBundle(self.plugins).dispatch(
+                "controlled_spatial", {"action": "navi_to_waypoint", "waypoint_name": "展厅入口"})
+            self.assertTrue(finished.wait(timeout=2))
+
+        (_, body), = self.transport.calls_to("PncService", "PlanningNaviToGoal")
+        self.assertEqual(body, {"task_id": 0, "map_id": 3, "target_id": 1,
+                                "guide_line_id": 0, "ackerman_mode": False})
+        self.assertEqual(result["state"], "navigating")
+        self.assertEqual(result["task_id"], 7)
+        self.assertEqual(notify.call_args.args[:2], (result["action_id"], "completed"))
+
+    def test_controlled_spatial_rejects_native_waypoint_on_different_map(self):
+        spatial = find_plugin(self.plugins, "controlled_spatial")
+        self.transport.responses["MappingService/GetCurrentWorkingMap"] = {"data": {"map_id": "4"}}
+        self.transport.responses["LocalizationService/GetTopoMsgs"] = {"data": {"points": [
+            {"point_id": 1, "name": "展厅入口"},
+        ]}}
+
+        with patch.object(spatial, "_nav_worker"):
+            with self.assertRaisesRegex(ValueError, "请切换"):
+                spatial.dispatch("navi_to_waypoint", {"map_id": 3, "waypoint_name": "展厅入口"})
+        self.assertEqual(self.transport.calls_to("PncService", "PlanningNaviToGoal"), [])
+
+    def test_controlled_spatial_rejects_missing_and_ambiguous_waypoint_names(self):
+        spatial = find_plugin(self.plugins, "controlled_spatial")
+        self.transport.responses["LocalizationService/GetTopoMsgs"] = {"data": {"points": [
+            {"point_id": 1, "name": "展厅入口"}, {"point_id": 2, "name": "展厅入口"},
+        ]}}
+        for name, error in [("  ", "需要 waypoint_name"), ("展厅", "没有名为"), ("展厅入口", "有多个名为")]:
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, error):
+                spatial.dispatch("navi_to_waypoint", {"map_id": 3, "waypoint_name": name})
+        self.assertEqual(self.transport.calls_to("PncService", "PlanningNaviToGoal"), [])
+
+    def test_controlled_spatial_navi_to_goal_still_accepts_target_id(self):
+        spatial = self._localized_spatial(3)
+        with patch.object(spatial, "_nav_worker"):
+            spatial.dispatch("navi_to_goal", {"map_id": 3, "target_id": 0})
+        (_, body), = self.transport.calls_to("PncService", "PlanningNaviToGoal")
+        self.assertEqual(body["target_id"], 0)
+        self.assertEqual(self.transport.calls_to("LocalizationService", "GetTopoMsgs"), [])
+
+    def test_controlled_spatial_records_waypoints_by_map_and_navigates_after_restart(self):
+        spatial = find_plugin(self.plugins, "controlled_spatial")
+        pose = {"position": {"x": 1.25, "y": -0.5}, "angle": 0.4}
+        self.transport.responses["MappingService/GetCurrentWorkingMap"] = {"data": {"map_id": "3"}}
+        with tempfile.TemporaryDirectory() as folder:
+            spatial.waypoint_db = Path(folder) / "waypoints.sqlite3"
+            bundle = DriverBundle(self.plugins)
+            with patch.object(self.nodes, "wait_for_localization", return_value=pose):
+                saved = bundle.dispatch("controlled_spatial", {"action": "tag_place", "waypoint_name": "展厅入口"})
+                with self.assertRaisesRegex(ValueError, "已有同名点位"):
+                    bundle.dispatch("controlled_spatial", {"action": "tag_place", "waypoint_name": "展厅入口"})
+            waypoint_id = saved.pop("waypoint_id")
+            self.assertEqual(saved, {"map_id": 3, "name": "展厅入口", "source": "recorded", "pose": pose})
+
+            reloaded = device.ControlledSpatialPlugin(self.nodes)
+            reloaded.waypoint_db = spatial.waypoint_db
+            self.assertEqual(reloaded.dispatch("list_waypoints", {"map_id": 4})["waypoints"], [])
+            self.assertEqual(reloaded.dispatch("list_waypoints", {})["waypoints"], [
+                {"point_id": None, "waypoint_id": waypoint_id, "name": "展厅入口",
+                 "source": "recorded", "pose": pose},
+            ])
+            args = {"map_id": 3, "waypoint_name": "展厅入口"}
+            self.transport.responses["MappingService/GetCurrentWorkingMap"] = {"data": {"map_id": "4"}}
+            with self.assertRaisesRegex(ValueError, "请切换"):
+                reloaded.dispatch("navi_to_waypoint", args)
+            self.assertEqual(self.transport.calls_to("PncService", "PlanningNaviToPose2D"), [])
+
+            self.transport.responses["MappingService/GetCurrentWorkingMap"] = {"data": {"map_id": "3"}}
+            with patch.object(reloaded, "_nav_worker"), \
+                    patch.object(self.nodes, "wait_for_localization", return_value=pose):
+                result = reloaded.dispatch("navi_to_waypoint", args)
+            (_, payload), = self.transport.calls_to("PncService", "PlanningNaviToPose2D")
+            self.assertEqual(payload, {"map_id": 3, "task_id": 0, "pose": pose, "ackerman_mode": False})
+            self.assertEqual(result["state"], "navigating")
+
+    def test_controlled_spatial_rejects_recording_when_working_map_changes(self):
+        spatial = find_plugin(self.plugins, "controlled_spatial")
+        with tempfile.TemporaryDirectory() as folder:
+            spatial.waypoint_db = Path(folder) / "waypoints.sqlite3"
+            with patch.object(spatial, "_current_map_id", side_effect=[3, 4]), \
+                    patch.object(self.nodes, "wait_for_localization", return_value={}):
+                with self.assertRaisesRegex(ValueError, "地图已切换"):
+                    spatial.dispatch("tag_place", {"waypoint_name": "展厅入口"})
+            self.assertFalse(spatial.waypoint_db.exists())
+
+    def test_controlled_spatial_localization_requires_fresh_map_frame(self):
+        callback = dict(self.nodes.robot.subscriptions)["/slam/localization/odometry"]
+        msg = FakeMsg()
+        msg.header.frame_id = "odom"
+        msg.header.stamp.sec, msg.header.stamp.nanosec = 100, 0
+        msg.pose.pose.position.x, msg.pose.pose.position.y = 1.5, -2.0
+        q = msg.pose.pose.orientation
+        q.x, q.y, q.z, q.w = 0.0, 0.0, math.sqrt(0.5), math.sqrt(0.5)
+        with patch.object(device.time, "time", return_value=100):
+            callback(msg)
+        self.assertIsNone(self.nodes._localization)
+        msg.header.frame_id = "map"
+        with patch.object(device.time, "time", return_value=104):
+            callback(msg)
+        self.assertIsNone(self.nodes._localization)
+        with patch.object(device.time, "time", return_value=100):
+            callback(msg)
+        with patch.object(device.time, "monotonic", return_value=self.nodes._localization[0] - 0.1):
+            pose = self.nodes.wait_for_localization()
+        self.assertEqual(pose["position"], {"x": 1.5, "y": -2.0})
+        self.assertAlmostEqual(pose["angle"], math.pi / 2)
+
+    def test_controlled_spatial_accepts_fresh_jazzy_relay_sample(self):
+        with tempfile.TemporaryDirectory() as folder:
+            self.nodes._localization_relay = Path(folder) / "localization.json"
+            started = time.monotonic()
+            stamp = time.time_ns()
+            sec, nanosec = divmod(stamp, 10**9)
+            self.nodes._localization_relay.write_text(json.dumps(
+                [started + 0.1, "map", sec, nanosec, 2.0, 3.0, 0.0, 0.0, 0.0, 1.0]))
+            with patch.object(device.time, "monotonic", side_effect=[started, started + 0.2]):
+                self.assertEqual(self.nodes.wait_for_localization(),
+                                 {"position": {"x": 2, "y": 3}, "angle": 0})
+
+    def test_controlled_spatial_navi_to_pose_payload(self):
+        spatial = self._localized_spatial(3)
         self.transport.responses["PncService"] = {"task_id": 7}
         spatial.dispatch("navi_to_pose", {"map_id": 3, "x": 1.5, "y": -2.0, "angle": 0.3})
         (url, body), = self.transport.calls_to("PncService", "PlanningNaviToPose2D")
@@ -1923,7 +2091,7 @@ class RpcDispatchTests(unittest.TestCase):
         self.assertEqual(self.transport.calls_to("PncService", "ActionResume"), [])
 
     def test_controlled_spatial_control_reuses_last_task_id(self):
-        spatial = find_plugin(self.plugins, "controlled_spatial")
+        spatial = self._localized_spatial(1)
         self.transport.responses["PncService"] = {"task_id": 9}
         spatial.dispatch("move_forward", {"map_id": 1, "distance": 0.5})
         spatial.dispatch("pause", {})
@@ -1933,9 +2101,14 @@ class RpcDispatchTests(unittest.TestCase):
     def test_controlled_spatial_schema_declares_x_completion(self):
         schema = find_plugin(self.plugins, "controlled_spatial").get_tool()["inputSchema"]
         self.assertEqual(schema["x-completion"], {
-            "actions": ["navi_to_goal", "navi_to_pose", "linear_to_goal",
-                        "linear_to_pose", "move_forward", "spin_turn"],
+            "actions": ["navi_to_goal", "navi_to_waypoint", "navi_to_pose", "linear_to_goal",
+                        "linear_to_pose", "move_forward", "spin_turn", "linear_to_relative",
+                        "spin_turn_and_move_forward"],
             "timeout": 180})
+        actions = schema["x-action-params"]
+        self.assertEqual(actions["list_waypoints"]["params"], ["map_id"])
+        self.assertEqual(actions["navi_to_waypoint"]["params"], ["map_id", "waypoint_name"])
+        self.assertEqual(actions["navi_to_waypoint"]["required"], ["waypoint_name"])
 
     def test_controlled_spatial_navi_reports_acp_completion(self):
         # Navigation is a long-running action: dispatch returns immediately with
@@ -1946,11 +2119,11 @@ class RpcDispatchTests(unittest.TestCase):
         device._acp_notify = lambda action_id, status, result, tool="": captured.append(
             (action_id, status, result, tool))
         try:
-            spatial = find_plugin(self.plugins, "controlled_spatial")
+            spatial = self._localized_spatial(3)
             spatial._NAV_POLL_INTERVAL_S = 0.02
             # One PncService response serves both the dispatch and the polls
             # (RecordingTransport matches by service prefix).
-            self.transport.responses["PncService"] = {"task_id": 7, "data": {"state": "finished"}}
+            self.transport.responses["PncService"] = {"task_id": 7, "data": {"state": "PncServiceState_SUCCESS"}}
             result = spatial.dispatch("navi_to_pose", {"map_id": 3, "x": 1.0, "y": 1.0, "angle": 0.0})
             self.assertEqual(result["state"], "navigating")
             self.assertTrue(result["action_id"].startswith("a3_nav_"))
@@ -1962,7 +2135,7 @@ class RpcDispatchTests(unittest.TestCase):
             self.assertEqual(action_id, result["action_id"])
             self.assertEqual(status, "completed")
             self.assertEqual(payload["task_id"], 7)
-            self.assertEqual(payload["final_state"], "finished")
+            self.assertEqual(payload["final_state"], "PncServiceState_SUCCESS")
             self.assertEqual(tool_name, "controlled_spatial")
         finally:
             device._acp_notify = original_notify
@@ -1975,7 +2148,7 @@ class RpcDispatchTests(unittest.TestCase):
         device._acp_notify = lambda action_id, status, result, tool="": captured.append(
             (action_id, status, result, tool))
         try:
-            spatial = find_plugin(self.plugins, "controlled_spatial")
+            spatial = self._localized_spatial(1)
             spatial._NAV_POLL_INTERVAL_S = 0.2  # long enough to still be polling
             self.transport.responses["PncService"] = {"task_id": 5, "data": {"state": "running"}}
             result = spatial.dispatch("move_forward", {"map_id": 1, "distance": 0.5})
@@ -1998,7 +2171,7 @@ class RpcDispatchTests(unittest.TestCase):
         device._acp_notify = lambda action_id, status, result, tool="": captured.append(
             (action_id, status, result, tool))
         try:
-            spatial = find_plugin(self.plugins, "controlled_spatial")
+            spatial = self._localized_spatial(3)
             spatial._NAV_POLL_INTERVAL_S = 0.2  # long enough to still be polling
             self.transport.responses["PncService"] = {"task_id": 11, "data": {"state": "running"}}
             result = spatial.dispatch("navi_to_pose", {"map_id": 3, "x": 1.0, "y": 1.0, "angle": 0.0})
@@ -2023,7 +2196,7 @@ class RpcDispatchTests(unittest.TestCase):
         device._acp_notify = lambda action_id, status, result, tool="": captured.append(
             (action_id, status, result, tool))
         try:
-            spatial = find_plugin(self.plugins, "controlled_spatial")
+            spatial = self._localized_spatial(1)
             spatial._NAV_POLL_INTERVAL_S = 5.0  # keep both workers polling
             responses = iter([{"task_id": 11, "data": {"state": "running"}},
                               {"task_id": 12, "data": {"state": "running"}}])
@@ -2031,7 +2204,7 @@ class RpcDispatchTests(unittest.TestCase):
                 next(responses) if service.startswith("PncService/MoveForward")
                 else {"info": {"current_action": "MotionControlAction_MOTION"}}
                 if service.startswith("MotionControlActionService/GetAction")
-                else {"header": {"code": "0"}})
+                else self.transport.responses.get(service, {"header": {"code": "0"}}))
             first = spatial.dispatch("move_forward", {"map_id": 1, "distance": 0.5})
             second = spatial.dispatch("move_forward", {"map_id": 1, "distance": 1.0})
             self.assertNotEqual(first["action_id"], second["action_id"])
@@ -2063,7 +2236,7 @@ class RpcDispatchTests(unittest.TestCase):
         device._acp_notify = lambda action_id, status, result, tool="": captured.append(
             (action_id, status, result, tool))
         try:
-            spatial = find_plugin(self.plugins, "controlled_spatial")
+            spatial = self._localized_spatial(1)
             spatial._NAV_POLL_INTERVAL_S = 5.0  # keep the survivor polling
             task_ids = iter([11, 12])
             self.transport.handler = lambda url, service: (
@@ -2071,7 +2244,7 @@ class RpcDispatchTests(unittest.TestCase):
                 if service.startswith("PncService/MoveForward")
                 else {"info": {"current_action": "MotionControlAction_MOTION"}}
                 if service.startswith("MotionControlActionService/GetAction")
-                else {"header": {"code": "0"}})
+                else self.transport.responses.get(service, {"header": {"code": "0"}}))
             first, second = run_concurrently(
                 lambda: spatial.dispatch("move_forward", {"map_id": 1, "distance": 0.5}),
                 lambda: spatial.dispatch("move_forward", {"map_id": 1, "distance": 1.0}))
@@ -2135,11 +2308,116 @@ class RpcDispatchTests(unittest.TestCase):
         wx, wy, _ = struct.unpack_from("<fff", buf, header_size)
         self.assertAlmostEqual(wx, 100 + 0.5 * 0.05, places=4)
         self.assertAlmostEqual(wy, 200 - 0.5 * 0.05, places=4)
+        self.transport.responses["MappingService/GetCurrentWorkingMap"] = {"data": {"map_id": 3}}
         self.transport.responses["MappingService"] = response
         result = spatial.dispatch("get_map", {"map_id": 0, "x": wx - 0.02, "y": wy + 0.02})
         # continuous pixel (0.1, 0.1) → cell (0, 0)
         self.assertEqual(result["pixel"]["x"], 0)
         self.assertEqual(result["pixel"]["y"], 0)
+
+    def test_controlled_spatial_rejects_navigation_without_map_pose_or_full_target(self):
+        spatial = find_plugin(self.plugins, "controlled_spatial")
+        self.transport.responses["MappingService/GetCurrentWorkingMap"] = {"data": {"map_id": 3}}
+        args = {"map_id": 3, "x": 0, "y": 1, "angle": 0}
+        with self.assertRaisesRegex(ValueError, "需要 y"):
+            spatial.dispatch("navi_to_pose", {**args, "y": None})
+        with self.assertRaisesRegex(ValueError, "请切换"):
+            spatial.dispatch("navi_to_pose", {**args, "map_id": 4})
+        with patch.object(self.nodes, "wait_for_localization", side_effect=ValueError("no_sample")):
+            with self.assertRaisesRegex(ValueError, "no_sample"):
+                spatial.dispatch("navi_to_pose", args)
+            self.assertEqual(spatial.dispatch("localization_status", {}),
+                             {"state": "unavailable", "map_id": 3, "reason": "no_sample"})
+        self.assertEqual(self.transport.calls_to("PncService", "PlanningNaviToPose2D"), [])
+
+    def test_controlled_spatial_navigation_failure_and_rejected_cancel(self):
+        spatial = self._localized_spatial(3)
+        self.transport.responses["PncService/SpinTurn"] = {"state": "CommonState_FAILURE"}
+        args = {"map_id": 3, "angle": 0.5}
+        with self.assertRaisesRegex(device.RpcError, "SpinTurn"):
+            spatial.dispatch("spin_turn", args)
+        self.assertIsNone(spatial._nav_action_id)
+
+        self.transport.responses["PncService/SpinTurn"] = {"state": "CommonState_SUCCESS", "task_id": "7"}
+        self.transport.responses["PncService/ActionCancel"] = {"state": "CommonState_FAILURE"}
+        with patch.object(spatial, "_nav_worker"):
+            result = spatial.dispatch("spin_turn", args)
+        with patch.object(device, "_acp_notify") as notify:
+            with self.assertRaisesRegex(device.RpcError, "ActionCancel"):
+                spatial.dispatch("spin_turn", args)
+            self.assertEqual(len(self.transport.calls_to("PncService", "SpinTurn")), 2)
+            notify.assert_not_called()
+            self.transport.responses["PncService/ActionGetState"] = {"state": "PncServiceState_FAILED"}
+            spatial._NAV_POLL_INTERVAL_S = 0
+            spatial._nav_worker(result["action_id"], 7, "spin_turn")
+            self.assertEqual(notify.call_args.args[:2], (result["action_id"], "error"))
+
+    def test_controlled_spatial_uses_documented_mapping_and_relocalization_payloads(self):
+        spatial = self._localized_spatial(3)
+        spatial.dispatch("set_current_map", {"map_id": 3})
+        self.assertEqual(self.transport.calls_to("MappingService", "SetCurrentWorkingMap")[0][1]["map_id"], 3)
+        self.assertEqual(spatial.dispatch("localization_status", {})["state"], "unavailable")
+        spatial.dispatch("start_global_relocalization", {})
+        (_, request), = self.transport.calls_to("RelocalizationService", "StartGlobalRelocalization")
+        self.assertEqual(request["command"], "RelocalizationCommand_GLOBAL_START")
+        self.assertEqual(request["map_id"], 3)
+        spatial.dispatch("stop_global_relocalization", {})
+        (_, request), = self.transport.calls_to("RelocalizationService", "StopGlobalRelocalization")
+        self.assertEqual(request["command"], "RelocalizationCommand_GLOBAL_CANCEL")
+        self.transport.responses["SLAMRelocalizationService/SLAMGetCurrentRelocalizationState"] = {"isRunning": True}
+        self.assertTrue(spatial.dispatch("relocalization_state", {})["isRunning"])
+        spatial.dispatch("stop_relocalization", {"x": 1, "y": -2, "angle": math.pi})
+        (_, request), = self.transport.calls_to("SLAMRelocalizationService", "SLAMStopNormalRelocalization")
+        self.assertEqual(request["reloc_pose"]["position"], {"x": 1, "y": -2, "z": 0})
+        self.assertAlmostEqual(request["reloc_pose"]["orientation"]["z"], 1)
+        self.assertAlmostEqual(request["reloc_pose"]["orientation"]["w"], 0)
+        spatial.dispatch("stop_relocalization", {})
+        (_, request) = self.transport.calls_to("SLAMRelocalizationService", "SLAMStopNormalRelocalization")[-1]
+        self.assertEqual(request, {"header": {}, "command_type": 1})
+        self.transport.responses["MappingService/Get2DWholeMap"] = {
+            "data": {"origin_x": 279, "origin_y": 384, "resolution": 20}}
+        result = spatial.dispatch("get_map", {"x": 1, "y": -2})
+        (_, request), = self.transport.calls_to("MappingService", "Get2DWholeMap")
+        self.assertEqual(request["map_id"], 3)
+        self.assertEqual((result["pixel"]["x"], result["pixel"]["y"]), (299, 424))
+
+    def test_controlled_spatial_additional_navigation_and_map_calls(self):
+        spatial = self._localized_spatial(3)
+        self.transport.responses["PncService"] = {"task_id": 7, "state": "CommonState_SUCCESS"}
+        with patch.object(spatial, "_nav_worker"), patch.object(device, "_acp_notify"):
+            spatial.dispatch("linear_to_relative", {"map_id": 3, "x": 0.2, "y": 0, "angle": 0})
+            (_, request), = self.transport.calls_to("PncService", "LinearNaviToRelative")
+            self.assertEqual(request["pose"], {"position": {"x": 0.2, "y": 0}, "angle": 0})
+            spatial.dispatch("spin_turn_and_move_forward", {"map_id": 3, "distance": 0.3, "angle": 0.2})
+            (_, request), = self.transport.calls_to("PncService", "SpinTurnAndMoveForward")
+            self.assertEqual(request, {"map_id": 3, "task_id": 0, "angle": 0.2, "distance": 0.3})
+            spatial.dispatch("cancel", {})
+        spatial.dispatch("get_realtime_map", {})
+        (_, request), = self.transport.calls_to("MappingService", "GetRealtimeMapData")
+        self.assertEqual(request["command"], "MappingCommand_GET_REALTIME_MAP")
+        region = {"type": "VerteciesType_CLOSURE", "color": "FFFFFFFF",
+                  "vertices": [{"position": {"u": u, "v": v}} for u, v in ((0, 0), (5, 0), (5, 5))]}
+        spatial.dispatch("sync_map_regions", {"map_id": 3, "regions": [region]})
+        (_, request), = self.transport.calls_to("MappingService", "SyncRegion")
+        self.assertEqual(request["map_id"], "3")
+        self.assertEqual(request["regions"], [region])
+
+    def test_controlled_spatial_migrates_and_maintains_recorded_waypoints(self):
+        spatial = self._localized_spatial(3)
+        with tempfile.TemporaryDirectory() as folder:
+            spatial.waypoint_db = Path(folder) / "waypoints.sqlite3"
+            with sqlite3.connect(spatial.waypoint_db) as db:
+                db.execute("CREATE TABLE waypoints (map_id TEXT, name TEXT, pose TEXT, PRIMARY KEY(map_id, name))")
+                db.execute("INSERT INTO waypoints VALUES ('3', '旧入口', '{}')")
+            original, = spatial.dispatch("list_waypoints", {})["waypoints"]
+            renamed = spatial.dispatch("rename_waypoint", {"waypoint_name": "旧入口", "new_name": "新入口"})
+            self.nodes.wait_for_localization.return_value = {"position": {"x": 2, "y": 1}, "angle": 0}
+            updated = spatial.dispatch("update_waypoint", {"waypoint_name": "新入口"})
+            self.assertEqual(updated["pose"], self.nodes.wait_for_localization.return_value)
+            deleted = spatial.dispatch("delete_waypoint", {"waypoint_name": "新入口"})
+            for result in (renamed, updated, deleted):
+                self.assertEqual(result["waypoint_id"], original["waypoint_id"])
+            self.assertEqual(spatial.dispatch("list_waypoints", {})["waypoints"], [])
 
     def test_auto_charging_start(self):
         charging = find_plugin(self.plugins, "auto_charging")

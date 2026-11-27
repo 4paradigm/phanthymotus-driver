@@ -27,11 +27,13 @@ import base64
 import json
 import math
 import os
+import sqlite3
 import struct
 import threading
 import time
 import queue
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 import zlib
 import atexit
 import xml.etree.ElementTree as ET
@@ -837,6 +839,21 @@ class A3Nodes:
 
         self._encode_and_publish = self._encode_and_publish_frame
 
+        self._localization = None
+        self._localization_issue = "no_sample"
+        self._localization_relay = None
+        self._localization_ready = threading.Condition()
+        if config.get("plugins", {}).get("controlled_spatial", {}).get("enabled"):
+            if self._jazzy_relay and os.environ.get("A3_SLAM_DDS_PROFILE"):
+                self._localization_relay = Path("/opt/phanthy-motus/data/a3-relay/localization.json")
+            try:
+                from nav_msgs.msg import Odometry
+            except ImportError:
+                print("[state] waypoint recording unavailable: missing nav_msgs", flush=True)
+            else:
+                self.robot.create_subscription(
+                    Odometry, "/slam/localization/odometry", self._on_localization, sensor_qos)
+
         # -- joint / state streams (plain sensor_msgs types) --
         mirror("arm_state", JointState, "/motion/control/arm_joint_state", "data/json")
         mirror("hand_state", JointState, "/motion/control/hand_joint_state", "data/json")
@@ -969,6 +986,58 @@ class A3Nodes:
         self.arm_command_pub = self.robot.create_publisher(JointState, "/motion/control/arm_joint_command", 10)
         self.neck_command_pub = self.robot.create_publisher(JointState, "/motion/control/neck_joint_command", 10)
         self.hand_command_pub = self.robot.create_publisher(JointState, "/motion/control/hand_joint_command", 10)
+
+    def _on_localization(self, msg):
+        stamp = msg.header.stamp
+        position = msg.pose.pose.position
+        q = msg.pose.pose.orientation
+        with self._localization_ready:
+            self._accept_localization(time.monotonic(), msg.header.frame_id, stamp.sec,
+                                      stamp.nanosec, position.x, position.y, q.x, q.y, q.z, q.w)
+            self._localization_ready.notify_all()
+
+    def _accept_localization(self, received_at, frame, sec, nanosec, px, py, qx, qy, qz, qw):
+        if self._localization and received_at <= self._localization[0]:
+            return
+        if frame.lstrip("/") != "map":
+            self._localization_issue = "invalid_frame"
+            return
+        if abs(time.time() - (sec + nanosec * 1e-9)) > 2.0:
+            self._localization_issue = "stale_timestamp"
+            return
+        norm = math.hypot(qx, qy, qz, qw)
+        if not all(map(math.isfinite, (px, py, norm))) or norm < 1e-6:
+            self._localization_issue = "invalid_pose"
+            return
+        x, y, z, w = (value / norm for value in (qx, qy, qz, qw))
+        yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+        self._localization = received_at, {"position": {"x": px, "y": py}, "angle": yaw}
+        self._localization_issue = "ready"
+
+    def wait_for_localization(self):
+        # Require a sample received after reading the working map.
+        started = time.monotonic()
+        with self._localization_ready:
+            while True:
+                if self._localization_relay is not None:
+                    try:
+                        sample = json.loads(self._localization_relay.read_text(encoding="utf-8"))
+                        if started < sample[0] <= time.monotonic():
+                            self._accept_localization(*sample)
+                    except FileNotFoundError:
+                        pass
+                    except (OSError, ValueError, TypeError, IndexError, AttributeError):
+                        self._localization_issue = "relay_read_error"
+                if self._localization and self._localization[0] > started:
+                    return self._localization[1]
+                remaining = started + 1.5 - time.monotonic()
+                if remaining <= 0:
+                    issue = self._localization_issue
+                    if issue == "ready":
+                        issue = "no_new_sample"
+                    raise ValueError(f"未收到实时地图定位数据 ({issue})，请先检查定位与 DDS 配置")
+                self._localization_ready.wait(
+                    min(0.05, remaining) if self._localization_relay is not None else remaining)
 
     def _republish_slow_states(self):
         with self.lock:
@@ -1833,6 +1902,38 @@ class A3Rpc:
         payload = {"command": "MappingCommand_GET_CURRENT_WORKING_MAP"}
         return self._unit(self.adu_port, 50807).call("MappingService", "GetCurrentWorkingMap", payload)
 
+    def current_map_id(self) -> int:
+        map_id = int((self.get_current_working_map().get("data") or {}).get("map_id") or 0)
+        _require(map_id > 0, "没有当前工作地图，请先加载地图")
+        return map_id
+
+    def set_current_working_map(self, map_id: int) -> dict:
+        return self._unit(self.adu_port, 50807).call("MappingService", "SetCurrentWorkingMap", {
+            "header": create_header(), "command": "MappingCommand_SET_CURRENT_WORKING_MAP",
+            "map_id": map_id})
+
+    def start_global_relocalization(self, map_id: int) -> dict:
+        return self._unit(self.adu_port, 50807).call("RelocalizationService", "StartGlobalRelocalization", {
+            "header": create_header(), "command": "RelocalizationCommand_GLOBAL_START",
+            "map_id": map_id})
+
+    def stop_global_relocalization(self) -> dict:
+        return self._unit(self.adu_port, 50807).call("RelocalizationService", "StopGlobalRelocalization", {
+            "header": create_header(), "command": "RelocalizationCommand_GLOBAL_CANCEL"})
+
+    def relocalization_state(self) -> dict:
+        return self._unit(self.adu_port, 50583).call(
+            "SLAMRelocalizationService", "SLAMGetCurrentRelocalizationState", {"header": {}})
+
+    def get_realtime_map(self) -> dict:
+        return self._unit(self.adu_port, 50807).call("MappingService", "GetRealtimeMapData", {
+            "header": create_header(), "command": "MappingCommand_GET_REALTIME_MAP"})
+
+    def sync_map_regions(self, map_id: int, regions: list) -> dict:
+        return self._unit(self.adu_port, 50807).call("MappingService", "SyncRegion", {
+            "header": create_header(), "command": "MappingCommand_SYNC_REGION",
+            "map_id": str(map_id), "regions": regions})
+
     def get_topo_msgs(self, map_id) -> dict:
         payload = {"command": "TopoCommand_GET_TOPO_MSG", "map_id": map_id}
         return self._unit(self.adu_port, 50807).call("LocalizationService", "GetTopoMsgs", payload)
@@ -1849,7 +1950,7 @@ class A3Rpc:
         return self._unit(self.adu_port, 50807).call("MappingService", "StopMapping", payload)
 
     def rename_map(self, map_id: str, old_name: str, new_name: str) -> dict:
-        payload = {"command": "MappingCommand_RENAME_MAP", "map_id": map_id,
+        payload = {"header": {}, "command": "MappingCommand_RENAME_MAP", "map_id": map_id,
                    "old_name": old_name, "new_name": new_name}
         return self._unit(self.adu_port, 50807).call("MappingService", "RenameMap", payload)
 
@@ -1868,7 +1969,9 @@ class A3Rpc:
         return self._unit(self.adu_port, 50583).call("SLAMRelocalizationService", "SLAMStartNormalRelocalization", payload)
 
     def slam_stop_normal_relocalization(self, reloc_pose: dict | None = None) -> dict:
-        payload = {"header": {}, "command_type": 0, "reloc_pose": reloc_pose or {}}
+        payload = {"header": {}, "command_type": 0 if reloc_pose is not None else 1}
+        if reloc_pose is not None:
+            payload["reloc_pose"] = reloc_pose
         return self._unit(self.adu_port, 50583).call("SLAMRelocalizationService", "SLAMStopNormalRelocalization", payload)
 
     def auto_charging(self, command: str, trigger: str) -> dict:
@@ -3943,30 +4046,17 @@ class SkillPlayPlugin:
 
 
 class ControlledSpatialPlugin:
-    """controlled_spatial 执行卡：建图 + 导航 + 重定位一体化（config 门控，默认关闭）。
-
-    参照 tianyi2.0/g1 的 controlled_spatial 卡，把同一 ADU 上的空间能力合并为一张卡：
-      - 建图/地图管理（MappingService）：StartMapping / StopMapping（保存/放弃）/
-        GetStoredMapNames / GetCurrentWorkingMap / RenameMap；
-      - 导航（PncService）：目标点/位姿规划导航、直线行走、平移/原地旋转、
-        暂停/恢复/取消/查询（task_id=0 自动分配，驱动记住返回的 id 供后续控制复用）；
-      - 重定位（SLAMRelocalizationService）：导航的硬性前置条件，在目标地图上
-        StartNormalRelocalization / StopNormalRelocalization；
-      - 地图数据查询（Get2DWholeMap）：含分辨率/原点/占用栅格，并支持物理坐标 →
-        像素坐标换算（合并自原 map_get 处理卡）。
-    前置条件（开发文档 §7.9）：MC 处于 MOTION 模式（mc_mode get_up）且已完成
-    重定位，导航与重定位需工作在相同 map_id 上；到点精度最大约 0.4 米。
-    """
+    """ADU mapping, relocalization, waypoint management and ACP navigation."""
 
     # 导航为长时间动作：声明 ACP 完成契约（tianyi2.0/g1 的 controlled_spatial
     # 同款 180 s 超时），由后台线程轮询 PncService/ActionGetState 判定到点。
-    NAV_ACTIONS = ("navi_to_goal", "navi_to_pose", "linear_to_goal",
-                   "linear_to_pose", "move_forward", "spin_turn")
+    NAV_ACTIONS = ("navi_to_goal", "navi_to_waypoint", "navi_to_pose", "linear_to_goal",
+                   "linear_to_pose", "move_forward", "spin_turn",
+                   "linear_to_relative", "spin_turn_and_move_forward")
     NAV_TIMEOUT_S = 180
     _NAV_POLL_INTERVAL_S = 1.0
 
-    # ActionGetState 响应中可判定“任务已终态”的取值（防御式：响应字段名在线
-    # 文档无法核对，state/status 里出现这些字符串即视为结束）。
+    # Official PncServiceState names are normalized alongside legacy responses.
     _NAV_TERMINAL_STATES = {"finished", "finish", "complete", "completed", "done",
                             "succeed", "succeeded", "success", "arrived", "stop",
                             "stopped", "cancelled", "canceled", "error", "failed",
@@ -3976,34 +4066,55 @@ class ControlledSpatialPlugin:
 
     ACTIONS = {
         # -- 建图 / 地图管理 --
-        "start_mapping": ([], "开始建图（机器人行走采集环境）"),
+        "start_mapping": ([], "开始建图"),
         "stop_save": (["map_name"], "结束建图并保存（map_name 为新地图名称）"),
         "stop_discard": ([], "结束建图不保存"),
         "list_maps": ([], "查询已保存地图列表"),
         "current_map": ([], "查询当前工作地图"),
-        "rename_map": (["map_id", "new_name"], "重命名地图"),
+        "set_current_map": (["map_id"], "切换当前工作地图，切换后需重定位"),
+        "list_waypoints": (["map_id"], "查询地图点位和已记录的位置（map_id 缺省时用当前工作地图）"),
+        "tag_place": (["waypoint_name"], "将机器人当前地图位姿保存为命名点位"),
+        "rename_waypoint": (["map_id", "waypoint_name", "new_name"], "重命名已记录点位"),
+        "update_waypoint": (["waypoint_name"], "用当前地图位姿更新已记录点位"),
+        "delete_waypoint": (["map_id", "waypoint_name"], "删除已记录点位"),
+        "rename_map": (["map_id", "old_name", "new_name"], "重命名地图"),
+        "get_realtime_map": ([], "获取实时建图数据"),
+        "sync_map_regions": (["map_id", "regions"], "更新地图底图区域"),
         # -- 重定位 --
-        "start_relocalization": (["map_dir"], "在指定地图目录上启动普通重定位（导航前置条件）"),
-        "stop_relocalization": ([], "停止重定位（可选带 reloc_pose 位姿辅助收敛）"),
+        "start_relocalization": (["map_dir"], "准备指定地图的手动重定位"),
+        "stop_relocalization": (["x", "y", "angle", "z"], "提交初始位姿（x/y/angle 一起填写）或无位姿时取消手动重定位"),
+        "start_global_relocalization": (["map_id"], "在当前工作地图上发起全局重定位"),
+        "stop_global_relocalization": ([], "取消全局重定位"),
+        "relocalization_state": ([], "查询 SLAM 的重定位任务是否运行"),
+        "localization_status": ([], "检查当前地图是否持续输出有效位姿，并返回最新样本"),
         # -- 导航 --
         "navi_to_goal": (["map_id", "target_id"], "按目标点 ID 规划导航（PlanningNaviToGoal；异步：返回 action_id，到点后回报 ACP）"),
+        "navi_to_waypoint": (["map_id", "waypoint_name"],
+                             "按点位名称精确匹配并规划导航（map_id 缺省时用当前工作地图；异步：返回 action_id，到点后回报 ACP）"),
         "navi_to_pose": (["map_id", "x", "y", "angle"], "按位姿规划导航（PlanningNaviToPose2D；异步：到点后回报 ACP）"),
         "linear_to_goal": (["map_id", "target_id"], "直线导航到目标点（LinearNaviToGoal，先转后走；异步回报 ACP）"),
         "linear_to_pose": (["map_id", "x", "y", "angle"], "直线导航到位姿（LinearNaviToPose2D；异步回报 ACP）"),
         "move_forward": (["map_id", "distance"], "直线平移指定距离（MoveForward，朝向不变；异步回报 ACP）"),
         "spin_turn": (["map_id", "angle"], "原地旋转指定角度（SpinTurn，rad；异步回报 ACP）"),
+        "linear_to_relative": (["map_id", "x", "y", "angle"], "导航到相对位姿（异步回报 ACP）"),
+        "spin_turn_and_move_forward": (["map_id", "angle", "distance"], "先原地旋转再直线移动（异步回报 ACP）"),
         "cancel": (["task_id"], "取消导航任务"),
         "pause": (["task_id"], "暂停导航任务"),
         "resume": (["task_id"], "恢复暂停的任务"),
         "nav_state": (["task_id"], "查询导航任务状态（task_id 缺省用最近一次任务）"),
         # -- 地图数据 --
-        "get_map": (["map_id"], "获取 SLAM 2D 全量栅格地图数据；可选传 x/y 返回像素坐标换算"),
+        "get_map": (["map_id", "x", "y"], "获取 2D 地图数据，可选同时传 x/y 换算像素坐标"),
     }
 
     def __init__(self, nodes):
         self.nodes = nodes
         self.last_task_id = None
         self._nav_action_id = None
+        self._active_task_id = None
+        self._active_nav_map = None
+        self._map_requires_relocalization = False
+        self.waypoint_db = Path("/opt/phanthy-motus/data/a3/waypoints.sqlite3")
+        self._waypoint_lock = threading.Lock()
         # ThreadingHTTPServer serves MCP calls concurrently — the check-then-set on
         # _nav_action_id (settle prior / arm new) must be atomic (MotionPlayPlugin 同款).
         self._nav_lock = threading.Lock()
@@ -4012,15 +4123,27 @@ class ControlledSpatialPlugin:
         schema = action_schema(self.ACTIONS, {
             "map_name": {"type": "string", "description": "保存时的新地图名称"},
             "map_id": {"type": "integer", "description": "工作地图 id（需与重定位地图一致）"},
-            "map_dir": {"type": "string", "description": "地图目录（list_maps → map_dir，重定位用）"},
-            "new_name": {"type": "string", "description": "新名称（rename_map）"},
+            "map_dir": {"type": "string", "description": "ADU 上用于手动重定位的地图目录"},
+            "old_name": {"type": "string", "description": "地图旧名称"},
+            "new_name": {"type": "string", "description": "地图或记录点位的新名称"},
             "target_id": {"type": "integer", "description": "目标点 id（地图点位）"},
+            "waypoint_name": {"type": "string", "description": "点位完整名称（由 list_waypoints 查询）"},
             "x": {"type": "number", "description": "目标/重定位位姿 x（m）"},
             "y": {"type": "number", "description": "目标/重定位位姿 y（m）"},
+            "z": {"type": "number", "description": "手动重定位位姿 z（m）"},
             "angle": {"type": "number", "description": "目标/重定位朝向角（rad）"},
             "distance": {"type": "number", "description": "平移距离（m，正为前进）"},
             "task_id": {"type": "integer", "description": "导航任务 id（0 自动分配；控制/查询动作可传空用最近任务）"},
+            "regions": {"type": "array", "items": {"type": "object"},
+                        "description": "地图像素区域，含 vertices、color 和 type"},
         })
+        for action in (*self.NAV_ACTIONS, "stop_save", "set_current_map", "start_relocalization",
+                       "tag_place", "update_waypoint", "rename_waypoint", "delete_waypoint",
+                       "rename_map", "sync_map_regions"):
+            optional = {"map_id"} if action in (
+                "navi_to_waypoint", "rename_waypoint", "delete_waypoint") else set()
+            schema["x-action-params"][action]["required"] = [
+                key for key in self.ACTIONS[action][0] if key not in optional]
         # 建图/导航/重定位期间底盘由 ADU 独占 —— 与 loco/auto_charging 同通道。
         schema["x-resource"] = "base"
         # 导航动作为长时间动作：声明 ACP 完成契约（tianyi2.0/g1 同款 180 s），
@@ -4032,7 +4155,7 @@ class ControlledSpatialPlugin:
         # 只为 navigate 动作声明契约的处理一致。
         return tool("controlled_spatial", "actuator",
                     "建图/导航/重定位一体化控制（ADU MappingService/PncService/SLAMRelocalizationService RPC；"
-                    "config 门控模块，默认关闭；导航前置：mc_mode get_up + start_relocalization 且 map_id 一致；"
+                    "导航前置：MOTION 模式、工作地图一致且 localization_status 返回 ready；"
                     "task_id 传 0 自动分配，控制/查询动作可缺省复用最近任务 id；"
                     "导航为异步：返回 action_id，轮询 ActionGetState 到点后回报 ACP 完成事件）",
                     schema)
@@ -4040,32 +4163,10 @@ class ControlledSpatialPlugin:
     def start(self):
         pass
 
-    def _settle_active(self, status, detail):
-        """结算挂起的 ACP 等待线程（若有）：清 id 后立刻回报终态。
-
-        调用方必须持有 _nav_lock。返回被结算的 (action_id, task_id)
-        （None 表示无挂起），供调用方在锁外按旧 task_id 执行物理取消 ——
-        ActionCancel 只对发起中的任务有效，必须在被新任务覆盖前捕获。
-
-        只清 id 会让 Agent Core 的 barrier 挂到 180 s 超时 —— 取消也必须显式
-        POST cancelled（LocoPlugin._settle_active 同款语义）。
-        """
-        action_id, self._nav_action_id = self._nav_action_id, None
-        if action_id is not None:
-            _acp_notify(action_id, status, detail, "controlled_spatial")
-        return (action_id, self.last_task_id) if action_id is not None else None
-
     def stop(self):
-        # 插件生命周期卸载：与框架 stop 同款 —— 有导航在跑就先物理取消并结算，
-        # 避免卸载后悬挂的 worker 再 POST 幽灵 completed（LocoPlugin.stop 先例）。
         with self._nav_lock:
-            prior = self._settle_active("cancelled", {"reason": "plugin_stopped",
-                                                      "task_id": self.last_task_id or 0})
-        if prior is not None:
-            try:
-                self.nodes.rpc.navi("ActionCancel", {"task_id": prior[1] or 0})
-            except Exception:
-                pass
+            if self._active_task_id is not None:
+                self._cancel_navigation(self._active_task_id, "plugin_stopped")
 
     def _task_id(self, args):
         value = args.get("task_id")
@@ -4075,33 +4176,176 @@ class ControlledSpatialPlugin:
             return self.last_task_id
         return int(value)
 
-    def _remember(self, response):
-        task_id = (response or {}).get("task_id")
-        if task_id:
-            self.last_task_id = task_id
-        return jsonable(response)
+    def _current_map_id(self):
+        return self.nodes.rpc.current_map_id()
+
+    @staticmethod
+    def _number(args, name):
+        value = args.get(name)
+        _require(value is not None and not isinstance(value, bool), f"需要 {name}")
+        value = float(value)
+        _require(math.isfinite(value), f"{name} 必须是有限数值")
+        return value
+
+    @staticmethod
+    def _id(args, name, minimum=1):
+        value = args.get(name)
+        _require((type(value) is int or isinstance(value, str) and value.isdecimal())
+                 and int(value) >= minimum, f"{name} 必须是不小于 {minimum} 的整数")
+        return int(value)
+
+    @staticmethod
+    def _name(args, key):
+        value = args.get(key)
+        _require(isinstance(value, str) and bool(value.strip()), f"需要 {key}")
+        return value.strip()
+
+    def _map_id(self, args):
+        value = args.get("map_id")
+        if value is None or value == "" or value == "0" or type(value) is int and value == 0:
+            return self._current_map_id()
+        return self._id(args, "map_id")
+
+    def _localized_pose(self, map_id):
+        _require(self._current_map_id() == map_id, "请切换到该点位所属地图并完成重定位")
+        _require(not self._map_requires_relocalization, "地图已切换，请先重定位")
+        pose = self.nodes.wait_for_localization()
+        _require(self._current_map_id() == map_id, "读取定位期间当前地图已切换")
+        return pose
+
+    def _native_waypoints(self, map_id):
+        response = self.nodes.rpc.get_topo_msgs(map_id)
+        return [
+            {"name": point.get("name", ""), "point_id": int(point["point_id"]), "pose": point.get("pose")}
+            for point in ((response.get("data") or {}).get("points") or [])
+        ]
+
+    def _list_waypoints(self, map_id):
+        map_id = self._map_id({"map_id": map_id})
+        waypoints = self._native_waypoints(map_id)
+        with self._waypoint_lock:
+            if self.waypoint_db.is_file():
+                with closing(sqlite3.connect(self.waypoint_db)) as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    self._init_waypoint_db(db)
+                    rows = db.execute("SELECT w.name, w.pose, i.waypoint_id FROM waypoints w "
+                                      "JOIN waypoint_ids i USING (map_id, name) "
+                                      "WHERE w.map_id = ? ORDER BY w.name", (str(map_id),)).fetchall()
+                    db.commit()
+                waypoints.extend(
+                    {"name": name, "point_id": None, "waypoint_id": waypoint_id,
+                     "source": "recorded", "pose": json.loads(pose)}
+                    for name, pose, waypoint_id in rows
+                )
+        return {"map_id": map_id, "waypoints": waypoints}
+
+    @staticmethod
+    def _init_waypoint_db(db):
+        db.execute("CREATE TABLE IF NOT EXISTS waypoints "
+                   "(map_id TEXT NOT NULL, name TEXT NOT NULL, pose TEXT NOT NULL, PRIMARY KEY (map_id, name))")
+        # Keep the original three-column table writable by older A3 images.
+        db.execute("CREATE TABLE IF NOT EXISTS waypoint_ids "
+                   "(map_id TEXT NOT NULL, name TEXT NOT NULL, waypoint_id TEXT NOT NULL UNIQUE, "
+                   "PRIMARY KEY (map_id, name))")
+        db.execute("INSERT OR IGNORE INTO waypoint_ids (map_id, name, waypoint_id) "
+                   "SELECT map_id, name, lower(hex(randomblob(16))) FROM waypoints "
+                   "WHERE NOT EXISTS (SELECT 1 FROM waypoint_ids WHERE "
+                   "waypoint_ids.map_id = waypoints.map_id AND waypoint_ids.name = waypoints.name)")
+
+    def _write_waypoint(self, action, name, map_id, new_name=None):
+        if action in ("tag_place", "rename_waypoint"):
+            candidate = new_name if action == "rename_waypoint" else name
+            _require(not any(point["name"] == candidate for point in self._native_waypoints(map_id)),
+                     f"地图 {map_id} 已有同名点位 {candidate!r}")
+        pose = None
+        if action in ("tag_place", "update_waypoint"):
+            _require(not self._map_requires_relocalization, "地图已切换，请先重定位")
+            pose = self.nodes.wait_for_localization()
+            _require(self._current_map_id() == map_id, "记录期间当前地图已切换，请重新记录")
+        self.waypoint_db.parent.mkdir(parents=True, exist_ok=True)
+        with self._waypoint_lock, closing(sqlite3.connect(self.waypoint_db)) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            self._init_waypoint_db(db)
+            key = (str(map_id), name)
+            if action == "tag_place":
+                waypoint_id = uuid4().hex
+                insert = db.execute("INSERT INTO waypoints (map_id, name, pose) VALUES (?, ?, ?) "
+                                    "ON CONFLICT (map_id, name) DO NOTHING",
+                                    (*key, json.dumps(pose)))
+                _require(insert.rowcount == 1, f"地图 {map_id} 已有同名点位 {name!r}")
+                db.execute("INSERT INTO waypoint_ids (map_id, name, waypoint_id) VALUES (?, ?, ?)",
+                           (*key, waypoint_id))
+            else:
+                row = db.execute("SELECT i.waypoint_id, w.pose FROM waypoints w "
+                                 "JOIN waypoint_ids i USING (map_id, name) WHERE w.map_id = ? AND w.name = ?",
+                                 key).fetchone()
+                _require(row is not None, f"地图 {map_id} 没有已记录点位 {name!r}")
+                waypoint_id, saved_pose = row
+                if action == "delete_waypoint":
+                    db.execute("DELETE FROM waypoints WHERE map_id = ? AND name = ?", key)
+                    db.execute("DELETE FROM waypoint_ids WHERE map_id = ? AND name = ?", key)
+                    return {"map_id": map_id, "name": name, "waypoint_id": waypoint_id, "deleted": True}
+                if action == "rename_waypoint":
+                    try:
+                        db.execute("UPDATE waypoints SET name = ? WHERE map_id = ? AND name = ?",
+                                   (new_name, *key))
+                        db.execute("UPDATE waypoint_ids SET name = ? WHERE map_id = ? AND name = ?",
+                                   (new_name, *key))
+                    except sqlite3.IntegrityError as exc:
+                        raise ValueError(f"地图 {map_id} 已有同名点位 {new_name!r}") from exc
+                    name, pose = new_name, json.loads(saved_pose)
+                if action == "update_waypoint":
+                    db.execute("UPDATE waypoints SET pose = ? WHERE map_id = ? AND name = ?",
+                               (json.dumps(pose), *key))
+        return {"map_id": map_id, "name": name, "waypoint_id": waypoint_id,
+                "source": "recorded", "pose": pose}
+
+    @staticmethod
+    def _nav_state_name(value):
+        if type(value) is int:
+            return {4: "success", 5: "failed"}.get(value)
+        if not isinstance(value, str):
+            return None
+        return value.strip().lower().removeprefix("pncservicestate_")
 
     def _nav_state_terminal(self, response):
-        """Probe an ActionGetState response for a terminal task state, defensively.
-
-        The exact response field names could not be verified against the online
-        dev guide, so this accepts a `state`/`status`/`task_state` string (or
-        enum-ish int ≥ 3) either top-level or nested under `data`. Unrecognized
-        shapes count as still-navigating — the NAV_TIMEOUT_S is the backstop.
-        Returns the raw value, or "error"/None marker handled by the caller via
-        _NAV_ERROR_STATES.
-        """
-        if not isinstance(response, dict):
-            return None
-        for scope in (response, response.get("data") if isinstance(response.get("data"), dict) else {}):
+        data = response.get("data")
+        for scope in (response, data if isinstance(data, dict) else {}):
             for key in ("state", "status", "task_state"):
                 value = scope.get(key)
-                if isinstance(value, str) and value.strip().lower() in self._NAV_TERMINAL_STATES:
-                    return value
-                # Common protobuf enum pattern: 0=IDLE 1=RUNNING 2=PAUSED 3+=done/fail.
-                if isinstance(value, int) and value >= 3:
+                if self._nav_state_name(value) in self._NAV_TERMINAL_STATES:
                     return value
         return None
+
+    def _nav_command(self, method, payload):
+        response = self.nodes.rpc.navi(method, payload)
+        data = response.get("data")
+        states = (response.get("state"), data.get("state") if isinstance(data, dict) else None)
+        allowed = {"success"}
+        allowed_codes = {1}
+        if method not in ("ActionCancel", "ActionPause", "ActionResume"):
+            allowed.update(("pending", "created", "running"))
+            allowed_codes.update((200, 300, 400))
+        for state in states:
+            if isinstance(state, str) and state.lower().startswith("commonstate_"):
+                if state.lower().removeprefix("commonstate_") in allowed:
+                    continue
+                raise RpcError(f"{method} 拒绝请求: {response!r}")
+            if type(state) is int and state not in allowed_codes:
+                raise RpcError(f"{method} 拒绝请求: {response!r}")
+        return response
+
+    def _cancel_navigation(self, task_id, reason):
+        # Caller holds _nav_lock. Keep tracking the active task if cancellation fails.
+        response = self._nav_command("ActionCancel", {"task_id": task_id})
+        if self._active_task_id is not None and task_id in (0, self._active_task_id):
+            self._active_task_id = None
+            self._active_nav_map = None
+            action_id, self._nav_action_id = self._nav_action_id, None
+            if action_id is not None:
+                _acp_notify(action_id, "cancelled", {"reason": reason, "task_id": task_id},
+                            "controlled_spatial")
+        return jsonable(response)
 
     def _nav_worker(self, action_id, task_id, action):
         # Superseded guard: a newer nav action or a cancel took over — never
@@ -4111,23 +4355,23 @@ class ControlledSpatialPlugin:
         with self._nav_lock:
             if self._nav_action_id != action_id:
                 return
-        deadline = time.time() + self.NAV_TIMEOUT_S
+        deadline = time.monotonic() + self.NAV_TIMEOUT_S
         result = {"action": action, "task_id": task_id}
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             time.sleep(self._NAV_POLL_INTERVAL_S)
             with self._nav_lock:
                 if self._nav_action_id != action_id:
                     return
             try:
                 response = self.nodes.rpc.navi_state(task_id)
-            except Exception as exc:  # noqa: BLE001 — notify and keep polling
+            except Exception as exc:
                 result["error"] = f"ActionGetState poll failed: {exc}"
-                self._finish(action_id, "error", result)
+                self._finish(action_id, "error", result, terminal=False)
                 return
             terminal = self._nav_state_terminal(response)
             if terminal is None:
                 continue
-            state = terminal.strip().lower() if isinstance(terminal, str) else str(terminal)
+            state = self._nav_state_name(terminal)
             result["final_state"] = terminal
             if state in self._NAV_ERROR_STATES:
                 result["error"] = f"navigation ended in {terminal}"
@@ -4136,173 +4380,221 @@ class ControlledSpatialPlugin:
                 self._finish(action_id, "completed", result)
             return
         result["error"] = f"navigation not finished within {self.NAV_TIMEOUT_S}s"
-        self._finish(action_id, "error", result)
+        self._finish(action_id, "error", result, terminal=False)
 
-    def _finish(self, action_id, status, result):
+    def _finish(self, action_id, status, result, *, terminal=True):
         """原子终态：锁内确认仍持有该 action_id 才清 id，锁外回报。"""
         with self._nav_lock:
             if self._nav_action_id != action_id:
                 return  # 已被取消/顶替，终态由对方回报
             self._nav_action_id = None
+            if terminal:
+                self._active_task_id = None
+                self._active_nav_map = None
         _acp_notify(action_id, status, result, "controlled_spatial")
 
     def _nav_dispatch(self, action, method, payload):
-        """Send a long-running navigation RPC and arm the ACP completion waiter.
-
-        新导航顶替旧导航：先结算旧等待线程（立即 cancelled）并在锁内按旧
-        task_id 物理取消 —— 不取消的话机器人会同时执行两个导航任务
-        （ThreadingHTTPServer 使并发下发可达，MotionPlayPlugin 同款）。
-        结算→ActionCancel→新导航→武装在同一把锁内完成（10th PR review）：
-        并发导航不会重叠下发，也不会互相顶掉对方的 id。
-        """
         with self._nav_lock:
-            prior = self._settle_active("cancelled", {"reason": "replaced_by_new_navigation"})
-            if prior is not None and prior[1]:
-                try:
-                    self.nodes.rpc.navi("ActionCancel", {"task_id": prior[1]})
-                except Exception:
-                    pass
-            response = self._remember(self.nodes.rpc.navi(method, payload))
-            task_id = (response or {}).get("task_id") or self.last_task_id or 0
+            self._localized_pose(payload["map_id"])
+            if self._active_task_id is not None:
+                self._cancel_navigation(self._active_task_id, "replaced_by_new_navigation")
+            response = self._nav_command(method, payload)
+            data = response.get("data")
+            raw_task_id = response.get("task_id") or (data.get("task_id") if isinstance(data, dict) else None)
+            task_id = int(raw_task_id or 0)
+            self.last_task_id = self._active_task_id = task_id
+            self._active_nav_map = payload["map_id"]
             action_id = f"a3_nav_{uuid4().hex[:8]}"
             self._nav_action_id = action_id
         threading.Thread(target=self._nav_worker,
                          args=(action_id, task_id, action), daemon=True).start()
         return {"state": "navigating", "action_id": action_id,
-                "task_id": task_id, "response": response}
+                "task_id": raw_task_id or 0, "response": response}
 
     def dispatch(self, action, args):
         if action == "start":
             return {"state": "ready"}
         if action == "stop":
-            # Framework stop must physically cancel the running nav task —
-            # otherwise the robot keeps driving and the ACP worker reports
-            # completion when the task finally ends on its own. With nothing
-            # armed the call stays inert (canvas lifecycle toggles must not
-            # spam ActionCancel when no task is navigating). The cancelled task
-            # id is captured under the lock: args may omit task_id, and
-            # last_task_id may already point at a newer task.
             with self._nav_lock:
-                if self._nav_action_id is None:
+                if self._active_task_id is None:
                     return {"state": "idle"}
-                prior = self._settle_active(
-                    "cancelled", {"reason": "cancelled_by_framework",
-                                  "task_id": self._task_id(args)})
-                stop_task = prior[1] if prior is not None else self._task_id(args)
-            response = jsonable(self.nodes.rpc.navi("ActionCancel", {"task_id": stop_task or 0}))
+                response = self._cancel_navigation(self._active_task_id, "cancelled_by_framework")
             return {"state": "stopped", "response": response}
         if action == "info":
             return {"state": "ready", "last_task_id": self.last_task_id}
-        # -- 建图 / 地图管理 --
-        if action == "start_mapping":
-            return jsonable(self.nodes.rpc.start_mapping())
-        if action == "stop_save":
-            return jsonable(self.nodes.rpc.stop_mapping(args.get("map_name")))
-        if action == "stop_discard":
-            return jsonable(self.nodes.rpc.stop_mapping(None))
+        if action in ("start_mapping", "stop_save", "stop_discard", "set_current_map",
+                      "start_global_relocalization", "stop_global_relocalization",
+                      "start_relocalization", "stop_relocalization"):
+            with self._nav_lock:
+                _require(self._active_task_id is None, "请先结束当前导航任务")
+                if action == "start_mapping":
+                    response = self.nodes.rpc.start_mapping()
+                    self._map_requires_relocalization = True
+                    return jsonable(response)
+                if action == "stop_save":
+                    return jsonable(self.nodes.rpc.stop_mapping(self._name(args, "map_name")))
+                if action == "stop_discard":
+                    return jsonable(self.nodes.rpc.stop_mapping())
+                if action == "set_current_map":
+                    response = self.nodes.rpc.set_current_working_map(self._id(args, "map_id"))
+                    self._map_requires_relocalization = True
+                    return jsonable(response)
+                if action == "start_global_relocalization":
+                    map_id = self._map_id(args)
+                    _require(self._current_map_id() == map_id, "请先切换到目标地图")
+                    response = self.nodes.rpc.start_global_relocalization(map_id)
+                    self._map_requires_relocalization = False
+                    return jsonable(response)
+                if action == "stop_global_relocalization":
+                    response = self.nodes.rpc.stop_global_relocalization()
+                    self._map_requires_relocalization = True
+                    return jsonable(response)
+                if action == "start_relocalization":
+                    response = self.nodes.rpc.slam_start_normal_relocalization(self._name(args, "map_dir"))
+                    self._map_requires_relocalization = True
+                    return jsonable(response)
+                # A pose-free request cancels the manual attempt.
+                if all(args.get(key) is None for key in ("x", "y", "z", "angle")):
+                    response = self.nodes.rpc.slam_stop_normal_relocalization()
+                    self._map_requires_relocalization = True
+                    return jsonable(response)
+                x, y, angle = (self._number(args, key) for key in ("x", "y", "angle"))
+                z = self._number(args, "z") if args.get("z") is not None else 0.0
+                pose = {"position": {"x": x, "y": y, "z": z},
+                        "orientation": {"x": 0.0, "y": 0.0,
+                                        "z": math.sin(angle / 2), "w": math.cos(angle / 2)}}
+                response = self.nodes.rpc.slam_stop_normal_relocalization(pose)
+                self._map_requires_relocalization = False
+                return jsonable(response)
         if action == "list_maps":
             return jsonable(self.nodes.rpc.get_stored_map_names())
         if action == "current_map":
             return jsonable(self.nodes.rpc.get_current_working_map())
-        if action == "rename_map":
-            return jsonable(self.nodes.rpc.rename_map(int(args.get("map_id", 0)),
-                                                      args.get("old_name", ""),
-                                                      args.get("new_name", "")))
-        # -- 重定位 --
-        if action == "start_relocalization":
-            return jsonable(self.nodes.rpc.slam_start_normal_relocalization(args.get("map_dir", "")))
-        if action == "stop_relocalization":
-            reloc_pose = None
-            if args.get("x") is not None or args.get("y") is not None or args.get("angle") is not None:
-                reloc_pose = {"x": float(args.get("x", 0)), "y": float(args.get("y", 0)),
-                              "angle": float(args.get("angle", 0))}
-            return jsonable(self.nodes.rpc.slam_stop_normal_relocalization(reloc_pose))
-        # -- 导航（长时间动作：_nav_dispatch 发 RPC 后返回 action_id 并武装
-        # ACP 完成等待线程，轮询 ActionGetState 判定到点） --
-        if action == "navi_to_goal":
-            rejected = _motion_gate(self.nodes.rpc, "controlled_spatial")
-            if rejected:
-                return rejected
-            return self._nav_dispatch(action, "PlanningNaviToGoal", {
-                "task_id": 0, "map_id": int(args.get("map_id", 0)),
-                "target_id": int(args.get("target_id", 0)), "guide_line_id": 0,
-                "ackerman_mode": False})
-        if action == "navi_to_pose":
-            rejected = _motion_gate(self.nodes.rpc, "controlled_spatial")
-            if rejected:
-                return rejected
-            return self._nav_dispatch(action, "PlanningNaviToPose2D", {
-                "task_id": 0, "map_id": int(args.get("map_id", 0)),
-                "pose": {"position": {"x": float(args.get("x", 0)), "y": float(args.get("y", 0))},
-                         "angle": float(args.get("angle", 0))},
-                "ackerman_mode": False})
-        if action == "linear_to_goal":
-            rejected = _motion_gate(self.nodes.rpc, "controlled_spatial")
-            if rejected:
-                return rejected
-            return self._nav_dispatch(action, "LinearNaviToGoal", {
-                "task_id": 0, "map_id": int(args.get("map_id", 0)),
-                "target_id": int(args.get("target_id", 0))})
-        if action == "linear_to_pose":
-            rejected = _motion_gate(self.nodes.rpc, "controlled_spatial")
-            if rejected:
-                return rejected
-            return self._nav_dispatch(action, "LinearNaviToPose2D", {
-                "task_id": 0, "map_id": int(args.get("map_id", 0)),
-                "pose": {"position": {"x": float(args.get("x", 0)), "y": float(args.get("y", 0))},
-                         "angle": float(args.get("angle", 0))}})
-        if action == "move_forward":
-            rejected = _motion_gate(self.nodes.rpc, "controlled_spatial")
-            if rejected:
-                return rejected
-            return self._nav_dispatch(action, "MoveForward", {
-                "task_id": 0, "map_id": int(args.get("map_id", 0)),
-                "angle": 0, "distance": float(args.get("distance", 0))})
-        if action == "spin_turn":
-            rejected = _motion_gate(self.nodes.rpc, "controlled_spatial")
-            if rejected:
-                return rejected
-            return self._nav_dispatch(action, "SpinTurn", {
-                "task_id": 0, "map_id": int(args.get("map_id", 0)),
-                "angle": float(args.get("angle", 0))})
-        if action == "cancel":
-            # 取消任务同时结算挂起的 ACP 等待线程（立刻回报 cancelled，
-            # 不让 Agent Core 的 barrier 挂到超时）。
+        if action == "relocalization_state":
+            return jsonable(self.nodes.rpc.relocalization_state())
+        if action == "localization_status":
+            map_id = None
             with self._nav_lock:
-                self._settle_active("cancelled", {"reason": "cancelled_by_request",
-                                                  "task_id": self._task_id(args)})
-            return jsonable(self.nodes.rpc.navi("ActionCancel", {"task_id": self._task_id(args)}))
+                try:
+                    map_id = self._current_map_id()
+                    pose = self._localized_pose(map_id)
+                except ValueError as exc:
+                    return {"state": "unavailable", "map_id": map_id, "reason": str(exc)}
+            return {"state": "ready", "map_id": map_id, "pose": pose}
+        if action == "list_waypoints":
+            return self._list_waypoints(args.get("map_id"))
+        if action in ("tag_place", "update_waypoint", "rename_waypoint", "delete_waypoint"):
+            name = self._name(args, "waypoint_name")
+            new_name = self._name(args, "new_name") if action == "rename_waypoint" else None
+            with self._nav_lock:
+                map_id = self._current_map_id() if action in ("tag_place", "update_waypoint") else self._map_id(args)
+                return self._write_waypoint(action, name, map_id, new_name)
+        if action == "rename_map":
+            return jsonable(self.nodes.rpc.rename_map(self._id(args, "map_id"),
+                                                      self._name(args, "old_name"),
+                                                      self._name(args, "new_name")))
+        if action == "get_realtime_map":
+            return jsonable(self.nodes.rpc.get_realtime_map())
+        if action == "sync_map_regions":
+            map_id = self._id(args, "map_id")
+            regions = args.get("regions")
+            _require(isinstance(regions, list) and regions, "需要 regions")
+            for region in regions:
+                _require(isinstance(region, dict), "区域必须是对象")
+                region_type = region.get("type")
+                _require(region_type in ("VerteciesType_CLOSURE", "VerteciesType_LINES"), "无效的区域类型")
+                vertices = region.get("vertices")
+                minimum = 3 if region_type == "VerteciesType_CLOSURE" else 2
+                _require(isinstance(vertices, list) and len(vertices) >= minimum, "区域顶点不足")
+                color = region.get("color", "")
+                _require(isinstance(color, str) and len(color) == 8
+                         and all(ch in "0123456789abcdefABCDEF" for ch in color), "无效的区域颜色")
+                for vertex in vertices:
+                    _require(isinstance(vertex, dict) and isinstance(vertex.get("position"), dict),
+                             "区域顶点需要 position")
+                    for axis in ("u", "v"):
+                        _require(type(vertex["position"].get(axis)) is int, f"{axis} 必须是整数")
+                    if vertex.get("angle") is not None:
+                        self._number(vertex, "angle")
+            with self._nav_lock:
+                _require(self._active_task_id is None, "请先结束当前导航任务")
+                return jsonable(self.nodes.rpc.sync_map_regions(map_id, regions))
+        if action in self.NAV_ACTIONS:
+            rejected = _motion_gate(self.nodes.rpc, "controlled_spatial")
+            if rejected:
+                return rejected
+            return self._navigate(action, args)
+        if action == "cancel":
+            with self._nav_lock:
+                return self._cancel_navigation(self._task_id(args), "cancelled_by_request")
         if action == "pause":
-            return jsonable(self.nodes.rpc.navi("ActionPause", {"task_id": self._task_id(args)}))
+            return jsonable(self._nav_command("ActionPause", {"task_id": self._task_id(args)}))
         if action == "resume":
             rejected = _motion_gate(self.nodes.rpc, "controlled_spatial")
             if rejected:
                 return rejected
-            return jsonable(self.nodes.rpc.navi("ActionResume", {"task_id": self._task_id(args)}))
+            with self._nav_lock:
+                map_id = self._active_nav_map or self._current_map_id()
+                self._localized_pose(map_id)
+                return jsonable(self._nav_command("ActionResume", {"task_id": self._task_id(args)}))
         if action == "nav_state":
             return jsonable(self.nodes.rpc.navi_state(self._task_id(args)))
-        # -- 地图数据（原 map_get 处理卡合并而来） --
         if action == "get_map":
-            response = self.nodes.rpc.get_2d_whole_map(int(args.get("map_id", 0)))
-            data = response.get("data") or {}
+            response = self.nodes.rpc.get_2d_whole_map(self._map_id(args))
             result = jsonable(response)
             if args.get("x") is not None or args.get("y") is not None:
-                resolution = data.get("resolution") or 0.05
-                origin = data.get("origin") or {}
-                origin_x = origin.get("x", 0) if isinstance(origin, dict) else 0
-                origin_y = origin.get("y", 0) if isinstance(origin, dict) else 0
-                # 逆变换 of the map transform (pixel → world used in
-                # spatial_map._grid_layers): world → pixel must SUBTRACT the
-                # metric origin and DIVIDE by resolution, not add/multiply.
-                # Row 0 of the occupancy grid is the highest y (grid rows grow
-                # downward), hence the y-axis inversion.
-                px = int(round((float(args.get("x", 0)) - origin_x) / resolution))
-                py = int(round((origin_y - float(args.get("y", 0))) / resolution))
-                result["pixel"] = {"x": px, "y": py,
-                                   "formula": "pixel_x = round((x - origin_x) / resolution); "
-                                              "pixel_y = round((origin_y - y) / resolution)"}
+                x, y = (self._number(args, key) for key in ("x", "y"))
+                data = response.get("data") or {}
+                resolution = self._number(data, "resolution")
+                _require(resolution > 0, "地图分辨率必须大于 0")
+                if "origin_x" in data or "origin_y" in data:
+                    px = self._number(data, "origin_x") + x * resolution
+                    py = self._number(data, "origin_y") - y * resolution
+                    formula = "pixel_x = round(origin_x + x * resolution), pixel_y = round(origin_y - y * resolution)"
+                else:
+                    origin = data.get("origin") or {}
+                    px = (x - self._number(origin, "x")) / resolution
+                    py = (self._number(origin, "y") - y) / resolution
+                    formula = "pixel_x = round((x - origin_x) / resolution), pixel_y = round((origin_y - y) / resolution)"
+                result["pixel"] = {"x": round(px), "y": round(py), "formula": formula}
             return result
         raise ValueError(f"controlled_spatial: unknown action {action!r}")
+
+    def _navigate(self, action, args):
+        map_id = self._map_id(args) if action == "navi_to_waypoint" else self._id(args, "map_id")
+        payload = {"task_id": 0, "map_id": map_id}
+        if action == "navi_to_waypoint":
+            name = self._name(args, "waypoint_name")
+            matches = [point for point in self._list_waypoints(map_id)["waypoints"] if point["name"] == name]
+            _require(bool(matches), f"地图 {map_id} 中没有名为 {name!r} 的点位，请使用 list_waypoints 查询")
+            _require(len(matches) == 1,
+                     f"地图 {map_id} 中有多个名为 {name!r} 的点位，请按原生 ID 或坐标导航")
+            waypoint = matches[0]
+            if waypoint.get("source") == "recorded":
+                payload.update(pose=waypoint["pose"], ackerman_mode=False)
+                return self._nav_dispatch(action, "PlanningNaviToPose2D", payload)
+            payload["target_id"] = waypoint["point_id"]
+        if action in ("navi_to_goal", "linear_to_goal"):
+            payload["target_id"] = self._id(args, "target_id", minimum=0)
+        if action in ("navi_to_waypoint", "navi_to_goal"):
+            payload.update(guide_line_id=0, ackerman_mode=False)
+            return self._nav_dispatch(action, "PlanningNaviToGoal", payload)
+        if action == "linear_to_goal":
+            return self._nav_dispatch(action, "LinearNaviToGoal", payload)
+        if action in ("navi_to_pose", "linear_to_pose", "linear_to_relative"):
+            x, y, angle = (self._number(args, key) for key in ("x", "y", "angle"))
+            payload["pose"] = {"position": {"x": x, "y": y}, "angle": angle}
+            if action == "navi_to_pose":
+                payload["ackerman_mode"] = False
+                return self._nav_dispatch(action, "PlanningNaviToPose2D", payload)
+            method = "LinearNaviToRelative" if action == "linear_to_relative" else "LinearNaviToPose2D"
+            return self._nav_dispatch(action, method, payload)
+        if action != "spin_turn":
+            payload["distance"] = self._number(args, "distance")
+        payload["angle"] = 0 if action == "move_forward" else self._number(args, "angle")
+        method = {"move_forward": "MoveForward", "spin_turn": "SpinTurn",
+                  "spin_turn_and_move_forward": "SpinTurnAndMoveForward"}[action]
+        return self._nav_dispatch(action, method, payload)
 
 
 class AutoChargingPlugin:
@@ -4419,7 +4711,8 @@ class SpatialMapPlugin:
             if not self._running:
                 return
             try:
-                response = self.nodes.rpc.get_2d_whole_map(self.map_id)
+                map_id = self.map_id or self.nodes.rpc.current_map_id()
+                response = self.nodes.rpc.get_2d_whole_map(map_id)
                 self.publish_map(response)
             except Exception:
                 pass
@@ -4547,7 +4840,8 @@ class SpatialMapPlugin:
                     "topic_out": [{"topic": self.topic, "format": "sensor/mapping"}],
                     "topic": self.topic, "map_id": self.map_id}
         if action == "refresh":
-            response = self.nodes.rpc.get_2d_whole_map(int(args.get("map_id", self.map_id)))
+            map_id = int(args.get("map_id", self.map_id)) or self.nodes.rpc.current_map_id()
+            response = self.nodes.rpc.get_2d_whole_map(map_id)
             published = self.publish_map(response)
             return {"state": "running", "topic": self.topic, "published": published}
         raise ValueError(f"spatial_map: unknown action {action!r}")
