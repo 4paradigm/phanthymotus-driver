@@ -1,0 +1,13 @@
+id: rokae-helios-face-follow
+name: Helios Face Follow
+category: driver
+hardware_provider: rokae
+hardware_model: helios-2.1
+image_name: rokae-helios-face-follow
+port: 15884
+mcp_url: http://localhost:15884/mcp
+description: Helios RGB-D face, active speaker and VOP target tracking preview
+build_context_extras:
+  - ../../common
+cards:
+  - { name: helios_face_follow, type: processor }
