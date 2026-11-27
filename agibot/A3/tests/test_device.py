@@ -320,6 +320,37 @@ def run_concurrently(fn_a, fn_b):
 # ---------------------------------------------------------------------------
 
 class ToolInventoryTests(unittest.TestCase):
+    def test_robot_discovery_servers_in_deployed_service(self):
+        service = yaml.safe_load((DEVICE_DIR / "deploy/service.yml").read_text())
+        settings = service["agibot-a3"]["environment"]
+        self.assertEqual([s for s in settings if s.startswith("ROS_DISCOVERY_SERVER=")],
+                         ["ROS_DISCOVERY_SERVER=10.42.10.10:11811;10.42.10.12:11811"])
+
+    def test_core_workers_clear_robot_discovery_before_ros_init(self):
+        import domain_bridge
+        import rclpy
+
+        profile = "/opt/phanthy-motus/dds-local.xml"
+        workers = [
+            (domain_bridge._run, (None, profile, 42, "state")),
+            (domain_bridge._run_subscription,
+             (None, None, profile, 42, "/test", "std_msgs/msg/String", 5)),
+        ]
+        serialization = types.SimpleNamespace(serialize_message=bytes)
+        for worker, args in workers:
+            with (self.subTest(worker=worker.__name__),
+                  patch.dict(os.environ, {"ROS_DISCOVERY_SERVER": "robot-server:11811"}),
+                  patch.object(os.path, "isfile", return_value=True),
+                  patch.dict(sys.modules, {"rclpy.serialization": serialization}),
+                  patch.object(rclpy.qos, "ReliabilityPolicy", FakeQoSReliabilityPolicy, create=True),
+                  patch.object(rclpy, "init", side_effect=StopIteration, create=True) as init):
+                with self.assertRaises(StopIteration):
+                    worker(*args)
+                init.assert_called_once()
+                self.assertIsNone(os.environ.get("ROS_DISCOVERY_SERVER"))
+                self.assertEqual(os.environ["ROS_DOMAIN_ID"], "42")
+                self.assertEqual(os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"], profile)
+
     def test_relay_start_failure_is_fatal_when_cameras_use_host_relay(self):
         dockerfile = (DEVICE_DIR / "Dockerfile").read_text(encoding="utf-8")
         self.assertIn("if ! /work/agibot/A3/jazzy_relay.sh start; then", dockerfile)

@@ -32,6 +32,9 @@ agibot-a3:
     # then forwards those small samples to domain 42 through its child bridge.
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     - A3_JAZZY_RELAY=1
+    # Robot-domain (232) driver and relay share these servers.
+    # Domain-42 bridge workers clear the variable before ROS initialization.
+    - ROS_DISCOVERY_SERVER=10.42.10.10:11811;10.42.10.12:11811
     # Subscribe all configured camera inputs at startup. The relay still bounds
     # memory/CPU with resize, JPEG quality and newest-frame replacement; relying
     # on canvas start/stop made the stream disappear when lifecycle callbacks
