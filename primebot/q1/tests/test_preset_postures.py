@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from preset_postures import MOTIONS, PRESETS, PresetController, PresetPosturesCard
+from preset_postures import BASIC_POSTURES, MOTIONS, PRESETS, PresetController, PresetPosturesCard
 from preset_robot import (RobotTransport, upright_quaternion, select_posture, reconcile_action,
                           FULL_IMU, TORSO_ORIENTATION, MC_STATE)
 
@@ -85,7 +85,7 @@ class PresetTests(unittest.TestCase):
         self.assertEqual(len(PRESETS), 16)
         self.assertEqual(len(MOTIONS), 16)
         self.assertEqual(set(schema["properties"]["action"]["enum"]),
-                         set(PRESETS) | set(MOTIONS) | {"reset", "status"})
+                         set(BASIC_POSTURES) | set(PRESETS) | set(MOTIONS) | {"reset", "status"})
         self.assertTrue(all(entry["params"] == [] for entry in schema["x-action-params"].values()))
         self.assertNotIn("x-completion", schema)  # No fabricated physical completion.
         self.assertIsNone(card.dispatch("invented_motion", {}))

@@ -25,11 +25,12 @@
 
 | 动作类别 | action（中文含义） |
 | --- | --- |
+| 基础姿态 | `lie_face_up` 仰面躺下（1010）、`lie_face_down` 趴下／俯卧（1009）、`stand_up` 自主站起（1007）、`store_default` 折叠收储（1001） |
 | 上肢互动 | `wave` 挥手、`beckon` 招手、`handshake` 握手、`bump_fists` 碰拳、`show_happiness` 开心、`make_heart` 比心、`cheer` 加油、`stretch` 伸懒腰、`speak_a/b/c` 三种讲话、`hug` 拥抱、`refuse` 拒绝、`dance_a/b/c` 三种上肢舞蹈 |
 | 全身动作 | `intro_pose7` 亮相、`boxing` 拳击、`dance_locking` 锁舞、`dance_mj` 星际滑步、`dance_go` 跃动时刻、`happy_pick` 元气蹦蹦、`dance_q` 奇妙节拍、`show_enter` 闪亮登场、`show_return` 潇洒退场、`run_jump` 欢乐巡游、`siuzhuan` 进球狂欢、`dream_fly` 梦羽轻扬、`dance_babyq` 星际萌芽、`taiji` 太极、`explosive_gunfire` 爆裂节拍、`xinbaodao` 新宝岛 |
 | 操作与查询 | `reset` 动作复位；`status` 只读查询当前运控状态、服务可用性和上次请求结果 |
 
-执行前，由操作者确认机器人稳定站立、双脚着地、空间平坦防滑且无人和障碍物，
+上肢互动和全身舞蹈执行前，由操作者确认机器人稳定站立、双脚着地、空间平坦防滑且无人和障碍物，
 并准备官方急停。驱动检查新鲜有效的机身直立朝向与运控的
 `RUNNING/switch_ready`，只从走跑、全身控制或越障模式进行直接切换。
 高层运控从 `/torso_imu_orientation` 读取朝向；若原始 IMU 有有效数据则优先使用。
@@ -37,13 +38,26 @@
 当前机身固件的 `GetMcAction` 没有填充切换就绪字段：驱动使用
 `/aima/mc/common/state` 中不超过 0.5 秒、且与 RPC 模式及状态一致的数据，
 并保留 `rpc_switch_ready` 与 `switch_ready_source` 便于诊断。
-没有新鲜状态时不会把 false 改为 true；摔倒、被提起、移动中或状态不一致均拒绝动作。
+没有新鲜状态时不会把 false 改为 true；上述站立动作遇到摔倒、被提起、移动中或状态不一致均拒绝。
 构建补充的消息定义及固件兼容性见 [motion_msgs](motion_msgs/README.md)。
 上肢动作通过 `SetMcPresetMotion` 执行（16 个 Q1 枚举）；全身动作通过
 `SetMcMotion` 执行（16 个官方公开名称）。下发前分别确认进入
 `BIPED_WHOLE_BODY_CTRL` 或 `BIPED_WALK_RUN`，不会从被动、阻尼、躺姿或收储模式自动起身。
 枚举来自[官方接口说明](https://github.com/QyroTech/qyro-q1-sdk/blob/main/docs/zh/接口说明.md)，
 与既有 v1.1.8.0 SDK 匹配。机身配置中其他未在公开文档列出的动作没有加入卡片。
+
+四个基础姿态通过一次 `SetMcAction` 直接发送对应枚举和名称，不调用上肢动画或全身舞蹈接口。
+`lie_face_up/lie_face_down` 要求稳定直立且处于走跑、全身控制或越障模式。
+`stand_up` 从地面姿态请求起身，直立时拒绝重复起身；`store_default` 请求官方折叠收储。
+后两者不套用“必须站立、不得报告倒地”的条件，具体起始姿态与模式切换是否合法交给官方运控判断。
+四个动作都要求新鲜且与查询一致的运控状态、有效朝向、切换就绪、未被提起且未移动，
+阻尼保护模式下拒绝执行。驱动不会为满足条件而先切被动、阻尼或自行串联其他动作。
+固件拒绝时原样保留 `code/state/reason`，操作者使用官方方式调整后再显式提交。
+`status.basic_action_readiness` 分别说明四个动作的本地前置条件；`can_request=true`
+仅表示可提交请求，不保证固件接受。顶层 `ready/not_ready` 仍描述站立互动／舞蹈的条件，
+因此躺姿下 `not_ready` 不代表不能请求 `stand_up`。
+基础姿态回执包括 `target_action`、起始状态和任务编号；随后用 `status` 查询实时模式、朝向和
+`last_request`，物理完成由现场观察确认，不把到达某个模式或等待固定时长当作完成。
 
 `state=accepted` 和 `task_id` 表示厂商服务已接受请求，**不代表物理动作完成**。
 没有使用定时等待伪造完成通知。服务错误同时检查 `header.code` 和 `state`，

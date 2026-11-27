@@ -50,11 +50,24 @@ MOTIONS = {
 }
 STANDING_MODES = {1002, 1005, 1012}
 MIMIC_MODES = {1003, 1018}
-MODE_NAMES = {1002: "BIPED_WALK_RUN", 1005: "BIPED_WHOLE_BODY_CTRL"}
+BASIC_POSTURES = {
+    "lie_face_up": (1010, "仰面躺下"),
+    "lie_face_down": (1009, "趴下／俯卧"),
+    "stand_up": (1007, "自主站起"),
+    "store_default": (1001, "折叠收储"),
+}
+MODE_NAMES = {1002: "BIPED_WALK_RUN", 1005: "BIPED_WHOLE_BODY_CTRL",
+              **{number: name.upper() for name, (number, _) in BASIC_POSTURES.items()}}
+BASIC_DESCRIPTIONS = {
+    "lie_face_up": "仰面躺下（1010）。从稳定站立姿态执行，确认身后和全身落地范围平坦、无障碍。",
+    "lie_face_down": "趴下／俯卧（1009）。从稳定站立姿态执行，确认身前和全身落地范围平坦、无障碍。",
+    "stand_up": "自主站起（1007）。从地面姿态执行，确认起身范围无障碍；具体姿态和切换条件由官方运控判断。",
+    "store_default": "折叠收储（1001）。会改变全身姿态，确认周围及落地范围无障碍；具体起始姿态由官方运控判断。",
+}
 
 
 class PresetController:
-    """One bounded command; transport is injectable for hardware-free tests."""
+    """One bounded command; a successful RPC never implies physical completion."""
 
     def __init__(self, transport, progress=lambda _: None):
         self.transport = transport
@@ -96,9 +109,11 @@ class PresetController:
                     "message": str(exc), **self.sent}
 
     def _execute(self, action):
-        if action not in (*PRESETS, *MOTIONS, "reset", "info"):
+        if action not in (*PRESETS, *MOTIONS, *BASIC_POSTURES, "reset", "info"):
             raise ValueError("未知出厂动作")
         t = self.transport
+        if action in BASIC_POSTURES:
+            return self._basic_posture(action)
         info = t.query()
         if action == "info":
             posture = t.posture()
@@ -117,10 +132,19 @@ class PresetController:
                 reasons.append("运控未报告切换就绪")
             if any(info.get(k) for k in ("is_fallen", "is_lifted", "is_moving")):
                 reasons.append("运控报告摔倒、被提起或仍在移动")
+            basic_readiness = {}
+            for name in BASIC_POSTURES:
+                try:
+                    self._basic_guard(name, info, posture)
+                    basic_readiness[name] = {"can_request": True,
+                                             "message": "本地前置条件满足，最终由官方运控判定是否接受"}
+                except ValueError as exc:
+                    basic_readiness[name] = {"can_request": False, "message": str(exc)}
             return {"state": "ready" if ready else "not_ready", "current_action": info,
                     "standing": standing, "posture": posture, "services": t.services(),
+                    "basic_action_readiness": basic_readiness,
                     "message": "状态查询，不发送运动指令" if ready else
-                               "；".join(reasons)}
+                               "；".join(reasons) + "；基础姿态动作请查看 basic_action_readiness"}
         self._stable(info)
         mode = info["value"]
         if action == "reset":
@@ -159,6 +183,53 @@ class PresetController:
             failure = self._issue("motion", MOTIONS[action][0])
         return failure or self._accepted(action, t.last_response)
 
+    @staticmethod
+    def _basic_guard(action, info, posture):
+        # Recovery from the ground must not inherit the standing-only guard.
+        # A fresh native state is required to distinguish being lifted/moving
+        # from lying on the ground. The firmware owns its transition matrix.
+        if info.get("state_consistent") is not True:
+            raise ValueError("缺少与查询一致的新鲜运控状态，未发送基础姿态动作")
+        if info["status"] != 100 or not info["switch_ready"]:
+            raise ValueError("运控正在切换或尚未就绪，未发送基础姿态动作")
+        if info["value"] == 2:
+            raise ValueError("当前处于阻尼保护模式，请先使用官方方式处理；本卡不自动解除保护")
+        if info.get("is_lifted") is not False or info.get("is_moving") is not False:
+            raise ValueError("运控报告被提起、仍在移动或状态未知，未发送基础姿态动作")
+        if (posture["upright"] is None or posture.get("age_s") is None
+                or not 0 <= posture["age_s"] <= .5):
+            raise ValueError("缺少新鲜有效的机身朝向，未发送基础姿态动作")
+        if action in {"lie_face_up", "lie_face_down"}:
+            if (info["value"] not in STANDING_MODES or not posture["upright"]
+                    or info.get("is_fallen") is not False):
+                raise ValueError("躺下／趴下需要先稳定站立并处于走跑、全身控制或越障模式")
+        elif action == "stand_up" and posture["upright"]:
+            raise ValueError("机身已处于直立朝向，无需发送地面起身动作；请确认实际姿态")
+        # For stand_up/store_default, is_fallen may be true on the ground.
+        # Submit only the explicitly selected action; never force PASSIVE or
+        # DAMPING, and never manufacture a recovery sequence in the driver.
+
+    def _basic_posture(self, action):
+        t = self.transport
+        # Posture acquisition may wait for telemetry; query again afterwards.
+        posture = t.posture()
+        posture_checked = time.monotonic()
+        info = t.query()
+        if posture.get("age_s") is not None:
+            posture = {**posture, "age_s": posture["age_s"] + time.monotonic() - posture_checked}
+        self._basic_guard(action, info, posture)
+        target = BASIC_POSTURES[action][0]
+        if info["value"] == target:
+            return {"state": "idle", "action": action, "execution_confirmed": False,
+                    "current_action": info, "message": "已处于该运控模式，未重复发送；不代表物理动作完成"}
+        failure = self._issue("set_mode", target)
+        if failure:
+            return {**failure, "action": action, "target_action": target}
+        return {**self._accepted(action, t.last_response), "target_action": target,
+                "previous_action": info, "starting_posture": posture,
+                "message": "官方运控已接受基础姿态请求；请选择 status 查看当前模式与姿态，并现场确认动作结果。"
+                           "请求不会自动重发，也不会自动切换到被动或阻尼模式。"}
+
     def _wait_mode(self, target, original):
         t = self.transport
         deadline = time.monotonic() + 6
@@ -196,19 +267,20 @@ class PresetPosturesCard:
         self._worker_started = None
 
     def get_tool(self):
-        actions = {name: ([], f"{label}。确认稳定站立、双脚着地且肢体活动范围内无人和障碍物。")
-                   for name, (_, label) in PRESETS.items()}
+        actions = {name: ([], description) for name, description in BASIC_DESCRIPTIONS.items()}
+        actions.update({name: ([], f"{label}。确认稳定站立、双脚着地且肢体活动范围内无人和障碍物。")
+                        for name, (_, label) in PRESETS.items()})
         actions.update({name: ([], f"全身动作：{label}。确认稳定站立，并留足平坦防滑的动作空间。")
                         for name, (_, label) in MOTIONS.items()})
         actions.update(reset=([], "复位上肢动画，或请求结束全身动作返回走跑模式；不是急停，可能被固件拒绝。"),
                        status=([], "刷新运控状态和上次请求，不运动。"))
         schema = action_schema(actions, {})
         schema["properties"]["action"]["description"] = "；".join(
-            f"{name}={label}" for name, (_, label) in {**PRESETS, **MOTIONS}.items()
+            f"{name}={label}" for name, (_, label) in {**BASIC_POSTURES, **PRESETS, **MOTIONS}.items()
         ) + "；reset=动作复位；status=状态查询"
         definition = tool(self.PREFIX, "actuator",
-                          "启元 Q1 出厂动作：挥手、握手、比心及全身舞蹈等。自动确认所需运控模式；"
-                          "需已稳定站立，开启画布不会运动。执行回执表示请求被接受，不代表动作完成。",
+                          "启元 Q1 出厂动作：躺下、趴下、自主站起、折叠收储、挥手、比心及舞蹈等。"
+                          "各动作有独立姿态要求，开启画布不会运动。执行回执表示请求被接受，不代表动作完成。",
                           schema)
         definition["topic_out"] = []
         return definition
@@ -286,7 +358,7 @@ class PresetPosturesCard:
         if action == "stop":
             self.stop()
             return {"state": "idle", "message": "已取消后续调度；已送达机器人的动作不保证停止，请使用官方急停"}
-        if not isinstance(action, str) or action not in (*PRESETS, *MOTIONS, "reset", "status"):
+        if not isinstance(action, str) or action not in (*PRESETS, *MOTIONS, *BASIC_POSTURES, "reset", "status"):
             return None
         action = "info" if action == "status" else action
         if not self._call_lock.acquire(blocking=False):
