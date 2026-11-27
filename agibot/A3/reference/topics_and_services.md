@@ -133,13 +133,26 @@ meshes. Note the `/motion/control/arm_joint_command` limits enforced in
 
 ### Recording a waypoint
 
-Load the target map and complete relocalization. Call `controlled_spatial` with
+Use `set_current_map` to select the saved map. Call `start_global_relocalization`
+and wait for `localization_status` to return `ready` with the expected map ID.
+`relocalization_state` queries the SLAM task, and `stop_global_relocalization`
+cancels a global attempt. For manual localization, use `start_relocalization`
+with the map directory and `stop_relocalization` with all of `x`, `y` and
+`angle` (optionally `z`) to submit the initial pose. Omit the pose to cancel.
+
+Call `controlled_spatial` with
 `{"action":"tag_place","waypoint_name":"Entrance"}` to save the next fresh map-frame
 sample from `/slam/localization/odometry`. The driver reads the current map before
 capturing and again before saving. A duplicate name on the same map is rejected.
+On deployed A3 systems the host Jazzy relay subscribes to the localization topic
+using the vendor DDS profile and discovery servers set in the driver service
+fragment. Its messages retain the original frame and timestamp.
 
 `list_waypoints` returns native and recorded points for the selected map. Recorded
-points have `source: recorded`, `point_id: null` and a saved map-frame pose. They
+points have `source: recorded`, `point_id: null`, a persistent `waypoint_id`,
+and a saved map-frame pose. Use `rename_waypoint`, `update_waypoint`, or
+`delete_waypoint` to maintain recorded points by name. They
 persist in `/opt/phanthy-motus/data/a3/waypoints.sqlite3` on the mounted host data
 directory. `navi_to_waypoint` uses pose navigation for recorded points and the
-vendor point ID for native points.
+vendor point ID for native points. Navigation requires current map localization
+and reports device task completion or failure through ACP.

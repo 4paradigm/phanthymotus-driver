@@ -8,9 +8,12 @@ packet used by Phanthy Motus.
 """
 from __future__ import annotations
 
+import json
 import multiprocessing as mp
 import os
+from pathlib import Path
 import queue
+import signal
 import struct
 import threading
 import time
@@ -399,9 +402,73 @@ def _output_one(key, messages):
         rclpy.spin_once(node, timeout_sec=0.0)
 
 
+def _relay_localization(profile, servers, output_path):
+    # The SLAM discovery network is separate from the media relay's DDS setup.
+    os.environ["ROS_DOMAIN_ID"] = "232"
+    os.environ["ROS_DISCOVERY_SERVER"] = servers
+    os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"] = profile
+    os.environ["FASTDDS_DEFAULT_PROFILES_FILE"] = profile
+    os.environ["RMW_IMPLEMENTATION"] = "rmw_fastrtps_cpp"
+    import rclpy
+    from nav_msgs.msg import Odometry
+    from rclpy.qos import qos_profile_sensor_data
+
+    path = Path(output_path)
+    temporary = path.with_suffix(f".{os.getpid()}.tmp")
+    last_write = 0.0
+
+    def publish_sample(msg):
+        nonlocal last_write
+        received_at = time.monotonic()
+        if received_at - last_write < 0.1:
+            return
+        p, q = msg.pose.pose.position, msg.pose.pose.orientation
+        sample = [received_at, msg.header.frame_id, msg.header.stamp.sec,
+                  msg.header.stamp.nanosec, p.x, p.y, q.x, q.y, q.z, q.w]
+        temporary.write_text(json.dumps(sample), encoding="utf-8")
+        temporary.replace(path)
+        last_write = received_at
+
+    rclpy.init()
+    node = rclpy.create_node("a3_jazzy_localization_relay")
+    node.create_subscription(Odometry, "/slam/localization/odometry",
+                             publish_sample, qos_profile_sensor_data)
+    print("[relay] Jazzy localization subscriber ready", flush=True)
+    try:
+        rclpy.spin(node)
+    finally:
+        temporary.unlink(missing_ok=True)
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
 def main():
     _check_image_dependencies()
-    _media_all()
+    profile = os.environ.get("A3_SLAM_DDS_PROFILE")
+    servers = os.environ.get("A3_SLAM_DISCOVERY_SERVERS")
+    localization = None
+    if profile and servers and os.path.isfile(profile):
+        output = "/opt/phanthy-motus/data/a3-relay/localization.json"
+        Path(output).unlink(missing_ok=True)
+        localization = mp.get_context("spawn").Process(
+            target=_relay_localization, args=(profile, servers, output),
+            name="a3-jazzy-localization-relay", daemon=True)
+        localization.start()
+    elif profile:
+        print(f"[relay] localization DDS profile or discovery servers unavailable: {profile}", flush=True)
+    if localization is None:
+        _media_all()
+        return
+
+    def stop(_signal, _frame):
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, stop)
+    try:
+        _media_all()
+    finally:
+        localization.terminate()
+        localization.join(timeout=2)
 
 
 if __name__ == "__main__":

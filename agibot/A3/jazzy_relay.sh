@@ -10,7 +10,8 @@ mkdir -p "$ROOT"
 case "${1:-start}" in
 start)
   if [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null \
-      && grep -q "Jazzy input ready" "$ROOT/relay.log" 2>/dev/null; then exit 0; fi
+      && grep -q "Jazzy input ready" "$ROOT/relay.log" 2>/dev/null \
+      && cmp -s "$SOURCE" "$HOST_SOURCE"; then exit 0; fi
   if [[ -f "$PIDFILE" ]]; then kill "$(cat "$PIDFILE")" 2>/dev/null || true; fi
   rm -f "$PIDFILE"
   # Keep the host-side log bounded; Docker's rotation does not cover this
@@ -82,7 +83,7 @@ start)
   exit 44
   ;;
 stop)
-  kill "$(cat "$PIDFILE" 2>/dev/null || echo 0)" 2>/dev/null || true
+  if [[ -s "$PIDFILE" ]]; then kill "$(cat "$PIDFILE")" 2>/dev/null || true; fi
   rm -f "$PIDFILE"
   ;;
 *) echo "usage: $0 {start|stop}" >&2; exit 2;;
