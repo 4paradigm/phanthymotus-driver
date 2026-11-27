@@ -98,6 +98,22 @@ class MappingKeyboardTests(unittest.TestCase):
         self.assertEqual(self.keyboard.last_failure, 'keyboard_watchdog_expired')
         self.assertFalse(self.spatial._keyboard_pending)
 
+    def test_error_bearing_initial_stop_is_json_serializable_and_preserves_reason(self):
+        self.stream.read = lambda timeout: {
+            'state': 'stopped', 'stationary': True, 'software_estop': True,
+            'error': 'keyboard_watchdog_expired'}
+        self.spatial.dispatch('keyboard_open', {})
+        self.assertTrue(wait_until(lambda: self.keyboard.session is None))
+        status = self.keyboard.info()
+        self.assertEqual(status['state'], 'idle')
+        self.assertEqual(self.keyboard.last_error, 'keyboard_watchdog_expired')
+        self.assertEqual(self.keyboard.last_failure, 'keyboard_watchdog_expired')
+        json.dumps(status)
+        json.dumps(self.spatial.dispatch('info', {}))
+        self.assertFalse(self.spatial._keyboard_pending)
+        self.assertFalse(self.stream.sent)
+        self.assertTrue(self.stream.closed)
+
     def test_delayed_ack_does_not_end_lease_or_add_another_frame_interval(self):
         original_read, original_send = self.stream.read, self.stream.send
         delayed, sent_after_reply = threading.Event(), threading.Event()
