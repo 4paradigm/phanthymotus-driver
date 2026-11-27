@@ -101,6 +101,31 @@ class BootRemoteTests(fixtures.unittest.TestCase):
         self.assertFalse(self.ros.sent_services)
         self.assertIsNone(self.bundle._upper_route_key)
 
+    def test_boot_complete_before_enable_probe_waits_without_consuming_permit(self):
+        with patch.object(self.bundle.state, 'confirmed_enable', side_effect=RuntimeError('probe pending')):
+            self.assertFalse(self.remote.attempt())
+        self.assertEqual(self.remote.info()['stage'], 'waiting_for_enable_verification')
+        self.assertIsNone(self.bundle.spatial.store.state('boot_remote:' + self.boot['boot_id']))
+        self.assertFalse(self.ros.sent_services)
+        self.assertFalse(self.client.calls)
+        self.assertTrue(self.remote.attempt())
+        self.assertEqual(self.remote.info()['state'], 'ready')
+
+    def test_stop_while_enable_probe_pending_never_resumes(self):
+        with patch.object(self.bundle.state, 'confirmed_enable', side_effect=RuntimeError('probe pending')):
+            self.assertFalse(self.remote.attempt())
+        self.remote.cancel('software_pause_requested')
+        self.assertTrue(self.remote.attempt())
+        self.assertFalse(self.ros.sent_services)
+        self.assertFalse(self.client.calls)
+
+    def test_enable_probe_pending_does_not_extend_boot_window(self):
+        self.feedback(ready_age_s=61.)
+        with patch.object(self.bundle.state, 'confirmed_enable', side_effect=RuntimeError('probe pending')):
+            self.assertTrue(self.remote.attempt())
+        self.assertEqual(self.remote.info()['state'], 'skipped')
+        self.assertFalse(self.ros.sent_services)
+
     def test_transient_chassis_read_failure_retries_before_control_writes(self):
         original = self.client.observe
         calls = []

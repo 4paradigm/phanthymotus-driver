@@ -104,12 +104,25 @@ class BootRemote:
                     self.status = {'state': 'skipped', 'reason': 'fresh_boot_permit_unavailable'}
                     return True
                 return False
+            age = boot.get('ready_age_s')
+            # The boot report and enable-verification probe are independent
+            # subscribers. Receiving COMPLETE first is not a failed handoff.
+            # Keep waiting read-only without consuming the controller permit.
+            if (not self.cancelled and not self.closed.is_set()
+                    and type(age) in (int, float) and 0 <= age <= self.WINDOW_S
+                    and b._transition is None and not b.spatial.unresolved()
+                    and not b.spatial.mapping_active() and not b.tracker._active):
+                try:
+                    b.state.confirmed_enable()
+                except RuntimeError:
+                    self.status = {'state': 'waiting', 'stage': 'waiting_for_enable_verification',
+                                   'motion_target_sent': False}
+                    return False
             # An INSERT OR IGNORE transaction claims BEFORE all control writes.
             # Persist skips as well: operator actions may precede boot feedback.
             if not b.spatial.store.claim_boot_remote(identity):
                 self.status = {'state': 'skipped', 'reason': 'boot_permit_already_consumed'}
                 return True
-            age = boot.get('ready_age_s')
             if (self.cancelled or self.closed.is_set() or type(age) not in (int, float)
                     or not 0 <= age <= self.WINDOW_S or boot['age_s'] > 1.
                     or b._transition is not None or b.spatial.unresolved()
