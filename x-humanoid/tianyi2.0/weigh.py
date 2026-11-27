@@ -319,6 +319,7 @@ class WeighEngine:
         self._results = {s: None for s in (*SIDES, "both")}
         self._attempt = None
         self._reset_confirm = {}                     # side → reset 请用户确认后，可以确认的截止时间
+        self._weigh_confirm = {}                     # side → weigh 请用户确认掌心是空的之后，可以确认的截止时间
         # 给用户的话：最近一条（weigh_state 的 to_user），以及收到新消息时要通知的回调
         # （weigh_state 用它立即发布一条）。
         self._msg_id = 0
@@ -1462,16 +1463,32 @@ class WeighEngine:
 
         if not all(self._ready(s) for s in sides):
             # 手臂已在托举姿态、零点却不能直接用（过期、驱动重启后手型不确定等）：重新去皮之前
-            # 先确认掌上是空的，否则会把物品当成零点，之后的读数全错。
+            # 先确认掌上是空的，否则会把物品当成零点，之后的读数全错。读数显示有东西、或者根本判断
+            # 不了（驱动重启后零点丢了、零点太旧、姿态变了）时先不动，请用户确认；
+            # reset_confirm_window_s 秒内对同一个 side 再调用一次 weigh，视为人已确认掌心是空的
+            # （读数也可能是错的：去皮时手上就有东西，拿走后反而显示"有东西"），照常去皮。
+            window = cfg["reset_confirm_window_s"]
+            deadline = self._weigh_confirm.pop(side, None)
+            confirmed = deadline is not None and self._clock() <= deadline
             for s in sides:
-                if self._in_pose(s):
-                    load, _ = self._palm_load(s, cfg["empty_check_max_age_s"])
-                    if load is not None and load > cfg["detect_kg"]:
-                        return self._finish_auto(self._error(
-                            "object_on_hand", side,
-                            f"{SIDE_NAMES[s]}掌上还有约 {load * 1000:.0f} g，去皮时须空着；请先取走再调用 weigh",
-                            load_kg=_r(load)), "prepare", side, seq,
-                            f"我{SIDE_NAMES[s]}掌心好像有东西，称重前要先空着。请拿走后再称一次。")
+                if confirmed or not self._in_pose(s):
+                    continue
+                load, problem = self._palm_load(s, cfg["empty_check_max_age_s"])
+                if load is not None and load <= cfg["detect_kg"]:
+                    continue
+                self._weigh_confirm[side] = self._clock() + window
+                name = SIDE_NAMES[s]
+                if load is not None:
+                    err = self._error("object_on_hand", side,
+                                      f"{name}掌上还有约 {load * 1000:.0f} g，去皮时须空着；先取走物体，"
+                                      f"用户确认掌心已空后 {window:g} 秒内再调用一次 weigh", load_kg=_r(load))
+                    text = f"我{name}掌心好像有东西，称重前要先空着。请拿走；确认是空的话，再称一次就行。"
+                else:
+                    err = self._error("load_unknown", side,
+                                      f"{name}举着，但没有可用的零点（{problem}），判断不了掌上有没有东西，"
+                                      f"不能直接去皮；用户确认掌心已空后 {window:g} 秒内再调用一次 weigh")
+                    text = f"我没法确认{name}上有没有东西。确认掌心是空的话，再称一次就行。"
+                return self._finish_auto(dict(err, confirm_within_s=window), "prepare", side, seq, text)
             # 不说"我要抬手"：这句话可能在手臂已经举好之后才传到人那里。只说正在准备，
             # 并且要等"可以放了"——去皮时掌心必须空着，提前放上去会被当成零点。
             self._tell("preparing", side,
@@ -1743,7 +1760,8 @@ class WeighPlugin:
                     "weigh": {"params": ["side"],
                               "description": "称重：必要时抬臂并去皮（约 20 秒），等人放物品"
                                              f"（最多 {cfg['place_window_s']:g} 秒），放稳后测量；"
-                                             "称完手臂保持举起"},
+                                             "称完手臂保持举起。手臂举着却判断不了掌上是否为空时（例如驱动"
+                                             "重启后）先不动、请用户确认；用户确认掌心是空的以后再调用一次"},
                     "reset": {"params": ["side"],
                               "description": "复位：张开手指、放下手臂、清除去皮。掌上可能还有东西时不动、"
                                              "请用户确认；用户确认掌心是空的以后再调用一次"},

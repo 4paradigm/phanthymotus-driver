@@ -1522,7 +1522,8 @@ def test_stale_tare_with_object_on_palm_is_not_retared(tmp_path):
     assert res["code"] == "object_on_hand" and res["stage"] == "prepare", res
     assert res["load_kg"] == pytest.approx(0.59, abs=0.01)
     assert len(r.arm_calls) == n_arm and len(r.hand_calls) == n_hand
-    assert r.told[-1] == "我右手掌心好像有东西，称重前要先空着。请拿走后再称一次。"
+    assert r.told[-1] == "我右手掌心好像有东西，称重前要先空着。请拿走；确认是空的话，再称一次就行。"
+    assert res["confirm_within_s"] == 60 and res["next_step"] == weigh.USER_DECIDES
     r.mass = 0.0                                        # 取走后：原地重新去皮，不再抬臂
     r.warm(1)
     n_moves = len(r.moves())
@@ -1530,6 +1531,59 @@ def test_stale_tare_with_object_on_palm_is_not_retared(tmp_path):
     res = r.engine.auto_weigh({})
     assert res["valid"] and res["mass_kg"] == pytest.approx(0.3, abs=0.005), res
     assert len(r.moves()) == n_moves
+
+
+def _restarted_with_arm_raised(tmp_path, mass):
+    """驱动重启时手臂还举着：新的引擎没有零点、手型未知，掌上可能还有东西。"""
+    r = _hanging_rig(tmp_path)
+    assert r.engine.pose({})["state"] == "posed"
+    r.engine._tare["right"] = None
+    r.engine._hand["right"] = None
+    r.mass = mass
+    r.warm(1)
+    return r
+
+
+def test_weigh_after_restart_with_object_on_raised_palm_does_not_retare(tmp_path):
+    """bot 审查（43dfba8，P1）：重启后手臂还举着、没有零点时，不能直接去皮——会把掌上的东西当成零点。"""
+    r = _restarted_with_arm_raised(tmp_path, 0.59)
+    n_arm, n_hand = len(r.arm_calls), len(r.hand_calls)
+    res = r.engine.auto_weigh({})
+    assert res["code"] == "load_unknown" and res["stage"] == "prepare", res
+    assert "not_tared" in res["error"] and res["confirm_within_s"] == 60
+    assert res["next_step"] == weigh.USER_DECIDES
+    assert len(r.arm_calls) == n_arm and len(r.hand_calls) == n_hand
+    assert r.engine._tare["right"] is None                  # 没有去皮
+    assert r.told[-1] == "我没法确认右手上有没有东西。确认掌心是空的话，再称一次就行。"
+    assert r.messages[-1]["kind"] == "failed"
+    # 用户拿走东西、确认是空的，再点一次：原地去皮，不抬臂，照常称
+    r.mass = 0.0
+    r.warm(1)
+    n_moves = len(r.moves())
+    place_after_prompt(r, 0.3)
+    res = r.engine.auto_weigh({})
+    assert res["valid"] and res["mass_kg"] == pytest.approx(0.3, abs=0.005), res
+    assert len(r.moves()) == n_moves
+
+
+def test_weigh_confirmation_expires_and_is_per_side(tmp_path):
+    r = _restarted_with_arm_raised(tmp_path, 0.0)
+    assert r.engine.auto_weigh({})["code"] == "load_unknown"
+    r.warm(61)                                               # 过了确认时间：重新问
+    assert r.engine.auto_weigh({})["code"] == "load_unknown"
+    assert r.engine.reset({"side": "left"})["state"] in ("reset", "error")   # 别的 side 不用掉右手的确认
+    assert "right" in r.engine._weigh_confirm
+    place_after_prompt(r, 0.3)
+    res = r.engine.auto_weigh({})
+    assert res["valid"] and res["mass_kg"] == pytest.approx(0.3, abs=0.005), res
+
+
+def test_weigh_from_hanging_needs_no_confirmation(hanging):
+    """手臂垂着时掌心朝内、托不住东西：直接抬臂去皮，不请人确认（11-27 的改动不受影响）。"""
+    place_after_prompt(hanging, 0.59)
+    res = hanging.engine.auto_weigh({})
+    assert res["state"] == "weighed" and res["valid"], res
+    assert hanging.engine._weigh_confirm == {}
 
 
 def test_weighs_normally_with_nobody_listening(tmp_path):
