@@ -69,6 +69,38 @@ def pose2d_to_follow_frame(payload, received_at):
     return {"timestamp": received_at, "persons": converted}
 
 
+def vop_to_follow_frame(payload, received_at):
+    """Use one fresh VOP person detection; VOP has no persistent person ID."""
+    if not isinstance(payload, dict) or not _finite_number(payload.get("timestamp")):
+        raise ValueError("invalid_vop_frame")
+    latency = payload.get("latency_ms", 0)
+    if not _finite_number(latency) or not 0 <= latency <= 1000:
+        raise ValueError("invalid_vop_latency")
+    age = time.time() - (payload["timestamp"] - latency / 1000)
+    if not 0 <= age <= 1.0 or payload.get("available") is False or payload.get("error"):
+        raise ValueError("stale_or_unavailable_vop")
+    objects = payload.get("objects")
+    if not isinstance(objects, list) or len(objects) > 1000:
+        raise ValueError("invalid_vop_objects")
+    if "count" in payload and (type(payload["count"]) is not int or
+                               payload["count"] != len(objects)):
+        raise ValueError("invalid_vop_count")
+    persons = []
+    for obj in objects:
+        if not isinstance(obj, dict):
+            raise ValueError("invalid_vop_object")
+        if obj.get("name") not in ("person", "human", "人"):
+            continue
+        position, confidence = obj.get("position"), obj.get("confidence")
+        if (not isinstance(position, list) or len(position) != 2 or
+                not all(_finite_number(v) and -1 <= v <= 1 for v in position) or
+                not _finite_number(confidence) or not 0 <= confidence <= 1):
+            raise ValueError("invalid_vop_person")
+        if confidence >= .55:
+            persons.append({"id": "single_vop_person", "position": position})
+    return {"timestamp": received_at, "persons": persons}
+
+
 class FollowCard:
     def __init__(self, clock=time.monotonic):
         self.clock = clock
@@ -185,18 +217,18 @@ class StationaryFollowPlugin:
     def get_tool(self):
         return {
             "name": self.PREFIX, "type": "actuator", "multiInstance": False,
-            "description": "G1 原地小跟班：根据单人姿态低速原地转向，丢失目标或超时停止。",
+            "description": "G1 原地小跟班：根据 VOP 单人位置低速原地转向，丢失目标或超时停止。",
             "inputSchema": {
                 "type": "object", "required": ["action"],
                 "properties": {
                     "action": {"type": "string", "enum": ["start", "stop", "info"]},
-                    "input_topic": {"type": "string", "description": "sensor/pose2d 人物姿态流话题"},
+                    "input_topic": {"type": "string", "description": "VOP /objects 检测流话题"},
                 },
                 "x-action-params": {"start": {"params": ["input_topic"]},
                                     "stop": {"params": []}, "info": {"params": []}},
                 "x-resource": "base",
             },
-            "topic_in": [{"format": "sensor/pose2d", "desc": "COCO-17 人物姿态流"}],
+            "topic_in": [{"format": "data/json", "desc": "VOP 人物检测流（/objects）"}],
             "topic_out": [{"topic": self._output, "format": "data/json"}],
         }
 
@@ -226,7 +258,7 @@ class StationaryFollowPlugin:
                 if topics and isinstance(topics[0], str):
                     topic = topics[0].strip()
             if not topic:
-                return {"state": "error", "error": "请在画布连接 sensor/pose2d 输入"}
+                return {"state": "error", "error": "请在画布连接 VOP /objects 输出"}
             with self._lock:
                 if (self._node is not None or self._cleanup_in_progress or
                         self._worker is not None and self._worker.is_alive()):
@@ -273,12 +305,12 @@ class StationaryFollowPlugin:
                 return
             received_at = self._clock()
             try:
-                frame = pose2d_to_follow_frame(json.loads(message.data), received_at)
+                frame = vop_to_follow_frame(json.loads(message.data), received_at)
                 self._last_decision = self._controller.ingest(frame)
             except (ValueError, TypeError, KeyError, json.JSONDecodeError,
                     UnicodeDecodeError):
                 # 坏帧不永久停用，只暂停，等待下一帧。
-                self._last_decision = self._controller.pause("invalid_pose2d")
+                self._last_decision = self._controller.pause("invalid_vop")
             self._last_received = received_at
 
     def _publish(self, decision, result=None):
