@@ -913,3 +913,29 @@ It uses pyalsaaudio when a working one is installed and otherwise captures
 through `arecord`, so PC1 needs no pip install and no internet. If its capture
 fails, the process exits rather than keep an empty port open, and the next
 health check restarts it.
+
+## Head follow card
+
+Add `head_face_follow`, call `start`, configure the mode, and call `arm`
+to enable head motion. `info` reports the selected mode and the reason
+the head is waiting. `stop` releases head control.
+
+- `set_mode(mode="nearest_face")` measures the median depth of the inner face
+  region and follows the closest visible target with a valid measurement.
+  It uses the built-in head camera and requires matching optical frame IDs,
+  matching dimensions, and RGB/depth timestamps within 85 ms.
+- `set_mode(mode="speaker")` locks a face to the bearing of the current
+  utterance. It releases the lock on speech end or a feed timeout. Turn
+  changes during an utterance do not replace the locked face. This mode
+  requires a calibrated speech localization producer, which is not included
+  in the Tianyi driver. The input shown by `info.speech_topic` expects ROS
+  `std_msgs/msg/String` JSON with Unix seconds in `ts`, a boolean `active`,
+  and `camera_bearing_deg` (left positive) for active speech. Publish active
+  updates more frequently than every 550 ms and an explicit inactive update
+  when the utterance ends. Built-in wake-word angles alone do not supply
+  this stream.
+- `set_target(object_name="cup")` follows a class from Perception's VOP
+  vocabulary. The card starts VOP on port 15720 when the camera's objects
+  topic has no publisher. The VOP service must be running with bounding box
+  output enabled. Use `set_mode(mode="face")` to return to the original
+  anonymous tracking mode.

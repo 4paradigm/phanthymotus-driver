@@ -1,6 +1,7 @@
 """Head following through the bundle, with ROS transport replaced by stubs."""
 
 import importlib.util
+import json
 import math
 import sys
 from types import ModuleType, SimpleNamespace as NS
@@ -11,6 +12,9 @@ from test_tianyi_loco_servo import Clock, DRIVER, Executor, Node, load_bundle
 
 
 class HeadNode(Node):
+    def count_publishers(self, topic):
+        return 0
+
     def create_publisher(self, kind, topic, qos):
         publisher = NS(messages=[])
         publisher.publish = publisher.messages.append
@@ -34,7 +38,7 @@ def setup(monkeypatch):
                           ReliabilityPolicy=enum, DurabilityPolicy=enum),
         "rclpy.exceptions": {"InvalidTopicNameException": TypeError},
         "rclpy.validate_full_topic_name": {"validate_full_topic_name": lambda topic: None},
-        "sensor_msgs.msg": {"CompressedImage": NS},
+        "sensor_msgs.msg": dict(CompressedImage=NS, CameraInfo=NS, Image=NS),
         "std_msgs.msg": dict(String=NS, Bool=NS, UInt32MultiArray=NS),
         "bodyctrl_msgs.msg": dict(CmdSetMotorPosition=NS, SetMotorPosition=NS,
                                   MotorStatusMsg=NS, PowerBoardKeyStatus=NS),
@@ -94,8 +98,9 @@ def setup(monkeypatch):
         clock.advance(step)
         callback(NS(data=(offset, delay)))
 
+
     yield NS(bundle=bundle, clock=clock, head=head, call=call, send=send,
-             feedback=feedback, commands=head._publisher.messages)
+             feedback=feedback, follow=follow, commands=head._publisher.messages)
     bundle.stop_all()
     assert not ros.executor_core.nodes
 
@@ -148,3 +153,61 @@ def test_loss_stale_frames_and_fault_require_safe_reacquisition(setup):
     assert not s.commands
     s.clock.advance(1)
     assert s.call("info")["reason"] == "camera_timeout"
+
+
+def test_nearest_uses_registered_depth_and_rejects_stale_or_wrong_frame(setup):
+    np = pytest.importorskip("numpy")
+    follow = sys.modules["head_face_follow"]
+
+    def header(frame="color", ns=0):
+        return NS(frame_id=frame, stamp=NS(sec=20, nanosec=ns))
+
+    pixels = np.full((80, 100), 2000, dtype="<u2")
+    pixels[35:65, 65:95] = 1200
+    depth = NS(width=100, height=80, step=200, is_bigendian=False,
+               encoding="16UC1", header=header(), data=pixels.tobytes())
+    rgb = NS(header=header())
+    large, nearer = (0, 0, 50, 60), (65, 35, 30, 30)
+    assert follow._nearest_face([large, nearer], (100, 80), rgb, depth, np) == nearer
+    depth.header = header(ns=200_000_000)
+    assert follow._nearest_face([large, nearer], (100, 80), rgb, depth, np) is None
+    depth.header = header(frame="depth")
+    assert follow._nearest_face([large, nearer], (100, 80), rgb, depth, np) is None
+
+
+def test_speaker_keeps_lock_until_speech_ends(setup):
+    s = setup
+    s.feedback()
+    assert s.call("set_mode", mode="speaker")["mode"] == "speaker"
+    assert s.call("arm")["armed"]
+    s.follow._intrinsics = ((200, 200), 100, 100)
+    callback = s.follow._node.subscriptions[2][2]
+
+    def speech(active, bearing=None):
+        s.clock.advance(0.01)
+        callback(NS(data=json.dumps(dict(ts=s.clock.time(), active=active,
+                                         camera_bearing_deg=bearing))))
+
+    speech(True, -39)
+    s.send()
+    s.send()
+    assert len(s.commands) == 1
+
+    speech(True, 39)
+    s.send(offset=(-0.8, 0.8))
+    assert len(s.commands) == 1
+    speech(False)
+    speech(True, 39)
+    s.send(offset=(-0.8, 0.8))
+    s.feedback()
+    s.send(offset=(-0.8, 0.8))
+    assert len(s.commands) == 2
+    assert s.commands[-1].cmds[2].pos > 0
+
+
+def test_object_mode_starts_vop_on_connected_camera(setup, monkeypatch):
+    calls = []
+    monkeypatch.setattr(sys.modules["head_face_follow"], "_start_vop", calls.append)
+    assert setup.call("set_target", object_name=" Cup ")["object_name"] == "cup"
+    assert calls == ["/tianyi/camera/head"]
+    assert setup.call("set_target", object_name="")["mode"] == "face"

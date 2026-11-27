@@ -11,10 +11,74 @@ from rclpy.node import Node
 from rclpy.exceptions import InvalidTopicNameException
 from rclpy.validate_full_topic_name import validate_full_topic_name
 from rclpy.qos import QoSProfile, ReliabilityPolicy
-from sensor_msgs.msg import CompressedImage
+from sensor_msgs.msg import CameraInfo, CompressedImage, Image
 from std_msgs.msg import String
+from urllib.request import Request, urlopen
 
 FRAME_MAX_AGE = 0.4
+DEPTH_MAX_SKEW = 0.085
+SPEECH_TIMEOUT = 0.55
+MODES = ("face", "nearest_face", "speaker", "object")
+
+
+def _stamp(message):
+    header = getattr(message, "header", None)
+    if header is None:
+        return "", 0
+    return header.frame_id, header.stamp.sec + header.stamp.nanosec / 1e9
+
+
+def _nearest_face(boxes, size, rgb, depth, np):
+    rgb_frame, rgb_time = _stamp(rgb)
+    depth_frame, depth_time = _stamp(depth)
+    if (not rgb_frame or rgb_frame != depth_frame or not rgb_time or not depth_time
+            or abs(rgb_time - depth_time) > DEPTH_MAX_SKEW
+            or size != (depth.width, depth.height)):
+        return None
+    formats = {"16UC1": ("u2", 0.001), "32FC1": ("f4", 1.0)}
+    if depth.encoding not in formats:
+        return None
+    code, scale = formats[depth.encoding]
+    dtype = np.dtype((">" if depth.is_bigendian else "<") + code)
+    if depth.step < depth.width * dtype.itemsize or len(depth.data) != depth.height * depth.step:
+        return None
+    pixels = np.ndarray((depth.height, depth.width), dtype=dtype,
+                        buffer=bytes(depth.data), strides=(depth.step, dtype.itemsize))
+    candidates = []
+    for box in boxes:
+        x, y, w, h = box
+        # Inner face patch excludes most background and avoids single-pixel noise.
+        patch = pixels[max(0, y+h//3):y+2*h//3, max(0, x+w//3):x+2*w//3]
+        metres = patch * scale
+        valid = metres[np.isfinite(metres) & (metres >= 0.2) & (metres <= 8)]
+        if patch.size and valid.size >= max(5, patch.size // 3):
+            candidates.append((float(np.median(valid)), box))
+    return min(candidates)[1] if candidates else None
+
+
+def _face_at_bearing(boxes, intrinsics, bearing):
+    _, fx, cx = intrinsics
+    ranked = sorted((abs(math.degrees(math.atan2(cx - (x + w / 2), fx)) - bearing),
+                     (x, y, w, h)) for x, y, w, h in boxes)
+    if not ranked or ranked[0][0] > 12:
+        return None
+    if len(ranked) > 1 and ranked[1][0] - ranked[0][0] < 5:
+        return None
+    return ranked[0][1]
+
+
+def _start_vop(topic):
+    request = Request("http://127.0.0.1:15720/mcp", data=json.dumps({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+            "name": "vop", "arguments": {"action": "start", "input_topic": topic},
+        },
+    }).encode(), headers={"Content-Type": "application/json"})
+    with urlopen(request, timeout=3) as response:
+        payload = json.load(response)
+    result = json.loads(payload["result"]["content"][0]["text"])
+    if result.get("state") not in ("running", "loading"):
+        raise ValueError(result.get("message", "VOP did not start"))
+
 COMMAND_PERIOD = 0.2
 DEADBAND = 0.12
 INPUT = {"format": "image/jpeg", "desc": "可选 RGB 相机，默认使用天轶头部相机"}
@@ -112,8 +176,17 @@ class HeadFaceFollowPlugin:
         self._last_frame = None
         self._last_command = -math.inf
         self._track = None
+        self._mode = "face"
+        self._depth_node = None
+        self._depth_frames = []
+        self._intrinsics = None
+        self._speech = None
+        self._speech_stamp = 0
+        self._speaker_locked = False
+        self._speaker_topic = f"/{namespace}/head_face_follow/speech"
         self._object_name = ""
         self._object_packet = None
+        self._object_stamp = 0
         self._reason = "idle"
 
     def get_tool(self):
@@ -125,7 +198,8 @@ class HeadFaceFollowPlugin:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["start", "arm", "stop", "info", "set_target"]},
+                    "action": {"type": "string", "enum": ["start", "arm", "stop", "info", "set_target", "set_mode"]},
+                    "mode": {"type": "string", "enum": list(MODES)},
                     "object_name": {"type": "string", "description": "VOP 类别名。空字符串切回人脸"},
                     "input_topic": {"type": "string", "description": "可选 JPEG 相机话题，留空使用内置头部相机"},
                 },
@@ -133,6 +207,7 @@ class HeadFaceFollowPlugin:
                 "x-resource": "head",
                 "x-action-params": {
                     "start": {"params": ["input_topic"], "description": "启动相机订阅，等待开启"},
+                    "set_mode": {"params": ["mode", "object_name"], "description": "切换跟随模式"},
                     "set_target": {"params": ["object_name"], "description": "由大脑选择要跟踪的物体"},
                     "arm": {"params": [], "description": "开启头部随动"},
                     "stop": {"params": [], "description": "停止发送随动指令并断开订阅"},
@@ -154,8 +229,15 @@ class HeadFaceFollowPlugin:
             node = self._node
             self._node = None
             self._detector = None
+            self._reset_tracking()
+            depth_node = self._depth_node
+            self._depth_node = None
+            self._depth_frames.clear()
+            self._intrinsics = None
             self._tracker = None
             self._topic = ""
+            self._mode = "face"
+            self._object_name = ""
             self._armed = False
             self._track = None
             self._last_frame = None
@@ -163,6 +245,16 @@ class HeadFaceFollowPlugin:
             if node is not None:
                 self._ros2.executor_core.remove_node(node)
                 node.destroy_node()
+            if depth_node is not None:
+                self._ros2.executor_tianyi.remove_node(depth_node)
+                depth_node.destroy_node()
+
+    def _reset_tracking(self):
+        self._tracker = _Tracker()
+        self._track = self._last_frame = None
+        self._speech = None
+        self._speaker_locked = False
+        self._object_packet = None
 
     def dispatch(self, action, args):
         if action == "stop":
@@ -188,6 +280,8 @@ class HeadFaceFollowPlugin:
                             CompressedImage, topic, lambda msg: self._on_frame(node, msg), qos)
                         node.create_subscription(
                             String, topic + "/objects", lambda msg: self._objects(node, msg), 1)
+                        node.create_subscription(
+                            String, self._speaker_topic, lambda msg: self._speech_event(node, msg), qos)
                         if topic == self._default_topic and self._camera is not None:
                             self._camera.start()
                         if not self._ros2.executor_core.add_node(node):
@@ -199,14 +293,33 @@ class HeadFaceFollowPlugin:
                     self._detector = detector
                     self._topic = topic
                     self._reason = "awaiting_arm"
-            elif action == "set_target":
-                name = args.get("object_name")
+            elif action in ("set_mode", "set_target"):
+                name = args.get("object_name", self._object_name if action == "set_mode" else None)
                 if not isinstance(name, str):
                     return {"state": "error", "error": "Provide a VOP class name"}
-                self._object_name = name.strip().casefold()
-                self._object_packet = None
-                self._tracker = _Tracker()
-                self._track = self._last_frame = None
+                name = name.strip().casefold()
+                mode = ("object" if name else "face") if action == "set_target" else args.get("mode")
+                if mode not in MODES or (mode == "object" and not name):
+                    return {"state": "error", "error": "Invalid mode or missing object name"}
+                if self._node is None:
+                    return {"state": "error", "error": "Start the card before selecting a mode"}
+                if mode in ("nearest_face", "speaker") and self._topic != self._default_topic:
+                    return {"state": "error", "error": "Start the card with its built-in head camera"}
+                if mode in ("nearest_face", "speaker") and self._depth_node is None:
+                    try:
+                        self._start_geometry()
+                    except Exception as error:
+                        return {"state": "error", "error": str(error)}
+                if mode == "object":
+                    if self._node.count_publishers(self._topic + "/objects") == 0:
+                        try:
+                            _start_vop(self._topic)
+                        except (OSError, ValueError, KeyError, IndexError, TypeError) as error:
+                            return {"state": "error", "error": f"Cannot start VOP: {error}"}
+                self._mode = mode
+                self._object_name = name if mode == "object" else ""
+                self._reset_tracking()
+                self._reason = f"waiting_for_{mode}"
             elif action == "arm":
                 if self._node is None:
                     return {"state": "error", "error": "Start the card first"}
@@ -216,7 +329,7 @@ class HeadFaceFollowPlugin:
                         return check
                     self._armed = True
                     self._armed_at = time.monotonic()
-                    self._tracker = _Tracker()
+                    self._reset_tracking()
                     self._last_sample = -math.inf
                     self._reason = "waiting_for_face"
                     self._track = None
@@ -231,10 +344,61 @@ class HeadFaceFollowPlugin:
             return {
                 "state": "running" if self._node else "idle",
                 "armed": self._armed,
+                "mode": self._mode,
+                "speech_topic": self._speaker_topic,
                 "object_name": self._object_name,
                 "reason": reason,
                 "topic_in": [{**INPUT, "topic": self._topic}] if self._topic else [],
             }
+
+    def _start_geometry(self):
+        node = Node("tianyi2_follow_geometry", context=self._ros2.ctx_tianyi)
+        qos = QoSProfile(depth=2, reliability=ReliabilityPolicy.BEST_EFFORT)
+        try:
+            node.create_subscription(Image, "/ob_camera_head/depth/image_raw",
+                                     lambda msg: self._depth_frame(node, msg), qos)
+            node.create_subscription(CameraInfo, "/ob_camera_head/color/camera_info",
+                                     lambda msg: self._camera_info(node, msg), qos)
+            if not self._ros2.executor_tianyi.add_node(node):
+                raise RuntimeError("Could not register follow geometry node")
+        except Exception:
+            node.destroy_node()
+            raise
+        self._depth_node = node
+
+    def _depth_frame(self, node, msg):
+        with self._lock:
+            if node is self._depth_node and self._mode == "nearest_face" and self._armed:
+                self._depth_frames = (self._depth_frames + [msg])[-4:]
+
+    def _camera_info(self, node, msg):
+        with self._lock:
+            if (node is self._depth_node and math.isfinite(msg.k[0]) and msg.k[0] > 0
+                    and math.isfinite(msg.k[2])):
+                self._intrinsics = ((msg.width, msg.height), msg.k[0], msg.k[2])
+
+    def _speech_event(self, node, msg):
+        # A calibrated provider emits current camera-relative VAD and azimuth.
+        try:
+            data = json.loads(msg.data)
+            ts = float(data["ts"])
+            active = data["active"]
+            if type(active) is not bool or not 0 <= time.time() - ts <= SPEECH_TIMEOUT:
+                return
+            bearing = float(data["camera_bearing_deg"]) if active else None
+            if active and not -90 <= bearing <= 90:
+                return
+        except (ValueError, KeyError, TypeError, OverflowError):
+            return
+        with self._lock:
+            if node is not self._node or not self._armed or self._mode != "speaker":
+                return
+            if ts <= self._speech_stamp:
+                return
+            self._speech_stamp = ts
+            if not active or (self._speech and ts - self._speech[0] > SPEECH_TIMEOUT):
+                self._reset_tracking()
+            self._speech = (ts, bearing) if active else None
 
     def _objects(self, node, msg):
         with self._lock:
@@ -246,7 +410,8 @@ class HeadFaceFollowPlugin:
                 ts = float(payload["timestamp"])
                 latency = float(payload["latency_ms"]) / 1000
                 age = time.time() - ts
-                if not (0 <= age and 0 <= latency and age + latency <= FRAME_MAX_AGE):
+                if (ts <= self._object_stamp
+                        or not (0 <= age and 0 <= latency and age + latency <= FRAME_MAX_AGE)):
                     return
                 boxes = []
                 for obj in payload["objects"]:
@@ -254,6 +419,7 @@ class HeadFaceFollowPlugin:
                         x, y, right, bottom = map(float, obj["bbox"])
                         if all(map(math.isfinite, (x, y, right, bottom))) and right > x and bottom > y:
                             boxes.append((x, y, right - x, bottom - y))
+                self._object_stamp = ts
                 self._object_packet = (ts, boxes, time.monotonic() + FRAME_MAX_AGE - age - latency)
             except (ValueError, KeyError, TypeError, AttributeError, OverflowError):
                 return
@@ -268,6 +434,8 @@ class HeadFaceFollowPlugin:
             self._last_sample = received
             detector, tracker = self._detector, self._tracker
             name = self._object_name
+            mode = self._mode
+            depth_frames = self._depth_frames
             if name:
                 packet = self._object_packet
                 self._object_packet = None
@@ -285,6 +453,13 @@ class HeadFaceFollowPlugin:
                          and b[0] + b[2] <= size[0] and b[1] + b[3] <= size[1]]
             else:
                 boxes, size = detector.detect(message.data)
+                if mode == "nearest_face" and boxes:
+                    _, stamp = _stamp(message)
+                    depth = min(depth_frames, key=lambda frame: abs(_stamp(frame)[1] - stamp),
+                                default=None)
+                    nearest = (_nearest_face(boxes, size, message, depth, detector.np)
+                               if depth is not None else None)
+                    boxes = [nearest] if nearest is not None else []
         except (ValueError, detector.cv2.error):
             boxes, size = (), None
         with self._lock:
@@ -294,10 +469,28 @@ class HeadFaceFollowPlugin:
                 self._track = None
                 self._reason = "invalid_or_stale_frame"
                 return
+            if mode == "speaker":
+                if not self._speech or time.time() - self._speech[0] > SPEECH_TIMEOUT:
+                    self._reset_tracking()
+                    self._reason = "waiting_for_speech"
+                    return
+                if not self._speaker_locked:
+                    candidate = (_face_at_bearing(boxes, self._intrinsics, self._speech[1])
+                                 if self._intrinsics and self._intrinsics[0] == size else None)
+                    boxes = [candidate] if candidate is not None else []
+                    self._speaker_locked = bool(boxes)
+                elif size != tracker.size or received - tracker.last_seen >= FRAME_MAX_AGE:
+                    # Hold identity through the utterance, even when vision drops it.
+                    self._reason = "speaker_face_lost"
+                    return
+            if mode == "nearest_face" and boxes and tracker.bbox and _iou(tracker.bbox, boxes[0]) < 0.2:
+                tracker.bbox = None
             target = tracker.update(boxes, size, received)
             if target is None:
                 self._track = None
-                self._reason = "waiting_for_face"
+                self._reason = {"object": "waiting_for_object", "speaker": "waiting_for_speaker_face",
+                                "nearest_face": "waiting_for_registered_face_depth"}.get(
+                                    mode, "waiting_for_face")
                 return
             track = target["track_id"]
             offset = target["offset"]
