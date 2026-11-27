@@ -6,6 +6,7 @@
 |---|---|---|
 | `joints` | sensor | 关节骨架和逐轴状态，默认 10 Hz |
 | `battery` | sensor | 两块电池状态，默认 1 Hz |
+| `driver_health` | actuator | 按需查询厂家底盘、内部网口和数据流健康快照 |
 | `model` | resource | 运行时读取本机 iNex 的 URDF，骨架渲染器自动调用 |
 
 ## 数据与单位
@@ -50,6 +51,16 @@
 
 关节默认 1 秒、电池默认 3 秒无有效报文即过期。断线、无效、过期或停止时清空相应数据；无关报文不刷新有效期。关节流的 `received_at_ms` 是 Driver 接收时间；`timestamp_ms` 是发布时刻。没有厂家采样时间，无法仅凭接收计数排除控制器内部数据冻结。
 
+## 驱动健康
+
+在画布中执行 `driver_health` 的 `status` 开始约 4 秒的后台采样，然后执行 `latest` 查看完整 JSON。Agent Core 通过动作完成回调跟踪采样进度，Agent 可在完成后调用 `latest` 读取结果。 标准部署中，Driver 与 Core 同主机，ACP 完成回调走本机回环地址。容器内可用 `AGENT_CORE_CA_CERT` 指定 CA 文件以验证证书链。结果包含正常项数、底盘 SDK 和厂家异常、内部网口载波与协商速率、两路雷达和里程计的 ROS 2 收帧状态。网口掉线计数是内核累计值。底盘异常字段按厂家上报显示，空值表示尚无报告。
+
+检查存在异常项时，结果会在 `recommendation` 中建议先等待片刻后重新查询，若异常持续则重启机器人后再查询。
+
+在拆分部署中，卡片通过本机 MCP 查询 `base_drive.info`、`lidar_cloud.status` 和 `loco_state.status`。端口分别由 `health_base_port`、`health_lidar_port`、`health_odometry_port` 指定，底盘与雷达默认使用 15782、15751，设为 0 可关闭对应查询。里程计 MCP 查询默认关闭，ROS 2 里程计采样仍可使用。在拆分部署中，可填写已核对的 Helios `loco_state` 服务端口以启用补充查询。可用容器环境变量 `HELIOS_HEALTH_BASE_PORT`、`HELIOS_HEALTH_LIDAR_PORT`、`HELIOS_HEALTH_ODOMETRY_PORT` 覆盖。主机网络下可用 `health_interface` 或 `HELIOS_HEALTH_INTERFACE` 选择连接底盘的物理网口，默认 `eth0`。
+
+采样只在执行查询时订阅两路原生 `PointCloud2` 和 `state/odom`。逐路显示发布者数量、收到帧数、接收帧率、距最后一帧的时间和原始时间戳推进。里程计分别检查位姿和速度来源。未发现发布者、等待首帧和时间戳停更有各自状态。源时间戳推进与接收跨度可用于排查积压，绝对采样延迟需另外校准时钟。
+
 ## 画布与 Core 前端
 
 在卡片共享配置中保存状态地址，再将 `joints` 和 `battery` 加入画布并启动。`model` 无需单独运行；首次请求时读取同一 iNex 地址的 `/api/robot_3d_model` 及其同源 `urdf_url`，核对 20 轴名称后在进程内缓存。没有把厂家模型打入镜像。模型服务暂不可用时明确返回错误，不影响关节和电池订阅启动。监控页从 `joints` 自动生成骨架。
@@ -73,7 +84,7 @@
 仓库根目录安装本 Driver 的 requirements 及 pytest 后执行：
 
 ```bash
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=. python -m pytest -q tests/test_helios_joints.py tests/test_helios_battery.py tests/test_helios_torque.py tests/test_helios_model.py
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=. python -m pytest -q tests/test_helios_joints.py tests/test_helios_battery.py tests/test_helios_torque.py tests/test_helios_model.py tests/test_helios_driver_health.py
 python scripts/check_service_yml.py rokae/helios
 ```
 
