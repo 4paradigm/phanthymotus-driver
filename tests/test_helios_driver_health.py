@@ -134,6 +134,18 @@ def test_status_card_reports_driver_input_separately_from_ros_output(monkeypatch
     assert result["streams"]["odometry"]["driver_input"] == "里程计查询不可用"
 
 
+def test_canvas_lifecycle_does_not_sample(monkeypatch):
+    plugin = health.HeliosDriverHealth({}, "test", None)
+    monkeypatch.setattr(plugin, "_sample_streams", lambda: pytest.fail("Only status should sample"))
+    bundle = DriverBundle([plugin])
+
+    start = bundle.dispatch("driver_health", {"action": "start", "instance_id": "canvas-card"})
+    stop = bundle.dispatch("driver_health", {"action": "stop", "instance_id": "canvas-card"})
+
+    assert start == {"state": "ready"}
+    assert stop == {"state": "idle"}
+
+
 def test_chassis_fault_and_unreported_state_have_distinct_status():
     ready = {"sdk_available": True, "worker_running": True}
     assert health.chassis_health(ready)["state"] == "waiting"

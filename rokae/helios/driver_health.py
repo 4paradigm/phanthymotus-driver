@@ -239,6 +239,10 @@ class HeliosDriverHealth:
             node.destroy_node()
 
     def dispatch(self, action, args):
+        if action == "start":
+            return {"state": "ready"}
+        if action == "stop":
+            return {"state": "idle"}
         if action == "info":
             return self.get_tool()
         if action not in (self.NAME, "status"):
