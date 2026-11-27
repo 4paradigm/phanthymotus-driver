@@ -27,11 +27,13 @@ import base64
 import json
 import math
 import os
+import sqlite3
 import struct
 import threading
 import time
 import queue
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 import zlib
 import atexit
 import xml.etree.ElementTree as ET
@@ -837,6 +839,17 @@ class A3Nodes:
 
         self._encode_and_publish = self._encode_and_publish_frame
 
+        self._localization = None
+        self._localization_ready = threading.Condition()
+        if config.get("plugins", {}).get("controlled_spatial", {}).get("enabled"):
+            try:
+                from nav_msgs.msg import Odometry
+            except ImportError:
+                print("[state] waypoint recording unavailable: missing nav_msgs", flush=True)
+            else:
+                self.robot.create_subscription(
+                    Odometry, "/slam/localization/odometry", self._on_localization, sensor_qos)
+
         # -- joint / state streams (plain sensor_msgs types) --
         mirror("arm_state", JointState, "/motion/control/arm_joint_state", "data/json")
         mirror("hand_state", JointState, "/motion/control/hand_joint_state", "data/json")
@@ -969,6 +982,36 @@ class A3Nodes:
         self.arm_command_pub = self.robot.create_publisher(JointState, "/motion/control/arm_joint_command", 10)
         self.neck_command_pub = self.robot.create_publisher(JointState, "/motion/control/neck_joint_command", 10)
         self.hand_command_pub = self.robot.create_publisher(JointState, "/motion/control/hand_joint_command", 10)
+
+    def _on_localization(self, msg):
+        received_at = time.monotonic()
+        stamp = msg.header.stamp
+        if msg.header.frame_id.lstrip("/") != "map":
+            return
+        if abs(time.time() - (stamp.sec + stamp.nanosec * 1e-9)) > 2.0:
+            return
+        position = msg.pose.pose.position
+        q = msg.pose.pose.orientation
+        norm = math.hypot(q.x, q.y, q.z, q.w)
+        if not all(map(math.isfinite, (position.x, position.y, norm))) or norm < 1e-6:
+            return
+        x, y, z, w = (value / norm for value in (q.x, q.y, q.z, q.w))
+        yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+        pose = {"position": {"x": position.x, "y": position.y}, "angle": yaw}
+        with self._localization_ready:
+            self._localization = received_at, pose
+            self._localization_ready.notify_all()
+
+    def wait_for_localization(self):
+        # Require a sample received after reading the working map.
+        started = time.monotonic()
+        with self._localization_ready:
+            ready = self._localization_ready.wait_for(
+                lambda: self._localization and self._localization[0] > started,
+                timeout=1.5,
+            )
+            _require(bool(ready), "未收到实时地图定位数据，请先完成重定位后重试")
+            return self._localization[1]
 
     def _republish_slow_states(self):
         with self.lock:
@@ -3954,13 +3997,14 @@ class ControlledSpatialPlugin:
         StartNormalRelocalization / StopNormalRelocalization；
       - 地图数据查询（Get2DWholeMap）：含分辨率/原点/占用栅格，并支持物理坐标 →
         像素坐标换算（合并自原 map_get 处理卡）。
+      - 地图点位：查询原生点位和按当前地图保存的点位，按名称导航。
     前置条件（开发文档 §7.9）：MC 处于 MOTION 模式（mc_mode get_up）且已完成
     重定位，导航与重定位需工作在相同 map_id 上；到点精度最大约 0.4 米。
     """
 
     # 导航为长时间动作：声明 ACP 完成契约（tianyi2.0/g1 的 controlled_spatial
     # 同款 180 s 超时），由后台线程轮询 PncService/ActionGetState 判定到点。
-    NAV_ACTIONS = ("navi_to_goal", "navi_to_pose", "linear_to_goal",
+    NAV_ACTIONS = ("navi_to_goal", "navi_to_waypoint", "navi_to_pose", "linear_to_goal",
                    "linear_to_pose", "move_forward", "spin_turn")
     NAV_TIMEOUT_S = 180
     _NAV_POLL_INTERVAL_S = 1.0
@@ -3981,12 +4025,16 @@ class ControlledSpatialPlugin:
         "stop_discard": ([], "结束建图不保存"),
         "list_maps": ([], "查询已保存地图列表"),
         "current_map": ([], "查询当前工作地图"),
+        "list_waypoints": (["map_id"], "查询地图点位和已记录的位置（map_id 缺省时用当前工作地图）"),
+        "tag_place": (["waypoint_name"], "将机器人当前地图位姿保存为命名点位"),
         "rename_map": (["map_id", "new_name"], "重命名地图"),
         # -- 重定位 --
         "start_relocalization": (["map_dir"], "在指定地图目录上启动普通重定位（导航前置条件）"),
         "stop_relocalization": ([], "停止重定位（可选带 reloc_pose 位姿辅助收敛）"),
         # -- 导航 --
         "navi_to_goal": (["map_id", "target_id"], "按目标点 ID 规划导航（PlanningNaviToGoal；异步：返回 action_id，到点后回报 ACP）"),
+        "navi_to_waypoint": (["map_id", "waypoint_name"],
+                             "按点位名称精确匹配并规划导航（map_id 缺省时用当前工作地图；异步：返回 action_id，到点后回报 ACP）"),
         "navi_to_pose": (["map_id", "x", "y", "angle"], "按位姿规划导航（PlanningNaviToPose2D；异步：到点后回报 ACP）"),
         "linear_to_goal": (["map_id", "target_id"], "直线导航到目标点（LinearNaviToGoal，先转后走；异步回报 ACP）"),
         "linear_to_pose": (["map_id", "x", "y", "angle"], "直线导航到位姿（LinearNaviToPose2D；异步回报 ACP）"),
@@ -4004,6 +4052,8 @@ class ControlledSpatialPlugin:
         self.nodes = nodes
         self.last_task_id = None
         self._nav_action_id = None
+        self.waypoint_db = Path("/opt/phanthy-motus/data/a3/waypoints.sqlite3")
+        self._waypoint_lock = threading.Lock()
         # ThreadingHTTPServer serves MCP calls concurrently — the check-then-set on
         # _nav_action_id (settle prior / arm new) must be atomic (MotionPlayPlugin 同款).
         self._nav_lock = threading.Lock()
@@ -4015,12 +4065,15 @@ class ControlledSpatialPlugin:
             "map_dir": {"type": "string", "description": "地图目录（list_maps → map_dir，重定位用）"},
             "new_name": {"type": "string", "description": "新名称（rename_map）"},
             "target_id": {"type": "integer", "description": "目标点 id（地图点位）"},
+            "waypoint_name": {"type": "string", "description": "点位完整名称（由 list_waypoints 查询）"},
             "x": {"type": "number", "description": "目标/重定位位姿 x（m）"},
             "y": {"type": "number", "description": "目标/重定位位姿 y（m）"},
             "angle": {"type": "number", "description": "目标/重定位朝向角（rad）"},
             "distance": {"type": "number", "description": "平移距离（m，正为前进）"},
             "task_id": {"type": "integer", "description": "导航任务 id（0 自动分配；控制/查询动作可传空用最近任务）"},
         })
+        for action in ("tag_place", "navi_to_waypoint"):
+            schema["x-action-params"][action]["required"] = ["waypoint_name"]
         # 建图/导航/重定位期间底盘由 ADU 独占 —— 与 loco/auto_charging 同通道。
         schema["x-resource"] = "base"
         # 导航动作为长时间动作：声明 ACP 完成契约（tianyi2.0/g1 同款 180 s），
@@ -4080,6 +4133,53 @@ class ControlledSpatialPlugin:
         if task_id:
             self.last_task_id = task_id
         return jsonable(response)
+
+    def _current_map_id(self):
+        response = self.nodes.rpc.get_current_working_map()
+        map_id = (response.get("data") or {}).get("map_id")
+        _require(map_id not in (None, "", 0, "0"), "没有当前工作地图，请先加载地图")
+        return int(map_id)
+
+    def _native_waypoints(self, map_id):
+        response = self.nodes.rpc.get_topo_msgs(map_id)
+        return [
+            {"name": point.get("name", ""), "point_id": int(point["point_id"]), "pose": point.get("pose")}
+            for point in ((response.get("data") or {}).get("points") or [])
+        ]
+
+    def _list_waypoints(self, map_id):
+        map_id = self._current_map_id() if map_id in (None, "") else int(map_id)
+        waypoints = self._native_waypoints(map_id)
+        with self._waypoint_lock:
+            if self.waypoint_db.is_file():
+                with closing(sqlite3.connect(self.waypoint_db)) as db:
+                    rows = db.execute(
+                        "SELECT name, pose FROM waypoints WHERE map_id = ? ORDER BY name", (str(map_id),)
+                    ).fetchall()
+                waypoints.extend(
+                    {"name": name, "point_id": None, "source": "recorded", "pose": json.loads(pose)}
+                    for name, pose in rows
+                )
+        return {"map_id": map_id, "waypoints": waypoints}
+
+    def _tag_place(self, name):
+        map_id = self._current_map_id()
+        _require(not any(point["name"] == name for point in self._native_waypoints(map_id)),
+                 f"地图 {map_id} 已有同名点位 {name!r}")
+        pose = self.nodes.wait_for_localization()
+        _require(self._current_map_id() == map_id, "记录期间当前地图已切换，请重新记录")
+        self.waypoint_db.parent.mkdir(parents=True, exist_ok=True)
+        with self._waypoint_lock, closing(sqlite3.connect(self.waypoint_db)) as db, db:
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS waypoints (map_id TEXT NOT NULL, name TEXT NOT NULL, "
+                "pose TEXT NOT NULL, PRIMARY KEY (map_id, name))"
+            )
+            insert = db.execute(
+                "INSERT INTO waypoints VALUES (?, ?, ?) ON CONFLICT (map_id, name) DO NOTHING",
+                (str(map_id), name, json.dumps(pose)),
+            )
+            _require(insert.rowcount == 1, f"地图 {map_id} 已有同名点位 {name!r}")
+        return {"map_id": map_id, "name": name, "source": "recorded", "pose": pose}
 
     def _nav_state_terminal(self, response):
         """Probe an ActionGetState response for a terminal task state, defensively.
@@ -4204,6 +4304,12 @@ class ControlledSpatialPlugin:
             return jsonable(self.nodes.rpc.get_stored_map_names())
         if action == "current_map":
             return jsonable(self.nodes.rpc.get_current_working_map())
+        if action == "list_waypoints":
+            return self._list_waypoints(args.get("map_id"))
+        if action == "tag_place":
+            name = (args.get("waypoint_name") or "").strip()
+            _require(bool(name), "需要 waypoint_name")
+            return self._tag_place(name)
         if action == "rename_map":
             return jsonable(self.nodes.rpc.rename_map(int(args.get("map_id", 0)),
                                                       args.get("old_name", ""),
@@ -4219,13 +4325,31 @@ class ControlledSpatialPlugin:
             return jsonable(self.nodes.rpc.slam_stop_normal_relocalization(reloc_pose))
         # -- 导航（长时间动作：_nav_dispatch 发 RPC 后返回 action_id 并武装
         # ACP 完成等待线程，轮询 ActionGetState 判定到点） --
-        if action == "navi_to_goal":
+        if action in ("navi_to_goal", "navi_to_waypoint"):
             rejected = _motion_gate(self.nodes.rpc, "controlled_spatial")
             if rejected:
                 return rejected
+            map_id = args.get("map_id", 0)
+            target_id = args.get("target_id", 0)
+            if action == "navi_to_waypoint":
+                name = (args.get("waypoint_name") or "").strip()
+                _require(bool(name), "需要 waypoint_name，请使用 list_waypoints 查询点位名称")
+                result = self._list_waypoints(args.get("map_id"))
+                map_id = result["map_id"]
+                matches = [point for point in result["waypoints"] if point["name"] == name]
+                _require(bool(matches), f"地图 {map_id} 中没有名为 {name!r} 的点位，请使用 list_waypoints 查询")
+                _require(len(matches) == 1,
+                         f"地图 {map_id} 中有多个名为 {name!r} 的点位，请按原生 ID 或坐标导航")
+                waypoint = matches[0]
+                if waypoint.get("source") == "recorded":
+                    _require(self._current_map_id() == map_id, "请切换到该点位所属地图并完成重定位")
+                    return self._nav_dispatch(action, "PlanningNaviToPose2D", {
+                        "task_id": 0, "map_id": map_id, "pose": waypoint["pose"],
+                        "ackerman_mode": False})
+                target_id = waypoint["point_id"]
             return self._nav_dispatch(action, "PlanningNaviToGoal", {
-                "task_id": 0, "map_id": int(args.get("map_id", 0)),
-                "target_id": int(args.get("target_id", 0)), "guide_line_id": 0,
+                "task_id": 0, "map_id": int(map_id),
+                "target_id": int(target_id), "guide_line_id": 0,
                 "ackerman_mode": False})
         if action == "navi_to_pose":
             rejected = _motion_gate(self.nodes.rpc, "controlled_spatial")
