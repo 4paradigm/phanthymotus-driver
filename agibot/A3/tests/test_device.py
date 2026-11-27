@@ -11,9 +11,11 @@ records every HTTP JSON RPC call, so payload shapes are asserted too.
 from __future__ import annotations
 
 import array
+import io
 import json
 import math
 import os
+import queue
 import struct
 import sys
 import tempfile
@@ -118,6 +120,17 @@ class FakeExecutor:
         pass
 
 
+class FakeSingleThreadedExecutor(FakeExecutor):
+    def spin_once(self, timeout_sec):
+        time.sleep(min(timeout_sec, 0.01))
+
+    def wake(self):
+        pass
+
+    def shutdown(self):
+        pass
+
+
 class FakeROS2:
     def __init__(self):
         self.ctx_robot = object()
@@ -142,6 +155,7 @@ def _install_ros_stubs():
     module("rclpy.qos", QoSProfile=FakeQoSProfile, QoSReliabilityPolicy=FakeQoSReliabilityPolicy)
     rclpy.node = sys.modules["rclpy.node"]
     rclpy.qos = sys.modules["rclpy.qos"]
+    rclpy.executors = module("rclpy.executors", SingleThreadedExecutor=FakeSingleThreadedExecutor)
 
     module("sensor_msgs")
     module("sensor_msgs.msg", Image=FakeMsg, CompressedImage=FakeMsg, Imu=FakeMsg,
@@ -166,6 +180,7 @@ import yaml  # noqa: E402
 import device  # noqa: E402
 import main  # noqa: E402
 from common.vendor_runtime import DriverBundle  # noqa: E402
+from hand_tactile import TAXEL_COUNT, HandTactilePlugin, TactileReader  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +200,7 @@ BASE_CONFIG = {
 FULL_PLUGINS = {
     "joints": {"enabled": True}, "imu": {"enabled": True},
     "joint_state": {"enabled": True},
+    "hand_tactile": {"enabled": True},
     "camera": {"enabled": True,
                "streams": ["head_left_fisheye", "head_right_fisheye", "head_rear_fisheye",
                            "head_stereo_left_fisheye", "head_stereo_right_fisheye", "armpit_right_fisheye",
@@ -307,11 +323,173 @@ def run_concurrently(fn_a, fn_b):
     return results
 
 
+class HandTactileTests(unittest.TestCase):
+    @staticmethod
+    def feedback(nanosec, values=None):
+        return {"header": {"frame_id": "O10Hand", "stamp": {"sec": 42, "nanosec": nanosec}},
+                "effort": [0.0] * TAXEL_COUNT if values is None else values}
+
+    def test_unknown_action_returns_none(self):
+        sensor = HandTactilePlugin(types.SimpleNamespace(namespace="test_ns"))
+        bundle = DriverBundle([sensor])
+        self.assertIsNone(bundle.dispatch("hand_tactile", {"action": "unsupported"}))
+
+    def test_layout_exact_values_and_release(self):
+        values = [0.0] * TAXEL_COUNT
+        values[0], values[267], values[284], values[433] = 13, 17, 29, 255
+        reader = TactileReader()
+        reading = reader.read(self.feedback(1, values), 0, 0)
+        left, right = (reading["hands"][side] for side in ("left", "right"))
+        self.assertEqual(left["thumb"]["raw"][0], 13)
+        self.assertEqual(left["back"]["raw"][-1], 17)
+        self.assertEqual(right["index"]["peak_raw"], 29)
+        self.assertEqual(right["palm"]["raw"][-1], 255)
+        self.assertEqual(right["palm"]["nonzero_points"], 1)
+        released = reader.read(self.feedback(2), 0.1, 0.1)
+        self.assertEqual(released["state"], "fresh")
+        self.assertEqual(released["hands"]["right"]["palm"]["peak_raw"], 0)
+
+    def test_cached_or_invalid_source_is_not_fresh_zero_pressure(self):
+        reader = TactileReader()
+        self.assertEqual(reader.read({}, 0)["state"], "waiting")
+        self.assertEqual(reader.read(self.feedback(1), 0)["state"], "waiting")
+        self.assertEqual(reader.read(self.feedback(2), 0.1, 0.1)["state"], "fresh")
+        stale = reader.read(self.feedback(2), 1.2, 0.1)
+        self.assertEqual(stale["state"], "stale")
+        self.assertIsNone(stale["hands"])
+        self.assertEqual(reader.read(self.feedback(3, [0.0] * 260), 1.3, 1.3)["state"], "unsupported_layout")
+        bad = self.feedback(4, [0.0] * 535 + [float("nan")])
+        self.assertEqual(reader.read(bad, 1.4, 1.4)["state"], "invalid_readings")
+        self.assertEqual(reader.read(self.feedback(5), 1.5, 1.5)["state"], "fresh")
+
+    def test_new_arrivals_with_repeated_header_remain_fresh_until_receiving_stops(self):
+        reader = TactileReader()
+        feedback = self.feedback(1)
+        self.assertEqual(reader.read(feedback, 0, 0)["state"], "fresh")
+        self.assertEqual(reader.read(feedback, 4, 4)["state"], "fresh")
+        self.assertEqual(reader.read(feedback, 4.9, 4)["state"], "fresh")
+        self.assertEqual(reader.read(feedback, 5.1, 4)["state"], "stale")
+
+    def test_sensor_lifecycle_isolates_receiver_and_keeps_existing_interfaces(self):
+        from PIL import Image
+
+        config = json.loads(json.dumps(BASE_CONFIG))
+        config["plugins"] = FULL_PLUGINS
+        plugins, transport = build_bundle_plugins(config)
+        disabled_config = json.loads(json.dumps(config))
+        disabled_config["plugins"]["hand_tactile"]["enabled"] = False
+        without_tactile, _ = build_bundle_plugins(disabled_config)
+        self.assertEqual([tool for tool in tool_definitions(plugins) if tool["name"] != "hand_tactile"],
+                         tool_definitions(without_tactile))
+
+        sensor = plugins["hand_tactile"]
+        nodes = sensor.nodes
+        bundle = DriverBundle([sensor])
+        existing_topics = set(nodes.core.publishers)
+        existing_subscriptions = len(nodes.robot.subscriptions)
+        bundle.start_all()
+        self.assertEqual(set(nodes.core.publishers), existing_topics)
+        self.addCleanup(bundle.stop_all)
+        result = bundle.dispatch("hand_tactile", {"action": "start"})
+        self.assertEqual(result["state"], "running")
+        self.assertEqual(result["topic_out"], sensor.get_tool()["topic_out"])
+        preview_pub, data_pub = [nodes.core.publishers[port["topic"]] for port in result["topic_out"]]
+        self.assertEqual(len(nodes.robot.subscriptions), existing_subscriptions)
+
+        frame_ready = threading.Event()
+        publish_preview = preview_pub.publish
+
+        def capture_preview(message):
+            publish_preview(message)
+            if json.loads(data_pub.published[-1].data)["state"] == "fresh":
+                frame_ready.set()
+
+        preview_pub.publish = capture_preview
+        source = sensor._source
+        self.assertIsNot(source._node, nodes.robot)
+        self.assertEqual(source._node.context, nodes.robot.context)
+        callback = next(cb for topic, cb in source._node.subscriptions if topic == "/motion/control/hand_joint_state")
+        # The aggregate mirror is deliberately frozen. Only the dedicated
+        # subscription receives the new pressure sample in this regression.
+        nodes.values["hand_state"] = self.feedback(1)
+        feedback = FakeMsg()
+        feedback.header = types.SimpleNamespace(frame_id="O10Hand", stamp=types.SimpleNamespace(sec=42, nanosec=1))
+        feedback.name, feedback.position, feedback.velocity = [], [], []
+        feedback.effort = array.array("d", [0.0] * TAXEL_COUNT)
+        feedback.effort[284] = 29
+        callback(feedback)
+        self.assertTrue(frame_ready.wait(3), "tactile preview never received its independent sample")
+        self.assertEqual(bundle.dispatch("hand_tactile", {"action": "stop"})["state"], "idle")
+        self.assertEqual(json.loads(data_pub.published[-1].data)["hands"]["right"]["index"]["peak_raw"], 29)
+        with Image.open(io.BytesIO(preview_pub.published[-1].data)) as rendered:
+            self.assertEqual(rendered.format, "JPEG")
+            self.assertEqual(rendered.size, (800, 600))
+            rendered.verify()
+        self.assertFalse(source._thread.is_alive())
+        self.assertIsNone(source._node)
+        bundle.dispatch("hand_tactile", {"action": "start"})
+        self.assertIsNot(sensor._source, source)
+        self.assertEqual(sensor._source.snapshot(), (None, None))
+        bundle.dispatch("hand_tactile", {"action": "stop"})
+        self.assertEqual(len(nodes.robot.subscriptions), existing_subscriptions)
+        self.assertEqual(transport.calls, [])
+
+    def test_tactile_bridge_is_lazy_and_does_not_enqueue_in_the_skill_lane(self):
+        bridge = object.__new__(device.CoreBridge)
+        bridge._ctx = types.SimpleNamespace(Queue=queue.Queue)
+        bridge._queues = {"state_system": queue.Queue(maxsize=1)}
+        bridge._metrics_lock = threading.Lock()
+        bridge._sent, bridge._dropped, bridge._topic_counts = 0, 0, {}
+        serialization = types.SimpleNamespace(serialize_message=lambda payload: payload)
+        with patch.object(bridge, "_start_worker") as start_worker:
+            bridge.enable_hand_tactile()
+            bridge.enable_hand_tactile()
+            start_worker.assert_called_once_with("hand_tactile", bridge._queues["hand_tactile"])
+        with patch.dict(sys.modules, {"rclpy.serialization": serialization}):
+            bridge.publish("/test_ns/skill_status", b"skill", FakeMsg)
+            bridge.publish("/test_ns/hand/tactile", b"json", FakeMsg)
+            bridge.publish("/test_ns/hand/tactile_preview", b"jpeg", FakeMsg)
+        self.assertEqual(bridge._queues["state_system"].get_nowait()[2], b"skill")
+        self.assertEqual([bridge._queues["hand_tactile"].get_nowait()[2] for _ in range(2)],
+                         [b"json", b"jpeg"])
+
+
 # ---------------------------------------------------------------------------
 # Inventory / schema tests
 # ---------------------------------------------------------------------------
 
 class ToolInventoryTests(unittest.TestCase):
+    def test_robot_discovery_servers_in_deployed_service(self):
+        service = yaml.safe_load((DEVICE_DIR / "deploy/service.yml").read_text())
+        settings = service["agibot-a3"]["environment"]
+        self.assertEqual([s for s in settings if s.startswith("ROS_DISCOVERY_SERVER=")],
+                         ["ROS_DISCOVERY_SERVER=10.42.10.10:11811;10.42.10.12:11811"])
+
+    def test_core_workers_clear_robot_discovery_before_ros_init(self):
+        import domain_bridge
+        import rclpy
+
+        profile = "/opt/phanthy-motus/dds-local.xml"
+        workers = [
+            (domain_bridge._run, (None, profile, 42, "state")),
+            (domain_bridge._run_subscription,
+             (None, None, profile, 42, "/test", "std_msgs/msg/String", 5)),
+        ]
+        serialization = types.SimpleNamespace(serialize_message=bytes)
+        for worker, args in workers:
+            with (self.subTest(worker=worker.__name__),
+                  patch.dict(os.environ, {"ROS_DISCOVERY_SERVER": "robot-server:11811"}),
+                  patch.object(os.path, "isfile", return_value=True),
+                  patch.dict(sys.modules, {"rclpy.serialization": serialization}),
+                  patch.object(rclpy.qos, "ReliabilityPolicy", FakeQoSReliabilityPolicy, create=True),
+                  patch.object(rclpy, "init", side_effect=StopIteration, create=True) as init):
+                with self.assertRaises(StopIteration):
+                    worker(*args)
+                init.assert_called_once()
+                self.assertIsNone(os.environ.get("ROS_DISCOVERY_SERVER"))
+                self.assertEqual(os.environ["ROS_DOMAIN_ID"], "42")
+                self.assertEqual(os.environ["FASTRTPS_DEFAULT_PROFILES_FILE"], profile)
+
     def test_relay_start_failure_is_fatal_when_cameras_use_host_relay(self):
         dockerfile = (DEVICE_DIR / "Dockerfile").read_text(encoding="utf-8")
         self.assertIn("if ! /work/agibot/A3/jazzy_relay.sh start; then", dockerfile)
@@ -419,7 +597,7 @@ class ToolInventoryTests(unittest.TestCase):
         plugins, _ = build_bundle_plugins(config)
         by_name = {d["name"]: d["type"] for d in tool_definitions(plugins)}
         self.assertEqual(by_name["model"], "resource")
-        for name in ("joints", "imu", "camera", "lidar_cloud", "battery", "estop",
+        for name in ("joints", "hand_tactile", "imu", "camera", "lidar_cloud", "battery", "estop",
                      "spatial_map"):
             self.assertEqual(by_name[name], "sensor", f"'{name}' must be a sensor tool")
 
