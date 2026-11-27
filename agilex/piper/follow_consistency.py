@@ -96,10 +96,10 @@ class FollowConsistency:
                                 'start': ([], 'Start passive CAN monitoring'),
                                 'stop': ([], 'Stop this monitor')}, {})
         result = tool(NAME, 'sensor',
-                      'Compares external PiPER joint targets with measured follower positions. '
+                      'Compares external PiPER leader joint targets with measured follower positions. '
                       'Does not issue CAN commands or change operating modes.', schema,
                       topic_out=[{'topic': self.topic, 'format': 'data/json'}])
-        result['title'] = 'ALOHA 主从跟随检测'
+        result['title'] = 'ALOHA Leader-Follower Tracking'
         return result
 
     def start(self):

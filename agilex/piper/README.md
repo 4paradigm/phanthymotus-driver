@@ -64,7 +64,7 @@ those fixes for the complete canvas experience. A `trigger` activity label is
 presentation; Get status is a synchronous query and its completion does not
 change the previous movement result.
 
-## ALOHA follow consistency
+## ALOHA Leader-Follower Tracking
 
 The optional `piper_follow_consistency` sensor compares six external joint
 targets with the measured follower joint angles of each configured SocketCAN
@@ -89,11 +89,11 @@ grid for delays up to 250 ms and is unavailable during static or ambiguous motio
 
 For a workcell with an existing PiPER deployment, the same image can be run with
 `python3 -m agilex.piper.follow_consistency` after sourcing ROS Humble. Set
-`CONFIG_PATH` to an explicit site YAML with a unique `mcp_port`, `ros_namespace`
-and the `follow_consistency` settings above. The standalone service uses its own
-Agent Core registration and starts only this passive card. It uses the existing
-host SocketCAN and Core DDS network. It needs no device mounts or extra Linux
-capabilities.
+`CONFIG_PATH` to an explicit site YAML with `name: ALOHA Leader-Follower Tracking`,
+a unique `mcp_port`, a unique `ros_namespace`, and the `follow_consistency`
+settings above. The standalone service uses its own Agent Core registration and
+starts only this passive card. It uses the existing host SocketCAN and Core DDS
+network. It needs no device mounts or extra Linux capabilities.
 
 ## Build and packaging
 

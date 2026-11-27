@@ -102,6 +102,7 @@ def test_mcp_tool_has_read_only_actions_and_explicit_bus_mapping():
     bundle = DriverBundle([plugin])
     definition, = bundle.get_all_tools()
     assert definition['topic_out'] == [{'topic': f'/test/{NAME}', 'format': 'data/json'}]
+    assert definition['title'] == 'ALOHA Leader-Follower Tracking'
     assert definition['type'] == 'sensor'
     assert bundle.dispatch(NAME, {'action': 'info'})['state'] == 'idle'
     with pytest.raises(ValueError, match='only'):
