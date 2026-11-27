@@ -2704,7 +2704,7 @@ class LocoPlugin:
 
     - 一次 walk = 一个 ACP 任务，duration 必填（≤60 s）。到时减速到零后回报 completed。
     - 新 walk 直接接管：旧任务 cancelled(superseded)，速度平滑过渡，不先停下。
-    - stop / interrupt hook：减速到零后结束，旧任务 cancelled。
+    - stop_move / stop / interrupt hook：减速到零后结束，旧任务 cancelled。
     - 速度按 ACCEL/DECEL 斜坡变化（厂商要求大幅变化分步过渡）。
     - 行走中 2 Hz 监视 GetAction，离开 MOTION 或超过 MONITOR_STALE_S 未读到状态即减速停下并报 error。
     - 任务在零速帧发出成功后才结算；零速帧发不出去报 PUBLISH_FAILED。
@@ -2744,6 +2744,7 @@ class LocoPlugin:
         schema = action_schema(
             {"walk": (["forward", "lateral", "angular", "duration"],
                       "按给定速度行走 duration 秒，到时自动减速停下并 ACP 回报；新的 walk 会直接接管当前行走"),
+             "stop_move": ([], "减速停下并取消当前行走任务"),
              "stop": ([], "减速停下并结束当前行走"),
              "status": ([], "查询当前行走任务、目标速度与实际下发速度")},
             {
@@ -2759,8 +2760,8 @@ class LocoPlugin:
         )
         schema["x-resource"] = ["base", "leg"]
         schema["x-completion"] = {"actions": ["walk"], "timeout": self.COMPLETION_TIMEOUT_S}
-        schema["x-hooks"] = {"on_interrupt_motion": {"action": "stop"},
-                             "on_interrupt_all": {"action": "stop"}}
+        schema["x-hooks"] = {"on_interrupt_motion": {"action": "stop_move"},
+                             "on_interrupt_all": {"action": "stop_move"}}
         return tool("loco", "actuator",
                     "双足行走：forward/lateral 为 m/s，angular 为 deg/s，走 duration 秒后自动停下；"
                     "需先 mc_mode stand 进入 MOTION", schema)
@@ -2776,9 +2777,11 @@ class LocoPlugin:
             return {"state": "ready"}
         if action == "info":
             return {"state": "walking" if self._task else "idle"}
-        if action == "stop":
-            stopped = self.halt("cancelled_by_request", wait=False)
-            return {"state": "idle", "stopping": stopped}
+        if action in ("stop_move", "stop"):
+            action_id = self.halt("cancelled_by_request", wait=False)
+            # The lifecycle stop keeps its existing idle acknowledgement.
+            state = "stopping" if action == "stop_move" and action_id else "idle"
+            return {"state": state, "stopping": action_id}
         if action == "status":
             return self._status()
         if action != "walk":
@@ -2859,7 +2862,7 @@ class LocoPlugin:
                 return _rejected("INVALID_ARG", f"{axis}={target[axis]:g} 超出 [{low:g}, {high:g}]",
                                  limits={k: list(v) for k, v in limits.items()})
         if not any(target.values()):
-            return _rejected("INVALID_ARG", "三个速度都为 0", "停止请用 stop")
+            return _rejected("INVALID_ARG", "三个速度都为 0", "停止请用 stop_move")
         rejected = _motion_gate(self.nodes.rpc, "loco")
         if rejected:
             return rejected

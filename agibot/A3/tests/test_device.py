@@ -1453,8 +1453,12 @@ class RpcDispatchTests(unittest.TestCase):
     def test_loco_schema_declares_completion_and_interrupt_hooks(self):
         schema = find_plugin(self.plugins, "loco").get_tool()["inputSchema"]
         self.assertEqual(schema["x-completion"], {"actions": ["walk"], "timeout": 75.0})
-        self.assertEqual(schema["properties"]["action"]["enum"], ["walk", "stop", "status"])
-        self.assertEqual(schema["x-hooks"]["on_interrupt_motion"], {"action": "stop"})
+        system_actions = {"start", "stop", "info", "config"}
+        visible = [name for name in schema["properties"]["action"]["enum"] if name not in system_actions]
+        self.assertEqual(visible, ["walk", "stop_move", "status"])
+        self.assertEqual(schema["x-action-params"]["stop_move"]["params"], [])
+        for hook in ("on_interrupt_motion", "on_interrupt_all"):
+            self.assertEqual(schema["x-hooks"][hook], {"action": "stop_move"})
 
     def test_loco_walk_reports_completion_after_duration_and_deceleration(self):
         loco = find_plugin(self.plugins, "loco")
@@ -1482,6 +1486,19 @@ class RpcDispatchTests(unittest.TestCase):
         self.assertEqual(captured[0][0:2], (result["action_id"], "cancelled"))
         self.assertEqual(captured[0][2]["reason"], "cancelled_by_request")
         self.assertEqual(self._loco_payloads()[-1]["data"]["forward_velocity"], 0.0)
+
+    def test_loco_canvas_stop_move_brakes_an_active_walk(self):
+        bundle = DriverBundle(self.plugins)
+        captured = self._capture_notifications()
+        walk = bundle.dispatch("loco", {"action": "walk", "forward": 0.1, "duration": 30})
+        self._wait_until(lambda: any(p["data"]["forward_velocity"] > 0 for p in self._loco_payloads()))
+        reply = bundle.dispatch("loco", {"action": "stop_move"})
+        self.assertEqual(reply, {"state": "stopping", "stopping": walk["action_id"]})
+        self._wait_until(lambda: len(captured) == 1)
+        self.assertEqual(captured[0][:2], (walk["action_id"], "cancelled"))
+        self.assertEqual(self._loco_payloads()[-1]["data"]["forward_velocity"], 0.0)
+        self.assertEqual(bundle.dispatch("loco", {"action": "stop_move"}),
+                         {"state": "idle", "stopping": None})
 
     def test_loco_new_command_settles_previous(self):
         loco = find_plugin(self.plugins, "loco")
