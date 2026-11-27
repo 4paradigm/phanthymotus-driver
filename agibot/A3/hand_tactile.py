@@ -169,7 +169,7 @@ class TactilePreview:
                 data = regions.get(region)
                 peak = data["peak_raw"] if data is not None else None
                 if index < 5:
-                    column = 4 - index if side == "left" else index
+                    column = index if side == "left" else 4 - index
                     left = x + 18 + column * 70
                     top = (183, 155, 139, 155, 175)[index]
                     box = (left, top, left + 66, 319)
