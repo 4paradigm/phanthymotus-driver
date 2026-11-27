@@ -180,7 +180,7 @@ import yaml  # noqa: E402
 import device  # noqa: E402
 import main  # noqa: E402
 from common.vendor_runtime import DriverBundle  # noqa: E402
-from hand_tactile import TAXEL_COUNT, TactileReader  # noqa: E402
+from hand_tactile import TAXEL_COUNT, HandTactilePlugin, TactileReader  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -328,6 +328,11 @@ class HandTactileTests(unittest.TestCase):
     def feedback(nanosec, values=None):
         return {"header": {"frame_id": "O10Hand", "stamp": {"sec": 42, "nanosec": nanosec}},
                 "effort": [0.0] * TAXEL_COUNT if values is None else values}
+
+    def test_unknown_action_returns_none(self):
+        sensor = HandTactilePlugin(types.SimpleNamespace(namespace="test_ns"))
+        bundle = DriverBundle([sensor])
+        self.assertIsNone(bundle.dispatch("hand_tactile", {"action": "unsupported"}))
 
     def test_layout_exact_values_and_release(self):
         values = [0.0] * TAXEL_COUNT

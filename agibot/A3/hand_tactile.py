@@ -283,7 +283,7 @@ class HandTactilePlugin:
         elif action == "stop":
             self.stop()
         elif action not in ("info", "hand_tactile"):
-            raise ValueError(f"hand_tactile: unknown action {action!r}")
+            return None
         running = self._thread is not None and self._thread.is_alive()
         return {"state": "running" if running else "idle", "topic_out": self.topic_out,
                 "data_state": self._data_state if running else "idle"}
