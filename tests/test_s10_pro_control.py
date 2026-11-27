@@ -1762,8 +1762,8 @@ def test_loco_servo_defaults_to_dry_run_and_explicit_live_start_requires_permiss
     assert definition["inputSchema"]["x-resource"] == "base"
     assert definition["topic_in"][0]["format"] == "control/velocity"
     descriptor = build_descriptor()
-    assert descriptor["limits"]["lower"] == [-.6, -0.4, 0, 0, 0, -1.0]
-    assert descriptor["limits"]["upper"] == [.6, 0.4, 0, 0, 0, 1.0]
+    assert descriptor["limits"]["lower"] == [-.6, 0, 0, 0, 0, -1.0]
+    assert descriptor["limits"]["upper"] == [.6, 0, 0, 0, 0, 1.0]
     assert "groups" not in descriptor
     assert plugin.dispatch("info", {})["dry_run"] is True
     assert plugin.dispatch("unknown", {}) is None
@@ -2041,10 +2041,10 @@ def test_loco_servo_core_stream_validates_messages_and_watchdog_holds(monkeypatc
         assert plugin.dispatch("start", {"input_topic": "/policy/velocity", "confirm": True})["state"] == "ready"
         native.calls.clear()  # Count velocity/watchdog sends after navigation setup.
 
-        subscriber.payloads.append(command([0.2, 0.1, 0.0, 0.0, 0.0, -0.2]))
+        subscriber.payloads.append(command([0.2, 0.0, 0.0, 0.0, 0.0, -0.2]))
         wait_for(lambda: len(native.calls) == 1)
         assert native.calls[-1][0][2] == {
-            "X": .03, "Y": .03, "Z": 0.0, "Roll": 0.0, "Pitch": 0.0, "Yaw": -0.2,
+            "X": .03, "Y": 0.0, "Z": 0.0, "Roll": 0.0, "Pitch": 0.0, "Yaw": -0.2,
         }
 
         time.sleep(0.06)

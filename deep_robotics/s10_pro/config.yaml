@@ -97,8 +97,7 @@ loco_servo:
   rotate_only: false
   speed_preset: normal  # S10 Pro vx ceilings: slow=.30, normal=.60, fast=1.00 m/s.
   min_vx: 0.0  # Planner metadata only; no invented minimum-speed compensation.
-  min_vy: 0.12  # m/s, lowest tested command with lateral displacement in both directions.
   min_wz: 0.0  # rad/s, minimum stable yaw magnitude advertised to the planner.
-  linear_acceleration: 0.3  # m/s² nominal at 10Hz, both vx and vy.
+  linear_acceleration: 0.3  # m/s² nominal at 10Hz for vx.
   angular_acceleration: 2.0  # rad/s² nominal at 10Hz.
   wz_limit: 1.0  # rad/s, never exceeds the native operating ceiling.

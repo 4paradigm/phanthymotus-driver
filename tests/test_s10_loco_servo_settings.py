@@ -104,30 +104,37 @@ def test_yaw_floor_is_advertised_to_planners_without_raising_native_commands(ser
     assert not p.dispatch('config', {'wz_limit': .2})['ok']
     started = p.dispatch('start', {'input_topic': '/policy/cmd', 'dry_run': False})
     assert started['state'] == 'ready'
-    assert started['control_interface']['limits']['min_magnitude'] == [0, .12, 0, 0, 0, .3]
+    assert started['control_interface']['limits']['min_magnitude'] == [0, 0, 0, 0, 0, .3]
     assert p.dispatch('info', {})['min_wz'] == .3
     for seq, yaw in enumerate((.05, -.05, 0.), start=1):
         submit(p, command(p, [0, 0, 0, 0, 0, yaw], seq=seq))
         assert servo.native.calls[-1][2]['Yaw'] == pytest.approx(yaw)
 
 
-def test_lateral_floor_is_advertised_without_raising_native_commands(servo):
-    p = servo.plugin
-    info = p.dispatch('info', {})
-    assert info['min_vy'] == .12
-    assert info['control_interface']['limits']['min_magnitude'][1] == .12
-    assert p.dispatch('config', {'min_vy': .14})['ok']
+def test_servo_disables_lateral_motion_with_saved_settings(servo):
+    p = servo.module.S10LocoServoPlugin(servo.native, ros2=object(), config={'min_vy': .12})
+    try:
+        started = p.dispatch('start', {'input_topic': '/policy/cmd', 'dry_run': False})
+        assert started['state'] == 'ready'
+        for response in (started, p.dispatch('info', {})):
+            limits = response['control_interface']['limits']
+            assert [limits[key][1] for key in ('lower', 'upper', 'min_magnitude')] == [0, 0, 0]
+        assert p.dispatch('config', {'min_vy': .14})['ok']
+        assert p.dispatch('info', {})['min_vy'] == 0
 
-    started = p.dispatch('start', {'input_topic': '/policy/cmd', 'dry_run': False})
-    assert started['state'] == 'ready'
-    assert started['control_interface']['limits']['min_magnitude'][1] == .14
-    for seq, vy in enumerate((.02, 0., -.02, 0.), start=1):
-        submit(p, command(p, [0, vy, 0, 0, 0, 0], seq=seq))
-        assert servo.native.calls[-1][2]['Y'] == pytest.approx(vy)
-        assert servo.native.calls[-1][2]['X'] == 0.
+        sent = len(servo.native.calls)
+        for seq, vy in enumerate((.02, -.02), start=1):
+            submit(p, command(p, [.02, vy, 0, 0, 0, .05], seq=seq))
+            last = p.dispatch('info', {})['last_command']
+            assert last['verdict'] == 'REJECTED' and 'vy' in last['reason']
+            assert len(servo.native.calls) == sent
 
-    assert p.dispatch('config', {'min_vy': 0})['ok']
-    assert p.dispatch('info', {})['control_interface']['limits']['min_magnitude'][1] == 0
+        submit(p, command(p, [.02, 0, 0, 0, 0, .05], seq=3))
+        assert p.dispatch('info', {})['last_command']['verdict'] == 'APPLIED'
+        native = servo.native.calls[-1][2]
+        assert (native['X'], native['Y'], native['Yaw']) == pytest.approx((.02, 0, .05))
+    finally:
+        p.stop()
 
 
 def test_servo_reports_static_standing_footprint_as_an_estimate(servo):
@@ -286,11 +293,11 @@ def test_config_schema_exposes_controls_without_start_defaults(servo):
     props = tool['configSchema']['properties']
     for action in ['start', 'config']:
         assert 'confirm' in tool['inputSchema']['x-action-params'][action]['params']
-        assert 'min_vy' in tool['inputSchema']['x-action-params'][action]['params']
+        assert 'min_vy' not in tool['inputSchema']['x-action-params'][action]['params']
         assert 'min_wz' in tool['inputSchema']['x-action-params'][action]['params']
-    assert props['min_vy']['default'] == .12
+    assert 'min_vy' not in props
     assert props['min_wz']['default'] == 0
-    for key in ['speed_preset', 'dry_run', 'rotate_only', 'min_vx', 'min_vy', 'min_wz',
+    for key in ['speed_preset', 'dry_run', 'rotate_only', 'min_vx', 'min_wz',
                 'linear_acceleration', 'angular_acceleration', 'wz_limit']:
         assert key in props
         assert 'default' not in tool['inputSchema']['properties'][key]
@@ -318,7 +325,7 @@ def test_canvas_resume_reuses_paused_stream_and_saved_settings(servo):
 def test_dry_run_counts_valid_commands_without_any_native_setup_or_velocity(servo):
     p = servo.plugin
     p.dispatch('start', {'input_topic': '/policy/cmd'})
-    submit(p, command(p, [.2, .1, 0, 0, 0, .8]))
+    submit(p, command(p, [.2, 0, 0, 0, 0, .8]))
     info = p.dispatch('info', {})
     assert info['dry_run_commands'] == 1
     assert servo.native.calls == []
@@ -491,10 +498,10 @@ def test_acceleration_begins_at_zero_and_zero_velocity_stops_immediately(servo):
     p = servo.plugin
     assert p.dispatch('start', {'input_topic': '/policy/cmd', 'dry_run': False, 'confirm': True})['state'] == 'ready'
     servo.native.calls.clear()
-    submit(p, command(p, [.3, .2, 0, 0, 0, .9]))
+    submit(p, command(p, [.3, 0, 0, 0, 0, .9]))
     values = servo.native.calls[-1][2]
     assert values['X'] == pytest.approx(.03)
-    assert values['Y'] == pytest.approx(.03)
+    assert values['Y'] == 0.
     assert values['Yaw'] == pytest.approx(.2)
     submit(p, command(p, [0] * 6, seq=2))
     assert all(value == 0 for value in servo.native.calls[-1][2].values())
@@ -524,7 +531,7 @@ def test_rotate_only_and_yaw_cap_match_the_advertised_limits(servo, yaw):
     assert limits['lower'][5] == -.1
     assert limits['upper'][5] == .1
     p.dispatch('start', {'input_topic': '/policy/cmd', 'dry_run': False, 'confirm': True})
-    submit(p, command(p, [.2, .2, 0, 0, 0, yaw]))
+    submit(p, command(p, [.2, 0, 0, 0, 0, yaw]))
     assert servo.native.calls[-1][2] == {'X': 0., 'Y': 0., 'Z': 0.,
                                         'Roll': 0., 'Pitch': 0., 'Yaw': yaw}
     count = len(servo.native.calls)
