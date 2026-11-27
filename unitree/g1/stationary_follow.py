@@ -137,25 +137,22 @@ class StationaryFollowPlugin:
         self._last_motion_at = 0.0
         self._last_received = None
         self._last_decision = {"command": "none", "reason": "idle"}
-        self._mode = "legs"
-        self._leg_detector = None
 
     def get_tool(self):
         return {
             "name": self.PREFIX, "type": "actuator", "multiInstance": False,
-            "description": "G1 原地小跟班：下视深度图检测唯一双腿候选，低速原地转向；识别不明确即停止。",
+            "description": "G1 原地小跟班：根据单人姿态低速原地转向，丢失目标或超时停止。",
             "inputSchema": {
                 "type": "object", "required": ["action"],
                 "properties": {
                     "action": {"type": "string", "enum": ["start", "stop", "info"]},
-                    "input_topic": {"type": "string", "description": "image/depth-zlib 下视深度流；pose 模式可手填姿态话题"},
-                    "input_mode": {"type": "string", "enum": ["legs", "pose"], "default": "legs"},
+                    "input_topic": {"type": "string", "description": "sensor/pose2d 人物姿态流话题"},
                 },
                 "x-action-params": {"start": {"params": ["input_topic"]},
                                     "stop": {"params": []}, "info": {"params": []}},
                 "x-resource": "base",
             },
-            "topic_in": [{"format": "image/depth-zlib", "desc": "G1 下视深度相机；仅连接这一路"}],
+            "topic_in": [{"format": "sensor/pose2d", "desc": "COCO-17 人物姿态流"}],
             "topic_out": [{"topic": self._output, "format": "data/json"}],
         }
 
@@ -178,15 +175,12 @@ class StationaryFollowPlugin:
 
     def dispatch(self, action, args):
         if action == "start":
-            mode = args.get("input_mode") or "legs"
-            if mode not in ("legs", "pose"):
-                return {"state": "error", "error": "input_mode must be legs or pose"}
             topic = (args.get("input_topic") or "").strip()
             if not topic:
                 topics = args.get("input_topics") or []
                 topic = (topics[0] or "").strip() if topics else ""
             if not topic:
-                return {"state": "error", "error": "请在画布连接 camera_depth 输入"}
+                return {"state": "error", "error": "请在画布连接 sensor/pose2d 输入"}
             with self._lock:
                 if (self._node is not None or self._cleanup_in_progress or
                         self._worker is not None and self._worker.is_alive()):
@@ -194,16 +188,11 @@ class StationaryFollowPlugin:
                 try:
                     from rclpy.node import Node
                     from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
-                    if mode == "legs":
-                        from sensor_msgs.msg import CompressedImage as Message
-                        from leg_detection import DepthLegDetector
-                    else:
-                        from std_msgs.msg import String as Message
+                    from std_msgs.msg import String
                     node = Node("g1_stationary_follow")
                     qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT,
                                      history=HistoryPolicy.KEEP_LAST, depth=1)
-                    node.create_subscription(Message, topic, self._on_message, qos)
-                    from std_msgs.msg import String
+                    node.create_subscription(String, topic, self._on_message, qos)
                     publisher = node.create_publisher(String, self._output, qos)
                     self._executor.add_node(node)
                 except Exception as exc:
@@ -214,8 +203,6 @@ class StationaryFollowPlugin:
                 self._publisher = publisher
                 self._message_type = String
                 self._topic = topic
-                self._mode = mode
-                self._leg_detector = DepthLegDetector() if mode == "legs" else None
                 self._last_received = None
                 self._last_decision = self._controller.start()
                 self._shutdown.clear()
@@ -223,14 +210,13 @@ class StationaryFollowPlugin:
                                                 name="g1_stationary_follow")
                 self._worker.start()
             return {"state": "running", "input": topic,
-                    "mode": mode, "topic_out": [{"topic": self._output, "format": "data/json"}]}
+                    "topic_out": [{"topic": self._output, "format": "data/json"}]}
         if action == "stop":
             return self._stop()
         if action == "info":
             with self._lock:
                 return {"state": "running" if self._node is not None else "idle",
                         "input": self._topic,
-                        "mode": self._mode,
                         "topic_out": [{"topic": self._output, "format": "data/json"}],
                         "last_decision": dict(self._last_decision)}
         return None
@@ -240,21 +226,6 @@ class StationaryFollowPlugin:
             if self._node is None:
                 return
             received_at = self._clock()
-            if self._mode == "legs":
-                if message.format != "16UC1; compressedDepth zlib":
-                    self._last_decision = self._controller.stop("invalid_depth_format")
-                else:
-                    center, reason = self._leg_detector.detect(message.data)
-                    if center is None:
-                        self._last_decision = (self._controller.stop(reason)
-                                               if self._controller.target_id is not None
-                                               else {"command": "none", "reason": reason})
-                    else:
-                        self._last_decision = self._controller.ingest(
-                            {"timestamp": received_at, "persons":
-                             [{"id": "leg_pair", "position": [center, 0]}]})
-                self._last_received = received_at
-                return
             try:
                 frame = pose2d_to_follow_frame(json.loads(message.data), received_at)
                 self._last_decision = self._controller.ingest(frame)
@@ -341,7 +312,6 @@ class StationaryFollowPlugin:
                 self._owned = False
                 self._publisher = None
                 self._message_type = None
-                self._leg_detector = None
                 if self._worker is worker:
                     self._worker = None
                 self._cleanup_in_progress = False

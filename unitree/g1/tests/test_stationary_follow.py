@@ -2,15 +2,12 @@ import unittest
 import sys
 import json
 import time
-import zlib
-from array import array
 from types import ModuleType, SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from stationary_follow import FollowCard, StationaryFollowPlugin, pose2d_to_follow_frame
-from leg_detection import DepthLegDetector
 
 def frame(stamp, persons):
     return {"timestamp": stamp, "count": len(persons), "persons": persons}
@@ -32,7 +29,7 @@ class TestMotusFollow(unittest.TestCase):
         plugin = StationaryFollowPlugin({}, "g1", object())
         tool = plugin.get_tool()
         self.assertEqual(tool["name"], "g1_stationary_follow")
-        self.assertEqual(tool["topic_in"][0]["format"], "image/depth-zlib")
+        self.assertEqual(tool["topic_in"][0]["format"], "sensor/pose2d")
         self.assertEqual(plugin.dispatch("start", {})["state"], "error")
         self.assertEqual(tool["topic_out"][0]["format"], "data/json")
         self.assertEqual(plugin.dispatch("info", {})["state"], "idle")
@@ -69,7 +66,7 @@ class TestMotusFollow(unittest.TestCase):
                                       "std_msgs": std_mod, "std_msgs.msg": std_msg_mod}):
             executor = Executor()
             plugin = StationaryFollowPlugin({}, "g1", executor, clock=lambda: clock[0])
-            self.assertEqual(plugin.dispatch("start", {"input_topic": "/pose", "input_mode": "pose"})["state"], "running")
+            self.assertEqual(plugin.dispatch("start", {"input_topic": "/pose"})["state"], "running")
             self.assertEqual(subscriptions[0][0], "/pose")
             subscriptions[0][1](SimpleNamespace(data=json.dumps({"image_size": [100, 100],
                 "persons": [{"bbox": [65, 0, 85, 90]}]})))
@@ -159,28 +156,6 @@ class TestMotusFollow(unittest.TestCase):
         c.start()
         c.ingest(frame(1,[{"id":1,"position":[.4,0]}]))
         self.assertEqual(c.ingest(frame(1,[{"id":1,"position":[.4,0]}]))["reason"],"stale_pose")
-
-    def test_depth_pair_requires_three_stable_frames_and_rejects_clutter(self):
-        detector = DepthLegDetector()
-        pixels = array('H', [2000]) * (640 * 480)
-        for top, bottom, left, right in ((210, 400, 220, 260),
-                                          (210, 400, 330, 370),
-                                          (210, 400, 500, 620)):
-            for y in range(top, bottom):
-                for x in range(left, right):
-                    pixels[y * 640 + x] = 800
-        data = zlib.compress(pixels.tobytes())
-        self.assertEqual(detector.detect(data)[1], "leg_candidate_unconfirmed")
-        self.assertEqual(detector.detect(data)[1], "leg_candidate_unconfirmed")
-        center, reason = detector.detect(data)
-        self.assertEqual(reason, "legs_tracked")
-        self.assertLess(abs(center), .2)
-        self.assertEqual(detector.detect(b"broken")[1], "invalid_depth")
-        for y in range(210, 400):
-            for x in range(330, 370):
-                pixels[y * 640 + x] = 2000
-        self.assertEqual(detector.detect(zlib.compress(pixels.tobytes()))[1],
-                         "no_unique_leg_pair")
 
 if __name__ == "__main__":
     unittest.main()

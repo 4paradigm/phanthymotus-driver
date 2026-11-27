@@ -1,8 +1,6 @@
 # G1 原地小跟班：决策原型
 
-`stationary_follow.py` 包含跟随决策层和 `g1_stationary_follow` Motus 卡片。下视相机版本在画布连接 `camera_depth` → `g1_stationary_follow`，输入为 G1 RealSense 的 `image/depth-zlib`（640×480、16UC1 毫米）。卡片把判断与运动接口结果发布为 `data/json`，也可通过 `info` 查看。旧的 `pose` 决策模式仍保留在代码中，可显式指定 `input_mode=pose` 和姿态话题，但画布默认使用双腿深度模式。
-
-双腿模式按每一行的远处深度估算地面，寻找比地面近的两个尺寸和深度相近的独立区域；需要连续三帧位置稳定、且场景里只有一组候选。它只识别**几何上的双腿候选**，不能证明目标一定是人。桌腿、箱体和遮挡仍可能造成误判，必须在现场深度数据上核验。画面中需有完整的两条小腿和鞋，且没有其他人的腿。候选丢失或不唯一时不发运动命令；丢失已锁定的目标后需重新启动卡片。
+`stationary_follow.py` 包含跟随决策层和 `g1_stationary_follow` Motus 卡片。画布连接 `camera_rgb` → `pose` → `g1_stationary_follow`，第二条线必须使用 `pose` 的 `sensor/pose2d`（`poses/skeleton`）输出。卡片把判断与运动接口结果发布为 `data/json`，也可通过 `info` 查看。
 
 运行离线检查：
 
@@ -12,7 +10,7 @@ python -m unittest discover -s unitree/g1/tests -p test_stationary_follow.py -v
 
 控制边界与真机验收：
 
-1. 先只连接 `camera_depth` 并查看数据流，确认深度帧稳定。再连接小跟班，查看 `decision` 输出：应从 `leg_candidate_unconfirmed` 变为 `legs_tracked`，无双腿时应为 `no_unique_leg_pair`。部署前用现场深度帧验证桌腿、纸箱、单腿及多人场景都不会触发转向。
+1. 在画布连接真实 `sensor/pose2d` 输出，核对 `image_size`、`bbox`/`keypoints`、人物 ID 稳定性与相机横坐标方向。只有标准姿态格式才会得到有效判断。
 2. 卡片只发送 `vx=0, vy=0` 的短时低速转向，经 SmartMotion 执行。只有平衡运动模式、底座空闲、没有相对运动任务时才发送；其他底座卡片的运动命令在小跟班运行时被拒绝。
-3. 候选居中、目标丢失、深度帧超过 0.3 秒未更新或停止卡片时不再发送新动作；已发送的定时指令最多再运行 0.12 秒后由 TimedMotion 自动结束。避免在定时指令结束后重复调用同步停止接口，造成 Core 的 5 秒停止超时。单次转向速度上限 0.2 rad/s。
+3. 人物居中、目标丢失、姿态超过 0.3 秒未更新或停止卡片时不再发送新动作；已发送的定时指令最多再运行 0.12 秒后由 TimedMotion 自动结束。避免在定时指令结束后重复调用同步停止接口，造成 Core 的 5 秒停止超时。单次转向速度上限 0.2 rad/s。
 4. 真机测试需机器人负责人在安全场地监督，先验证相机画面、姿态输出与转向方向；原地转向也可能产生脚步位移。单元测试不能代替真机验收。
