@@ -19,7 +19,7 @@ VX_LIMIT, VY_LIMIT, WZ_LIMIT = 1.67, 0.4, 1.0
 # These are command ceilings, not measured minimum stable chassis speeds.
 SPEED_PRESETS = {"slow": .30, "normal": .60, "fast": 1.00}
 DEFAULT_SETTINGS = {"dry_run": True, "rotate_only": False, "speed_preset": "normal",
-                    "min_vx": 0., "min_wz": 0., "linear_acceleration": .3,
+                    "min_vx": 0., "min_vy": 0., "min_wz": 0., "linear_acceleration": .3,
                     "angular_acceleration": 2., "wz_limit": WZ_LIMIT}
 
 
@@ -33,9 +33,9 @@ def _validated_settings(values):
             raise ValueError(f"{key} must be a boolean")
     if result["speed_preset"] not in SPEED_PRESETS:
         raise ValueError("speed_preset must be slow, normal or fast")
-    for key in ("min_vx", "min_wz", "linear_acceleration", "angular_acceleration", "wz_limit"):
+    for key in ("min_vx", "min_vy", "min_wz", "linear_acceleration", "angular_acceleration", "wz_limit"):
         value = result[key]
-        allow_zero = key in ("min_vx", "min_wz")
+        allow_zero = key in ("min_vx", "min_vy", "min_wz")
         try:
             valid = (not isinstance(value, bool) and isinstance(value, (int, float))
                      and math.isfinite(value) and (value >= 0 if allow_zero else value > 0))
@@ -46,6 +46,8 @@ def _validated_settings(values):
         result[key] = float(value)
     if result["min_vx"] > min(SPEED_PRESETS[result["speed_preset"]], VX_LIMIT):
         raise ValueError("min_vx must not exceed the selected forward-speed limit")
+    if result["min_vy"] > VY_LIMIT:
+        raise ValueError("min_vy must not exceed the chassis lateral-speed limit")
     if result["wz_limit"] > WZ_LIMIT:
         raise ValueError("wz_limit must not exceed the chassis yaw limit")
     if result["min_wz"] > result["wz_limit"]:
@@ -63,7 +65,7 @@ def build_descriptor(expected_hz=10.0, settings=None):
         "joint_names": AXES, "units": {"linear": "m/s", "angular": "rad/s", "time": "s"},
         "limits": {"lower": [-vx, -VY_LIMIT, 0, 0, 0, -settings["wz_limit"]],
                    "upper": [vx, VY_LIMIT, 0, 0, 0, settings["wz_limit"]],
-                   "min_magnitude": [settings["min_vx"], 0, 0, 0, 0, settings["min_wz"]],
+                   "min_magnitude": [settings["min_vx"], settings["min_vy"], 0, 0, 0, settings["min_wz"]],
                    "zero_immediate": True,
                    "max_delta_per_step": [linear_step, linear_step, 1e-6, 1e-6, 1e-6, angular_step]},
         "frame": "base_link",
@@ -132,6 +134,8 @@ class S10LocoServoPlugin:
                              "description": "山猫前后速度上限：slow=0.30、normal=0.60、fast=1.00 m/s，低于 SDK 1.67 m/s 上限；非实测最低速度，不放大指令，不改变横移/转向上限。修改后重启 navi 读取新上限。"},
             "min_vx": {"type": "number", "minimum": 0, "maximum": self._descriptor_raw["limits"]["upper"][0],
                        "description": "实测最小稳定前后速度，仅向规划器声明，不抬高执行速度；0 表示不声明。"},
+            "min_vy": {"type": "number", "minimum": 0, "maximum": VY_LIMIT,
+                       "description": "左右横移的规划下限（m/s）。0 表示不声明；修改后重启 Navi 读取。"},
             "min_wz": {"type": "number", "minimum": 0, "maximum": WZ_LIMIT,
                        "description": "最小稳定转向角速度（rad/s），左右共用。0 表示不声明；取值须小于或等于 wz_limit。修改后重启 Navi 读取规划下限。"},
             "linear_acceleration": {"type": "number", "exclusiveMinimum": 0,
