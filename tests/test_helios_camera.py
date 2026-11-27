@@ -1,5 +1,6 @@
 """RGB identity, real worker lifecycle and independent multi-card ownership."""
 
+import re
 import struct
 import sys
 import time
@@ -34,13 +35,19 @@ def wait_for(predicate, timeout=3):
 def test_device_identity_survives_renumbering_and_rejects_ir_metadata(tmp_path):
     sysfs, dev = tmp_path / "sys", tmp_path / "dev"
     dev.mkdir()
-    for name, label in [("video24", SOURCES["chest_rgb"]["device_name"]),
-                        ("video4", "vi-output, G300 ir_r 9-0071"),
-                        ("video5", "tegra-capture-vi-metadata-2")]:
+    for name, label, number in [("video24", SOURCES["chest_rgb"]["device_name"], "81:26"),
+                                ("video4", "vi-output, G300 ir_r 9-0071", "81:0"),
+                                ("video5", "tegra-capture-vi-metadata-2", "81:23")]:
         (sysfs / name).mkdir(parents=True)
         (sysfs / name / "name").write_text(label)
+        (sysfs / name / "dev").write_text(number + "\n")
         (dev / name).touch()
     assert resolve_device(SOURCES["chest_rgb"], sysfs, dev) == str(dev / "video24")
+    # Right name on a device number the container cgroup does not allow: refuse.
+    (sysfs / "video24" / "dev").write_text("81:30\n")
+    with pytest.raises(ValueError, match="found 0"):
+        resolve_device(SOURCES["chest_rgb"], sysfs, dev)
+    (sysfs / "video24" / "dev").write_text("81:26\n")
     (dev / "video24").unlink()
     with pytest.raises(ValueError, match="found 0"):
         resolve_device(SOURCES["chest_rgb"], sysfs, dev)
@@ -329,3 +336,12 @@ def test_topic_names_never_collide_and_are_valid_ros_names():
     camera.dispatch("start", {"instance_id": "a_b", "camera": "head_rgb"})
     chest, head = camera._streams["chest_rgb"], camera._streams["head_rgb"]
     assert set(chest.attached.values()).isdisjoint(head.attached.values())
+
+
+def test_service_cgroup_allows_exactly_the_five_colour_nodes():
+    service = (Path(__file__).resolve().parents[1] / "rokae/helios/deploy/service.yml").read_text()
+    rules = set(re.findall(r'"c (\d+:[\d*]+) rw"', service))
+    video = {rule for rule in rules if rule.startswith("81:")}
+    assert video == {source["dev"] for source in SOURCES.values()}
+    assert "81:*" not in rules
+    assert not re.search(r"^\s*(devices|privileged):", service, re.M)

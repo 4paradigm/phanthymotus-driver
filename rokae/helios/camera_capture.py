@@ -17,16 +17,19 @@ from pathlib import Path
 
 MAX_JPEG_BYTES = 2 * 1024 * 1024
 
+# "dev" is the V4L2 char device number. Tegra VI derives the minor from the
+# device-tree channel, so it is stable across reboots even when videoN changes;
+# deploy/service.yml allows exactly these numbers in the container cgroup.
 SOURCES = {
-    "chest_rgb": {"label": "胸部 RGB（G300）", "device_name": "vi-output, G300 color 9-006f",
+    "chest_rgb": {"label": "胸部 RGB（G300）", "device_name": "vi-output, G300 color 9-006f", "dev": "81:26",
                 "format": "YUY2", "width": 1280, "height": 800, "fps": 30},
-    "head_rgb": {"label": "头部 RGB（G300）", "device_name": "vi-output, G300 color 9-0067",
+    "head_rgb": {"label": "头部 RGB（G300）", "device_name": "vi-output, G300 color 9-0067", "dev": "81:38",
                 "format": "YUY2", "width": 1280, "height": 800, "fps": 30},
-    "head_front_fisheye": {"label": "头前鱼眼（SHW3H）", "device_name": "vi-output, shw3h 10-0020",
+    "head_front_fisheye": {"label": "头前鱼眼（SHW3H）", "device_name": "vi-output, shw3h 10-0020", "dev": "81:44",
                 "format": "UYVY", "width": 1920, "height": 1536, "fps": 60},
-    "head_rear_left_fisheye": {"label": "头后左鱼眼（SHW3H）", "device_name": "vi-output, shw3h 10-0021",
+    "head_rear_left_fisheye": {"label": "头后左鱼眼（SHW3H）", "device_name": "vi-output, shw3h 10-0021", "dev": "81:46",
                 "format": "UYVY", "width": 1920, "height": 1536, "fps": 60},
-    "head_rear_right_fisheye": {"label": "头后右鱼眼（SHW3H）", "device_name": "vi-output, shw3h 10-0022",
+    "head_rear_right_fisheye": {"label": "头后右鱼眼（SHW3H）", "device_name": "vi-output, shw3h 10-0022", "dev": "81:48",
                 "format": "UYVY", "width": 1920, "height": 1536, "fps": 60},
 }
 
@@ -37,12 +40,14 @@ def resolve_device(source, sysfs=Path("/sys/class/video4linux"), dev=Path("/dev"
     matches = []
     for entry in sysfs.glob("video[0-9]*"):
         try:
-            if entry.joinpath("name").read_text().strip() == expected and dev.joinpath(entry.name).exists():
+            if (entry.joinpath("name").read_text().strip() == expected
+                    and entry.joinpath("dev").read_text().strip() == source["dev"]
+                    and dev.joinpath(entry.name).exists()):
                 matches.append(str(dev / entry.name))
         except OSError:
             continue
     if len(matches) != 1:
-        raise ValueError(f"Expected exactly one colour device named {expected!r}; found {len(matches)}")
+        raise ValueError(f"Expected exactly one colour device named {expected!r} at {source['dev']}; found {len(matches)}")
     return matches[0]
 
 

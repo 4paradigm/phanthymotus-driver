@@ -13,14 +13,22 @@ rokae-helios:
   # per-node `devices:` entries. Per-node entries make Docker refuse to start the
   # whole container when a node is missing; on Helios the sensor nodes appear a
   # few seconds after dockerd at boot, which left joints/battery down as well.
-  # The cgroup rules allow only V4L2 (major 81) and the Tegra VI channel nodes
-  # (capture-vi-channel, major 504 on this kernel per /proc/devices). The VI
-  # driver opens a free /dev/capture-vi-channelN by path in the caller's mount
-  # namespace when streaming starts; without them capture yields no frames.
-  # The code picks the five colour nodes by sysfs name and never opens depth/IR.
+  # Access control is the cgroup allowlist, not the bind: only the five colour
+  # V4L2 nodes (81:26 chest, 81:38 head, 81:44/46/48 SHW3H fisheyes) can be
+  # opened. Tegra VI derives these minors from the device-tree channel, so they
+  # are stable across reboots even when /dev/videoN numbering changes; the code
+  # also requires the same numbers (camera_capture.SOURCES). Depth, IR, metadata
+  # and every other V4L2 node stay denied.
+  # capture-vi-channel (major 504 on this kernel, /proc/devices): the VI driver
+  # opens a free /dev/capture-vi-channelN by path in the caller's mount namespace
+  # when streaming starts, and the kernel picks N; without them no frames arrive.
   # No privileged mode, no extra capabilities, MKNOD stays dropped (cap_drop ALL).
   device_cgroup_rules:
-    - "c 81:* rw"
+    - "c 81:26 rw"
+    - "c 81:38 rw"
+    - "c 81:44 rw"
+    - "c 81:46 rw"
+    - "c 81:48 rw"
     - "c 504:* rw"
   volumes:
     - /dev:/dev:ro
