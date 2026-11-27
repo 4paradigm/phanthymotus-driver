@@ -2,6 +2,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 import io
+from itertools import islice
 import json
 import math
 import struct
@@ -9,27 +10,28 @@ import time
 from urllib.request import Request, urlopen
 from zipfile import ZipFile
 
+import yaml
+
 XYZ = struct.Struct("<fff")
 MAX_POINTS = 80000
 
 
-def read_pcd(archive, name):
-    with ZipFile(archive) as package, package.open(f"lidmap/{name}/map.pcd") as stream:
-        header = {}
-        for line in stream:
-            cells = line.decode("ascii").strip().split()
-            if cells and not cells[0].startswith("#"):
-                header[cells[0]] = cells[1:]
-                if cells[0] == "DATA":
-                    break
-        fields = header.get("FIELDS", [])
-        if (fields not in (["x", "y", "z"], ["x", "y", "z", "rgb"])
-                or header.get("DATA") != ["binary"] or header["SIZE"] != ["4"] * len(fields)
-                or header["TYPE"][:3] != ["F"] * 3 or header["COUNT"] != ["1"] * len(fields)):
-            raise ValueError("Unsupported Helios binary XYZ PCD")
-        count = int(header["POINTS"][0])
-        width = 4 * len(fields)
-        raw = stream.read()
+def read_pcd(stream):
+    header = {}
+    for line in stream:
+        cells = line.decode("ascii").strip().split()
+        if cells and not cells[0].startswith("#"):
+            header[cells[0]] = cells[1:]
+            if cells[0] == "DATA":
+                break
+    fields = header.get("FIELDS", [])
+    if (fields not in (["x", "y", "z"], ["x", "y", "z", "rgb"])
+            or header.get("DATA") != ["binary"] or header["SIZE"] != ["4"] * len(fields)
+            or header["TYPE"][:3] != ["F"] * 3 or header["COUNT"] != ["1"] * len(fields)):
+        raise ValueError("Unsupported Helios binary XYZ PCD")
+    count = int(header["POINTS"][0])
+    width = 4 * len(fields)
+    raw = stream.read()
     if len(raw) != count * width:
         raise ValueError("Incomplete PCD point records")
     result = bytearray()
@@ -40,11 +42,54 @@ def read_pcd(archive, name):
     return bytes(result)
 
 
-def fetch_pcd(origin, name):
+def read_grid(package, name):
+    with package.open(name + ".yaml") as meta:
+        lines = (line for line in meta if not line.startswith(b"%YAML:"))
+        config = yaml.safe_load(b"".join(lines))
+    with package.open(config["image"]) as pgm:
+        header = []
+        while len(header) < 4:
+            line = pgm.readline()
+            if not line:
+                raise ValueError("Incomplete PGM header")
+            header.extend(line.split(b"#", 1)[0].split())
+        if header[0] != b"P5" or header[3] != b"255":
+            raise ValueError("Expected an 8-bit binary PGM map")
+        width, height = map(int, header[1:3])
+        pixels = pgm.read()
+    if len(pixels) != width * height:
+        raise ValueError("Incomplete PGM raster")
+    threshold = config["occupied_thresh"] * 255
+    occupied = bytes(int((v if config["negate"] else 255 - v) > threshold) for v in range(256))
+    mask = pixels.translate(occupied)
+    stride = max(1, math.ceil(mask.count(1) / MAX_POINTS))
+    ox, oy, yaw = config["origin"]
+    resolution = config["resolution"]
+    c, s = math.cos(yaw), math.sin(yaw)
+    result = bytearray()
+    for i in islice((i for i, cell in enumerate(mask) if cell), 0, None, stride):
+        row, col = divmod(i, width)
+        x, y = (col + .5) * resolution, (height - row - .5) * resolution
+        result.extend(XYZ.pack(ox + c*x - s*y, oy + s*x + c*y, 0))
+    return bytes(result)
+
+
+def read_map(archive, name):
+    with ZipFile(archive) as package:
+        pcd = f"lidmap/{name}/map.pcd"
+        if pcd in package.namelist():
+            with package.open(pcd) as stream:
+                return "pcd", read_pcd(stream)
+        if name + ".yaml" in package.namelist():
+            return "grid", read_grid(package, name)
+        raise ValueError(f"No PCD or occupancy map in archive for {name}")
+
+
+def fetch_map(origin, name):
     request = Request(origin + "/tool/rob/getRunMapZip", data=json.dumps({"name": name}).encode(),
                       headers={"Content-Type": "application/json"})
     with urlopen(request, timeout=10) as response:
-        return read_pcd(io.BytesIO(response.read()), name)
+        return read_map(io.BytesIO(response.read()), name)
 
 
 class SavedCloud:
@@ -56,6 +101,7 @@ class SavedCloud:
     def clear(self):
         self.name = None
         self.points = b""
+        self.kind = None
         self.error = ""
         self.retry_at = 0
         self.pending = None
@@ -68,14 +114,14 @@ class SavedCloud:
             self.name = name
         if self.pending and self.pending.done():
             try:
-                self.points = self.pending.result()
+                self.kind, self.points = self.pending.result()
                 self.error = ""
             except Exception as exc:
                 self.error = str(exc)
                 self.retry_at = time.monotonic() + 5
             self.pending = None
-        if name and not self.points and not self.pending and time.monotonic() >= self.retry_at:
-            self.pending = self.pool.submit(fetch_pcd, self.origin, name)
+        if name and self.kind is None and not self.pending and time.monotonic() >= self.retry_at:
+            self.pending = self.pool.submit(fetch_map, self.origin, name)
         return self.points
 
     def close(self):

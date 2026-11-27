@@ -8,7 +8,7 @@ from zipfile import ZipFile
 
 import pytest
 
-from rokae.helios.spatial_cloud import XYZ, mapping_frame, read_pcd
+from rokae.helios.spatial_cloud import XYZ, mapping_frame, read_map
 from rokae.helios.spatial_map_worker import MappingScan
 from rokae.helios.controlled_spatial import ControlledSpatial
 
@@ -19,12 +19,24 @@ def test_saved_native_xyz_matches_core_wire_format():
         header = b"FIELDS x y z rgb\nSIZE 4 4 4 4\nTYPE F F F U\nCOUNT 1 1 1 1\nPOINTS 2\nDATA binary\n"
         records = struct.pack("<fffIfffI", 1, 2, 3, 0, -1, -2, -3, 123)
         z.writestr("lidmap/lab/map.pcd", header + records)
-    points = read_pcd(data, "lab")
+    kind, points = read_map(data, "lab")
+    assert kind == "pcd"
     frame = mapping_frame(points, {"x": 1, "y": -3, "theta": 0.5}, [], "lab")
     assert struct.unpack_from("<fffBI", frame) == (1, -3, -0.5, 7, 2)
     assert list(XYZ.iter_unpack(frame[17:41])) == [(1, 2, 3), (-1, -2, -3)]
     length, = struct.unpack_from("<I", frame, 41)
     assert len(frame[45:]) == length and json.loads(frame[45:])["active_map"] == "lab"
+
+
+def test_grid_only_archive_uses_yaml_origin_and_occupied_cell_centres():
+    data = io.BytesIO()
+    with ZipFile(data, "w") as archive:
+        archive.writestr("1.yaml", "%YAML:1.0\nimage: 1.pgm\nresolution: 0.5\n"
+                        f"origin: [10, -2, {math.pi/2}]\nnegate: 0\noccupied_thresh: 0.65\n")
+        archive.writestr("1.pgm", b"P5\n2 2\n255\n" + bytes([255, 0, 205, 255]))
+    kind, points = read_map(data, "1")
+    assert kind == "grid"
+    assert XYZ.unpack(points) == pytest.approx((9.25, -1.25, 0))
 
 
 def test_building_scan_uses_synchronized_pose_and_real_height():

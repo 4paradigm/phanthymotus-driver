@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>选择地图</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 20px; background: #f7f8f8; color: #172723; font: 15px system-ui, sans-serif; }
+  .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+  select, button { font: inherit; padding: 8px 12px; border-radius: 6px; border: 1px solid #9caeaa; background: white; }
+  select { flex: 1; min-width: 12em; }
+  figure { margin: 16px 0 0; }
+  canvas { width: 100%; height: clamp(200px, 60vh, 500px); display: block; background: #10201e; border-radius: 8px; }
+  figcaption, #message { margin-top: 8px; line-height: 1.5; }
+</style>
+<div class="controls">
+  <label for="maps">预览地图</label>
+  <select id="maps" disabled><option value="">跟随当前地图</option></select>
+  <button id="refresh" disabled>刷新列表</button>
+</div>
+<figure>
+  <canvas id="plot" aria-label="地图点云俯视图"></canvas>
+  <figcaption id="details"></figcaption>
+</figure>
+<p id="message" role="status">正在连接地图卡…</p>
+<script>
+  const maps = document.getElementById('maps');
+  const refresh = document.getElementById('refresh');
+  const plot = document.getElementById('plot');
+  const details = document.getElementById('details');
+  const message = document.getElementById('message');
+  let port, reply, snapshot, timer, nextId = 0;
+
+  // The host gives this iframe a port scoped to the spatial_map card.
+  function call(action, args = {}) {
+    const id = String(++nextId);
+    return new Promise((resolve, reject) => {
+      reply = {id, resolve, reject};
+      port.postMessage({id, method: 'call', args: {action, ...args}});
+    });
+  }
+
+  function draw(encoded) {
+    const scale = window.devicePixelRatio || 1;
+    plot.width = Math.max(1, Math.round(plot.clientWidth * scale));
+    plot.height = Math.max(1, Math.round(plot.clientHeight * scale));
+    if (!encoded) return;
+    const bytes = Uint8Array.from(atob(encoded), c => c.charCodeAt(0));
+    const points = new DataView(bytes.buffer);
+    const bounds = [[Infinity, -Infinity], [Infinity, -Infinity], [Infinity, -Infinity]];
+    for (let i = 0; i < bytes.length; i += 12) {
+      for (let axis = 0; axis < 3; axis++) {
+        const v = points.getFloat32(i + axis * 4, true);
+        bounds[axis][0] = Math.min(bounds[axis][0], v);
+        bounds[axis][1] = Math.max(bounds[axis][1], v);
+      }
+    }
+    const [[xmin, xmax], [ymin, ymax], [zmin, zmax]] = bounds;
+    const zoom = .94 * Math.min(plot.width / Math.max(.1, xmax - xmin), plot.height / Math.max(.1, ymax - ymin));
+    const ctx = plot.getContext('2d');
+    for (let i = 0; i < bytes.length; i += 12) {
+      const x = points.getFloat32(i, true), y = points.getFloat32(i + 4, true), z = points.getFloat32(i + 8, true);
+      ctx.fillStyle = 'hsl(' + (183 - 135 * (z - zmin) / Math.max(.01, zmax - zmin)) + ', 75%, 66%)';
+      ctx.fillRect(plot.width / 2 + (x - (xmin + xmax) / 2) * zoom,
+                   plot.height / 2 - (y - (ymin + ymax) / 2) * zoom, 2 * scale, 2 * scale);
+    }
+  }
+
+  async function update(action) {
+    clearTimeout(timer);
+    maps.disabled = refresh.disabled = true;
+    try {
+      if (action === 'select') {
+        if (maps.value) await call('select_map', {map_name: maps.value});
+        else await call('follow_current');
+      }
+      if (action === 'list') {
+        const result = await call('list_maps');
+        maps.replaceChildren(new Option('跟随当前地图', ''), ...result.maps.map(name => new Option(name, name)));
+      }
+      snapshot = await call('inspect');
+      if (snapshot.selected_map && !Array.from(maps.options).some(o => o.value === snapshot.selected_map)) {
+        maps.add(new Option(snapshot.selected_map, snapshot.selected_map));
+      }
+      maps.value = snapshot.selected_map || '';
+      draw(snapshot.xyz);
+      details.textContent = ({pcd: '三维点云', grid: '二维占据栅格', scan: '建图扫描'}[snapshot.map_format] || '俯视预览') + ' · ' + (snapshot.display_map || '等待地图') + ' · ' +
+        snapshot.cloud_points.toLocaleString() + ' 点　｜　底盘当前地图：' + (snapshot.map_name || '等待反馈');
+      message.textContent = snapshot.cloud_error || (snapshot.cloud_points
+        ? '在「监控 → spatial_map」可旋转、缩放完整地图。' : snapshot.map_format === 'grid' ? '该图没有占据栅格。' : '等待读取点云…');
+      if (!snapshot.map_format && !snapshot.cloud_error) timer = setTimeout(() => update('inspect'), 2000);
+    } catch (error) {
+      maps.value = snapshot?.selected_map || '';
+      message.textContent = error.message + '。请点击「刷新列表」重试。';
+    } finally {
+      maps.disabled = refresh.disabled = false;
+    }
+  }
+
+  window.addEventListener('message', event => {
+    if (port || event.source !== parent || event.data?.protocol !== 'motus.workbench/1' || !event.ports[0]) return;
+    port = event.ports[0];
+    port.onmessage = ({data}) => {
+      if (data.id !== reply?.id) return;
+      if (data.error) reply.reject(new Error(data.error));
+      else reply.resolve(data.result);
+    };
+    update('list');
+  });
+  maps.onchange = () => update('select');
+  refresh.onclick = () => update('list');
+  window.addEventListener('resize', () => draw(snapshot?.xyz));
+</script>
+</html>

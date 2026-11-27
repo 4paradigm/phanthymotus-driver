@@ -7,12 +7,16 @@
 | `joints` | sensor | 关节骨架和逐轴状态，默认 10 Hz |
 | `battery` | sensor | 两块电池状态，默认 1 Hz |
 | `model` | resource | 运行时读取本机 iNex 的 URDF，骨架渲染器自动调用 |
-| `spatial_map` | sensor | 原厂 XYZ 点云地图、当前位置、地图状态和站点 |
+| `spatial_map` | actuator | 选择机载地图预览或跟随当前地图，输出点云、定位和站点 |
 | `controlled_spatial` | actuator | 建图、保存和加载地图、按当前位置打点、到点导航 |
 
 ### 三维地图与导航
 
 在 Motus 的「监控」页找到 `spatial_map` 或 `…/controlled_spatial/map` 的 MAPPING 面板，可旋转、平移、缩放地图，或用右上角的准星切换跟随视角。主输出 `/<namespace>/state/spatial_map` 使用 `sensor/mapping`，从底盘导出包的 `lidmap/<地图名>/map.pcd` 读取 XYZ。颜色由 Core 按点的高度生成。`controlled_spatial` 的地图输出为 `/<namespace>/controlled_spatial/map`，两张卡可独立开启显示。
+
+在「配置」页的 `spatial_map` 卡点「选择地图 → 执行」。窗口中的下拉框从底盘读取地图列表；选中地图即可查看俯视图，监控页的 `spatial_map` 同步显示完整地图。三维图使用原厂 PCD，只有二维栅格的地图按原厂 PGM 的分辨率和原点显示占据单元，Z 为零。「刷新列表」重新读取机载目录，「跟随当前地图」恢复实时预览。选图只改变这张卡的显示，控制卡继续使用原来的地图和导航目标。
+
+状态话题的 `map_name`、`localization` 和 `stations` 属于底盘当前地图，`display_map`、`tags`、`cloud_points` 和 `map_format` 属于预览地图。不同地图的点云帧标记为 `pose_available=false`。通过 MCP 可调用 `list_maps`、`select_map(map_name)`、`inspect` 和 `follow_current`。停止预览卡后，下次启动默认跟随当前地图。
 
 1. 运行 `controlled_spatial.start` 可查看当前点云。选择 `start_mapping(map_name, confirm=true)` 开始一张新地图，现场人员按厂家流程手动走一圈并回到起点，选择 `stop_mapping(confirm=true)` 结束并由底盘保存地图。采集期间根据时间相近的 VMR 定位，将底盘实时三维点云变换到地图坐标。保存后控制卡显示该地图的原厂 PCD。
 2. `list_maps` 列出底盘地图，`load_map(map_name, confirm=true)` 加载指定地图。定位后用 `tag_place(name, description)` 保存当前位置和朝向；`list_tags` / `untag_place(name)` 可查看或移除本图标签。标签按地图保存在挂载目录内的 SQLite 数据库，点云上用立柱和朝向线标出。

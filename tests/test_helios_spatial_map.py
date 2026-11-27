@@ -1,9 +1,11 @@
 """Contracts for the two SDK station classes and the Helios sensor lifecycle."""
 
+import base64
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 from queue import Queue
+import struct
 import sys
 import threading
 from types import SimpleNamespace
@@ -58,7 +60,7 @@ def test_canvas_read_start_stop_without_vendor_runtime(monkeypatch, tmp_path):
     bundle = DriverBundle([plugin])
     definition, control = bundle.get_all_tools()
     assert control["name"] == "controlled_spatial" and control["topic_out"][0]["format"] == "sensor/mapping"
-    assert (definition["name"], definition["type"], definition["multiInstance"]) == ("spatial_map", "sensor", False)
+    assert (definition["name"], definition["type"], definition["multiInstance"]) == ("spatial_map", "actuator", False)
     assert definition["topic_out"] == [{"topic": "/rokae_helios/state/spatial_map", "format": "sensor/mapping"},
                                        {"topic": "/rokae_helios/state/spatial_map/status", "format": "data/json"}]
     assert bundle.dispatch("spatial_map", {"action": "info"})["preview_topic"] == definition["topic_out"][0]["topic"]
@@ -190,6 +192,57 @@ def test_controlled_map_commands(vmr_sensor):
     assert control("load_map", map_name="lab2", confirm=True)["state"] == "map_loaded"
 
 
+def test_picker_previews_saved_map_without_switching_chassis(vmr_sensor, monkeypatch):
+    sensor = vmr_sensor
+    bundle = DriverBundle([sensor])
+    active_xyz = struct.pack("<fff", 1, 2, 3)
+    saved_xyz = struct.pack("<fff", 5, 6, 0)
+    maps = {"lab": ("pcd", active_xyz), "1": ("grid", saved_xyz)}
+
+    def preview(action, **args):
+        return bundle.dispatch("spatial_map", {"action": action, **args})
+
+    monkeypatch.setattr("rokae.helios.spatial_cloud.fetch_map", lambda origin, name: maps[name])
+    preview("start")
+    bundle.dispatch("controlled_spatial", {"action": "start"})
+    wait_for(lambda: sensor.payload()["state"] == "online")
+    sensor.command = Mock(return_value={"maps": list(maps)})
+    assert preview("list_maps")["maps"] == ["lab", "1"]
+    schema = preview("info")["inputSchema"]
+    assert preview(schema["x-workbench"]["entry"])["protocol"] == "motus.workbench/1"
+    assert preview("select_map", map_name="1")["display_map"] == "1"
+    wait_for(lambda: preview("inspect")["cloud_points"] == 1)
+    assert base64.b64decode(preview("inspect")["xyz"]) == saved_xyz
+    with pytest.raises(ValueError, match="Unknown saved map"):
+        preview("select_map", map_name="missing")
+    assert preview("inspect")["selected_map"] == "1"
+
+    sensor._publisher = Mock()
+    sensor._map_publishers = {key: Mock() for key in sensor._users}
+    sensor._message = sensor._cloud_message = SimpleNamespace
+
+    def frames():
+        sensor._tick()
+        return {key: bytes(p.publish.call_args.args[0].data) for key, p in sensor._map_publishers.items()}
+
+    wait_for(lambda: frames()["controlled_spatial"][17:29] == active_xyz)
+    published = frames()
+    assert published["spatial_map"][17:29] == saved_xyz
+    meta = json.loads(published["spatial_map"][33:])
+    assert meta["active_map"] == "1" and not meta["robot"]["pose_available"]
+    status = json.loads(sensor._publisher.publish.call_args.args[0].data)
+    assert (status["map_name"], status["display_map"], status["map_format"]) == ("lab", "1", "grid")
+    assert preview("follow_current")["display_map"] == "lab"
+    assert frames()["spatial_map"] == frames()["controlled_spatial"]
+    assert sensor.control.selected is None
+    assert all(call.args == ("list_maps",) for call in sensor.command.call_args_list)
+
+    preview("select_map", map_name="1")
+    preview("stop")
+    assert preview("start")["state"] == "ready"
+    assert preview("inspect")["selected_map"] is None
+
+
 def test_chassis_mode_changes_and_navigation_require_explicit_confirmation(vmr_sensor):
     bundle = DriverBundle([vmr_sensor])
     schema = bundle.dispatch("controlled_spatial", {"action": "info"})["inputSchema"]
@@ -223,7 +276,7 @@ def test_canvas_navigation_reports_acp_outcome(vmr_sensor, acp_posts):
         return body["result"]
 
     assert control("info")["inputSchema"]["x-completion"]["actions"] == ["navigate_to_tag", "navigate_to_pose"]
-    assert bundle.dispatch("spatial_map", {"action": "start"})["state"] == "running"
+    assert bundle.dispatch("spatial_map", {"action": "start"})["state"] == "ready"
     assert control("start")["state"] == "ready"
     bundle.dispatch("spatial_map", {"action": "stop"})
     wait_for(lambda: sensor.payload()["state"] == "online")

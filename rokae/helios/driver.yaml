@@ -12,6 +12,6 @@ build_context_extras:
 cards:
   - {name: joints, type: sensor}
   - {name: battery, type: sensor}
-  - {name: spatial_map, type: sensor}
+  - {name: spatial_map, type: actuator}
   - {name: controlled_spatial, type: actuator}
   - {name: model, type: resource}

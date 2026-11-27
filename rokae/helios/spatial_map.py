@@ -1,4 +1,4 @@
-"""Helios map and station sensor. The SDK worker runs only while the card is active."""
+"""Helios map preview and chassis controls. The SDK worker runs only while the card is active."""
 
 from array import array
 import base64
@@ -35,6 +35,7 @@ class HeliosSpatialMap:
         endpoint = urlsplit(chassis_url)
         self.cloud = SavedCloud(("https://" if endpoint.scheme == "wss" else "http://") + endpoint.netloc)
         self.selected_cloud = SavedCloud(self.cloud.origin)
+        self.preview_cloud = SavedCloud(self.cloud.origin)
         self.chassis = ChassisMapState(chassis_url)
         self.control = ControlledSpatial(config.get("spatial_db", "/var/lib/helios-spatial/tags.db"))
         self.voxels = {}
@@ -53,9 +54,22 @@ class HeliosSpatialMap:
         self._last_read = self._next_attempt = 0.0
 
     def get_tool(self):
-        definition = tool("spatial_map", "sensor",
-                          "查看原厂三维点云地图、机器人位置和标记点；同时输出地图、定位和站点。",
-                          topic_out=self._topics)
+        actions = ["browse", "list_maps", "select_map", "follow_current", "inspect", "read",
+                   "start", "stop", "info"]
+        schema = {
+            "type": "object", "required": ["action"],
+            "properties": {
+                "action": {"type": "string", "enum": actions,
+                           "oneOf": [{"const": a, "title": "选择地图" if a == "browse" else a} for a in actions]},
+                "map_name": {"type": "string", "description": "list_maps 返回的地图名"},
+            },
+            "x-action-params": {"browse": {"params": []}},
+            "x-workbench": {"protocol": "motus.workbench/1", "entry": "browse", "title": "选择地图",
+                            "actions": ["info", "stop", "list_maps", "select_map", "follow_current", "inspect"]},
+        }
+        definition = tool("spatial_map", "actuator",
+                          "选择已保存的三维地图或跟随当前地图。选图只改变预览；底盘定位和导航继续使用当前地图。",
+                          schema, topic_out=self._topics)
         definition["preview_topic"] = self._topics[0]["topic"]
         return definition
 
@@ -214,35 +228,62 @@ class HeliosSpatialMap:
             with self._lock:
                 self._pending.pop(ident, None)
 
+    def _display_cloud(self, key, active):
+        if key == "spatial_map" and self.preview_cloud.name is not None:
+            cloud = self.preview_cloud
+            name = cloud.name
+        elif self.control.building:
+            points = b"".join(XYZ.pack(*pt) for pt in self.voxels.values())
+            return self.control.building, points, "scan", ""
+        elif key == "controlled_spatial" and self.control.selected and self.control.selected != active:
+            cloud, name = self.selected_cloud, self.control.selected
+        else:
+            cloud, name = self.cloud, active
+        return name, cloud.read(name), cloud.kind, cloud.error
+
     def _publish(self):
         if self._publisher is None:
             return
         data = self.payload()
-        name = data["map_name"]
-        if self.control.building:
-            name = self.control.building
-            points = b"".join(XYZ.pack(*pt) for pt in self.voxels.values())
-        else:
-            points = self.cloud.read(name)
-        tags = self.control.tags(name)
-        pose = data["localization"] if name == data["map_name"] else None
-        if "spatial_map" in self._users:
-            status = {**data, "display_map": name, "cloud_points": len(points)//12,
-                      "cloud_error": self.cloud.error, "tags": tags}
-            self._publisher.publish(self._message(data=json.dumps(status, ensure_ascii=False)))
-        if self._users:
+        for key in self._users:
+            name, points, kind, error = self._display_cloud(key, data["map_name"])
+            tags = self.control.tags(name)
+            pose = data["localization"] if name == data["map_name"] else None
+            if key == "spatial_map":
+                status = {**data, "display_map": name, "map_format": kind, "cloud_points": len(points) // XYZ.size,
+                          "cloud_error": error, "tags": tags}
+                self._publisher.publish(self._message(data=json.dumps(status, ensure_ascii=False)))
             msg = self._cloud_message()
             msg.data = array("B", mapping_frame(points, pose, tags, name))
-            for key in self._users:
-                if (key == "controlled_spatial" and not self.control.building and
-                        self.control.selected and self.control.selected != name):
-                    selected = self.control.selected
-                    archive = self.selected_cloud.read(selected)
-                    selected_msg = self._cloud_message()
-                    selected_msg.data = array("B", mapping_frame(archive, None, self.control.tags(selected), selected))
-                    self._map_publishers[key].publish(selected_msg)
-                else:
-                    self._map_publishers[key].publish(msg)
+            self._map_publishers[key].publish(msg)
+
+    def _preview(self, action, args):
+        if action == "browse":
+            page = Path(__file__).with_name("resource") / "map_picker.html"
+            return {"protocol": "motus.workbench/1", "html": page.read_text(encoding="utf-8")}
+        if action == "list_maps":
+            return self.command("list_maps")
+        if action == "select_map":
+            name = args.get("map_name")
+            if not isinstance(name, str) or name not in self.command("list_maps")["maps"]:
+                raise ValueError("Unknown saved map")
+        with self._lock:
+            if "spatial_map" not in self._users:
+                raise ValueError("地图预览卡已停止")
+            if action == "select_map":
+                self.preview_cloud.read(name)
+            elif action == "follow_current":
+                self.preview_cloud.clear()
+            active = self.payload()["map_name"]
+            name, points, kind, error = self._display_cloud("spatial_map", active)
+            result = {"map_name": active, "display_map": name, "selected_map": self.preview_cloud.name, "map_format": kind,
+                      "cloud_points": len(points) // XYZ.size, "cloud_error": error}
+            if action == "inspect":
+                # The monitor gets the full XYZ frame. Bound only the workbench thumbnail.
+                stride = max(1, math.ceil(result["cloud_points"] / 6000)) * XYZ.size
+                sample = b"".join(points[i:i + XYZ.size] for i in range(0, len(points), stride))
+                result["xyz"] = base64.b64encode(sample).decode("ascii")
+            return result
 
     def _enable(self, key):
         with self._lock:
@@ -258,6 +299,8 @@ class HeliosSpatialMap:
     def _disable(self, key):
         with self._lock:
             self._users.discard(key)
+            if key == "spatial_map":
+                self.preview_cloud.clear()
             if key in self._map_publishers:
                 msg = self._cloud_message()
                 msg.data = array("B", mapping_frame(b"", None, [], None))
@@ -291,6 +334,7 @@ class HeliosSpatialMap:
             self.control.close()
             self.cloud.close()
             self.selected_cloud.close()
+            self.preview_cloud.close()
             if self._node is not None:
                 self._ros2.executor_core.remove_node(self._node)
                 self._node.destroy_node()
@@ -301,6 +345,12 @@ class HeliosSpatialMap:
     def dispatch(self, action, args):
         key = args.get("_tool_name", "spatial_map")
         topics = [self._control_topic] if key == "controlled_spatial" else self._topics
+        if key == "spatial_map" and action in ("browse", "list_maps", "select_map", "follow_current", "inspect"):
+            if action != "inspect":
+                with self._operations:
+                    self._enable(key)
+            # A slow catalog request must not hold the control card's dispatch lock.
+            return self._preview(action, args)
         with self._operations:
             if action == "info":
                 return definition(self._control_topic) if key == "controlled_spatial" else self.get_tool()
@@ -308,7 +358,7 @@ class HeliosSpatialMap:
                 return {"state": "configured", "topic_out": topics}
             if action == "start":
                 self._enable(key)
-                return {"state": "ready" if key == "controlled_spatial" else "running", "topic_out": topics}
+                return {"state": "ready", "topic_out": topics}
             if action == "stop":
                 try:
                     if key == "controlled_spatial" and key in self._users:
