@@ -33,6 +33,8 @@ COPY status_card.py direct_control.py /work/agilex/piper/
 COPY intent_control.py intent_motion.py intent_monitor.py intent_teaching.py /work/agilex/piper/
 COPY unified_control.py user_motion.py path_capability.py preset.py /work/agilex/piper/
 COPY completion.py /work/agilex/piper/
+COPY table_clearance.py clearance_estimate.py /work/agilex/piper/
+COPY clearance_feedback.py clearance_display.py clearance_ui.py /work/agilex/piper/
 COPY camera_live.py camera_worker.py camera_owner.py /work/agilex/piper/
 COPY resource/ /work/agilex/piper/resource/
 COPY deploy/ /deploy/

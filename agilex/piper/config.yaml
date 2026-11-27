@@ -25,6 +25,26 @@ intent_control:
   # Default closed. Acceptance binds adapter serial, firmware, source/config hashes
   # and an operator-reviewed evidence record. Never enable from SDK support alone.
   point_to_point_acceptance: null
+table_clearance:
+  # Included model for the site's original 100 mm PiPER gripper. Estimates
+  # assume a horizontal table at the arm's model mounting plane (z=0).
+  enabled: true
+  mode: model_estimate
+  estimate_profile_path: "builtin:piper_100mm"
+  table_z_mm: 0
+  verified: false
+  calibration_id: ""
+  calibration_can_interface: ""
+  can_interface: "can0"
+  arm_label: "左侧从臂（can0，请核对接线）"
+  base_frame: ""
+  plane_base_mm: null
+  body_vertices_mm: []
+  left_finger_vertices_mm: []
+  right_finger_vertices_mm: []
+  opening_axis: null
+  opening_range_mm: null
+  uncertainty_mm: null
 mode:
   # Exact versions returned by this SDK, NOT a version range. Keep empty until
   # MotionCtrl_1 enter/stop/exit has been witnessed on this robot without homing,

@@ -64,6 +64,17 @@ those fixes for the complete canvas experience. A `trigger` activity label is
 presentation; Get status is a synchronous query and its completion does not
 change the previous movement result.
 
+## 可选：夹爪离桌距离
+
+随附配置启用 `piper_table_clearance` 只读 sensor，内置原厂 100 mm 夹爪模型，
+基于 can0 的现有关节和开度反馈，以 5 Hz 输出“夹爪离桌距离（估算）”。
+假设桌面水平且与模型安装平面重合；`verified=false`，不作为实测标定结果。
+反馈失效时清空距离，不连接 CAN、不使能、不执行运动或避碰。
+配置和现场验收见 [TABLE_CLEARANCE.md](TABLE_CLEARANCE.md)。
+
+内置模型已随镜像打包，无需下载、填写路径或额外挂载；仍支持外部模型 profile
+和 `calibrated` 模式。估算输出 `state=estimated`，不提供经过验证的保守间隙。
+
 ## Build and packaging
 
 ```bash
