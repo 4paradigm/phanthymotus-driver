@@ -15,7 +15,7 @@ import time
 from urllib.parse import urlsplit
 import uuid
 
-from common.vendor_runtime import tool
+from common.vendor_runtime import action_schema, tool
 from .controlled_spatial import ControlledSpatial, NavigationCompletion, definition
 from .spatial_state import ChassisMapState
 from .spatial_cloud import MAX_POINTS, XYZ, SavedCloud, mapping_frame
@@ -56,19 +56,23 @@ class HeliosSpatialMap:
         self._last_read = self._next_attempt = 0.0
 
     def get_tool(self):
-        actions = ["browse", "list_maps", "select_map", "follow_current", "inspect", "read",
-                   "start", "stop", "info"]
-        schema = {
-            "type": "object", "required": ["action"],
-            "properties": {
-                "action": {"type": "string", "enum": actions,
-                           "oneOf": [{"const": a, "title": "选择地图" if a == "browse" else a} for a in actions]},
-                "map_name": {"type": "string", "description": "list_maps 返回的地图名"},
-            },
-            "x-action-params": {"browse": {"params": []}},
-            "x-workbench": {"protocol": "motus.workbench/1", "entry": "browse", "title": "选择地图",
-                            "actions": ["info", "stop", "list_maps", "select_map", "follow_current", "inspect"]},
+        actions = {
+            "browse": ([], "选择地图"),
+            "list_maps": ([], "列出机载地图"),
+            "select_map": (["map_name"], "按名称预览地图"),
+            "follow_current": ([], "跟随当前地图"),
+            "inspect": ([], "读取预览快照"),
+            "read": ([], "读取底盘地图与定位"),
+            "start": ([], "启动地图预览"),
+            "stop": ([], "停止地图预览"),
+            "info": ([], "查看卡片说明"),
         }
+        schema = action_schema(actions, {"map_name": {"type": "string", "description": "list_maps 返回的地图名"}})
+        schema["x-action-params"]["select_map"]["required"] = ["map_name"]
+        schema["properties"]["action"]["oneOf"] = [{"const": name, "title": title}
+                                                    for name, (_, title) in actions.items()]
+        schema["x-workbench"] = {"protocol": "motus.workbench/1", "entry": "browse", "title": "选择地图",
+                                 "actions": ["info", "stop", "list_maps", "select_map", "follow_current", "inspect"]}
         definition = tool("spatial_map", "actuator",
                           "选择已保存的三维地图或跟随当前地图。选图只改变预览；底盘定位和导航继续使用当前地图。",
                           schema, topic_out=self._topics)
@@ -269,7 +273,9 @@ class HeliosSpatialMap:
             return self.command("list_maps")
         if action == "select_map":
             name = args.get("map_name")
-            if not isinstance(name, str) or name not in self.command("list_maps")["maps"]:
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("map_name is required")
+            if name not in self.command("list_maps")["maps"]:
                 raise ValueError("Unknown saved map")
         with self._lock:
             if "spatial_map" not in self._users:

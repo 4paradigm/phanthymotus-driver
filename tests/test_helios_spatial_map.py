@@ -76,6 +76,15 @@ def test_canvas_read_start_stop_without_vendor_runtime(monkeypatch, tmp_path):
     assert bundle.dispatch("spatial_map", {"action": "stop"})["state"] == "idle"
 
 
+def test_preview_action_schema_covers_all_actions():
+    schema = HeliosSpatialMap({}).get_tool()["inputSchema"]
+    params = schema["x-action-params"]
+    assert set(params) == set(schema["properties"]["action"]["enum"])
+    assert params["select_map"]["params"] == params["select_map"]["required"] == ["map_name"]
+    assert all(not spec["params"] for action, spec in params.items() if action != "select_map")
+    assert schema["x-workbench"]["entry"] == "browse"
+
+
 def test_worker_logs_and_full_station_snapshot_use_separate_pipes(tmp_path, monkeypatch, capfd):
     (tmp_path / "py_client_common.py").write_text(
         "import os, sys\n"
@@ -260,6 +269,8 @@ def test_picker_previews_saved_map_without_switching_chassis(vmr_sensor, monkeyp
     assert preview("list_maps")["maps"] == ["lab", "1"]
     schema = preview("info")["inputSchema"]
     assert preview(schema["x-workbench"]["entry"])["protocol"] == "motus.workbench/1"
+    with pytest.raises(ValueError, match="map_name is required"):
+        preview("select_map")
     assert preview("select_map", map_name="1")["display_map"] == "1"
     wait_for(lambda: preview("inspect")["cloud_points"] == 1)
     assert base64.b64decode(preview("inspect")["xyz"]) == saved_xyz
