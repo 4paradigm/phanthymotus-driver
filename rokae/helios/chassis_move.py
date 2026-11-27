@@ -6,7 +6,8 @@ explicit duration, an immediate `stop`, `x-completion` via Agent Core ACP and
 third-party speed control (`nav.set_third_speed_ctrl` /
 `send_third_expected_speed` / `close_third_speed_ctrl`), which runs in a
 separate worker process (see chassis_sdk_worker.py). The vendor SDK is not part
-of this repository; the Dockerfile fetches it from the project COS (hash-pinned).
+of this repository or the image; it is installed on the robot and mounted
+read-only (deploy/service.yml), as for the Helios odometry and spatial-map cards.
 """
 
 from __future__ import annotations

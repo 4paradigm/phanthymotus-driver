@@ -664,11 +664,20 @@ def test_wake_brake_is_tolerated_only_before_motion_and_only_briefly():
     assert worker._blocked() == "chassis exception level 1"
 
 
-def test_sdk_python_runtime_is_installed_only_with_the_sdk():
+def test_vendor_sdk_is_mounted_from_the_robot_not_built_into_the_image():
     from pathlib import Path
-    text = (Path(__file__).parents[1] / "rokae/helios/Dockerfile").read_text()
-    branch = text[text.index('RUN if [ -n "${VMR_SDK_URL}" ]; then'):text.index("fi && rm -f /tmp/build_fetch.py")]
-    assert text.count("/tmp/sdk-python.tar.gz") == branch.count("/tmp/sdk-python.tar.gz") > 0  # only inside the SDK branch
+    root = Path(__file__).parents[1] / "rokae/helios"
+    dockerfile = (root / "Dockerfile").read_text()
+    assert "VMR_SDK_URL" not in dockerfile and "sdk-python" not in dockerfile.split("# Vendor chassis SDK")[0]
+    assert not any(line.startswith(("RUN", "COPY", "ADD")) and ("vmr-sdk" in line or "sdk-python" in line)
+                   for line in dockerfile.splitlines())
+    service = (root / "deploy/service.yml").read_text()
+    # Same variables and container paths as the Helios spatial-map card, read-only.
+    assert "${HELIOS_SDK_PYTHON_DIR:-/home/admin/helios-dev/native-odom-runtime/sdk-python}:/opt/sdk-python:ro" in service
+    assert "${HELIOS_VMR_SDK_DIR:-/home/admin/helios-dev/native-odom-runtime/vmr-sdk}:/opt/vmr-sdk:ro" in service
+    import yaml
+    config = yaml.safe_load((root / "config.yaml").read_text())
+    assert config["chassis_sdk_dir"] == "/opt/vmr-sdk" and config["chassis_sdk_python"] == "/opt/sdk-python/bin/python3.12"
 
 
 def test_acp_failure_log_names_the_action(monkeypatch, capsys):

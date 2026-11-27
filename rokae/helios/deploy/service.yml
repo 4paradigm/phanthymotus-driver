@@ -9,6 +9,11 @@ rokae-helios:
     - /tmp:rw,nosuid,nodev,size=16m
   volumes:
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
+    # Vendor chassis SDK + its CPython 3.12 runtime, installed on the robot (not in the
+    # image or Git). Same variables and defaults as the Helios spatial-map card; set them in
+    # the host Compose .env if installed elsewhere.
+    - ${HELIOS_SDK_PYTHON_DIR:-/home/admin/helios-dev/native-odom-runtime/sdk-python}:/opt/sdk-python:ro
+    - ${HELIOS_VMR_SDK_DIR:-/home/admin/helios-dev/native-odom-runtime/vmr-sdk}:/opt/vmr-sdk:ro
   environment:
     - ROS_DOMAIN_ID=42
     - RMW_IMPLEMENTATION=rmw_fastrtps_cpp

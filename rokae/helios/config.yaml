@@ -9,11 +9,11 @@ publish_hz: 10
 stale_timeout_s: 1.0
 connect_timeout_s: 3.0
 reconnect_delay_s: 1.0
-# Chassis movement (base_drive) via the vendor VMR AMR SDK (fetched at image build time).
+# Chassis movement (base_drive) via the vendor VMR AMR SDK (mounted from the robot, see deploy/service.yml).
 chassis_motion_enabled: false  # opt in per deployment: HELIOS_CHASSIS_MOTION_ENABLED=1
 chassis_sdk_dir: /opt/vmr-sdk
 chassis_sdk_lib_subdir: lib
-chassis_sdk_python: /opt/sdk-python/bin/python3
+chassis_sdk_python: /opt/sdk-python/bin/python3.12
 chassis_sdk_host: 192.168.0.100
 chassis_sdk_port: 9003
 chassis_command_hz: 50
