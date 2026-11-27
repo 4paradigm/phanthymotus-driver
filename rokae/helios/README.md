@@ -1,11 +1,12 @@
 # ROKAE Helios-2.1 状态卡片
 
-通过现有 iNex 和底盘 WebSocket 读取 20 轴关节及双电池状态。两张传感器卡可独立开始、停止，不提供运动、使能、模式切换或充放电控制。
+通过现有 iNex 和底盘 WebSocket 读取 20 轴关节及双电池状态，并按需读取上半身 RGB 相机。传感器卡可独立开始、停止，不提供运动、使能、模式切换或充放电控制。
 
 | 工具 | 类型 | 输出 |
 |---|---|---|
 | `joints` | sensor | 关节骨架和逐轴状态，默认 10 Hz |
 | `battery` | sensor | 两块电池状态，默认 1 Hz |
+| `camera_rgb` | sensor，支持多实例 | 选择一路彩色相机，标准 JPEG / FPS 视图，默认 15 fps |
 | `model` | resource | 运行时读取本机 iNex 的 URDF，骨架渲染器自动调用 |
 
 ## 数据与单位
@@ -68,12 +69,22 @@
 
 `config.yaml` 控制发布、过期、连接和重连时间。MCP 仅监听 `127.0.0.1:15747`，ROS domain 42，复用 `common/vendor_runtime.py` 注册到 Core。WebSocket 只读订阅，不安装或运行厂家运动 SDK。
 
+## RGB 相机
+
+`camera_rgb` 复用 G1 使用的 `image/jpeg` 通用渲染器，无需新 Core 补丁。在每张卡的实例配置中选择 `Camera`；可添加多张卡同时查看不同相机。五路上半身相机已通过短时并发采集测试，按现场确认的安装位置命名：胸部 RGB、头部 RGB（G300，640×400）与头前鱼眼、头后左鱼眼、头后右鱼眼（SHW3H，640×512），保持原始宽高比。
+
+相机不随 Driver 启动自动打开，第一张引用该通道的卡启动时创建采集进程，最后一张停止时释放。相同通道的多张卡共享一个采集进程，停止一张不影响其他卡。每张卡使用独立且稳定的 ROS topic，切换相机后订阅地址不变。首帧校验通过才返回运行成功；设备被占用、无彩色帧或启动超时明确报错。
+
+底盘前后两台 S10 相机不在选择器中：底盘配置当前 `read_rgb=0`，没有已验证的 RGB 数据源。此 Driver 不启用底盘 RGB、不重载避障感知、不把深度/红外画面当作 RGB。详细来源、采集约束及未完成事项见 [CAMERA_INTERFACE.md](CAMERA_INTERFACE.md)。
+
+部署片段以只读方式绑定 `/dev`，但容器 cgroup 只放行五个彩色节点（字符设备 81:26、81:38、81:44、81:46、81:48）和 Tegra VI 采集通道（`capture-vi-channel`），深度、红外、元数据及其他视频节点一律拒绝打开。不再逐个映射 `/dev/video*`：开机时相机节点比 Docker 晚几秒出现，逐节点映射会让整个容器（含 joints/battery）启动失败。Tegra VI 的次设备号由设备树通道决定，重启后 videoN 编号变化也不变；代码启动时同时核对 sysfs 设备名称和设备号，两者都匹配才打开。若硬件或设备树改变导致设备号变化，更新部署规则与 `SOURCES` 再用 bot 镜像验证，不能放开为整个 81 主设备号或使用 privileged。`camera_publish_fps` 控制输出帧率，默认 15（允许 1～15，与 G1/Go2 采图帧率一致）；先丢帧再缩放编码，避免堆积历史帧。
+
 ## 本地验证
 
 仓库根目录安装本 Driver 的 requirements 及 pytest 后执行：
 
 ```bash
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=. python -m pytest -q tests/test_helios_joints.py tests/test_helios_battery.py tests/test_helios_torque.py tests/test_helios_model.py
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=. python -m pytest -q tests/test_helios_joints.py tests/test_helios_battery.py tests/test_helios_torque.py tests/test_helios_model.py tests/test_helios_camera.py
 python scripts/check_service_yml.py rokae/helios
 ```
 

@@ -9,3 +9,4 @@ publish_hz: 10
 stale_timeout_s: 1.0
 connect_timeout_s: 3.0
 reconnect_delay_s: 1.0
+camera_publish_fps: 15
