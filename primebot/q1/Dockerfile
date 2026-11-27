@@ -14,7 +14,7 @@ RUN . /opt/ros/humble/setup.sh && MAKEFLAGS=-j3 colcon build --packages-select a
 WORKDIR /work
 COPY deploy/service.yml /deploy/service.yml
 COPY common/ common/
-COPY main.py battery.py robot.py config.yaml primebot/q1/
+COPY main.py battery.py robot.py preset_postures.py preset_robot.py config.yaml primebot/q1/
 ENV PYTHONPATH=/work PYTHONUNBUFFERED=1 RCUTILS_COLORIZED_OUTPUT=0 RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 EXPOSE 15748
 ENTRYPOINT []
