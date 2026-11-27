@@ -3229,12 +3229,20 @@ class VisionCapturePlugin:
                 except Exception:
                     path.unlink(missing_ok=True)
                     raise
+            # The camera process stamps the ROS message. timestamp_ms is when
+            # the frame subscriber received it, which may be much later.
+            source_stamp = frame.get("ros_timestamp")
+            if not isinstance(source_stamp, dict):
+                source_stamp = {}
+            sec, nanosec = source_stamp.get("sec"), source_stamp.get("nanosec")
+            frame_captured_at = None
+            if (type(sec) is int and 0 < sec < 2**31
+                    and type(nanosec) is int and 0 <= nanosec < 1_000_000_000):
+                frame_captured_at = datetime.fromtimestamp(sec + nanosec / 1_000_000_000, timezone.utc).isoformat()
             return {"ok": True, "media_type": "photo", "file_path": str(path),
                     "captured_at": datetime.now().isoformat(timespec="seconds"),
-                    "frame_captured_at": (
-                        datetime.fromtimestamp(frame["timestamp_ms"] / 1000, timezone.utc).isoformat()
-                        if frame.get("timestamp_ms") else None),
-                    "timestamp_source": "camera_host_publish",
+                    "frame_captured_at": frame_captured_at,
+                    "timestamp_source": "camera_host_publish" if frame_captured_at else "unknown",
                     "frame_age_s": round(max(0.0, time.time() - frame.get("timestamp_ms", 0) / 1000), 2)}
         except Exception as exc:
             return {"ok": False, "code": "CAPTURE_FAILED", "message": str(exc)}

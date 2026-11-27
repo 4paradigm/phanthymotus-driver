@@ -308,10 +308,17 @@ def test_patrol_sources_and_default_baseline_are_packaged():
     docker = (BUMI / "Dockerfile").read_text(encoding="utf-8")
     assert "COPY patrol_baseline.py patrol_card.py /work/" in docker
     assert "patrol-baseline-bumi-fixed.json" in docker
+    assert "report_dir: /opt/phanthy-motus/data/patrol" in (BUMI / "config.yaml").read_text(encoding="utf-8")
+    assert "/opt/phanthy-motus/data:/opt/phanthy-motus/data" in (BUMI / "deploy/service.yml").read_text()
 
 
-@pytest.mark.parametrize("timestamp_ms", [0, 1795676400123, 4102444800000])
-def test_real_photo_method_preserves_frame_time_and_saved_bytes(tmp_path, timestamp_ms):
+@pytest.mark.parametrize(("source_stamp", "source_seconds"), [
+    ({"sec": 1795676400, "nanosec": 123000000}, 1795676400.123),
+    (None, None),
+    ({"sec": 0, "nanosec": 0}, None),
+    ({"sec": 1795676400, "nanosec": 1_000_000_000}, None),
+])
+def test_real_photo_method_preserves_source_header_and_saved_bytes(tmp_path, source_stamp, source_seconds):
     import ast
     import time
     from types import SimpleNamespace
@@ -323,13 +330,16 @@ def test_real_photo_method_preserves_frame_time_and_saved_bytes(tmp_path, timest
                           and node.name == "_capture_photo")
     scope = {"datetime": datetime, "timezone": timezone, "time": time}
     exec(compile(ast.Module(body=[capture_method], type_ignores=[]), "actual_photo_method", "exec"), scope)
-    frame = {"data": b"synthetic-jpeg-payload", "timestamp_ms": timestamp_ms}
+    frame = {"data": b"synthetic-jpeg-payload", "timestamp_ms": 1795676520123,
+             "ros_timestamp": source_stamp}
     capture = SimpleNamespace(_output_dir=tmp_path, _frame=lambda: (frame, 1))
     result = scope["_capture_photo"](capture, {})
     assert result["ok"] is True
     assert Path(result["file_path"]).read_bytes() == frame["data"]
-    assert result["timestamp_source"] == "camera_host_publish"
-    if timestamp_ms:
-        assert datetime.fromisoformat(result["frame_captured_at"]).timestamp() == timestamp_ms / 1000
-    else:
+    if source_seconds is None:
         assert result["frame_captured_at"] is None
+        assert result["timestamp_source"] == "unknown"
+    else:
+        assert datetime.fromisoformat(result["frame_captured_at"]).timestamp() == pytest.approx(
+            source_seconds, rel=0, abs=1e-6)
+        assert result["timestamp_source"] == "camera_host_publish"

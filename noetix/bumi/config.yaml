@@ -8,7 +8,7 @@ plugins:
     baseline_path: examples/patrol-baseline-bumi-fixed.json
     min_battery_percent: 20
     telemetry_max_age_s: 3
-    report_dir: data/patrol
+    report_dir: /opt/phanthy-motus/data/patrol
   patrol_baseline:
     enabled: false
     baseline_path: examples/patrol-baseline-bumi-fixed.json
