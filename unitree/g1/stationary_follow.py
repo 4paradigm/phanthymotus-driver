@@ -5,57 +5,72 @@ import json
 import threading
 
 
+def _finite_number(value):
+    return (isinstance(value, (int, float)) and
+            not isinstance(value, bool) and
+            math.isfinite(value))
+
+
+def _convert_person(person, size):
+    """Convert one person; raise ValueError only for this person."""
+    if not isinstance(person, dict):
+        raise ValueError("invalid_person")
+    person_id = person.get("id")
+    if (not isinstance(person_id, (int, str)) or isinstance(person_id, bool)
+            or person_id == ""):
+        raise ValueError("missing_person_id")
+    points = person.get("keypoints")
+    leg_center = None
+    if isinstance(points, list) and len(points) >= 17:
+        def side_x(indices):
+            xs = []
+            for index in indices:
+                point = points[index]
+                if (isinstance(point, list) and len(point) >= 3 and
+                        _finite_number(point[0]) and
+                        _finite_number(point[2]) and
+                        point[2] >= .3):
+                    xs.append(point[0])
+            return sum(xs) / len(xs) if xs else None
+        left, right = side_x((13, 15)), side_x((14, 16))
+        if left is not None and right is not None:
+            leg_center = (left + right) / 2
+    box = person.get("bbox")
+    if leg_center is not None:
+        center = leg_center
+    elif isinstance(box, list) and len(box) == 4 and all(_finite_number(v) for v in box):
+        center = (box[0] + box[2]) / 2
+    else:
+        if not isinstance(points, list):
+            raise ValueError("missing_person_position")
+        xs = [p[0] for p in points if isinstance(p, list) and len(p) >= 2
+              and _finite_number(p[0])
+              and (len(p) < 3 or (_finite_number(p[2]) and p[2] > 0))]
+        if not xs:
+            raise ValueError("missing_person_position")
+        center = (min(xs) + max(xs)) / 2
+    x = 2 * center / size[0] - 1
+    # bbox 可以合法越界；clamp 而不是 raise，避免整帧丢弃。
+    x = max(-1.0, min(1.0, x))
+    return {"id": person_id, "position": [x, 0]}
+
+
 def pose2d_to_follow_frame(payload, received_at):
     """Convert the documented sensor/pose2d pixel coordinates to [-1, 1]."""
     size = payload.get("image_size")
     persons = payload.get("persons")
     if (not isinstance(size, list) or len(size) != 2 or
-            not isinstance(size[0], (int, float)) or
-            not math.isfinite(size[0]) or size[0] <= 0 or
+            not _finite_number(size[0]) or size[0] <= 0 or
+            not _finite_number(size[1]) or size[1] <= 0 or
             not isinstance(persons, list)):
         raise ValueError("invalid_pose2d")
     converted = []
     for person in persons:
-        if not isinstance(person, dict):
-            raise ValueError("invalid_person")
-        person_id = person.get("id")
-        if not isinstance(person_id, (int, str)) or isinstance(person_id, bool) or person_id == "":
-            raise ValueError("missing_person_id")
-        points = person.get("keypoints")
-        leg_center = None
-        if isinstance(points, list) and len(points) >= 17:
-            def side_x(indices):
-                xs = []
-                for index in indices:
-                    point = points[index]
-                    if (isinstance(point, list) and len(point) >= 3 and
-                            isinstance(point[0], (int, float)) and math.isfinite(point[0]) and
-                            isinstance(point[2], (int, float)) and math.isfinite(point[2]) and
-                            point[2] >= .3):
-                        xs.append(point[0])
-                return sum(xs) / len(xs) if xs else None
-            left, right = side_x((13, 15)), side_x((14, 16))
-            if left is not None and right is not None:
-                leg_center = (left + right) / 2
-        box = person.get("bbox")
-        if leg_center is not None:
-            center = leg_center
-        elif isinstance(box, list) and len(box) == 4 and all(
-                isinstance(v, (int, float)) and math.isfinite(v) for v in box):
-            center = (box[0] + box[2]) / 2
-        else:
-            if not isinstance(points, list):
-                raise ValueError("missing_person_position")
-            xs = [p[0] for p in points if isinstance(p, list) and len(p) >= 2
-                  and isinstance(p[0], (int, float)) and math.isfinite(p[0])
-                  and (len(p) < 3 or isinstance(p[2], (int, float)) and p[2] > 0)]
-            if not xs:
-                raise ValueError("missing_person_position")
-            center = (min(xs) + max(xs)) / 2
-        x = 2 * center / size[0] - 1
-        if not -1 <= x <= 1:
-            raise ValueError("position_out_of_range")
-        converted.append({"id": person_id, "position": [x, 0]})
+        try:
+            converted.append(_convert_person(person, size))
+        except ValueError:
+            # 单个 person 解析失败不影响整帧。
+            continue
     return {"timestamp": received_at, "persons": converted}
 
 
@@ -73,10 +88,13 @@ class FollowCard:
         self.enabled = True
         self.target_id = None
         self.last_frame = None
+        self.last_command = 0.0
+        self.last_motion = False
         self.reason = "waiting_for_single_person"
         return {"command": "none", "reason": self.reason}
 
     def stop(self, reason="manual_stop"):
+        """Hard stop: requires an explicit start() to resume."""
         self.enabled = False
         self.target_id = None
         self.reason = reason
@@ -84,32 +102,41 @@ class FollowCard:
         self.last_command = 0.0
         return {"command": "stop_move", "reason": reason}
 
+    def pause(self, reason):
+        """Recoverable error: keep enabled and target, resume on next valid frame."""
+        self.reason = reason
+        self.last_motion = False
+        self.last_command = 0.0
+        return {"command": "stop_move", "reason": reason}
+
     def ingest(self, payload):
-        now = self.clock()
         if not self.enabled:
             return {"command": "none", "reason": self.reason}
         stamp = payload.get("timestamp")
         persons = payload.get("persons")
-        if not isinstance(stamp, (float, int)) or not math.isfinite(stamp) or not isinstance(persons, list):
-            return self.stop("invalid_pose")
+        if (not isinstance(stamp, (float, int)) or not math.isfinite(stamp)
+                or not isinstance(persons, list)):
+            return self.pause("invalid_pose")
         if self.last_frame is not None and stamp <= self.last_frame:
-            return self.stop("stale_pose")
+            return self.pause("stale_pose")
         self.last_frame = stamp
         if self.target_id is None:
             if len(persons) != 1:
-                return {"command": "none", "reason": "waiting_for_single_person"}
+                self.reason = "waiting_for_single_person"
+                return {"command": "none", "reason": self.reason}
             self.target_id = persons[0].get("id")
             if self.target_id is None:
-                return self.stop("invalid_target")
+                return self.pause("invalid_target")
         matches = [p for p in persons if p.get("id") == self.target_id]
         if len(matches) != 1:
-            return self.stop("target_lost")
+            return self.pause("target_lost")
         position = matches[0].get("position")
-        if not isinstance(position, list) or len(position) < 1 or not isinstance(position[0], (float, int)) or not math.isfinite(position[0]):
-            return self.stop("invalid_position")
+        if (not isinstance(position, list) or len(position) < 1 or
+                not _finite_number(position[0])):
+            return self.pause("invalid_position")
         x = float(position[0])  # Motus pose normalized horizontal position, +right.
         if abs(x) > 1:
-            return self.stop("position_out_of_range")
+            return self.pause("position_out_of_range")
         # Hysteresis: start correction beyond 0.18, stop inside 0.08.
         if abs(x) > .18:
             self.last_motion = True
@@ -117,17 +144,19 @@ class FollowCard:
             self.last_motion = False
         if not self.last_motion:
             self.last_command = 0.0
-            return {"command": "stop_move", "reason": "centered"}
+            self.reason = "centered"
+            return {"command": "stop_move", "reason": self.reason}
         # Camera x is right-positive, G1 vyaw is left-positive.
         vyaw = -max(-.20, min(.20, x * .4))
         self.last_command = vyaw
+        self.reason = "following"
         return {"command": "move", "vx": 0.0, "vy": 0.0,
-                "vyaw": vyaw, "duration": .2, "reason": "following",
+                "vyaw": vyaw, "duration": .12, "reason": self.reason,
                 "target_id": self.target_id}
 
     def tick(self, age_s):
         if self.enabled and age_s > .3:
-            return self.stop("pose_timeout")
+            return self.pause("pose_timeout")
         return {"command": "none", "reason": self.reason}
 
 
@@ -195,10 +224,12 @@ class StationaryFollowPlugin:
 
     def dispatch(self, action, args):
         if action == "start":
-            topic = (args.get("input_topic") or "").strip()
+            raw_topic = args.get("input_topic")
+            topic = raw_topic.strip() if isinstance(raw_topic, str) else ""
             if not topic:
                 topics = args.get("input_topics") or []
-                topic = (topics[0] or "").strip() if topics else ""
+                if topics and isinstance(topics[0], str):
+                    topic = topics[0].strip()
             if not topic:
                 return {"state": "error", "error": "请在画布连接 sensor/pose2d 输入"}
             with self._lock:
@@ -249,8 +280,10 @@ class StationaryFollowPlugin:
             try:
                 frame = pose2d_to_follow_frame(json.loads(message.data), received_at)
                 self._last_decision = self._controller.ingest(frame)
-            except (ValueError, TypeError, KeyError, json.JSONDecodeError):
-                self._last_decision = self._controller.stop("invalid_pose2d")
+            except (ValueError, TypeError, KeyError, json.JSONDecodeError,
+                    UnicodeDecodeError):
+                # 坏帧不永久停用，只暂停，等待下一帧。
+                self._last_decision = self._controller.pause("invalid_pose2d")
             self._last_received = received_at
 
     def _publish(self, decision, result=None):
@@ -273,36 +306,53 @@ class StationaryFollowPlugin:
                         self._last_decision = watchdog
                     decision = dict(self._last_decision)
             result = None
-            with self._base_lock:
-                if self._shutdown.is_set():
-                    break
-                if decision.get("command") == "move" and self._motion is not None:
-                    state = {}
-                    try:
-                        ready = self._admission() if self._admission else {"admitted": False}
-                        state = self._motion.get_state()
+            if decision.get("command") == "move":
+                if self._motion is None:
+                    # 没有运动接口时不要发布 move。
+                    decision = {"command": "none", "reason": "motion_unavailable"}
+                    result = {"error": "motion_unavailable"}
+                else:
+                    motion_failed = False
+                    base_ok = False
+                    with self._base_lock:
                         if self._shutdown.is_set():
                             break
-                        if ready.get("admitted") is not True or state.get("base_available") is not True:
-                            result = {"error": "base_not_available_or_locomotion_not_ready"}
-                        else:
-                            result = self._motion.move(0.0, 0.0, decision["vyaw"], .12)
-                            self._owned = result.get("ret") == 0
-                            if self._owned:
-                                self._last_motion_at = time.monotonic()
-                    except Exception as exc:
-                        result = {"error": str(exc)}
-                    if (result.get("error") or result.get("ret", 0) != 0) and state.get("base_available") is True:
+                        state = {}
+                        try:
+                            ready = self._admission() if self._admission else {"admitted": False}
+                            state = self._motion.get_state()
+                            if self._shutdown.is_set():
+                                break
+                            if (ready.get("admitted") is not True or
+                                    state.get("base_available") is not True):
+                                result = {"error": "base_not_available_or_locomotion_not_ready"}
+                                base_ok = state.get("base_available") is True
+                            else:
+                                result = self._motion.move(0.0, 0.0, decision["vyaw"], .12)
+                                with self._lock:
+                                    self._owned = result.get("ret") == 0
+                                    if self._owned:
+                                        self._last_motion_at = time.monotonic()
+                        except Exception as exc:
+                            result = {"error": str(exc)}
+                            base_ok = state.get("base_available") is True
+                        motion_failed = bool(result.get("error")) or result.get("ret", 0) != 0
+                    if motion_failed and base_ok:
                         with self._lock:
                             self._last_decision = self._controller.stop("motion_error")
                         decision = dict(self._last_decision)
-                elif self._owned:
-                    # Every command has a 0.12 s deadline in TimedMotion. A second
-                    # synchronous stop RPC can block the safety process well past
-                    # Core's 5 s project-stop deadline after that command expires.
-                    # Suppress new commands; the existing one expires on its timer.
+                    elif motion_failed:
+                        # base 不可用时降级为 stop_move，不要发布 move。
+                        decision = {"command": "stop_move",
+                                    "reason": "base_not_available"}
+            else:
+                with self._lock:
+                    owned = self._owned
+                    if owned:
+                        self._owned = False
+                if owned:
+                    # 0.12 s lease 内不再发新命令，等它自然过期。
                     result = {"status": "bounded_motion_expiry", "max_remaining_s": .12}
-                    self._owned = False
             self._publish(decision, result)
 
     def _stop(self):
@@ -314,27 +364,48 @@ class StationaryFollowPlugin:
             self._shutdown.set()
             self._topic = ""
             self._last_decision = self._controller.stop()
+            publisher = self._publisher
+            message_type = self._message_type
             worker = self._worker
+        # 发布最终停止决策，便于外部诊断。
+        if publisher is not None and message_type is not None:
+            try:
+                payload = {"timestamp": time.time(),
+                           "decision": dict(self._last_decision),
+                           "motion_result": None,
+                           "motion_enabled": self._motion is not None}
+                publisher.publish(message_type(data=json.dumps(payload, ensure_ascii=False)))
+            except Exception:
+                pass
         if worker is not None and worker is not threading.current_thread():
             worker.join(timeout=1)
+
         def cleanup():
-            if worker is not None and worker.is_alive():
-                worker.join()
-            # A successful TimedMove can still be within its 0.12 s lease
-            # after the worker exits. Keep base ownership until it expires.
-            remaining = self._last_motion_at + .15 - time.monotonic()
-            if remaining > 0:
-                time.sleep(remaining)
-            if node is not None:
-                self._executor.remove_node(node)
-                node.destroy_node()
-            with self._lock:
-                self._owned = False
-                self._publisher = None
-                self._message_type = None
-                if self._worker is worker:
-                    self._worker = None
-                self._cleanup_in_progress = False
+            # 无论如何都要重置 _cleanup_in_progress，避免 base 被永久锁住。
+            try:
+                if worker is not None and worker.is_alive():
+                    worker.join(timeout=2)
+                remaining = self._last_motion_at + .15 - time.monotonic()
+                if remaining > 0:
+                    time.sleep(remaining)
+                if node is not None:
+                    try:
+                        self._executor.remove_node(node)
+                    except Exception:
+                        pass
+                    try:
+                        node.destroy_node()
+                    except Exception:
+                        pass
+            finally:
+                with self._lock:
+                    self._owned = False
+                    self._publisher = None
+                    self._message_type = None
+                    if self._worker is worker:
+                        self._worker = None
+                    self._cleanup_in_progress = False
+
         if worker is not None and worker.is_alive():
             threading.Thread(target=cleanup, daemon=True,
                              name="g1_stationary_follow_cleanup").start()
