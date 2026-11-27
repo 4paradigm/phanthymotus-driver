@@ -166,6 +166,7 @@ plugins:
     joint_dev_deg: 1.5      # 关节相对去皮时偏差超过 1.5° → valid=false
     default_hand: cup       # 托举手型：四指立起 65 围住掌心
     place_window_s: 30      # 发出"可以放了"之后等人放物品的时间（转告可能晚几秒，给宽一些）
+    place_hint_s: 5         # "可以放了"里说的时限（只是催一下，实际仍等 place_window_s）
     place_window_both_s: 30 # side=both 时两只手都要放，等待时间
     detect_kg: 0.05         # 掌上读数超过此值算放上了物品
     reset_confirm_window_s: 60  # reset 请用户确认掌心是空的之后，这么多秒内再 reset 一次才动

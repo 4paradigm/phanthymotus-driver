@@ -120,7 +120,11 @@ DEFAULTS = {
     # 托举姿态：2026-11-23 可行性测试实测姿态，[肩pitch,肩roll,肩yaw,肘pitch,腕yaw,腕pitch,腕roll]（度）
     "pose_deg": [5.0, 5.6, 0.0, -90.0, -90.0, 9.0, 0.1],
     "rest_deg": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],   # 没有记录到出发姿态时，retract 回到这里
-    "rest_zone_deg": 20.0,           # pose 只允许从"手臂基本垂下"出发：每个关节离 rest_deg 不超过此值
+    "rest_zone_deg": 20.0,           # 每个关节离 rest_deg 不超过此值算"垂下"：pose 从当前角度直接抬
+    # 大致垂下但超出 rest_zone_deg（2026-11-27 真机：驱动重启后右腕 pitch 坠到 20.6°，weigh 和 reset
+    # 都拒绝，只能找人用 arm 卡放手）：pose 先慢速回到 rest_deg 再抬，retract / reset 直接回到 rest_deg。
+    # 离 rest_deg 更远的姿态仍然不自动动。
+    "hang_zone_deg": 35.0,
     "pose_speed": 0.3,               # rad/s，与可行性测试一致
     "arrive_tol_deg": 3.0,           # 到位容差（与 arm 卡的反馈容差一致）
     "arrive_speed_rad_s": 0.02,
@@ -140,6 +144,9 @@ DEFAULTS = {
     # 等人把物品放到掌心的时间，从发出"可以放了"算起。卡片自己不出声，这句话经 decision_core
     # 转告用户（语音或消息），什么时候真正传到人那里不确定，所以给得宽一些。
     "place_window_s": 30.0,
+    # "可以放了"里说的放物品时限（秒）。只是催一下，实际等 place_window_s：这句话要经大模型转告，
+    # 真机上晚约 4–5 s 才说出来，真按 5 秒等，人刚听到就超时了。
+    "place_hint_s": 5.0,
     "place_window_both_s": 30.0,     # side=both 时两只手都要放
     # 返回给调用方的准备时间估计。2026-11-25 实测：从垂下到去皮完成约 18 s；
     # 手臂已举着、只需重新摆手势和去皮约 6 s。
@@ -184,7 +191,7 @@ _FAIL_TO_USER = {
     "no_object": "这次没等到东西，称重先结束了。想称的话再叫我。",
     "not_stable": "东西一直在晃，没称出来。请放稳后再称一次。",
     "object_on_hand": "我手上好像有东西，称重前要先空着。请拿走后再称一次。",
-    "unknown_start_pose": "我的手臂不在起始位置，没法开始称重，需要先复位。",
+    "unknown_start_pose": "我的手臂离垂下的位置太远，我不敢自己动。请用手臂控制卡把手臂放下来，再叫我称。",
     "tare_failed": "准备的时候手上不够稳，没准备好。请别碰我的手，再称一次。",
     "hand_failed": "手指没摆好，称重停下了。",
     "pose_changed_since_tare": "我的手臂位置变了，需要先复位再称。",
@@ -192,6 +199,13 @@ _FAIL_TO_USER = {
     "servo_active": "手臂正在被别的程序控制，称重停下了。",
 }
 _FAIL_TO_USER_DEFAULT = "称重没有完成。"
+_RESET_FAIL_TO_USER = {
+    "unknown_start_pose": "我的手臂离垂下的位置太远，我不敢自己动。请用手臂控制卡把手臂放下来。",
+    "joint_error": "手臂电机报错，没有复位。",
+    "servo_active": "手臂正在被别的程序控制，没有复位。",
+    "hand_open_failed": "手指张不开，手臂没有动。",
+}
+_RESET_FAIL_TO_USER_DEFAULT = "复位没有完成。"
 _PALM = {"right": "右手掌心", "left": "左手掌心", "both": "两只手掌心"}
 _ARM = {"right": "右臂", "left": "左臂", "both": "双臂"}
 
@@ -1151,12 +1165,17 @@ class WeighEngine:
             elif self._within(cur, rest, cfg["rest_zone_deg"]):
                 per_side[s] = [("raise_forearm", mid), ("palm_up", pose)]
                 origins[s] = [_r(x, 2) for x in cur]
+            elif self._within(cur, rest, cfg["hang_zone_deg"]):
+                # 大致垂下、只是离 rest_deg 稍远（例如驱动重启后关节往下坠）：先回 rest_deg 再抬，
+                # 不用先找人复位。收回时回到 rest_deg。
+                per_side[s] = [("to_rest", rest), ("raise_forearm", mid), ("palm_up", pose)]
+                origins[s] = [_r(x, 2) for x in rest]
             else:
                 return self._error("unknown_start_pose", side,
-                                   f"{s} 臂不在垂下的姿态附近，也不在托举姿态，出于安全不自动摆姿态。"
-                                   "请先用 arm 卡把手臂放下",
-                                   joints_deg=[_r(x, 2) for x in cur], rest_zone_deg=cfg["rest_zone_deg"])
-        stages = self._merge_stages(("raise_forearm", "palm_up"), per_side)
+                                   f"{s} 臂离垂下的姿态太远（有关节离 rest_deg 超过 {cfg['hang_zone_deg']:g}°），"
+                                   "也不在托举姿态，出于安全不自动摆姿态。请先用 arm 卡把手臂放下",
+                                   joints_deg=[_r(x, 2) for x in cur], hang_zone_deg=cfg["hang_zone_deg"])
+        stages = self._merge_stages(("to_rest", "raise_forearm", "palm_up"), per_side)
         steps = []
         servo_paused = False
         if stages or hand != "keep":
@@ -1240,10 +1259,17 @@ class WeighEngine:
                 per_side[s] = [("palm_inward", mid), ("lower_arm", rest)]
             elif self._within(cur, mid, tol):
                 per_side[s] = [("lower_arm", rest)]
+            elif self._within(cur, self._rest_deg(s), cfg["hang_zone_deg"]):
+                # 手臂大致垂下：掌心没朝上、托不住东西，直接回到 rest_deg，不用查掌上有没有东西
+                # （没有零点时也不必请人确认）。
+                home = self._rest_deg(s)
+                per_side[s] = [] if self._within(cur, home, tol) else [("lower_arm", home)]
+                continue
             else:
                 return self._error("unknown_start_pose", side,
-                                   f"{s} 臂不在托举姿态，出于安全不自动收回。请用 arm 卡操作",
-                                   joints_deg=[_r(x, 2) for x in cur])
+                                   f"{s} 臂不在托举姿态，也离垂下的姿态太远（有关节离 rest_deg 超过 "
+                                   f"{cfg['hang_zone_deg']:g}°），出于安全不自动收回。请用 arm 卡操作",
+                                   joints_deg=[_r(x, 2) for x in cur], hang_zone_deg=cfg["hang_zone_deg"])
             # 只要这只手臂要动，就先确认掌上是空的（托举姿态和中间姿态都一样）：
             # 张开手指、转腕或放下手臂都可能让物体掉下去。有可用的零点时看读数，否则要求确认。
             # 零点只在去皮时的姿态下有意义：姿态变了（例如停在中间姿态）就不能靠读数判断。
@@ -1336,7 +1362,7 @@ class WeighEngine:
 
     def _tell(self, kind: str, side: str, text: str, seq=None) -> dict:
         """记下一条给用户的话，并通知 weigh_state 发布。不等、不出声，也不判断有没有人在听。
-        kind：preparing / ready / result / failed / reset_done / reset_confirm。
+        kind：preparing / ready / result / failed / reset_done / reset_confirm / reset_failed。
         和指令一样在 _cmd_lock 内先查取消：stop 之后不再有话发出去（动作以 cancelled 结束）。"""
         with self._cmd_lock:
             self._check_cancel()
@@ -1456,7 +1482,9 @@ class WeighEngine:
         loads = [self._palm_load(s, cfg["tare_ttl_s"])[0] for s in sides]
         if not all(x is not None and x >= cfg["detect_kg"] for x in loads):
             window = cfg["place_window_both_s"] if len(sides) > 1 else cfg["place_window_s"]
-            where = "请在两只手掌心各放一件" if side == "both" else f"请把东西放到{palm}"
+            hint = cfg["place_hint_s"]
+            where = (f"请在{hint:g}秒内往两只手掌心各放一件" if side == "both"
+                     else f"请在{hint:g}秒内把东西放到{palm}")
             self._tell("ready", side, f"可以放了，{where}。放好后手拿开，几秒就能称好。", seq)
             _, problem = self._wait_for_object(sides, window)
             if problem == "no_object":
@@ -1517,6 +1545,11 @@ class WeighEngine:
             what = "掌上读数显示还有物体" if res.get("code") == "object_on_hand" else "无法判断掌上是否有物体"
             res = dict(res, error=f"{what}；先取走物体，用户确认掌心已空后 {window:g} 秒内再调用一次 reset",
                        confirm_within_s=window, to_user=text)
+        else:
+            # 其他原因没复位成功也要让用户知道（卡片上点的 reset 没人看返回值）
+            text = _RESET_FAIL_TO_USER.get(res.get("code"), _RESET_FAIL_TO_USER_DEFAULT)
+            self._tell("reset_failed", side, text)
+            res = dict(res, to_user=text)
         return {"next_step": USER_DECIDES, **res}
 
     def snapshot(self) -> dict:
@@ -1687,7 +1720,7 @@ class WeighPlugin:
                 "reset：张开手指、放下手臂（掌上可能还有物品时先请用户确认）。"
                 "两者都会动手臂，只在用户要求时调用；失败后不要自行重试或复位，转告用户、由用户决定。"
                 "side 选 right（默认）、left，或 both（两只手各放一件，重量相加）。"
-                "调用前手臂须垂下或已在托举姿态，周围无人无物。"
+                "调用前手臂须大致垂下（会先自己回到垂下的位置）或已在托举姿态，周围无人无物。"
                 "卡片自己不出声：过程中要让用户知道的事（正在准备、可以放了、称出的重量、出错原因、"
                 "复位结果）作为给用户的话（to_user）发到 weigh_state 传感器，收到就要原样转告用户，"
                 "不转告用户就听不到。weigh_state 的消息不是让你动手：称重也可能是用户在卡片上发起的，"
@@ -2011,11 +2044,11 @@ class WeighStatePlugin:
                 "你不转告用户就听不到。每条消息都带 priority=1，直接送到你这里，顶层的 instruction 重复了"
                 "这条要求。称重和复位是 weigh 卡自己在做的，也可能是用户在卡片上点的；这些消息不是让你动手，"
                 "不要因为收到它们调用 weigh 或 reset。to_user.id 每条加一，to_user.kind 是 preparing / ready / "
-                "result / failed / reset_done / reset_confirm。sides.<right|left>.last 是该手最近一次测出的"
+                "result / failed / reset_done / reset_confirm / reset_failed。sides.<right|left>.last 是该手最近一次测出的"
                 "结果：mass_kg / mass_g、valid（false 时不要使用重量）、reasons、seq；side=both 的结果在 "
                 "both_last。in_pose / tare_valid 是消息发出时手臂是否在托举姿态、去皮是否有效。"
                 "last_attempt 是最近一次 weigh 调用的结局（含失败，例如 no_object）。"
-                "kind=failed / reset_confirm 时手臂保持原样，转告后等用户决定，不要自行调用 weigh 或 reset。"
+                "kind=failed / reset_confirm / reset_failed 时手臂保持原样，转告后等用户决定，不要自行调用 weigh 或 reset。"
             ),
             "inputSchema": {"type": "object", "properties": {}},
             "topic_out": [{"topic": self._topic, "format": "data/json"}],

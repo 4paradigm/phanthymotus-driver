@@ -1401,7 +1401,7 @@ def test_servo_resumed_during_a_stage_stops_waiting_without_commands(hanging):
 # ── 一键称重：卡片的 weigh / reset ─────────────────────────────────────────────
 
 PREPARING = "我在准备称重，等我说“可以放了”，再把东西放到右手掌心。在这之前先别碰我的手。"
-READY = "可以放了，请把东西放到右手掌心。放好后手拿开，几秒就能称好。"
+READY = "可以放了，请在5秒内把东西放到右手掌心。放好后手拿开，几秒就能称好。"
 
 
 def place_after_prompt(rig, mass, delay=1.0, side="right"):
@@ -1446,13 +1446,16 @@ def test_weigh_from_hanging_poses_prompts_measures_and_tells_the_result(hanging)
 
 
 def test_messages_never_announce_an_upcoming_motion(hanging):
-    """转告可能晚几秒到：不能说"我要抬手"这类马上要做的动作，也不报倒计时秒数。"""
+    """转告可能晚几秒到：不能说"我要抬手"这类马上要做的动作。"可以放了"里催人"5 秒内放好"，
+    但实际等得更久：这句话晚几秒才说出来，人按说的时间放也来得及。"""
     place_after_prompt(hanging, 0.59)
     hanging.engine.auto_weigh({"side": "both"})
     hanging.engine.reset({"side": "both"})
-    texts = hanging.told + list(weigh._FAIL_TO_USER.values())
+    texts = hanging.told + list(weigh._FAIL_TO_USER.values()) + list(weigh._RESET_FAIL_TO_USER.values())
     for t in texts:
-        assert not re.search(r"(我先|我要|马上|即将|抬起|秒内)", t), t
+        assert not re.search(r"(我先|我要|马上|即将|抬起)", t), t
+    cfg = hanging.engine.cfg
+    assert cfg["place_hint_s"] + 10 <= min(cfg["place_window_s"], cfg["place_window_both_s"])
 
 
 def test_second_weigh_reuses_pose_and_tare(hanging):
@@ -1555,7 +1558,49 @@ def test_unknown_start_pose_is_told_and_nothing_moves(hanging):
     res = hanging.engine.auto_weigh({})
     assert res["code"] == "unknown_start_pose" and res["stage"] == "prepare", res
     assert hanging.moves() == []
-    assert hanging.told[-1] == "我的手臂不在起始位置，没法开始称重，需要先复位。"
+    assert hanging.told[-1] == "我的手臂离垂下的位置太远，我不敢自己动。请用手臂控制卡把手臂放下来，再叫我称。"
+
+
+# 2026-11-27 真机：驱动重启后右臂停在这里（腕 pitch 20.6°，刚超出 rest_zone_deg 20°），
+# weigh 说"需要先复位"，reset 又说"不在托举姿态"，两个按钮都动不了。
+DROOPED = [4.38, 6.73, 2.03, -12.03, -17.94, 20.6, -5.86]
+
+
+def test_weigh_from_a_drooped_arm_goes_to_rest_first_then_weighs(hanging):
+    hanging.pose = list(DROOPED)
+    hanging.warm(1)
+    place_after_prompt(hanging, 0.59)
+    res = hanging.engine.auto_weigh({})
+    assert res["state"] == "weighed" and res["valid"], res
+    assert [m["right_positions"] for m in hanging.moves()] == [REST, MID, list(POSE_DEG)]
+    assert hanging.told == [PREPARING, READY, _result(res["mass_g"])]
+    # 收回时回到 rest_deg，而不是坠下去的那个角度
+    hanging.mass = 0.0
+    hanging.warm(1)
+    assert hanging.engine.reset({})["state"] == "reset"
+    assert hanging.moves()[-1]["right_positions"] == REST
+
+
+def test_reset_from_a_drooped_arm_lowers_it_without_asking(hanging):
+    hanging.pose = list(DROOPED)
+    hanging.warm(1)
+    res = hanging.engine.reset({})                 # 没有零点，但手臂垂着、托不住东西：不用确认
+    assert res["state"] == "reset", res
+    assert [m["right_positions"] for m in hanging.moves()] == [REST]
+    assert hanging.order.index(("hand", "set_fingers_raw")) < hanging.order.index(("arm", "move_pos"))
+    assert hanging.told == ["好了，手已经放下来了。"]
+    assert max(abs(x) for x in hanging.pose) < 0.01
+
+
+def test_reset_far_from_hanging_refuses_and_tells_the_user(hanging):
+    hanging.pose = [30.0, 5.0, 0.0, -40.0, 0.0, 0.0, 0.0]
+    hanging.warm(1)
+    res = hanging.engine.reset({})
+    assert res["code"] == "unknown_start_pose", res
+    assert hanging.arm_calls == [] and hanging.hand_calls == []
+    assert hanging.told == ["我的手臂离垂下的位置太远，我不敢自己动。请用手臂控制卡把手臂放下来。"]
+    assert hanging.messages[-1]["kind"] == "reset_failed" and res["to_user"] == hanging.told[-1]
+    assert res["next_step"] == weigh.USER_DECIDES
 
 
 def test_weigh_cancelled_while_waiting_for_the_object(hanging):
@@ -1768,7 +1813,7 @@ def test_weigh_both_waits_for_both_hands_and_adds_them_up(hanging):
     assert res["mass_kg"] == pytest.approx(0.70, abs=0.01)
     texts = hanging.told
     assert texts[0] == "我在准备称重，等我说“可以放了”，再把东西放到两只手掌心。在这之前先别碰我的手。"
-    assert texts[1] == "可以放了，请在两只手掌心各放一件。放好后手拿开，几秒就能称好。"
+    assert texts[1] == "可以放了，请在5秒内往两只手掌心各放一件。放好后手拿开，几秒就能称好。"
     assert texts[-1] == _result(res["mass_g"], both=True)
     snap = hanging.engine.snapshot()
     assert snap["both_last"]["mass_g"] == res["mass_g"] and snap["both_last"]["side"] == "both"
@@ -1836,6 +1881,8 @@ def test_reset_confirmation_expires(tmp_path):
 def test_reset_confirmation_is_per_side(tmp_path):
     r = _posed_without_tare(tmp_path)
     assert r.engine.reset({})["code"] == "load_unknown"
+    r.left, r.left_target = list(REST), None            # 左臂已经放下：对 left 的 reset 不动
+    r.warm(1)
     n_moves = len(r.moves())
     # 确认记在 right 上：中间对 left 调用一次不会用掉或误用右手的确认
     assert not r.engine.reset({"side": "left"}).get("confirmed_empty")
