@@ -10,7 +10,9 @@ import time
 import urllib.request
 from dataclasses import dataclass, field
 from http.client import HTTPException
+from ipaddress import ip_address
 from pathlib import Path
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from common.vendor_runtime import action_schema, tool
@@ -171,6 +173,12 @@ def chassis_health(data):
     }
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # A local self-signed exception must never carry over to another host.
+        return None
+
+
 class HeliosDriverHealth:
     NAME = "driver_health"
 
@@ -312,21 +320,45 @@ class HeliosDriverHealth:
             "action_id": action_id, "status": status, "result": result,
             "tool": self.NAME, "ts": time.time(),
         }, ensure_ascii=False).encode()
+        failure = None
         try:
+            target = urlsplit(endpoint)
+            hostname = target.hostname or ""
+            try:
+                loopback = ip_address(hostname).is_loopback
+            except ValueError:
+                loopback = hostname in ("localhost", "localhost.")
             ca_file = os.getenv("AGENT_CORE_CA_CERT") or None
-            context = ssl.create_default_context(cafile=ca_file)
-            context.check_hostname = False
-            if ca_file is None:
-                context.verify_mode = ssl.CERT_NONE
-            request = urllib.request.Request(
-                f"{endpoint}/api/acp/complete", data=payload,
-                headers={"Content-Type": "application/json"}, method="POST",
-            )
-            with urllib.request.urlopen(request, timeout=3, context=context):
-                pass
+            if not hostname or target.scheme not in ("http", "https"):
+                failure = "invalid Core URL"
+            elif not loopback and (target.scheme != "https" or ca_file is None):
+                failure = "remote Core requires HTTPS and AGENT_CORE_CA_CERT"
+            else:
+                context = ssl.create_default_context(cafile=ca_file)
+                if loopback:
+                    context.check_hostname = False
+                    if ca_file is None:
+                        context.verify_mode = ssl.CERT_NONE
+                opener = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({}),
+                    urllib.request.HTTPSHandler(context=context),
+                    _NoRedirect(),
+                )
+                request = urllib.request.Request(
+                    f"{endpoint}/api/acp/complete", data=payload,
+                    headers={"Content-Type": "application/json"}, method="POST",
+                )
+                with opener.open(request, timeout=3) as reply:
+                    ack = json.loads(reply.read(4096))
+                if not isinstance(ack, dict) or ack.get("ok") is not True or ack.get("action_id") != action_id:
+                    failure = "invalid acknowledgement"
         except (OSError, ValueError, HTTPException) as exc:
-            print(f"[driver_health] ACP callback failed for {action_id} ({type(exc).__name__})",
+            failure = type(exc).__name__
+        if failure:
+            print(f"[driver_health] ACP callback failed for {action_id} ({failure})",
                   file=sys.stderr, flush=True)
+        else:
+            print(f"[driver_health] ACP completion acknowledged for {action_id}", flush=True)
 
     def _collect_health(self):
         try:

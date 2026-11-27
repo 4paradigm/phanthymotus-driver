@@ -1,9 +1,12 @@
 """Regression checks for the on-demand Helios health card."""
 
 import json
+import ssl
+from io import BytesIO
 from queue import Queue
 from threading import Event
 from types import SimpleNamespace
+from urllib import request as urllib_request
 
 import pytest
 
@@ -229,6 +232,94 @@ def test_failed_worker_posts_terminal_error_and_allows_new_sample(monkeypatch):
     assert new_id == retry["action_id"]
     assert new_id != action_id
     assert status == "completed"
+
+
+@pytest.fixture
+def acp_transport(monkeypatch):
+    transport = SimpleNamespace(
+        handlers=None, request=None, timeout=None, cafile=None,
+        acknowledgement=b'{"ok": true, "action_id": "health-1"}',
+    )
+
+    def create_context(*, cafile=None):
+        transport.cafile = cafile
+        return ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+    def open_completion(request, *, timeout):
+        transport.request = request
+        transport.timeout = timeout
+        return BytesIO(transport.acknowledgement)
+
+    def build_opener(*handlers):
+        transport.handlers = handlers
+        return SimpleNamespace(open=open_completion)
+
+    monkeypatch.delenv("AGENT_CORE_CA_CERT", raising=False)
+    monkeypatch.setattr(health.ssl, "create_default_context", create_context)
+    monkeypatch.setattr(health.urllib.request, "build_opener", build_opener)
+    return transport
+
+
+@pytest.mark.parametrize("endpoint,ca_file", [
+    ("https://localhost:15678", None),
+    ("https://127.0.0.1:15678", None),
+    ("https://[::1]:15678", None),
+    ("https://core.example.test:15678", "core-test.pem"),
+])
+def test_acp_completion_uses_hostname_verification_for_remote_core(
+    monkeypatch, capsys, acp_transport, endpoint, ca_file,
+):
+    monkeypatch.setenv("AGENT_CORE_URL", endpoint)
+    if ca_file:
+        monkeypatch.setenv("AGENT_CORE_CA_CERT", ca_file)
+    plugin = health.HeliosDriverHealth({}, "test", None)
+    snapshot = {"state": "running"}
+
+    plugin._post_completion("health-1", "completed", snapshot)
+
+    tls_handler, = [handler for handler in acp_transport.handlers if isinstance(handler, urllib_request.HTTPSHandler)]
+    assert acp_transport.cafile == ca_file
+    assert tls_handler._context.check_hostname is bool(ca_file)
+    assert tls_handler._context.verify_mode == (ssl.CERT_REQUIRED if ca_file else ssl.CERT_NONE)
+    assert acp_transport.request.full_url == f"{endpoint}/api/acp/complete"
+    assert acp_transport.request.get_method() == "POST"
+    assert acp_transport.timeout == 3
+    payload = json.loads(acp_transport.request.data)
+    assert payload["tool"] == "driver_health"
+    assert (payload["action_id"], payload["status"], payload["result"]) == ("health-1", "completed", snapshot)
+    assert not capsys.readouterr().err
+
+
+@pytest.mark.parametrize("endpoint,ca_file", [
+    ("https://core.example.test:15678", None),
+    ("http://core.example.test:15678", "core-test.pem"),
+])
+def test_acp_completion_blocks_untrusted_remote_endpoints(monkeypatch, capsys, acp_transport, endpoint, ca_file):
+    monkeypatch.setenv("AGENT_CORE_URL", endpoint)
+    if ca_file:
+        monkeypatch.setenv("AGENT_CORE_CA_CERT", ca_file)
+
+    health.HeliosDriverHealth({}, "test", None)._post_completion("health-1", "completed", {})
+
+    assert acp_transport.handlers is None
+    assert "ACP callback failed for health-1" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("acknowledgement", [
+    b"malformed JSON",
+    b"[]",
+    b'{"ok": false, "action_id": "health-1"}',
+    b'{"ok": 1, "action_id": "health-1"}',
+    b'{"ok": true, "action_id": "other"}',
+])
+def test_acp_completion_logs_invalid_acknowledgements(monkeypatch, capsys, acp_transport, acknowledgement):
+    monkeypatch.setenv("AGENT_CORE_URL", "https://localhost:15678")
+    acp_transport.acknowledgement = acknowledgement
+
+    health.HeliosDriverHealth({}, "test", None)._post_completion("health-1", "completed", {})
+
+    assert acp_transport.request is not None
+    assert "ACP callback failed for health-1" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("odometry_port", [None, "15749"])
