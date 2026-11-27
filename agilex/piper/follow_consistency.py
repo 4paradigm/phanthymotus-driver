@@ -15,7 +15,9 @@ from agilex.piper.follow_analysis import FRAME_IDS, FollowPair
 NAME = 'piper_follow_consistency'
 CAN_FRAME = struct.Struct('=IB3x8s')
 CAN_FILTER = struct.Struct('=II')
-CAN_MASK = 0xE00007FF
+# SocketCAN reserves CAN_ERR_FLAG in a filter mask for error subscriptions.
+# Match the standard data identifier and reject extended and RTR frames.
+CAN_MASK = 0xC00007FF
 KERNEL_TIMESPEC = struct.Struct('@ll')
 # SO_TIMESTAMPNS_OLD on the supported 64-bit Linux image architectures.
 SO_TIMESTAMPNS = getattr(socket, 'SO_TIMESTAMPNS', 35)

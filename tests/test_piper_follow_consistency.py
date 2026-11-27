@@ -8,7 +8,7 @@ import pytest
 
 from agilex.piper.follow_analysis import FEEDBACK_IDS, REFERENCE_IDS, FollowPair, JointFrames
 from agilex.piper.follow_consistency import (
-    CAN_FRAME, KERNEL_TIMESPEC, NAME, SO_TIMESTAMPNS, FollowConsistency, receive_sample,
+    CAN_FRAME, CAN_MASK, KERNEL_TIMESPEC, NAME, SO_TIMESTAMPNS, FollowConsistency, receive_sample,
 )
 from common.vendor_runtime import DriverBundle
 
@@ -79,6 +79,7 @@ def test_socket_receiver_rejects_host_originated_and_untimestamped_frames():
         def recvmsg(self, *_):
             return packet, ancillary, flags, None
 
+    assert CAN_MASK == 0x80000000 | 0x40000000 | 0x7FF
     packet = CAN_FRAME.pack(REFERENCE_IDS[0], 8, b'\x00' * 8)
     seconds, nanos = divmod(time.time_ns(), 1_000_000_000)
     ancillary = [(socket.SOL_SOCKET, SO_TIMESTAMPNS, KERNEL_TIMESPEC.pack(seconds, nanos))]
