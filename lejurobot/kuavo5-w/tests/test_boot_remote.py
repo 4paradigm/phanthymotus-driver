@@ -119,6 +119,23 @@ class BootRemoteTests(fixtures.unittest.TestCase):
         self.assertFalse(self.ros.sent_services)
         self.assertFalse(self.client.calls)
 
+    def test_discovery_timeout_waits_without_consuming_permit_then_recovers(self):
+        with patch.object(self.bundle.sensors, 'require_profile', side_effect=RuntimeError('rosapi timeout')):
+            self.assertFalse(self.remote.attempt())
+        self.assertEqual(self.remote.info()['stage'], 'waiting_for_robot_identity')
+        self.assertIsNone(self.bundle.spatial.store.state('boot_remote:' + self.boot['boot_id']))
+        self.assertFalse(self.ros.sent_services)
+        self.assertTrue(self.remote.attempt())
+        self.assertEqual(self.remote.info()['state'], 'ready')
+
+    def test_stop_during_identity_wait_does_not_resume_when_discovery_recovers(self):
+        with patch.object(self.bundle.sensors, 'require_profile', side_effect=RuntimeError('rosapi timeout')):
+            self.assertFalse(self.remote.attempt())
+        self.remote.cancel('software_pause_requested')
+        self.assertTrue(self.remote.attempt())
+        self.assertFalse(self.ros.sent_services)
+        self.assertFalse(self.client.calls)
+
     def test_enable_probe_pending_does_not_extend_boot_window(self):
         self.feedback(ready_age_s=61.)
         with patch.object(self.bundle.state, 'confirmed_enable', side_effect=RuntimeError('probe pending')):

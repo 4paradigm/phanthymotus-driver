@@ -118,6 +118,14 @@ class BootRemote:
                     self.status = {'state': 'waiting', 'stage': 'waiting_for_enable_verification',
                                    'motion_target_sent': False}
                     return False
+                try:
+                    b.sensors.require_profile()
+                except RuntimeError:
+                    # Discovery refreshes independently after rosapi timeouts.
+                    # Never consume the boot permit while identity is unknown.
+                    self.status = {'state': 'waiting', 'stage': 'waiting_for_robot_identity',
+                                   'motion_target_sent': False}
+                    return False
             # An INSERT OR IGNORE transaction claims BEFORE all control writes.
             # Persist skips as well: operator actions may precede boot feedback.
             if not b.spatial.store.claim_boot_remote(identity):
