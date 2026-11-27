@@ -936,6 +936,6 @@ the head is waiting. `stop` releases head control.
   this stream.
 - `set_target(object_name="cup")` follows a class from Perception's VOP
   vocabulary. The card starts VOP on port 15720 when the camera's objects
-  topic has no publisher. The VOP service must be running with bounding box
-  output enabled. Use `set_mode(mode="face")` to return to the original
+  topic has no publisher. The Perception service must be running. The card consumes normalized
+  object positions and confidences from VOP. Use `set_mode(mode="face")` to return to the original
   anonymous tracking mode.

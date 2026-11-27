@@ -96,6 +96,7 @@ def _iou(a, b):
 class _Tracker:
     def __init__(self):
         self.bbox = None
+        self.point = None
         self.track_id = 0
         self.last_seen = 0.0
         self.size = None
@@ -124,6 +125,24 @@ class _Tracker:
             "offset": [round((2 * x + w) / width - 1, 4),
                        round((2 * y + h) / height - 1, 4)],
         }
+
+
+    def update_points(self, points, now):
+        if now - self.last_seen >= FRAME_MAX_AGE:
+            self.point = None
+        if not points:
+            return None
+        anchor = self.point or (0, 0)
+        ranked = sorted((math.dist(anchor, point), point) for point in points)
+        distance, candidate = ranked[0]
+        if (self.point is not None and distance > 0.25
+                or len(ranked) > 1 and ranked[1][0] - distance < 0.05):
+            return None
+        if self.point is None:
+            self.track_id += 1
+        self.point = candidate
+        self.last_seen = now
+        return {"track_id": self.track_id, "offset": candidate}
 
 
 class _Detector:
@@ -408,19 +427,26 @@ class HeadFaceFollowPlugin:
             try:
                 payload = json.loads(msg.data)
                 ts = float(payload["timestamp"])
-                latency = float(payload["latency_ms"]) / 1000
+                latency = float(payload.get("latency_ms", 0)) / 1000
                 age = time.time() - ts
                 if (ts <= self._object_stamp
                         or not (0 <= age and 0 <= latency and age + latency <= FRAME_MAX_AGE)):
                     return
-                boxes = []
+                if payload.get("error") or payload.get("available") is False:
+                    return
+                points = []
                 for obj in payload["objects"]:
-                    if obj["name"].casefold() == self._object_name:
-                        x, y, right, bottom = map(float, obj["bbox"])
-                        if all(map(math.isfinite, (x, y, right, bottom))) and right > x and bottom > y:
-                            boxes.append((x, y, right - x, bottom - y))
+                    if obj["name"].casefold() != self._object_name:
+                        continue
+                    x, y = obj["position"]
+                    confidence = obj["confidence"]
+                    values = (x, y, confidence)
+                    if not all(type(value) in (int, float) for value in values):
+                        continue
+                    if -1 <= x <= 1 and -1 <= y <= 1 and 0.5 <= confidence <= 1:
+                        points.append((x, y))
                 self._object_stamp = ts
-                self._object_packet = (ts, boxes, time.monotonic() + FRAME_MAX_AGE - age - latency)
+                self._object_packet = (points, time.monotonic() + FRAME_MAX_AGE - age - latency)
             except (ValueError, KeyError, TypeError, AttributeError, OverflowError):
                 return
 
@@ -439,18 +465,12 @@ class HeadFaceFollowPlugin:
             if name:
                 packet = self._object_packet
                 self._object_packet = None
-                if packet is None or received > packet[2]:
+                if packet is None or received > packet[1]:
                     self._reason = "waiting_for_object_detection"
                     return
         try:
             if name:
-                image = detector.cv2.imdecode(detector.np.frombuffer(message.data, dtype=detector.np.uint8),
-                                              detector.cv2.IMREAD_GRAYSCALE)
-                if image is None:
-                    raise ValueError("Invalid camera frame")
-                size = (image.shape[1], image.shape[0])
-                boxes = [b for b in packet[1] if b[0] >= 0 and b[1] >= 0
-                         and b[0] + b[2] <= size[0] and b[1] + b[3] <= size[1]]
+                boxes, size = (), None
             else:
                 boxes, size = detector.detect(message.data)
                 if mode == "nearest_face" and boxes:
@@ -465,7 +485,8 @@ class HeadFaceFollowPlugin:
         with self._lock:
             if self._node is not node or not self._armed or self._tracker is not tracker:
                 return
-            if size is None or time.monotonic() - received > FRAME_MAX_AGE or (name and time.monotonic() > packet[2]):
+            if ((not name and size is None) or time.monotonic() - received > FRAME_MAX_AGE
+                    or (name and time.monotonic() > packet[1])):
                 self._track = None
                 self._reason = "invalid_or_stale_frame"
                 return
@@ -485,7 +506,8 @@ class HeadFaceFollowPlugin:
                     return
             if mode == "nearest_face" and boxes and tracker.bbox and _iou(tracker.bbox, boxes[0]) < 0.2:
                 tracker.bbox = None
-            target = tracker.update(boxes, size, received)
+            target = (tracker.update_points(packet[0], received) if name
+                      else tracker.update(boxes, size, received))
             if target is None:
                 self._track = None
                 self._reason = {"object": "waiting_for_object", "speaker": "waiting_for_speaker_face",

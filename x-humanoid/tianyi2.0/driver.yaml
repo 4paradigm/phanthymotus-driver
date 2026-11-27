@@ -35,6 +35,7 @@ cards:
   - { name: remote_event,       type: sensor }
   - { name: head,               type: actuator }
   - { name: head_gesture,       type: actuator }
+  - { name: head_face_follow,   type: actuator }
   - { name: arm,                type: actuator }
   - { name: arm_gesture,        type: actuator }
   - { name: waist,              type: actuator }

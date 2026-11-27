@@ -211,3 +211,31 @@ def test_object_mode_starts_vop_on_connected_camera(setup, monkeypatch):
     assert setup.call("set_target", object_name=" Cup ")["object_name"] == "cup"
     assert calls == ["/tianyi/camera/head"]
     assert setup.call("set_target", object_name="")["mode"] == "face"
+
+
+def test_native_vop_positions_drive_only_on_live_distinct_results(setup, monkeypatch):
+    s = setup
+    monkeypatch.setattr(sys.modules["head_face_follow"], "_start_vop", lambda topic: None)
+    assert s.call("set_target", object_name="cup")["mode"] == "object"
+    s.feedback()
+    assert s.call("arm")["armed"]
+    objects = s.follow._node.subscriptions[1][2]
+
+    def publish(position, age=0):
+        objects(NS(data=json.dumps({"timestamp": s.clock.time() - age,
+                                    "objects": [{"name": "cup", "position": position,
+                                                 "confidence": 0.9}]})))
+
+    publish([0.8, 0.2], age=1)
+    s.send()
+    publish(["bad", 0.2])
+    s.send()
+    assert not s.commands
+    publish([0.8, 0.2])
+    s.send()
+    s.feedback()
+    publish([0.81, 0.2])
+    s.send()
+    assert len(s.commands) == 1
+    s.send(step=0.25)
+    assert len(s.commands) == 1
