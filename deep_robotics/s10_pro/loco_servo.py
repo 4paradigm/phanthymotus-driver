@@ -19,7 +19,7 @@ VX_LIMIT, VY_LIMIT, WZ_LIMIT = 1.67, 0.4, 1.0
 # These are command ceilings, not measured minimum stable chassis speeds.
 SPEED_PRESETS = {"slow": .30, "normal": .60, "fast": 1.00}
 DEFAULT_SETTINGS = {"dry_run": True, "rotate_only": False, "speed_preset": "normal",
-                    "min_vx": 0., "min_vy": 0., "min_wz": 0., "linear_acceleration": .3,
+                    "min_vx": 0., "min_vy": .12, "min_wz": 0., "linear_acceleration": .3,
                     "angular_acceleration": 2., "wz_limit": WZ_LIMIT}
 
 

@@ -104,7 +104,7 @@ def test_yaw_floor_is_advertised_to_planners_without_raising_native_commands(ser
     assert not p.dispatch('config', {'wz_limit': .2})['ok']
     started = p.dispatch('start', {'input_topic': '/policy/cmd', 'dry_run': False})
     assert started['state'] == 'ready'
-    assert started['control_interface']['limits']['min_magnitude'] == [0, 0, 0, 0, 0, .3]
+    assert started['control_interface']['limits']['min_magnitude'] == [0, .12, 0, 0, 0, .3]
     assert p.dispatch('info', {})['min_wz'] == .3
     for seq, yaw in enumerate((.05, -.05, 0.), start=1):
         submit(p, command(p, [0, 0, 0, 0, 0, yaw], seq=seq))
@@ -114,13 +114,13 @@ def test_yaw_floor_is_advertised_to_planners_without_raising_native_commands(ser
 def test_lateral_floor_is_advertised_without_raising_native_commands(servo):
     p = servo.plugin
     info = p.dispatch('info', {})
-    assert info['min_vy'] == 0
-    assert info['control_interface']['limits']['min_magnitude'][1] == 0
-    assert p.dispatch('config', {'min_vy': .12})['ok']
+    assert info['min_vy'] == .12
+    assert info['control_interface']['limits']['min_magnitude'][1] == .12
+    assert p.dispatch('config', {'min_vy': .14})['ok']
 
     started = p.dispatch('start', {'input_topic': '/policy/cmd', 'dry_run': False})
     assert started['state'] == 'ready'
-    assert started['control_interface']['limits']['min_magnitude'][1] == .12
+    assert started['control_interface']['limits']['min_magnitude'][1] == .14
     for seq, vy in enumerate((.02, 0., -.02, 0.), start=1):
         submit(p, command(p, [0, vy, 0, 0, 0, 0], seq=seq))
         assert servo.native.calls[-1][2]['Y'] == pytest.approx(vy)
@@ -288,7 +288,7 @@ def test_config_schema_exposes_controls_without_start_defaults(servo):
         assert 'confirm' in tool['inputSchema']['x-action-params'][action]['params']
         assert 'min_vy' in tool['inputSchema']['x-action-params'][action]['params']
         assert 'min_wz' in tool['inputSchema']['x-action-params'][action]['params']
-    assert props['min_vy']['default'] == 0
+    assert props['min_vy']['default'] == .12
     assert props['min_wz']['default'] == 0
     for key in ['speed_preset', 'dry_run', 'rotate_only', 'min_vx', 'min_vy', 'min_wz',
                 'linear_acceleration', 'angular_acceleration', 'wz_limit']:

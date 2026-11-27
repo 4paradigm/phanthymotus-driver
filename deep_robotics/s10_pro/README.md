@@ -110,7 +110,7 @@ The card gear and `config`/`start` actions expose:
 | `angular_acceleration` | 2.0 | Nominal rad/s² at expected10Hz |
 | `wz_limit` | 1.0 | Execution yaw cap, rad/s; does not multiply commands |
 | `min_vx` | 0 | Measured minimum stable speed, planner metadata only; no forced speed floor |
-| `min_vy` | 0 | Lateral command floor for planning (m/s), shared by both directions. Set to zero to omit the floor. Restart Navi to read a change. |
+| `min_vy` | 0.12 | Lateral command floor for planning (m/s), shared by both directions. Set to zero to omit the floor. Restart Navi to read a change. |
 | `min_wz` | 0 | Minimum stable yaw magnitude for Navi in either direction (rad/s), from 0 to `wz_limit`. Zero disables the floor. Restart Navi to read a change. |
 
 Presets change the declared/enforced vx operating limit, not the native ceiling
@@ -121,9 +121,9 @@ reads the new descriptor.
 
 A short S10 Pro test in gait `0x3002` on 2026-11-27 showed lateral
 displacement in both directions at 0.12 m/s and almost none at 0.06 m/s.
-Both settings also produced forward travel. Enabling a 0.12 m/s planning
-floor caused a box-detour regression, so the default leaves the floor disabled.
-Native commands still follow the existing speed and step limits.
+Both settings also produced forward travel. At the 0.12 m/s planning
+floor, the box-detour simulation stalled. Native commands still follow the
+existing speed and step limits.
 
 The servo descriptor estimates the static standing half-width at 0.20 m in
 `base_link`. [DEEP Robotics lists a standing width of approximately 0.40 m](https://www.deeprobotics.cn/products/detail/2.html);
