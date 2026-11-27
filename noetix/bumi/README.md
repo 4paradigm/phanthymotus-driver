@@ -1,6 +1,13 @@
 # Noetix Bumi driver
 
+The personal `patrol` experiment integrates readiness checks, fixed-point image
+capture and local reports. See [local inspection](PATROL_LOCAL.md).
+
 The bundle exposes Bumi sensor, locomotion, audio, camera, motion-state, and independent sound-direction cards. The direction card is implemented in `direction_card.py`; the other cards remain in `device.py`.
+
+The optional [`patrol_baseline` card](PATROL_BASELINE.md) reads an operator-defined
+baseline and prepares unsent inspection reports. It is disabled by default and
+ships with a fixed-point rehearsal template; hardware acceptance is pending.
 
 ## `mic` and `sound_direction`
 

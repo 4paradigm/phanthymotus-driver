@@ -2,6 +2,16 @@ mcp_port: 15704
 ros_namespace: ""   # 留空则自动使用 hostname
 
 plugins:
+  # Personal fixed-point inspection experiment, integrated readiness checks.
+  patrol:
+    enabled: false
+    baseline_path: examples/patrol-baseline-bumi-fixed.json
+    min_battery_percent: 20
+    telemetry_max_age_s: 3
+    report_dir: /opt/phanthy-motus/data/patrol
+  patrol_baseline:
+    enabled: false
+    baseline_path: examples/patrol-baseline-bumi-fixed.json
   state:
     enabled: true
   loco:

@@ -122,6 +122,7 @@ class BumiDeviceBundle:
         self._plugins: list = []
         plugins_cfg = cfg.get("plugins", {})
         camera_plugin = None
+        capture_plugin = None
         loco_plugin = None
         # The camera subprocess reads this env var; set it before any plugin can
         # start that subprocess, so the raw RGB-D branch is published only when
@@ -200,10 +201,11 @@ class BumiDeviceBundle:
 
         if plugins_cfg.get("vision_capture", {}).get("enabled", False):
             from device import VisionCapturePlugin
-            self._plugins.append(VisionCapturePlugin(
+            capture_plugin = VisionCapturePlugin(
                 plugins_cfg["vision_capture"], camera_plugin, namespace=namespace,
                 executor=executor, mic_enabled=bool(plugins_cfg.get("mic", {}).get("enabled", False)
-                                                   and media_ctrl is not None)))
+                                                   and media_ctrl is not None))
+            self._plugins.append(capture_plugin)
             print("[bundle] VisionCapturePlugin loaded")
 
         if plugins_cfg.get("live_stream", {}).get("enabled", False):
@@ -211,6 +213,19 @@ class BumiDeviceBundle:
             self._plugins.append(LiveStreamPlugin(
                 plugins_cfg["live_stream"], namespace, executor))
             print("[bundle] LiveStreamPlugin loaded")
+
+        if plugins_cfg.get("patrol", {}).get("enabled", False):
+            from device import _acp_notify
+            from patrol_card import PatrolPlugin
+            self._plugins.append(PatrolPlugin(
+                plugins_cfg["patrol"], namespace, executor, capture_plugin,
+                notify_completion=_acp_notify))
+            print("[bundle] PatrolPlugin loaded")
+        elif plugins_cfg.get("patrol_baseline", {}).get("enabled", False):
+            from patrol_baseline import PatrolBaselinePlugin
+            self._plugins.append(PatrolBaselinePlugin(
+                plugins_cfg["patrol_baseline"], namespace, executor))
+            print("[bundle] PatrolBaselinePlugin loaded")
 
     def start_all(self) -> None:
         failed = 0
