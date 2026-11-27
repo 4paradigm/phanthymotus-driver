@@ -57,7 +57,9 @@ def plan(request):
     current[order] = [request["measured"][name] for name in names]
     for name, index in zip(names, order):
         low, high = request["limits"][name]
-        model.lowerPositionLimit[index] = max(low, model.lowerPositionLimit[index])
+        # Add small epsilon to lower limit to account for floating-point precision
+        # in joint position readings (e.g., encoder zero offset)
+        model.lowerPositionLimit[index] = max(low - 1e-3, model.lowerPositionLimit[index])
         model.upperPositionLimit[index] = min(high, model.upperPositionLimit[index])
     data = model.createData()
     state = pink.Configuration(model, data, current)
