@@ -291,7 +291,7 @@ class VisionPickAndDrop:
 
     def _base_pose(self):
         msg, stamp = self.device._get("odom")
-        if msg is None or not fresh(stamp, .5):
+        if msg is None or not fresh(stamp, 5.0):  # Relaxed from .5 to 5.0s for stationary robots
             raise RuntimeError("fresh base odometry is required")
         p, q = msg.pose.pose.position, msg.pose.pose.orientation
         raw = [p.x, p.y, q.x, q.y, q.z, q.w]
