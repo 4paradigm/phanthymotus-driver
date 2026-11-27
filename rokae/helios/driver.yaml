@@ -12,4 +12,5 @@ build_context_extras:
 cards:
   - {name: joints, type: sensor}
   - {name: battery, type: sensor}
+  - {name: driver_health, type: actuator}
   - {name: model, type: resource}

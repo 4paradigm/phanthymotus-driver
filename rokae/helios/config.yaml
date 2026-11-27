@@ -9,3 +9,7 @@ publish_hz: 10
 stale_timeout_s: 1.0
 connect_timeout_s: 3.0
 reconnect_delay_s: 1.0
+health_interface: eth0
+health_base_port: 15782
+health_lidar_port: 15751
+health_odometry_port: 15749
