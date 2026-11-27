@@ -3,13 +3,21 @@
 import json
 import os
 import re
+import ssl
+import sys
 import threading
 import time
 import urllib.request
 from dataclasses import dataclass, field
+from http.client import HTTPException
 from pathlib import Path
+from uuid import uuid4
 
 from common.vendor_runtime import action_schema, tool
+
+
+RECOVERY_RECOMMENDATION = "建议先等待片刻后重新查询。若异常持续，请重启机器人后再查询。"
+COMPLETION_TIMEOUT = 20
 
 
 @dataclass
@@ -171,7 +179,7 @@ class HeliosDriverHealth:
         self._interface = os.getenv("HELIOS_HEALTH_INTERFACE", config.get("health_interface", "eth0"))
         self._ports = {
             key: int(os.getenv(f"HELIOS_HEALTH_{key.upper()}_PORT", config.get(f"health_{key}_port", port)))
-            for key, port in (("base", 15782), ("lidar", 15751), ("odometry", 15749))
+            for key, port in (("base", 15782), ("lidar", 15751), ("odometry", 0))
         }
         if any(not 0 <= port <= 65535 for port in self._ports.values()):
             raise ValueError("Invalid driver health MCP port")
@@ -180,21 +188,31 @@ class HeliosDriverHealth:
             "right_rear": f"/{namespace}/lidar/right_rear/points",
             "odometry": f"/{namespace}/state/odom",
         }
-        self._sampling = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._active_id = None
+        self._latest = None
+        self._worker = None
 
     def get_tool(self):
+        schema = action_schema({
+            "status": ([], "启动约 4 秒的健康采样，完成后调用 latest 获取完整结果"),
+            "latest": ([], "读取最近完成的健康快照，包含异常项及建议"),
+        }, {})
+        schema["x-completion"] = {"actions": ["status"], "timeout": COMPLETION_TIMEOUT}
         return tool(
             self.NAME, "actuator",
             "按需查看底盘 SDK、机身网口、双路雷达和里程计的数据状态。",
-            action_schema({"status": ([], "采样并返回一次健康快照")}, {}),
+            schema,
         )
 
     def start(self):
-        # The status action owns the bounded ROS subscription window.
         pass
 
     def stop(self):
-        pass
+        with self._state_lock:
+            worker = self._worker
+        if worker is not None:
+            worker.join(timeout=COMPLETION_TIMEOUT)
 
     def _sample_streams(self):
         from rclpy.executors import SingleThreadedExecutor
@@ -245,45 +263,108 @@ class HeliosDriverHealth:
             return {"state": "idle"}
         if action == "info":
             return self.get_tool()
+        if action == "latest":
+            with self._state_lock:
+                if self._active_id:
+                    return {"state": "sampling", "action_id": self._active_id}
+                return self._latest or {"state": "waiting", "message": "请先执行 status。"}
         if action not in (self.NAME, "status"):
             raise ValueError(f"Unsupported driver health action: {action}")
-        if not self._sampling.acquire(blocking=False):
-            return {"state": "busy", "health_summary": "健康检查正在采样"}
-        try:
+
+        with self._state_lock:
+            if self._active_id:
+                return {"state": "busy", "message": "健康检查正在采样，请稍后执行 latest。"}
+            action_id = f"helios_health_{uuid4().hex}"
+            worker = threading.Thread(target=self._run_status, args=(action_id,),
+                                      name="helios-driver-health", daemon=True)
+            self._active_id = action_id
             try:
-                streams = self._sample_streams()
-            except (ImportError, OSError, RuntimeError) as exc:
-                streams = {key: {"state": "error", "topic": topic, "error": type(exc).__name__}
-                           for key, topic in self._topics.items()}
-            chassis = chassis_health(_read_tool(self._ports["base"], "base_drive", "info"))
-            lidar = _read_tool(self._ports["lidar"], "lidar_cloud", "status")
-            odom = _read_tool(self._ports["odometry"], "loco_state", "status")
-            lidar_sources = lidar.get("sources")
-            if not isinstance(lidar_sources, dict):
-                lidar_sources = {}
-            for key in ("left_front", "right_rear"):
-                streams[key]["driver_input"] = lidar.get("error") or lidar_sources.get(key)
+                worker.start()
+            except RuntimeError:
+                self._active_id = None
+                raise
+            self._worker = worker
+        return {"state": "sampling", "action_id": action_id,
+                "message": "采样约 4 秒，完成后执行 latest 读取结果。"}
+
+    def _run_status(self, action_id):
+        terminal = "completed"
+        try:
+            result = self._collect_health()
+        except Exception as exc:
+            terminal = "error"
+            result = {
+                "state": "error",
+                "health_summary": "健康检查失败",
+                "issues": ["health_check error"],
+                "error": type(exc).__name__,
+                "recommendation": RECOVERY_RECOMMENDATION,
+            }
+        result = {**result, "action_id": action_id}
+        with self._state_lock:
+            self._latest = result
+            self._active_id = None
+        self._post_completion(action_id, terminal, result)
+
+    def _post_completion(self, action_id, status, result):
+        endpoint = os.getenv("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
+        payload = json.dumps({
+            "action_id": action_id, "status": status, "result": result,
+            "tool": self.NAME, "ts": time.time(),
+        }, ensure_ascii=False).encode()
+        try:
+            ca_file = os.getenv("AGENT_CORE_CA_CERT") or None
+            context = ssl.create_default_context(cafile=ca_file)
+            context.check_hostname = False
+            if ca_file is None:
+                context.verify_mode = ssl.CERT_NONE
+            request = urllib.request.Request(
+                f"{endpoint}/api/acp/complete", data=payload,
+                headers={"Content-Type": "application/json"}, method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=3, context=context):
+                pass
+        except (OSError, ValueError, HTTPException) as exc:
+            print(f"[driver_health] ACP callback failed for {action_id} ({type(exc).__name__})",
+                  file=sys.stderr, flush=True)
+
+    def _collect_health(self):
+        try:
+            streams = self._sample_streams()
+        except (ImportError, OSError, RuntimeError) as exc:
+            streams = {key: {"state": "error", "topic": topic, "error": type(exc).__name__}
+                       for key, topic in self._topics.items()}
+        chassis = chassis_health(_read_tool(self._ports["base"], "base_drive", "info"))
+        lidar = _read_tool(self._ports["lidar"], "lidar_cloud", "status")
+        lidar_sources = lidar.get("sources")
+        if not isinstance(lidar_sources, dict):
+            lidar_sources = {}
+        for key in ("left_front", "right_rear"):
+            streams[key]["driver_input"] = lidar.get("error") or lidar_sources.get(key)
+        odometry_port = self._ports["odometry"]
+        odometry_input = {"state": "disabled"}
+        if odometry_port:
+            odom = _read_tool(odometry_port, "loco_state", "status")
             odom_data = odom.get("data")
             if not isinstance(odom_data, dict):
                 odom_data = {}
-            streams["odometry"]["driver_input"] = odom.get("error") or {
+            odometry_input = odom.get("error") or {
                 key: odom_data.get(key) for key in ("pose_state", "speed_state", "sample_timestamps_ms")
             }
-            link = read_link(self._interface)
-            checks = {"chassis": chassis, "chassis_link": link, **streams}
-            issues = [f"{name} {value['state']}" for name, value in checks.items()
-                      if value["state"] != "running"]
-            result = {
-                "state": "degraded" if issues else "running",
-                "health_summary": f"{len(checks) - len(issues)}/{len(checks)} 项正常",
-                "issues": issues,
-                "chassis": chassis,
-                "chassis_link": link,
-                "streams": streams,
-                "timestamp_ms": time.time_ns() // 1_000_000,
-            }
-            if issues:
-                result["recommendation"] = "建议先等待片刻后重新查询。若异常持续，请重启机器人后再查询。"
-            return result
-        finally:
-            self._sampling.release()
+        streams["odometry"]["driver_input"] = odometry_input
+        link = read_link(self._interface)
+        checks = {"chassis": chassis, "chassis_link": link, **streams}
+        issues = [f"{name} {value['state']}" for name, value in checks.items()
+                  if value["state"] != "running"]
+        result = {
+            "state": "degraded" if issues else "running",
+            "health_summary": f"{len(checks) - len(issues)}/{len(checks)} 项正常",
+            "issues": issues,
+            "chassis": chassis,
+            "chassis_link": link,
+            "streams": streams,
+            "timestamp_ms": time.time_ns() // 1_000_000,
+        }
+        if issues:
+            result["recommendation"] = RECOVERY_RECOMMENDATION
+        return result

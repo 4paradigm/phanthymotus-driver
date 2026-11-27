@@ -12,4 +12,4 @@ reconnect_delay_s: 1.0
 health_interface: eth0
 health_base_port: 15782
 health_lidar_port: 15751
-health_odometry_port: 15749
+health_odometry_port: 0
