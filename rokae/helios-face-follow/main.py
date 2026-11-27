@@ -10,7 +10,7 @@ from collections import deque
 from http.server import ThreadingHTTPServer
 from urllib.request import Request, urlopen
 
-from base_follow import CHEST_CAMERA, BaseFollower
+from base_follow import CHEST_CAMERA, MANUAL_CHARGING, BaseFollower, exception_codes
 from common.vendor_runtime import (
     DriverBundle, action_schema, load_config, make_handler, start_registration, tool,
 )
@@ -127,6 +127,8 @@ class HeliosFaceFollow:
                     if self.base is not None:
                         try:
                             base = call_local(15782, "base_drive", "info")
+                            if MANUAL_CHARGING in exception_codes(base):
+                                return {**self.info(), "启动说明": "人体检测已启动，底盘正在手动充电，断开充电线后才能转向"}
                             if not base.get("worker_running") or base.get("chassis_exception_level") != 0:
                                 detail = base.get("connect_error") or "底盘尚未返回可用的运动反馈"
                                 return {**self.info(), "启动说明": f"人体检测已启动，转向等待底盘：{detail}"}

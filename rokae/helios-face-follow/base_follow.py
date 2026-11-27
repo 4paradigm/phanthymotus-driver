@@ -12,6 +12,16 @@ CENTER_OFFSET = 0.07
 MIN_RATE = 3.5
 MAX_RATE = 8.0
 START_ALLOWANCE = 3.0
+MANUAL_CHARGING = (83, 2)  # VMR /tool/rob/getWarningJson
+WAKE_MOTOR = {(2, 1), (2, 2)}
+WAKE_ALLOWED = WAKE_MOTOR | {(2, 7), (116, 1)}
+
+
+def exception_codes(info):
+    warnings = info.get("chassis_exceptions")
+    return {(item.get("module"), item.get("code")) for item in warnings
+            if isinstance(item, dict) and type(item.get("module")) is int and type(item.get("code")) is int
+            } if isinstance(warnings, list) else set()
 
 
 def _call(port, tool, action, **args):
@@ -128,6 +138,7 @@ class BaseFollower:
                     info = self._base("info")
                     if "active_move" not in info:
                         raise ValueError("base status omitted the active move")
+                    codes = exception_codes(info)
                     if info["active_move"] != self.action_id:
                         last = info.get("last_move") or {}
                         failed = (isinstance(last, dict) and last.get("action_id") == self.action_id
@@ -137,9 +148,19 @@ class BaseFollower:
                         self.state = "fault" if failed else "settling"
                         if failed:
                             self.error = last.get("error") or "base turn failed"
+                    elif MANUAL_CHARGING in codes:
+                        if self.halt("charging"):
+                            self.wait_detail = "底盘正在手动充电，等待断开充电线"
+                    elif (info.get("chassis_exception_level") == 1
+                          and codes <= WAKE_ALLOWED and codes & WAKE_MOTOR):
+                        # The stock driver owns the brake-release window and
+                        # stops on any fault or if its wake allowance expires.
+                        self.state = "waiting_for_motor_wake"
                     elif info.get("chassis_exception_level") != 0:
                         if self.halt("fault"):
                             self.error = "base exception during turn"
+                    else:
+                        self.state = "controlling"
                 return
             if self.last_sample == sample or self.clock() < self.retry_after:
                 return
@@ -153,6 +174,11 @@ class BaseFollower:
             info = self._base("info")
             if "active_move" not in info or info["active_move"] is not None:
                 self.state = "base_busy"
+                return
+            if MANUAL_CHARGING in exception_codes(info):
+                self.state = "charging"
+                self.wait_detail = "底盘正在手动充电，等待断开充电线"
+                self.retry_after = self.clock() + 0.75
                 return
             odom = info.get("odometry")
             if (info.get("state") != "ready" or info.get("motion_enabled") is not True

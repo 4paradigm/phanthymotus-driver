@@ -245,7 +245,7 @@ def test_base_turns_in_place_with_fresh_targets_and_respects_existing_motion(mon
     from base_follow import BaseFollower
 
     clock = NS(now=10.0)
-    drive = NS(active=None, nav="idle", level=0, calls=[])
+    drive = NS(active=None, nav="idle", level=0, warnings=[], calls=[])
 
     def call(port, tool, action, **params):
         drive.calls.append((port, tool, action, params))
@@ -253,7 +253,8 @@ def test_base_turns_in_place_with_fresh_targets_and_respects_existing_motion(mon
             return {"navigation": {"state": drive.nav}}
         if action == "info":
             return {"state": "ready", "motion_enabled": True, "sdk_available": True, "worker_running": True,
-                    "chassis_exception_level": drive.level, "active_move": drive.active,
+                    "chassis_exception_level": drive.level, "chassis_exceptions": drive.warnings,
+                    "active_move": drive.active,
                     "odometry": {"age_s": 0.2, "vx": 0.0, "vy": 0.0, "w": 0.0}}
         if action == "move":
             drive.active = "our-turn"
@@ -324,10 +325,20 @@ def test_base_turns_in_place_with_fresh_targets_and_respects_existing_motion(mon
 
     base.reset()
     base.camera_ok = True
+    drive.warnings = [{"module": 83, "code": 2}]
     base.step(other_side, 21, 16.2)
     base.step(other_side, 22, 16.2)
+    assert base.state == "charging" and drive.active is None
+    drive.warnings = []
+    clock.now += 0.8
+    base.step(other_side, 23, 17.2)
+    assert drive.active == "our-turn"
     drive.level = 1
-    base.step(other_side, 23, 16.2)
+    drive.warnings = [{"module": 2, "code": 2}, {"module": 116, "code": 1}]
+    base.step(other_side, 24, 17.2)
+    assert drive.active == "our-turn" and base.state == "waiting_for_motor_wake"
+    drive.warnings.append({"module": 17, "code": 1})
+    base.step(other_side, 25, 17.2)
     assert drive.calls[-1][2] == "stop_move"
     assert base.status()["state"] == "fault" and not base.status()["centered"]
     assert base.status()["target_x"] == -0.4
