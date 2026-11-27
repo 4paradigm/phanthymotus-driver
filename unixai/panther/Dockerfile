@@ -43,11 +43,16 @@ RUN . /etc/os-release && \
 # On x86_64 -> arm64 QEMU builds, libc-bin's post-install trigger has crashed
 # after the combined install; do not mask apt/dpkg failures.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3-numpy python3-opencv && \
+      python3-numpy python3-opencv python3-venv && \
     rm -rf /var/lib/apt/lists/*
 
-# Runtime dependencies deliberately come from Ubuntu/ROS apt packages. This
-# avoids duplicate pip NumPy/OpenCV wheels and keeps their ABI aligned with ROS.
+# Keep Pink/Pinocchio wheels isolated from system ROS/OpenCV NumPy.
+RUN python3 -m venv /opt/panther-pink && \
+    /opt/panther-pink/bin/pip install --no-cache-dir --quiet \
+        --index-url https://mirrors.tencentyun.com/pypi/simple/ \
+        'pin-pink==4.0.0' 'daqp'
+
+# ROS runtime dependencies deliberately come from Ubuntu/ROS apt packages.
 # nav-msgs is required for the /odom Odometry subscription; removing the
 # navigation card did not remove that message dependency. util-linux supplies
 # nsenter; systemd supplies the systemctl/systemd-run clients used to manage the
@@ -57,6 +62,7 @@ COPY --from=interface-builder /panther_ws/install /panther_ws/install
 WORKDIR /work
 COPY common/ /work/common/
 COPY main.py device.py plugins.py contracts.py core_bridge.py camera.py stereo_camera.py audio.py controlled_spatial.py spatial_map.py spatial_inputs.py base_servo.py config.yaml driver.yaml /work/
+COPY vision_pick_and_drop.py pick_ik.py /work/
 COPY resource/panther.urdf /work/resource/panther.urdf
 COPY resource/cyclonedds-muzzle.xml /work/resource/cyclonedds-muzzle.xml
 COPY entrypoint.sh /work/entrypoint.sh
@@ -68,4 +74,3 @@ ENV PYTHONUNBUFFERED=1
 ENV RCUTILS_COLORIZED_OUTPUT=0
 EXPOSE 15792
 CMD ["/work/entrypoint.sh"]
-
