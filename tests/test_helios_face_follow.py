@@ -203,6 +203,27 @@ def test_canvas_lifecycle_and_object_mode(monkeypatch):
     assert not base.camera_ok
     card.stop()
 
+    camera_calls = []
+    body_rgb = "/rokae_helios/camera/card_xyz/rgb"
+
+    def camera_request(port, tool, action, **parameters):
+        if port == 15782:
+            assert (tool, action, parameters) == ("base_drive", "info", {})
+            return {"worker_running": False, "connect_error": "chassis reports no navigation device"}
+        assert (port, tool, parameters) == (15747, "camera_rgb", {"instance_id": "card-xyz"})
+        camera_calls.append(action)
+        if action == "info":
+            return {"state": "idle", "camera": "chest_rgb",
+                    "camera_info": [{"id": driver.CHEST_CAMERA, "topic": body_rgb}]}
+        return {"state": "online" if action == "start" else "idle"}
+
+    monkeypatch.setattr(driver, "call_local", camera_request)
+    result = card.dispatch("toggle_person_follow", {"input_topic": body_rgb})
+    assert result["state"] == "running" and "no navigation device" in result["启动说明"]
+    assert base.camera_ok
+    assert card.dispatch("toggle_person_follow", {})["state"] == "idle"
+    assert camera_calls == ["info", "start", "stop"]
+
 
 AXES = {
     "head_joint_1": dict(image_axis="x", image_sign=-1, lower_rad=-0.5, upper_rad=0.5, max_rad_s=0.2),

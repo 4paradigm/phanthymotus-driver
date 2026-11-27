@@ -46,15 +46,20 @@ class BaseFollower:
         self.yaw_rate = 0.0
         self.last_sample = None
         self.candidate = None
+        self.retry_after = 0.0
+        self.wait_detail = None
 
     def status(self):
         return {"backend": "base", "state": self.state, "error": self.error,
+                "detail": self.wait_detail,
                 "action_id": self.action_id, "yaw_rate_deg_s": self.yaw_rate}
 
     def reset(self):
         if self.halt("idle"):
             self.state, self.error = "idle", None
         self.camera_ok = False
+        self.retry_after = 0.0
+        self.wait_detail = None
 
     def halt(self, state):
         self.candidate = None
@@ -73,6 +78,7 @@ class BaseFollower:
             self.action_id, self.yaw_rate = None, 0.0
         if not self.error:
             self.state = state
+            self.wait_detail = None
         return True
 
     def _base(self, action, **args):
@@ -103,6 +109,7 @@ class BaseFollower:
         magnitude = min(MAX_RATE, max(MIN_RATE, 14 * abs(x)))
         rate = -magnitude if x > 0 else magnitude
         candidate = (target["track_id"], rate > 0)
+        requesting_move = False
         try:
             if self.action_id:
                 if self.clock() >= self.stop_at:
@@ -129,7 +136,7 @@ class BaseFollower:
                         if self.halt("fault"):
                             self.error = "base exception during turn"
                 return
-            if self.last_sample == sample:
+            if self.last_sample == sample or self.clock() < self.retry_after:
                 return
             self.last_sample = sample
             if self.candidate != candidate:
@@ -150,12 +157,14 @@ class BaseFollower:
                     or not finite(odom.get("age_s")) or not 0 <= odom["age_s"] <= 1
                     or any(not finite(odom.get(k)) or abs(odom[k]) > 0.025 for k in ("vx", "vy", "w"))):
                 self.state = "waiting_for_base"
+                self.wait_detail = info.get("connect_error") or "底盘反馈或里程计尚未就绪"
                 return
             now = self.clock()
             if now >= valid_until:
                 self.halt("waiting_for_target")
                 return
             duration = min(1.2, max(0.35, 1.8 * abs(x)))
+            requesting_move = True
             reply = self._base("move", vx=0.0, vy=0.0, vyaw=rate, duration_s=duration)
             action_id = reply.get("action_id")
             if reply.get("state") != "running" or not isinstance(action_id, str) or not action_id:
@@ -165,7 +174,12 @@ class BaseFollower:
             # This deadline only applies while fresh observations keep arriving.
             self.stop_at = now + START_ALLOWANCE + duration
             self.state = "controlling"
+            self.wait_detail = None
             if self.clock() >= valid_until:
                 self.halt("waiting_for_target")
         except (OSError, ValueError, http.client.HTTPException) as error:
-            self.state, self.error = "fault", str(error)
+            if self.action_id or requesting_move:
+                self.state, self.error = "fault", str(error)
+            else:
+                self.state, self.wait_detail = "waiting_for_base", str(error)
+                self.retry_after = self.clock() + 0.75

@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import signal
 import threading
 import time
@@ -24,15 +25,21 @@ DEFAULT_SPEECH = "/rokae_helios/speech/localized"
 JOINTS = "/rokae_helios/state/joints"
 
 
-def start_perception(name, topic):
-    request = Request("http://127.0.0.1:15720/mcp", data=json.dumps({
+def call_local(port, name, action, **arguments):
+    request = Request(f"http://127.0.0.1:{port}/mcp", data=json.dumps({
         "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
-            "name": name, "arguments": {"action": "start", "input_topic": topic},
+            "name": name, "arguments": {"action": action, **arguments},
         },
     }).encode(), headers={"Content-Type": "application/json"})
     with urlopen(request, timeout=3) as response:
         payload = json.load(response)
-    result = json.loads(payload["result"]["content"][0]["text"])
+    if payload.get("error"):
+        raise ValueError(payload["error"].get("message", f"{name} failed"))
+    return json.loads(payload["result"]["content"][0]["text"])
+
+
+def start_perception(name, topic):
+    result = call_local(15720, name, "start", input_topic=topic)
     if result.get("state") not in ("running", "loading"):
         raise ValueError(result.get("message", f"{name} did not start"))
 
@@ -53,6 +60,7 @@ class HeliosFaceFollow:
         self.detector = None
         self.subscriptions = []
         self.session = None
+        self.manual_camera = None
         self.topics = {}
         self.policy = FollowPolicy("person", "person")
         self.depth_frames = deque(maxlen=8)
@@ -77,10 +85,11 @@ class HeliosFaceFollow:
         node.create_timer(CONTROL_PERIOD, self.move_motion)
 
     def get_tools(self):
-        return [tool("helios_face_follow", "processor",
+        entry = tool("helios_face_follow", "processor",
                      "Helios 目标随动，默认通过 RGB 跟踪人体，输出目标位置和朝向控制状态。",
                      action_schema({
                          "start": (["input_topic", "depth_topic", "speech_topic", "object_topic"], "连接输入"),
+                         "toggle_person_follow": (["input_topic"], "开始或停止持续人体随动"),
                          "set_mode": (["mode", "object_name"], "切换模式"),
                          "set_target": (["object_name"], "跟踪指定的 VOP 物体类别"),
                          "stop": ([], "结束跟踪"),
@@ -93,12 +102,29 @@ class HeliosFaceFollow:
                          "mode": {"type": "string", "enum": list(MODES), "default": "person"},
                          "object_name": {"type": "string", "description": "指定 VOP 类别"},
                      }), topic_in=[{"format": "image/jpeg", "desc": "Helios RGB"}],
-                     topic_out=self.output)]
+                     topic_out=self.output)
+        entry["inputSchema"]["x-helios-canvas-execute"] = "toggle_person_follow"
+        return [entry]
 
     def dispatch(self, action, args):
         with self.lock:
             if action == "start":
                 self.start(args)
+                # Core now owns the upstream source for this running project.
+                self.manual_camera = None
+            elif action == "toggle_person_follow":
+                if self.session is not None:
+                    self.stop()
+                else:
+                    self.start_from_canvas(args)
+                    if self.base is not None:
+                        try:
+                            base = call_local(15782, "base_drive", "info")
+                            if not base.get("worker_running") or base.get("chassis_exception_level") != 0:
+                                detail = base.get("connect_error") or "底盘尚未返回可用的运动反馈"
+                                return {**self.info(), "启动说明": f"人体检测已启动，转向等待底盘：{detail}"}
+                        except (OSError, ValueError, KeyError, IndexError, TypeError) as error:
+                            return {**self.info(), "启动说明": f"人体检测已启动，底盘接口暂未就绪：{error}"}
             elif action == "stop":
                 self.stop()
             elif action in ("set_mode", "set_target"):
@@ -121,6 +147,29 @@ class HeliosFaceFollow:
             elif action != "info":
                 raise ValueError(f"unsupported action {action}")
             return self.info()
+
+    def start_from_canvas(self, args):
+        topic = args.get("input_topic")
+        match = re.fullmatch(r"/rokae_helios/camera/card_([a-z0-9]+)/rgb", topic or "")
+        if not match:
+            raise ValueError("请先将 Helios 胸部 RGB 相机接到随动卡的输入端口")
+        instance = "card-" + match[1]
+        camera = call_local(15747, "camera_rgb", "info", instance_id=instance)
+        declarations = camera.get("camera_info") or []
+        declaration = next((d for d in declarations
+                            if d.get("id") == CHEST_CAMERA and d.get("topic") == topic), None)
+        if camera.get("camera") != "chest_rgb" or declaration is None:
+            raise ValueError("随动卡需要接入胸部 RGB 相机")
+        if camera.get("state") != "online":
+            reply = call_local(15747, "camera_rgb", "start", instance_id=instance)
+            if reply.get("state") in (None, "error", "idle"):
+                raise ValueError(reply.get("error") or "胸部相机未能启动")
+            self.manual_camera = instance
+        try:
+            self.start({"input_topic": topic, "camera_info": {topic: declaration}})
+        except Exception:
+            self.stop()
+            raise
 
     def ensure_vop(self, topics):
         # An explicit topic belongs to its producer. Otherwise request VOP for this RGB feed.
@@ -200,6 +249,12 @@ class HeliosFaceFollow:
             self.person_depth = self.rgb_size = None
             self.topics = {}
             self.policy = FollowPolicy("person", "person")
+            if self.manual_camera:
+                instance, self.manual_camera = self.manual_camera, None
+                try:
+                    call_local(15747, "camera_rgb", "stop", instance_id=instance)
+                except (OSError, ValueError, KeyError, IndexError, TypeError) as error:
+                    print(f"[camera] cannot stop {instance}: {error}", flush=True)
             if was_active:
                 self.emit(None, "idle")
 
