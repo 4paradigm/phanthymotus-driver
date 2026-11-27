@@ -1,0 +1,16 @@
+id: primebot-q1-driver
+name: 启元 Q1 探索版
+category: driver
+hardware_provider: primebot
+hardware_model: q1
+image_name: primebot-q1
+port: 15748
+mcp_url: "http://localhost:15748/mcp"
+description: 启元 Q1 探索版电池 SOC、电压、电流、功率、温度、容量与循环次数，支持机身 IMU、内置麦克风和原生语音识别
+build_context_extras:
+  - ../../common
+cards:
+  - { name: battery, type: sensor }
+  - { name: imu, type: sensor }
+  - { name: mic, type: sensor }
+  - { name: asr, type: sensor }

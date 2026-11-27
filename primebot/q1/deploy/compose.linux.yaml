@@ -1,0 +1,4 @@
+services:
+  driver:
+    volumes:
+      - "${Q1_PULSE_RUNTIME_DIR:-/run/user/1000/pulse}:/run/q1-pulse:ro"

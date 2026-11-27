@@ -1,0 +1,9 @@
+name: 启元 Q1 探索版
+mcp_port: 15748
+ros_namespace: primebot_q1
+ros:
+  robot_domain_id: 0
+  core_domain_id: 42
+mic:
+  source: alsa_input.platform-aw89403_sound.pro-input-0
+  channels: [5, 6]

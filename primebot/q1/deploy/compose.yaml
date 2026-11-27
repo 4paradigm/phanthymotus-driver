@@ -1,0 +1,18 @@
+services:
+  driver:
+    image: ${Q1_IMAGE}
+    platform: linux/arm64
+    network_mode: host
+    ipc: host
+    restart: unless-stopped
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+    volumes:
+      - "${Q1_CORE_DDS}:/opt/phanthy-motus/dds-local.xml:ro"
+    environment:
+      AGENT_CORE_URL: ${Q1_CORE_URL}
+      FASTRTPS_DEFAULT_PROFILES_FILE: /opt/phanthy-motus/dds-local.xml
+      PULSE_SERVER: "${Q1_PULSE_SERVER:-unix:/run/q1-pulse/native}"
