@@ -7,91 +7,23 @@ rokae-helios:
   security_opt: [no-new-privileges:true]
   tmpfs:
     - /tmp:rw,nosuid,nodev,size=16m
-  # Five colour nodes on the verified Helios host. Identity is checked via sysfs.
-  # Do not mount depth/IR nodes, /dev as a whole, or privileged camera controls.
-  devices:
-    - /dev/video4:/dev/video4:rw
-    - /dev/video12:/dev/video12:rw
-    - /dev/video16:/dev/video16:rw
-    - /dev/video17:/dev/video17:rw
-    - /dev/video18:/dev/video18:rw
-    # The Tegra VI driver opens a free /dev/capture-vi-channelN by path in the
-    # caller's mount namespace when streaming starts; without these nodes the
-    # stream starts but never delivers a frame (dmesg: err -2). Kernel picks the
-    # channel, so all 72 VI channel nodes are mapped. ISP channels are not needed.
-    - /dev/capture-vi-channel0:/dev/capture-vi-channel0:rw
-    - /dev/capture-vi-channel1:/dev/capture-vi-channel1:rw
-    - /dev/capture-vi-channel2:/dev/capture-vi-channel2:rw
-    - /dev/capture-vi-channel3:/dev/capture-vi-channel3:rw
-    - /dev/capture-vi-channel4:/dev/capture-vi-channel4:rw
-    - /dev/capture-vi-channel5:/dev/capture-vi-channel5:rw
-    - /dev/capture-vi-channel6:/dev/capture-vi-channel6:rw
-    - /dev/capture-vi-channel7:/dev/capture-vi-channel7:rw
-    - /dev/capture-vi-channel8:/dev/capture-vi-channel8:rw
-    - /dev/capture-vi-channel9:/dev/capture-vi-channel9:rw
-    - /dev/capture-vi-channel10:/dev/capture-vi-channel10:rw
-    - /dev/capture-vi-channel11:/dev/capture-vi-channel11:rw
-    - /dev/capture-vi-channel12:/dev/capture-vi-channel12:rw
-    - /dev/capture-vi-channel13:/dev/capture-vi-channel13:rw
-    - /dev/capture-vi-channel14:/dev/capture-vi-channel14:rw
-    - /dev/capture-vi-channel15:/dev/capture-vi-channel15:rw
-    - /dev/capture-vi-channel16:/dev/capture-vi-channel16:rw
-    - /dev/capture-vi-channel17:/dev/capture-vi-channel17:rw
-    - /dev/capture-vi-channel18:/dev/capture-vi-channel18:rw
-    - /dev/capture-vi-channel19:/dev/capture-vi-channel19:rw
-    - /dev/capture-vi-channel20:/dev/capture-vi-channel20:rw
-    - /dev/capture-vi-channel21:/dev/capture-vi-channel21:rw
-    - /dev/capture-vi-channel22:/dev/capture-vi-channel22:rw
-    - /dev/capture-vi-channel23:/dev/capture-vi-channel23:rw
-    - /dev/capture-vi-channel24:/dev/capture-vi-channel24:rw
-    - /dev/capture-vi-channel25:/dev/capture-vi-channel25:rw
-    - /dev/capture-vi-channel26:/dev/capture-vi-channel26:rw
-    - /dev/capture-vi-channel27:/dev/capture-vi-channel27:rw
-    - /dev/capture-vi-channel28:/dev/capture-vi-channel28:rw
-    - /dev/capture-vi-channel29:/dev/capture-vi-channel29:rw
-    - /dev/capture-vi-channel30:/dev/capture-vi-channel30:rw
-    - /dev/capture-vi-channel31:/dev/capture-vi-channel31:rw
-    - /dev/capture-vi-channel32:/dev/capture-vi-channel32:rw
-    - /dev/capture-vi-channel33:/dev/capture-vi-channel33:rw
-    - /dev/capture-vi-channel34:/dev/capture-vi-channel34:rw
-    - /dev/capture-vi-channel35:/dev/capture-vi-channel35:rw
-    - /dev/capture-vi-channel36:/dev/capture-vi-channel36:rw
-    - /dev/capture-vi-channel37:/dev/capture-vi-channel37:rw
-    - /dev/capture-vi-channel38:/dev/capture-vi-channel38:rw
-    - /dev/capture-vi-channel39:/dev/capture-vi-channel39:rw
-    - /dev/capture-vi-channel40:/dev/capture-vi-channel40:rw
-    - /dev/capture-vi-channel41:/dev/capture-vi-channel41:rw
-    - /dev/capture-vi-channel42:/dev/capture-vi-channel42:rw
-    - /dev/capture-vi-channel43:/dev/capture-vi-channel43:rw
-    - /dev/capture-vi-channel44:/dev/capture-vi-channel44:rw
-    - /dev/capture-vi-channel45:/dev/capture-vi-channel45:rw
-    - /dev/capture-vi-channel46:/dev/capture-vi-channel46:rw
-    - /dev/capture-vi-channel47:/dev/capture-vi-channel47:rw
-    - /dev/capture-vi-channel48:/dev/capture-vi-channel48:rw
-    - /dev/capture-vi-channel49:/dev/capture-vi-channel49:rw
-    - /dev/capture-vi-channel50:/dev/capture-vi-channel50:rw
-    - /dev/capture-vi-channel51:/dev/capture-vi-channel51:rw
-    - /dev/capture-vi-channel52:/dev/capture-vi-channel52:rw
-    - /dev/capture-vi-channel53:/dev/capture-vi-channel53:rw
-    - /dev/capture-vi-channel54:/dev/capture-vi-channel54:rw
-    - /dev/capture-vi-channel55:/dev/capture-vi-channel55:rw
-    - /dev/capture-vi-channel56:/dev/capture-vi-channel56:rw
-    - /dev/capture-vi-channel57:/dev/capture-vi-channel57:rw
-    - /dev/capture-vi-channel58:/dev/capture-vi-channel58:rw
-    - /dev/capture-vi-channel59:/dev/capture-vi-channel59:rw
-    - /dev/capture-vi-channel60:/dev/capture-vi-channel60:rw
-    - /dev/capture-vi-channel61:/dev/capture-vi-channel61:rw
-    - /dev/capture-vi-channel62:/dev/capture-vi-channel62:rw
-    - /dev/capture-vi-channel63:/dev/capture-vi-channel63:rw
-    - /dev/capture-vi-channel64:/dev/capture-vi-channel64:rw
-    - /dev/capture-vi-channel65:/dev/capture-vi-channel65:rw
-    - /dev/capture-vi-channel66:/dev/capture-vi-channel66:rw
-    - /dev/capture-vi-channel67:/dev/capture-vi-channel67:rw
-    - /dev/capture-vi-channel68:/dev/capture-vi-channel68:rw
-    - /dev/capture-vi-channel69:/dev/capture-vi-channel69:rw
-    - /dev/capture-vi-channel70:/dev/capture-vi-channel70:rw
-    - /dev/capture-vi-channel71:/dev/capture-vi-channel71:rw
+    # Private shm under the read-only /dev bind.
+    - /dev/shm:rw,nosuid,nodev,noexec,size=64m,mode=1777
+  # Camera nodes are reached through a read-only /dev directory bind instead of
+  # per-node `devices:` entries. Per-node entries make Docker refuse to start the
+  # whole container when a node is missing; on Helios the sensor nodes appear a
+  # few seconds after dockerd at boot, which left joints/battery down as well.
+  # The cgroup rules allow only V4L2 (major 81) and the Tegra VI channel nodes
+  # (capture-vi-channel, major 504 on this kernel per /proc/devices). The VI
+  # driver opens a free /dev/capture-vi-channelN by path in the caller's mount
+  # namespace when streaming starts; without them capture yields no frames.
+  # The code picks the five colour nodes by sysfs name and never opens depth/IR.
+  # No privileged mode, no extra capabilities, MKNOD stays dropped (cap_drop ALL).
+  device_cgroup_rules:
+    - "c 81:* rw"
+    - "c 504:* rw"
   volumes:
+    - /dev:/dev:ro
     - /opt/phanthy-motus/dds-local.xml:/opt/phanthy-motus/dds-local.xml:ro
   environment:
     - ROS_DOMAIN_ID=42
