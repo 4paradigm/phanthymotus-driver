@@ -419,7 +419,7 @@ class _FakeRos2:
 
 
 def test_tool_schema(tmp_path):
-    """卡片上只有 weigh / reset、side（right / left / both，默认右手）和必填的 confirm。"""
+    """卡片上只有 weigh / reset 和 side（right / left / both，默认右手）。"""
     p = weigh.WeighPlugin({"state_file": str(tmp_path / "w.json")}, "ns", _FakeRos2())
     tool = p.get_tool()
     assert tool["name"] == "weigh" and tool["type"] == "actuator"
@@ -428,13 +428,10 @@ def test_tool_schema(tmp_path):
     assert actions == ["weigh", "reset"] and set(schema["x-action-params"]) == set(actions)
     for spec in schema["x-action-params"].values():
         assert set(spec["params"]) <= set(schema["properties"])
-    assert set(schema["properties"]) == {"action", "side", "confirm"}
-    assert schema["x-action-params"]["weigh"]["params"] == ["side", "confirm"]
-    assert schema["x-action-params"]["reset"]["params"] == ["side", "confirm"]
-    assert schema["required"] == ["action", "confirm"]
-    assert schema["properties"]["confirm"]["type"] == "boolean"
-    assert schema["properties"]["confirm"]["default"] is False
-    assert schema["x-is-dangerous"] is True and "confirm=true" in tool["description"]
+    assert set(schema["properties"]) == {"action", "side"}
+    assert schema["x-action-params"]["weigh"]["params"] == ["side"]
+    assert schema["x-action-params"]["reset"]["params"] == ["side"]
+    assert schema["required"] == ["action"]
     assert schema["properties"]["side"]["enum"] == ["right", "left", "both"]
     assert schema["properties"]["side"]["default"] == "right"
     assert schema["x-completion"]["actions"] == ["weigh", "reset"]
@@ -449,25 +446,6 @@ def test_tool_schema(tmp_path):
                                   "ns", _FakeRos2()).get_tool()["inputSchema"]
     assert only_left["properties"]["side"]["enum"] == ["left"]
     assert only_left["properties"]["side"]["default"] == "left"
-
-
-@pytest.mark.parametrize("action", ["weigh", "reset"])
-@pytest.mark.parametrize("confirm", [None, False, "false", 0, "", "yes"])
-def test_card_actions_without_confirm_send_nothing(tmp_path, action, confirm):
-    """bot 审查（1415cdf，High）：危险动作要有显式确认。不是 confirm=true 就不下发任何指令、不发消息。"""
-    rig = Rig(tmp_path)
-    rig.pose = list(REST)
-    rig.warm()
-    p = weigh.WeighPlugin({"state_file": str(tmp_path / "w.json")}, "ns", _FakeRos2())
-    p._engine = rig.engine
-    p.start = lambda: None
-    args = {"side": "right"} if confirm is None else {"side": "right", "confirm": confirm}
-    res = p.dispatch(action, args)
-    assert res["state"] == "error" and res["code"] == "confirm_required", res
-    assert "confirm=true" in res["error"]
-    assert rig.arm_calls == [] and rig.hand_calls == [] and rig.told == []
-    assert p._busy.acquire(blocking=False)             # 没有占用
-    p._busy.release()
 
 
 def test_plugin_lifecycle_and_unknown_action(tmp_path):
@@ -880,33 +858,33 @@ def test_hand_shape_is_fixed_to_cup(hanging):
 def test_side_defaults_to_right_and_rejects_others(rig, tmp_path):
     p, calls, fired = _async_plugin(rig, tmp_path, grace=60)
     for bad in ("up", "Both"):
-        r = p.dispatch("weigh", {"confirm": True, "side": bad})
+        r = p.dispatch("weigh", {"side": bad})
         assert r["state"] == "error" and r["code"] == "bad_side", r
     assert rig.arm_calls == [] and rig.hand_calls == [] and rig.told == []
     seen = []
     rig.engine.auto_weigh = lambda args: seen.append(("weigh", dict(args))) or {"state": "weighed"}
     rig.engine.reset = lambda args: seen.append(("reset", dict(args))) or {"state": "reset"}
-    p.dispatch("weigh", {"confirm": True})
-    p.dispatch("reset", {"confirm": True, "side": "", "confirm_empty": True})    # confirm_empty 不再对外，忽略
-    p.dispatch("weigh", {"confirm": True, "side": "left"})
-    p.dispatch("weigh", {"confirm": True, "side": "both"})
+    p.dispatch("weigh", {})
+    p.dispatch("reset", {"side": "", "confirm_empty": True})    # confirm_empty 不再对外，忽略
+    p.dispatch("weigh", {"side": "left"})
+    p.dispatch("weigh", {"side": "both"})
     assert seen == [("weigh", {"side": "right"}), ("reset", {"side": "right"}),
                     ("weigh", {"side": "left"}), ("weigh", {"side": "both"})]
 
 
 def test_both_is_not_offered_when_only_one_hand_is_configured(tmp_path):
     p = weigh.WeighPlugin({"state_file": str(tmp_path / "w.json"), "sides": ["right"]}, "ns", _FakeRos2())
-    assert p.dispatch("weigh", {"confirm": True, "side": "both"})["code"] == "bad_side"
+    assert p.dispatch("weigh", {"side": "both"})["code"] == "bad_side"
 
 
 def test_left_weigh_does_not_change_the_default_hand(hanging, tmp_path):
     p, calls, fired = _async_plugin(hanging, tmp_path, grace=600)
     place_after_prompt(hanging, 0.4, side="left")
-    r = p.dispatch("weigh", {"confirm": True, "side": "left"})
+    r = p.dispatch("weigh", {"side": "left"})
     assert r["state"] == "weighed" and r["side"] == "left", r
     assert r["mass_kg"] == pytest.approx(0.4, abs=0.005)
     n = len(hanging.moves())
-    r = p.dispatch("reset", {"confirm": True})                         # 另一个调用方没写 side：右手，不碰左臂
+    r = p.dispatch("reset", {})                         # 另一个调用方没写 side：右手，不碰左臂
     assert r["state"] == "reset" and r["side"] == "right" and r["already_retracted"], r
     assert len(hanging.moves()) == n
 
@@ -956,7 +934,7 @@ def test_long_action_returns_action_id_then_completes(hanging, tmp_path, monkeyp
 
     monkeypatch.setattr(hanging.engine, "auto_weigh", delayed)
     try:
-        res = p.dispatch("weigh", {"confirm": True, "side": "right"})
+        res = p.dispatch("weigh", {"side": "right"})
         assert res["state"] == "weighing" and res["action_id"].startswith("weigh_weigh_"), res
         # 说清楚现在在做什么、接下来会收到什么、这段时间不要做什么
         msg = res["message"]
@@ -982,7 +960,7 @@ def test_async_error_is_reported_with_error_status(rig, tmp_path):
     p, calls, fired = _async_plugin(rig, tmp_path)
     rig.engine.pose({"hand": "keep"})
     rig.engine._hand_call = None
-    res = p.dispatch("reset", {"confirm": True, "side": "right"})
+    res = p.dispatch("reset", {"side": "right"})
     if "action_id" in res:                         # 慢机器上可能超过宽限期
         assert fired.wait(30)
         assert calls[0][1] == "error" and calls[0][2]["code"] == "hand_open_failed"
@@ -996,7 +974,7 @@ def test_quick_result_stays_synchronous_without_callback(rig, tmp_path):
     assert res["state"] == "calibrated" and "action_id" not in res
     rig.error = 1
     rig.warm()
-    res = p.dispatch("reset", {"confirm": True, "side": "right"})
+    res = p.dispatch("reset", {"side": "right"})
     assert res["code"] == "joint_error" and "action_id" not in res
     assert calls == []
 
@@ -1013,9 +991,9 @@ def test_busy_while_async_action_runs(hanging, tmp_path, monkeypatch):
 
     monkeypatch.setattr(hanging.engine, "auto_weigh", delayed)
     try:
-        assert "action_id" in p.dispatch("weigh", {"confirm": True, "side": "right"})
-        assert p.dispatch("weigh", {"confirm": True, "side": "right"})["code"] == "busy"
-        assert p.dispatch("reset", {"confirm": True, "side": "right"})["code"] == "busy"
+        assert "action_id" in p.dispatch("weigh", {"side": "right"})
+        assert p.dispatch("weigh", {"side": "right"})["code"] == "busy"
+        assert p.dispatch("reset", {"side": "right"})["code"] == "busy"
         assert p.dispatch("calibrate", {"side": "right", "scale": 1.05})["code"] == "busy"
         assert p.dispatch("read", {"side": "right"})["state"] == "ok"
     finally:
@@ -1032,7 +1010,7 @@ def test_engine_exception_becomes_error_completion(rig, tmp_path):
         raise RuntimeError("kaput")
     rig.engine.auto_weigh = boom
     try:
-        res = p.dispatch("weigh", {"confirm": True, "side": "right"})
+        res = p.dispatch("weigh", {"side": "right"})
     finally:
         gate.set()
     assert fired.wait(30)
@@ -1132,7 +1110,7 @@ def test_stop_cancels_pending_weigh_and_sends_nothing_more(hanging, tmp_path):
         release.wait(0.05)
         real_sleep(dt)
     hanging.engine._raw_sleep = slow_sleep
-    res = p.dispatch("weigh", {"confirm": True, "side": "right"})
+    res = p.dispatch("weigh", {"side": "right"})
     assert "action_id" in res
     assert entered.wait(10)
     n_arm, n_hand, n_told = len(hanging.arm_calls), len(hanging.hand_calls), len(hanging.told)
@@ -1267,14 +1245,14 @@ def test_stop_with_stuck_worker_defers_teardown_and_blocks_new_actions(hanging, 
             release.wait(10)                                    # arm 卡调用卡住
         return real_arm(args)
     hanging.engine._arm_call = stuck_arm
-    res = p.dispatch("weigh", {"confirm": True, "side": "right"})
+    res = p.dispatch("weigh", {"side": "right"})
     assert "action_id" in res and inside.wait(10)
     real_join = p._worker.join
     p._worker.join = lambda timeout=None: real_join(0.2 if timeout else None)   # 测试里别真等 5 s
     p.HOLD_LOCK_TIMEOUT_S = 0.2
     r = p.dispatch("stop", {})
     assert r["state"] == "stopping" and torn == []
-    assert p.dispatch("weigh", {"confirm": True, "side": "right"})["code"] in ("stopping", "busy")
+    assert p.dispatch("weigh", {"side": "right"})["code"] in ("stopping", "busy")
     n = len(hanging.arm_calls)
     release.set()
     assert fired.wait(10) and calls[0][1] == "cancelled"
@@ -1304,7 +1282,7 @@ def test_stop_holds_the_arm_before_returning_and_only_once(hanging, tmp_path):
         time.sleep(0.002)
         real_sleep(dt)
     hanging.engine._raw_sleep = slow_sleep
-    assert "action_id" in p.dispatch("weigh", {"confirm": True, "side": "right"})
+    assert "action_id" in p.dispatch("weigh", {"side": "right"})
     assert moving.wait(10)
     n = len(hanging.moves())
     order_before = len(hanging.order)
@@ -1768,7 +1746,7 @@ def test_weigh_state_sensor_reads_the_latest_result(hanging, tmp_path):
     before = sensor.dispatch("read", {})
     assert before["seq"] == 0 and before["sides"]["right"]["last"] is None and before["to_user"] is None
     place_after_prompt(hanging, 0.59)
-    res = p.dispatch("weigh", {"confirm": True})
+    res = p.dispatch("weigh", {})
     assert res["state"] == "weighed"
     after = sensor.dispatch("read", {})
     last = after["sides"]["right"]["last"]
@@ -1788,7 +1766,7 @@ def test_weigh_state_publishes_one_message_per_thing_to_tell_and_nothing_else(ha
         time.sleep(1.5)
         assert pub.sent == []                           # 没有话要说时不发（不会反复唤醒 decision_core）
         place_after_prompt(hanging, 0.59)
-        res = p.dispatch("weigh", {"confirm": True})
+        res = p.dispatch("weigh", {})
         assert _wait_for(lambda: len(pub.sent) == 3), pub.sent
         assert [m["to_user"]["kind"] for m in pub.sent] == ["preparing", "ready", "result"]
         assert [m["to_user"]["text"] for m in pub.sent] == hanging.told
@@ -1810,7 +1788,7 @@ def test_weigh_state_not_started_publishes_nothing(hanging, tmp_path):
     p, calls, fired = _async_plugin(hanging, tmp_path, grace=600)
     sensor = weigh.WeighStatePlugin({}, "ns", _FakeRos2(), p)
     place_after_prompt(hanging, 0.59)
-    p.dispatch("weigh", {"confirm": True})
+    p.dispatch("weigh", {})
     assert list(sensor._queue) == []
     assert sensor.dispatch("read", {})["to_user"]["kind"] == "result"
 

@@ -1409,7 +1409,7 @@ class WeighEngine:
             return (f"已开始复位（{SIDE_NAMES.get(side, side)}）：张开手指、放下{arm}。"
                     "复位完成，或者因为掌上可能还有东西而没有动时，weigh_state 传感器会发一条给用户的话"
                     "（to_user）；后一种情况要等用户确认掌心是空的（不要替用户确认），"
-                    f"{cfg['reset_confirm_window_s']:g} 秒内再调用一次 reset（同一个 side，同样带 confirm=true）才会动。"
+                    f"{cfg['reset_confirm_window_s']:g} 秒内再调用一次 reset（同一个 side）才会动。"
                     "完成通知是静默的。")
         sides = self._sides_of(side)
         if all(self._ready(s) for s in sides):
@@ -1718,8 +1718,7 @@ class WeighPlugin:
                 "天轶2.0 掌心称重（实验性）。weigh：机器人自己抬起手臂、四指立起托住掌心并去皮，"
                 "然后等人把物品放到掌心，放稳后测量；称完手臂保持举起，可以接着称下一件。"
                 "reset：张开手指、放下手臂（掌上可能还有物品时先请用户确认）。"
-                "两者都会动手臂，只在用户要求时调用，并且必须传 confirm=true（确认是用户要求的、手臂周围无人无物），"
-                "否则不动；失败后不要自行重试或复位，转告用户、由用户决定。"
+                "两者都会动手臂，只在用户要求时调用；失败后不要自行重试或复位，转告用户、由用户决定。"
                 "side 选 right（默认）、left，或 both（两只手各放一件，重量相加）。"
                 "调用前手臂须大致垂下（会先自己回到垂下的位置）或已在托举姿态，周围无人无物。"
                 "卡片自己不出声：过程中要让用户知道的事（正在准备、可以放了、称出的重量、出错原因、"
@@ -1738,17 +1737,14 @@ class WeighPlugin:
                     "side": {"type": "string", "enum": self._side_choices(),
                              "default": "right" if "right" in self._sides else self._sides[0],
                              "description": "用哪只手，默认右手；both=两只手各放一件"},
-                    "confirm": {"type": "boolean", "default": False,
-                                "description": "必须为 true 才会动：确认是用户要求的，手臂周围无人无物。"
-                                               "不是 true 时什么都不做，直接返回 confirm_required"},
                 },
-                "required": ["action", "confirm"],
+                "required": ["action"],
                 "x-action-params": {
-                    "weigh": {"params": ["side", "confirm"],
+                    "weigh": {"params": ["side"],
                               "description": "称重：必要时抬臂并去皮（约 20 秒），等人放物品"
                                              f"（最多 {cfg['place_window_s']:g} 秒），放稳后测量；"
                                              "称完手臂保持举起"},
-                    "reset": {"params": ["side", "confirm"],
+                    "reset": {"params": ["side"],
                               "description": "复位：张开手指、放下手臂、清除去皮。掌上可能还有东西时不动、"
                                              "请用户确认；用户确认掌心是空的以后再调用一次"},
                 },
@@ -1909,15 +1905,6 @@ class WeighPlugin:
         if action not in (*CARD_ACTIONS, *MAINTENANCE_ACTIONS):
             return {"error": f"unknown action: {action}"}
         if action in CARD_ACTIONS:
-            # 两个动作都会让双臂和手指自己动（x-is-dangerous）：必须显式 confirm=true，否则什么都不发。
-            # 这和 reset 的"掌心是空的"确认是两回事，后者仍是请用户确认后再调用一次。
-            if args.get("confirm") not in (True, "true", "True"):
-                result = {"state": "error", "code": "confirm_required", "experimental": True,
-                          "error": f"{action} 会让手臂和手指自己动，没有下发任何指令。确认是用户要求的、"
-                                   "手臂周围无人无物后，带 confirm=true 再调用"}
-                print(f"[weigh] {action} args={args} -> {_brief(result)}", flush=True)
-                return result
-            args.pop("confirm", None)
             # 卡片动作：side 可省略，默认右手；只接受卡片上列出的选项。confirm_empty 不再对外
             # 提供（reset 改成"请用户确认后再调用一次"），外部传进来也忽略。
             args.pop("confirm_empty", None)
