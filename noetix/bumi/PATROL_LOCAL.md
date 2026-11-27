@@ -25,7 +25,7 @@ python noetix/bumi/examples/patrol-local-demo.py --scenario raw-error
 2. `preflight` 查看电量、模式、关节和相机检查结果。
 3. `begin` 传入本轮 `run_id`，检查通过后创建巡检会话。
 4. `plan`、`read` 查看点位及正常标准。默认基线为 `fixed-passage` / `clear-walkway`。
-5. `inspect` 传入 `point_id`，复查状态并拍照，返回 `inspection_id`、保存位置和检查标准。
+5. `inspect` 传入 `point_id`，复查状态后返回 `queued` 和 `action_id`。拍照完成后，Agent Core 收到对应的 ACP 结果，其中包含 `inspection_id`、照片位置和检查标准。直接调用 MCP 时，也可在 `info.last_inspection` 中按 `action_id` 查结果。
 6. `record` 传入 `inspection_id`、`check_id`、`decision` 和 `assessment`。判断值为 `normal`、`deviation` 或 `needs_review`。Agent 或操作员负责依据刚采集的图像填写真实结论。
 7. `finish` 生成本地报告。检查项不齐时返回 `incomplete`，任意偏离或待复核项都会使 `all_normal=false`。再次调用返回同一份完成报告。
 8. `stop` 结束本卡会话并释放自己的订阅。

@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 import importlib.util
 import json
 from pathlib import Path
+from queue import Queue
 import sys
 import threading
 
@@ -28,6 +29,11 @@ class Capture:
         self.age = 0.1
         self.photos = 0
         self.timestamp = lambda: datetime.now(timezone.utc).isoformat()
+        self.completions = Queue()
+
+    def notify_completion(self, action_id, status, result, tool):
+        self.completions.put({"action_id": action_id, "status": status, "result": result, "tool": tool})
+
     def dispatch(self, action, args):
         if action == "info":
             return {"ok": self.available, "latest_frame_age_s": self.age}
@@ -58,7 +64,7 @@ def setup_card(tmp_path):
     telemetry = PatrolTelemetry(clock=clock)
     capture = Capture()
     card = PatrolPlugin({"report_dir": str(tmp_path / "reports")}, "test", None, capture,
-                        telemetry=telemetry, input_factory=Inputs)
+                        notify_completion=capture.notify_completion, telemetry=telemetry, input_factory=Inputs)
     feed(telemetry)
     return card, telemetry, capture, clock
 
@@ -67,8 +73,19 @@ def begin(card, run_id="round-1"):
     return card.dispatch("begin", {"run_id": run_id})
 
 
-def inspect(card):
-    return card.dispatch("inspect", {"point_id": "fixed-passage"})
+def inspection_result(capture, accepted, status="completed"):
+    assert accepted["state"] == "queued"
+    assert "inspection_id" not in accepted
+    completion = capture.completions.get(timeout=3)
+    assert completion["action_id"] == accepted["action_id"]
+    assert completion["status"] == status
+    assert completion["tool"] == "patrol"
+    return completion["result"]
+
+
+def inspect(card, capture, status="completed"):
+    accepted = card.dispatch("inspect", {"point_id": "fixed-passage"})
+    return inspection_result(capture, accepted, status)
 
 
 def record(card, inspection, decision="normal", **overrides):
@@ -130,7 +147,7 @@ def test_full_normal_patrol_captures_assesses_and_writes_report_once(setup_card)
     card.start()
     assert begin(card)["state"] == "active"
     assert begin(card, "another")["state"] == "busy"
-    observation = inspect(card)
+    observation = inspect(card, capture)
     assert observation["state"] == "awaiting_assessment"
     assert capture.photos == 1
     result = record(card, observation)
@@ -160,7 +177,7 @@ def test_unknown_or_stale_photo_time_never_becomes_normal(setup_card, timestamp)
     card, telemetry, capture, clock = setup_card
     capture.timestamp = lambda: timestamp
     begin(card)
-    result = record(card, inspect(card))
+    result = record(card, inspect(card, capture))
     assert result["status"] == "needs_review"
     assert result["agent_decision"] == "normal"
     assert card.dispatch("finish", {})["all_normal"] is False
@@ -169,7 +186,7 @@ def test_unknown_or_stale_photo_time_never_becomes_normal(setup_card, timestamp)
 def test_state_changes_after_capture_force_review(setup_card):
     card, telemetry, capture, clock = setup_card
     begin(card)
-    observation = inspect(card)
+    observation = inspect(card, capture)
     feed(telemetry, soc=1)
     result = record(card, observation)
     assert result["status"] == "needs_review"
@@ -179,7 +196,7 @@ def test_state_changes_after_capture_force_review(setup_card):
 def test_client_cannot_replace_server_owned_capture_reference(setup_card):
     card, telemetry, capture, clock = setup_card
     begin(card)
-    result = record(card, inspect(card), "deviation", evidence={"reference": "forged"})
+    result = record(card, inspect(card, capture), "deviation", evidence={"reference": "forged"})
     assert result["evidence"]["reference"] == "synthetic:photo-1"
     assert result["status"] == "deviation_report"
     assert card.dispatch("finish", {})["all_normal"] is False
@@ -194,7 +211,9 @@ def test_failed_capture_never_completes_checks(setup_card):
             raise RuntimeError("camera disconnected")
         return original(action, args)
     capture.dispatch = broken
-    assert inspect(card)["state"] == "needs_review"
+    result = inspect(card, capture, status="error")
+    assert result["state"] == "needs_review"
+    assert result["error"] == "capture_failed"
     assert card.dispatch("finish", {})["state"] == "incomplete"
 
 
@@ -211,24 +230,36 @@ def test_stop_discards_late_capture_and_releases_only_own_inputs(setup_card):
             assert release.wait(2)
         return original(action, args)
     capture.dispatch = delayed
-    results = []
-    thread = threading.Thread(target=lambda: results.append(inspect(card)))
-    thread.start()
-    assert entered.wait(2)
-    card.stop()
-    release.set()
-    thread.join(2)
-    assert not thread.is_alive()
-    assert inputs.closed
-    assert results[0]["state"] == "cancelled"
-    assert card.dispatch("info", {})["records"] == []
+    accepted = card.dispatch("inspect", {"point_id": "fixed-passage"})
+    try:
+        assert accepted["state"] == "queued"
+        assert entered.wait(2)
+        assert card.dispatch("info", {})["active_inspection"] == accepted["action_id"]
+        another = card.dispatch("inspect", {"point_id": "fixed-passage"})
+        assert another["state"] == "busy" and "action_id" not in another
+        assert card.dispatch("finish", {})["state"] == "busy"
+        assert card.dispatch("stop", {})["state"] == "idle"
+        assert inputs.closed
+        feed(telemetry)
+        begin(card, run_id="after-stop")
+    finally:
+        release.set()
+    result = inspection_result(capture, accepted, status="cancelled")
+    assert result["state"] == "cancelled" and "inspection_id" not in result
+    info = card.dispatch("info", {})
+    assert info["active_inspection"] is None
+    assert info["last_inspection"]["action_id"] == accepted["action_id"]
+    assert info["records"] == []
+    another = card.dispatch("inspect", {"point_id": "fixed-passage"})
+    assert another["action_id"] != accepted["action_id"]
+    assert inspection_result(capture, another)["state"] == "awaiting_assessment"
 
 
 def test_report_save_failure_cleans_temporary_file_and_can_retry(setup_card, monkeypatch):
     import patrol_card
     card, telemetry, capture, clock = setup_card
     begin(card)
-    record(card, inspect(card))
+    record(card, inspect(card, capture))
     replace = patrol_card.os.replace
     def fail(*args):
         raise OSError("simulated disk failure")
@@ -246,6 +277,8 @@ def test_only_one_patrol_card_and_internal_status_actions_are_declared(setup_car
     assert card.PREFIX == spec["name"] == "patrol"
     assert "preflight" in spec["inputSchema"]["x-action-params"]
     assert "inspect" in spec["inputSchema"]["x-action-params"]
+    assert spec["inputSchema"]["x-completion"]["actions"] == ["inspect"]
+    assert spec["inputSchema"]["x-completion"]["timeout"] > 5
     assert "evidence" not in spec["inputSchema"]["properties"]
     with pytest.raises(ValueError):
         card.dispatch("begin", {"run_id": "../escape"})
@@ -260,8 +293,10 @@ def test_real_bundle_registration_and_http_patrol_workflow(setup_card, monkeypat
     fake_ros = SimpleNamespace(executors=SimpleNamespace())
     monkeypatch.setitem(sys.modules, "rclpy", fake_ros)
     monkeypatch.setitem(sys.modules, "rclpy.executors", fake_ros.executors)
+    monkeypatch.setitem(sys.modules, "device", SimpleNamespace(_acp_notify=capture.notify_completion))
     factory_calls = []
-    def factory(config, namespace, executor, capture_plugin):
+    def factory(config, namespace, executor, capture_plugin, *, notify_completion):
+        assert notify_completion == capture.notify_completion
         factory_calls.append((config, capture_plugin))
         return card
     monkeypatch.setattr(patrol_card, "PatrolPlugin", factory)
@@ -274,6 +309,15 @@ def test_real_bundle_registration_and_http_patrol_workflow(setup_card, monkeypat
     server = ThreadingHTTPServer(("127.0.0.1", 0), main.make_handler())
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+    release = threading.Event()
+    original = capture.dispatch
+
+    def delayed(action, args):
+        if action == "capture_photo":
+            assert release.wait(6)
+        return original(action, args)
+
+    capture.dispatch = delayed
     try:
         def rpc(method, params):
             request = Request(f"http://127.0.0.1:{server.server_port}/mcp",
@@ -282,18 +326,24 @@ def test_real_bundle_registration_and_http_patrol_workflow(setup_card, monkeypat
                               headers={"Content-Type": "application/json"})
             with urlopen(request, timeout=3) as response:
                 return json.load(response)
-        assert [tool["name"] for tool in rpc("tools/list", {})["result"]["tools"]] == ["patrol"]
+        [tool] = rpc("tools/list", {})["result"]["tools"]
+        assert tool["name"] == "patrol"
+        assert tool["inputSchema"]["x-completion"]["actions"] == ["inspect"]
         def call(arguments):
             response = rpc("tools/call", {"name": "patrol", "arguments": arguments})
             return json.loads(response["result"]["content"][0]["text"])
         assert call({"action": "begin", "run_id": "http-round"})["state"] == "active"
-        observation = call({"action": "inspect", "point_id": "fixed-passage"})
+        accepted = call({"action": "inspect", "point_id": "fixed-passage"})
+        assert call({"action": "info"})["active_inspection"] == accepted["action_id"]
+        release.set()
+        observation = inspection_result(capture, accepted)
         result = call({"action": "record", "inspection_id": observation["inspection_id"],
                        "check_id": "clear-walkway", "decision": "normal", "assessment": "合成 HTTP 巡检通过。"})
         assert result["status"] == "normal"
         assert call({"action": "finish"})["all_normal"] is True
         assert Path(call({"action": "finish"})["report_path"]).is_file()
     finally:
+        release.set()
         server.shutdown()
         server.server_close()
         thread.join(3)
@@ -309,7 +359,8 @@ def test_patrol_sources_and_default_baseline_are_packaged():
     assert "COPY patrol_baseline.py patrol_card.py /work/" in docker
     assert "patrol-baseline-bumi-fixed.json" in docker
     assert "report_dir: /opt/phanthy-motus/data/patrol" in (BUMI / "config.yaml").read_text(encoding="utf-8")
-    assert "/opt/phanthy-motus/data:/opt/phanthy-motus/data" in (BUMI / "deploy/service.yml").read_text()
+    assert "/opt/phanthy-motus/data:/opt/phanthy-motus/data" in (
+        BUMI / "deploy/service.yml").read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize(("source_stamp", "source_seconds"), [

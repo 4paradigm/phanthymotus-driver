@@ -16,6 +16,8 @@ from patrol_baseline import PatrolBaselinePlugin, _id, _text
 
 
 CARD = "patrol"
+INSPECTION_TIMEOUT_S = 20
+ACP_HANDOFF_S = 0.25
 
 
 def number(value, label):
@@ -127,10 +129,11 @@ class PatrolPlugin:
     PREFIX = CARD
 
     def __init__(self, plugin_config, namespace, executor, capture_plugin=None,
-                 *, telemetry=None, input_factory=ROSPatrolInputs):
+                 *, notify_completion, telemetry=None, input_factory=ROSPatrolInputs):
         self._baseline = PatrolBaselinePlugin(plugin_config, namespace, executor)
         self._namespace, self._executor = namespace, executor
         self._capture = capture_plugin
+        self._notify_completion = notify_completion
         self.telemetry = telemetry or PatrolTelemetry()
         self._input_factory = input_factory
         self._inputs = None
@@ -140,7 +143,8 @@ class PatrolPlugin:
             raise ValueError("invalid patrol readiness thresholds")
         self._report_dir = Path(plugin_config.get("report_dir", "data/patrol"))
         self._lock = threading.RLock()
-        self._inspection_lock = threading.Lock()
+        self._inspection = None
+        self._last_inspection = None
         self._generation = 0
         self._run = None
         self._observations = {}
@@ -161,13 +165,15 @@ class PatrolPlugin:
             "inspection_id": {"type": "string"},
             "decision": {"type": "string", "enum": ["normal", "deviation", "needs_review"]},
         })
+        schema["x-completion"] = {"actions": ["inspect"], "timeout": INSPECTION_TIMEOUT_S}
         schema["x-action-params"] = {
             "start": {"params": []}, "stop": {"params": []}, "info": {"params": []},
             "preflight": {"params": []},
             "begin": {"params": ["run_id"], "required": ["run_id"]},
             "plan": {"params": []},
             "read": {"params": ["point_id"], "required": ["point_id"]},
-            "inspect": {"params": ["point_id"], "required": ["point_id"]},
+            "inspect": {"params": ["point_id"], "required": ["point_id"],
+                        "description": "排队拍照，完成结果提供 inspection_id。"},
             "record": {"params": ["inspection_id", "check_id", "decision", "assessment", "priority"],
                        "required": ["inspection_id", "check_id", "decision", "assessment"]},
             "finish": {"params": []},
@@ -180,9 +186,10 @@ class PatrolPlugin:
                 self._inputs = self._input_factory(self._namespace, self._executor, self.telemetry)
         return {"state": "ready", "hardware_command": False}
 
-    def stop(self):
+    def stop(self, *, wait=True):
         with self._lock:
             self._generation += 1
+            inspection = self._inspection
             inputs, self._inputs = self._inputs, None
             self._run = None
             self._observations.clear()
@@ -191,6 +198,9 @@ class PatrolPlugin:
         if inputs is not None:
             inputs.close()
         self.telemetry.clear()
+        if wait and inspection is not None:
+            # Give the worker time to send cancellation before bundle shutdown.
+            inspection["thread"].join(timeout=6)
         return {"state": "idle", "hardware_command": False}
 
     def _preflight(self):
@@ -215,7 +225,7 @@ class PatrolPlugin:
         if action == "start":
             return self.start()
         if action == "stop":
-            return self.stop()
+            return self.stop(wait=False)
         if action == "preflight":
             return self._preflight()
         if action in ("plan", "read"):
@@ -224,6 +234,8 @@ class PatrolPlugin:
             with self._lock:
                 return {"state": "active" if self._run else "idle", "run_id": self._run,
                         "records": deepcopy(list(self._records.values())),
+                        "active_inspection": self._inspection["action_id"] if self._inspection else None,
+                        "last_inspection": deepcopy(self._last_inspection),
                         "preflight": self._preflight(), "hardware_command": False,
                         "topic_in": [], "topic_out": []}
         if action == "begin":
@@ -243,41 +255,65 @@ class PatrolPlugin:
                 return {"state": "active", "run_id": run_id, "preflight": check,
                         "plan": self._baseline.dispatch("plan", {}), "hardware_command": False}
         if action == "inspect":
-            if not self._inspection_lock.acquire(blocking=False):
-                return {"state": "busy", "hardware_command": False}
-            try:
-                return self._inspect(args)
-            finally:
-                self._inspection_lock.release()
+            return self._start_inspection(args)
         if action == "record":
             return self._record(args)
         if action == "finish":
             return self._finish()
         return None
 
-    def _inspect(self, args):
+    def _start_inspection(self, args):
         with self._lock:
+            if self._inspection is not None:
+                return {"state": "busy", "reason": "capture_in_progress", "hardware_command": False}
             if self._run is None or self._finished:
                 return {"state": "error", "error": "begin an active patrol first"}
             point = self._baseline.dispatch("read", args)
             check = self._preflight()
             if check["state"] != "ready":
                 return check
-            generation = self._generation
+            action_id = f"{CARD}_inspect_{uuid.uuid4().hex}"
+            notify_after = time.monotonic() + ACP_HANDOFF_S
+            thread = threading.Thread(target=self._inspect_worker,
+                                      args=(action_id, self._generation, point, notify_after),
+                                      daemon=True, name="bumi_patrol_inspect")
+            self._inspection = {"action_id": action_id, "thread": thread}
+            try:
+                thread.start()
+            except RuntimeError:
+                self._inspection = None
+                raise
+        return {"state": "queued", "action_id": action_id, "hardware_command": False}
+
+    def _inspect_worker(self, action_id, generation, point, notify_after):
         try:
             capture = self._capture.dispatch("capture_photo", {})
+            if not isinstance(capture, dict):
+                raise TypeError("expected a photo capture result")
         except Exception as exc:
             capture = {"ok": False, "error": str(exc)}
+        # A cached frame can finish before Core receives the MCP action ID.
+        # Allow a short handoff for Core to register that ID before posting.
+        remaining = notify_after - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
         with self._lock:
             if generation != self._generation:
-                return {"state": "cancelled", "hardware_command": False}
-            if capture.get("ok") is not True:
-                return {"state": "needs_review", "error": "capture_failed", "capture": capture}
-            inspection_id = uuid.uuid4().hex
-            record = {"inspection_id": inspection_id, "point": point, "capture": deepcopy(capture)}
-            self._observations[inspection_id] = record
-            return {"state": "awaiting_assessment", "inspection_id": inspection_id,
-                    "point": point, "capture": capture, "hardware_command": False}
+                status = "cancelled"
+                result = {"state": "cancelled", "hardware_command": False}
+            elif capture.get("ok") is not True:
+                status = "error"
+                result = {"state": "needs_review", "error": "capture_failed",
+                          "capture": capture, "hardware_command": False}
+            else:
+                status = "completed"
+                inspection_id = uuid.uuid4().hex
+                result = {"state": "awaiting_assessment", "inspection_id": inspection_id,
+                          "point": point, "capture": capture, "hardware_command": False}
+                self._observations[inspection_id] = deepcopy(result)
+            self._last_inspection = {"action_id": action_id, "status": status, "result": deepcopy(result)}
+            self._inspection = None
+        self._notify_completion(action_id, status, result, CARD)
 
     def _record(self, args):
         with self._lock:
@@ -323,6 +359,8 @@ class PatrolPlugin:
                 return {"state": "error", "error": "no active patrol"}
             if self._finished is not None:
                 return deepcopy(self._finished)
+            if self._inspection is not None:
+                return {"state": "busy", "reason": "capture_in_progress"}
             plan = self._baseline.dispatch("plan", {})
             expected = []
             for point in plan["points"]:

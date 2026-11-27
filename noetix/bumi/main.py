@@ -215,9 +215,11 @@ class BumiDeviceBundle:
             print("[bundle] LiveStreamPlugin loaded")
 
         if plugins_cfg.get("patrol", {}).get("enabled", False):
+            from device import _acp_notify
             from patrol_card import PatrolPlugin
             self._plugins.append(PatrolPlugin(
-                plugins_cfg["patrol"], namespace, executor, capture_plugin))
+                plugins_cfg["patrol"], namespace, executor, capture_plugin,
+                notify_completion=_acp_notify))
             print("[bundle] PatrolPlugin loaded")
         elif plugins_cfg.get("patrol_baseline", {}).get("enabled", False):
             from patrol_baseline import PatrolBaselinePlugin

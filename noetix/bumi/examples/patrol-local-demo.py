@@ -3,6 +3,7 @@ import argparse
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+from queue import Queue
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -32,12 +33,16 @@ def main():
         "joint_states": [{"motor_id": i, "velocity": 0, "error": 1 if options.scenario == "raw-error" else 0}
                          for i in range(21)],
     })
-    card = PatrolPlugin({"report_dir": options.report_dir}, "local", None,
-                        SyntheticCapture(), telemetry=telemetry)
+    completions = Queue()
+    card = PatrolPlugin({"report_dir": options.report_dir}, "local", None, SyntheticCapture(),
+                        notify_completion=lambda *event: completions.put(event), telemetry=telemetry)
     started = card.dispatch("begin", {"run_id": "synthetic-demo"})
     output = {"environment": "synthetic_local_demo", "begin": started}
     if started["state"] == "active":
-        inspection = card.dispatch("inspect", {"point_id": "fixed-passage"})
+        accepted = card.dispatch("inspect", {"point_id": "fixed-passage"})
+        action_id, status, inspection, _ = completions.get(timeout=5)
+        if action_id != accepted.get("action_id") or status != "completed":
+            raise RuntimeError(f"Synthetic capture failed: {inspection}")
         decision = "deviation" if options.scenario == "deviation" else "normal"
         output["record"] = card.dispatch("record", {
             "inspection_id": inspection["inspection_id"], "check_id": "clear-walkway",
