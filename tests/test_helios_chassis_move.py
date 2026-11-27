@@ -270,6 +270,19 @@ def test_tool_contract_matches_guarded_base_drive():
     assert "vy" in lateral.get_tools()[0]["inputSchema"]["properties"]
 
 
+def test_lateral_follows_deployment_variable(monkeypatch):
+    monkeypatch.setenv("HELIOS_CHASSIS_ALLOW_LATERAL", "1")
+    move, _, _ = card()
+    schema = move.get_tools()[0]["inputSchema"]
+    assert "vy" in schema["properties"] and schema["x-action-params"]["move"]["params"] == ["vx", "vy", "vyaw", "duration_s"]
+    assert move.dispatch("info", {})["limits"]["lateral_enabled"] is True
+    monkeypatch.setenv("HELIOS_CHASSIS_ALLOW_LATERAL", "0")
+    move, _, _ = card({**CONFIG, "chassis_allow_lateral": True})  # the variable wins over config
+    assert "vy" not in move.get_tools()[0]["inputSchema"]["properties"]
+    with pytest.raises(ValueError, match="HELIOS_CHASSIS_ALLOW_LATERAL"):
+        move.dispatch("move", {"vy": 0.05, "duration_s": 1})
+
+
 @pytest.mark.parametrize("args, match", [
     ({"vx": 0.1}, "duration_s"),
     ({"vx": 0.1, "duration_s": 0}, "duration_s"),

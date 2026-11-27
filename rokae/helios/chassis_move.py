@@ -244,7 +244,9 @@ class HeliosChassisMove:
             raise ValueError(f"chassis_max_linear_m_s must be in (0, {HARD_MAX_LINEAR_M_S}]")
         if not 0 < self._max_angular_deg <= HARD_MAX_ANGULAR_DEG_S:
             raise ValueError(f"chassis_max_angular_deg_s must be in (0, {HARD_MAX_ANGULAR_DEG_S}]")
-        self._allow_lateral = bool(config.get("chassis_allow_lateral", False))
+        lateral = os.environ.get("HELIOS_CHASSIS_ALLOW_LATERAL")
+        # Swerve-base sideways motion: off unless the deployment opts in, like movement itself.
+        self._allow_lateral = (lateral == "1") if lateral is not None else bool(config.get("chassis_allow_lateral", False))
         enabled = os.environ.get("HELIOS_CHASSIS_MOTION_ENABLED")
         # Off unless the deployment opts in: charging interlock, controller command timeout and
         # obstacle-avoidance behaviour under SDK speed control are not yet verified.
@@ -346,7 +348,7 @@ class HeliosChassisMove:
         vx = _limit(_number(args, "vx"), self._max_linear, "vx", "m/s")
         vy = _number(args, "vy")
         if vy and not self._allow_lateral:
-            raise ValueError("lateral movement (vy) is disabled by chassis_allow_lateral")
+            raise ValueError("lateral movement (vy) is disabled (chassis_allow_lateral / HELIOS_CHASSIS_ALLOW_LATERAL)")
         vy = _limit(vy, self._max_linear, "vy", "m/s")
         vyaw = _limit(_number(args, "vyaw"), self._max_angular_deg, "vyaw", "deg/s")
         if vx == 0 and vy == 0 and vyaw == 0:

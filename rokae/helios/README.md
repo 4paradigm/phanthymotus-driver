@@ -53,7 +53,7 @@
 
 ## 底盘移动 `base_drive`
 
-与 AgileX Bunker 的 `base_drive` 同一契约：`move(vx, vy, vyaw, duration_s)` 必须给时长，到时自动停车；`stop_move` 立即停车（画布可见；Core 会隐藏系统动作 `stop`，`stop` 仍保留供项目停止时调用）；`info` 返回限速、SDK 连接与底盘异常等级。`x-completion` 经 Agent Core ACP 回报 completed / cancelled / error，`x-resource: base`。默认上限 0.2 m/s、15°/s、10 s（代码硬上限 0.5 m/s、30°/s，配置不能超过）；横移 `vy` 默认关闭。
+与 AgileX Bunker 的 `base_drive` 同一契约：`move(vx, vy, vyaw, duration_s)` 必须给时长，到时自动停车；`stop_move` 立即停车（画布可见；Core 会隐藏系统动作 `stop`，`stop` 仍保留供项目停止时调用）；`info` 返回限速、SDK 连接与底盘异常等级。`x-completion` 经 Agent Core ACP 回报 completed / cancelled / error，`x-resource: base`。默认上限 0.2 m/s、15°/s、10 s（代码硬上限 0.5 m/s、30°/s，配置不能超过）；横移 `vy` 默认关闭，部署时用 `HELIOS_CHASSIS_ALLOW_LATERAL=1` 开启（与运动开关传法相同，例如 `curl -fsSL https://motus.phanthy.com/run-pr-image.sh | sudo HELIOS_CHASSIS_MOTION_ENABLED=1 HELIOS_CHASSIS_ALLOW_LATERAL=1 bash -s -- <镜像>`），开启后卡片才显示 VY。
 
 速度经厂家 VMR AMR SDK 的第三方控速下发（`set_third_speed_ctrl` → 50 Hz `send_third_expected_speed` → 零速 → `close_third_speed_ctrl`），在独立 worker 进程内运行：每次移动自带截止时间，Driver 退出或 worker 被杀时底盘因收不到速度指令自动停车（厂家示例说明）。`info` 与每次移动结果附带里程计实测位移（前进/左移/转角）。
 

@@ -19,4 +19,4 @@ chassis_sdk_port: 9003
 chassis_command_hz: 50
 chassis_max_linear_m_s: 0.2
 chassis_max_angular_deg_s: 15
-chassis_allow_lateral: false
+chassis_allow_lateral: false  # opt in per deployment: HELIOS_CHASSIS_ALLOW_LATERAL=1

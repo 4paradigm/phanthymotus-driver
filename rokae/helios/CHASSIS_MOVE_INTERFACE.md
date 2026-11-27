@@ -23,7 +23,7 @@ Vendor VMR AMR SDK 2.1.51 (`VMR_AMR_SDK_arm_SDK-2.1.51_e22f4_py312`), module `na
   For a web-console deployment, set `HELIOS_CHASSIS_MOTION_ENABLED=1` in the host's `/opt/phanthy-motus/.env`.
 - A move fails closed. It is refused when movement is disabled, the SDK is not mounted, the worker cannot connect, the SDK has no exception device, no exception report has arrived since the worker started (the SDK offers only the `exception_state` subscription, no synchronous getter; a move waits up to 3 s for the first report), or the reported level is not normal. The worker applies the same check on its side, and a non-normal level during a move stops it.
 - The worker installs `common.logsafe` before importing the vendor SDK, so its output follows the same line-atomic logging contract as the Driver (a separate interpreter does not inherit the Driver's wrapper).
-- Limits: configurable `chassis_max_linear_m_s` (default 0.2) and `chassis_max_angular_deg_s` (default 15), capped in code at 0.5 m/s and 30°/s. `chassis_allow_lateral` (default false) exposes `vy`.
+- Limits: configurable `chassis_max_linear_m_s` (default 0.2) and `chassis_max_angular_deg_s` (default 15), capped in code at 0.5 m/s and 30°/s. Lateral `vy` (swerve base) is off by default; a deployment opts in with `HELIOS_CHASSIS_ALLOW_LATERAL=1` (or `chassis_allow_lateral: true`), passed the same way as `HELIOS_CHASSIS_MOTION_ENABLED`; only then does the card show `vy`.
 
 ## Distribution (same as the other Helios SDK cards)
 
