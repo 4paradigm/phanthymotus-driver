@@ -1002,7 +1002,13 @@ class ControlledSpatialPlugin:
                 if (response.get('success') is not True or response.get('stationary') is not True
                         or response.get('software_estop') is not True):
                     raise RuntimeError('chassis_soft_stop_unconfirmed')
-                if uncertain:
+                # Boot handoff releases use the native stop-generation lock.
+                # A new confirmed stop fences those old releases, including
+                # after container restart. Other uncertain writes (map/mode)
+                # must retain their own reconciliation requirements.
+                boot_release_fenced = (self._preparation.get('owner') == 'boot_remote_ready'
+                                       and response.get('older_release_fenced') is True)
+                if uncertain and not boot_release_fenced:
                     raise RuntimeError('older_chassis_release_unresolved')
                 self._preparation = None
                 self._persist()

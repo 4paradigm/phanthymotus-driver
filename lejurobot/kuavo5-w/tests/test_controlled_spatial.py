@@ -659,6 +659,29 @@ class SpatialTests(unittest.TestCase):
         finally:
             restored.close()
 
+    def test_boot_preparation_fence_clears_only_after_new_confirmed_fenced_stop(self):
+        original = self.client.native
+        for owner, fenced, success in (('boot_remote_ready', True, True),
+                                       ('boot_remote_ready', False, False),
+                                       ('mode_transition', True, False)):
+            with self.subTest(owner=owner, fenced=fenced):
+                self.plugin._preparation = {'delivery_uncertain': True, 'owner': owner}
+                self.plugin._persist()
+                def native(operation, **args):
+                    if operation == 'soft_stop':
+                        return {'success': True, 'stationary': True, 'software_estop': True,
+                                'older_release_fenced': fenced}
+                    return original(operation, **args)
+                self.client.native = native
+                if success:
+                    self.plugin.cancel_remote()
+                    self.assertIsNone(self.plugin._preparation)
+                    self.assertIsNone(self.plugin.store.state('pending')['chassis_preparation'])
+                else:
+                    with self.assertRaisesRegex(RuntimeError, 'older_chassis_release_unresolved'):
+                        self.plugin.cancel_remote()
+                    self.assertIsNotNone(self.plugin._preparation)
+
     def test_cancel_ack_without_stationary_is_unconfirmed(self):
         self.client.check = {'success': True, 'status': 1, 'arrived': False}
         self.navigate()
@@ -1633,7 +1656,9 @@ class NativePreparationTests(unittest.TestCase):
     def test_soft_stop_accepts_rejected_cancel_only_when_empty_hold_is_verified(self):
         self.reject = 2
         with patch.object(self.module, 'confirm_empty_held_tracker') as empty:
-            self.assertTrue(self.call('soft_stop')['software_estop'])
+            result = self.call('soft_stop')
+            self.assertTrue(result['software_estop'])
+            self.assertTrue(result['older_release_fenced'])
         empty.assert_called_once()
         self.assertNotIn(1, self.events)
 

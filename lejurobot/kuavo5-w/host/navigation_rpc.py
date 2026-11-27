@@ -919,7 +919,8 @@ def main(request):
             confirm_stationary(rospy, Odometry)
             if not state().soft_estop:
                 raise RuntimeError('chassis_soft_stop_unconfirmed')
-            return {'success': True, 'stationary': True, 'software_estop': True}
+            return {'success': True, 'stationary': True, 'software_estop': True,
+                    'older_release_fenced': operation == 'soft_stop'}
         request['_preparation_stage'] = 'read_fault_state'
         healthy(state())
         request['_preparation_stage'] = 'hold_software_stop'
