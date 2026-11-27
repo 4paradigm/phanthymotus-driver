@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 import threading
 import time
@@ -11,6 +12,7 @@ from rclpy.exceptions import InvalidTopicNameException
 from rclpy.validate_full_topic_name import validate_full_topic_name
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import CompressedImage
+from std_msgs.msg import String
 
 FRAME_MAX_AGE = 0.4
 COMMAND_PERIOD = 0.2
@@ -110,6 +112,8 @@ class HeadFaceFollowPlugin:
         self._last_frame = None
         self._last_command = -math.inf
         self._track = None
+        self._object_name = ""
+        self._object_packet = None
         self._reason = "idle"
 
     def get_tool(self):
@@ -121,13 +125,15 @@ class HeadFaceFollowPlugin:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["start", "arm", "stop", "info"]},
+                    "action": {"type": "string", "enum": ["start", "arm", "stop", "info", "set_target"]},
+                    "object_name": {"type": "string", "description": "VOP 类别名。空字符串切回人脸"},
                     "input_topic": {"type": "string", "description": "可选 JPEG 相机话题，留空使用内置头部相机"},
                 },
                 "required": ["action"],
                 "x-resource": "head",
                 "x-action-params": {
                     "start": {"params": ["input_topic"], "description": "启动相机订阅，等待开启"},
+                    "set_target": {"params": ["object_name"], "description": "由大脑选择要跟踪的物体"},
                     "arm": {"params": [], "description": "开启头部随动"},
                     "stop": {"params": [], "description": "停止发送随动指令并断开订阅"},
                     "info": {"params": [], "description": "查看是否已开启及等待原因"},
@@ -180,6 +186,8 @@ class HeadFaceFollowPlugin:
                         qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
                         node.create_subscription(
                             CompressedImage, topic, lambda msg: self._on_frame(node, msg), qos)
+                        node.create_subscription(
+                            String, topic + "/objects", lambda msg: self._objects(node, msg), 1)
                         if topic == self._default_topic and self._camera is not None:
                             self._camera.start()
                         if not self._ros2.executor_core.add_node(node):
@@ -191,6 +199,14 @@ class HeadFaceFollowPlugin:
                     self._detector = detector
                     self._topic = topic
                     self._reason = "awaiting_arm"
+            elif action == "set_target":
+                name = args.get("object_name")
+                if not isinstance(name, str):
+                    return {"state": "error", "error": "Provide a VOP class name"}
+                self._object_name = name.strip().casefold()
+                self._object_packet = None
+                self._tracker = _Tracker()
+                self._track = self._last_frame = None
             elif action == "arm":
                 if self._node is None:
                     return {"state": "error", "error": "Start the card first"}
@@ -215,9 +231,32 @@ class HeadFaceFollowPlugin:
             return {
                 "state": "running" if self._node else "idle",
                 "armed": self._armed,
+                "object_name": self._object_name,
                 "reason": reason,
                 "topic_in": [{**INPUT, "topic": self._topic}] if self._topic else [],
             }
+
+    def _objects(self, node, msg):
+        with self._lock:
+            if node is not self._node or not self._armed or not self._object_name:
+                return
+            self._object_packet = None
+            try:
+                payload = json.loads(msg.data)
+                ts = float(payload["timestamp"])
+                latency = float(payload["latency_ms"]) / 1000
+                age = time.time() - ts
+                if not (0 <= age and 0 <= latency and age + latency <= FRAME_MAX_AGE):
+                    return
+                boxes = []
+                for obj in payload["objects"]:
+                    if obj["name"].casefold() == self._object_name:
+                        x, y, right, bottom = map(float, obj["bbox"])
+                        if all(map(math.isfinite, (x, y, right, bottom))) and right > x and bottom > y:
+                            boxes.append((x, y, right - x, bottom - y))
+                self._object_packet = (ts, boxes, time.monotonic() + FRAME_MAX_AGE - age - latency)
+            except (ValueError, KeyError, TypeError, AttributeError, OverflowError):
+                return
 
     def _on_frame(self, node, message):
         received = time.monotonic()
@@ -228,14 +267,30 @@ class HeadFaceFollowPlugin:
                 return
             self._last_sample = received
             detector, tracker = self._detector, self._tracker
+            name = self._object_name
+            if name:
+                packet = self._object_packet
+                self._object_packet = None
+                if packet is None or received > packet[2]:
+                    self._reason = "waiting_for_object_detection"
+                    return
         try:
-            boxes, size = detector.detect(message.data)
+            if name:
+                image = detector.cv2.imdecode(detector.np.frombuffer(message.data, dtype=detector.np.uint8),
+                                              detector.cv2.IMREAD_GRAYSCALE)
+                if image is None:
+                    raise ValueError("Invalid camera frame")
+                size = (image.shape[1], image.shape[0])
+                boxes = [b for b in packet[1] if b[0] >= 0 and b[1] >= 0
+                         and b[0] + b[2] <= size[0] and b[1] + b[3] <= size[1]]
+            else:
+                boxes, size = detector.detect(message.data)
         except (ValueError, detector.cv2.error):
             boxes, size = (), None
         with self._lock:
             if self._node is not node or not self._armed or self._tracker is not tracker:
                 return
-            if size is None or time.monotonic() - received > FRAME_MAX_AGE:
+            if size is None or time.monotonic() - received > FRAME_MAX_AGE or (name and time.monotonic() > packet[2]):
                 self._track = None
                 self._reason = "invalid_or_stale_frame"
                 return
