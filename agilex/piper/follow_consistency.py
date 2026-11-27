@@ -10,6 +10,7 @@ import time
 
 from common.vendor_runtime import action_schema, run_driver, tool
 from agilex.piper.follow_analysis import FRAME_IDS, FollowPair
+from agilex.piper.follow_dashboard import render_dashboard
 
 
 NAME = 'piper_follow_consistency'
@@ -77,6 +78,7 @@ class FollowConsistency:
             raise ValueError('follow_consistency.pairs requires one or two named, distinct CAN interfaces')
         self.interfaces = dict(pairs)
         self.topic = f'/{namespace}/{NAME}'
+        self.dashboard_topic = f'{self.topic}/tracking_dashboard'
         self.ros2 = ros2
         self.tolerance = parameter(config, 'tolerance_deg', 3, 0.1, 90)
         self.persistence = parameter(config, 'persistence_ms', 250, 20, 5000)
@@ -97,12 +99,15 @@ class FollowConsistency:
                                 'stop': ([], 'Stop this monitor')}, {})
         result = tool(NAME, 'sensor',
                       'Compares external PiPER leader joint targets with measured follower positions. '
+                      'Provides a live tracking dashboard in Monitor. '
                       'Does not issue CAN commands or change operating modes.', schema,
-                      topic_out=[{'topic': self.topic, 'format': 'data/json'}])
+                      topic_out=[{'topic': self.topic, 'format': 'data/json'},
+                                 {'topic': self.dashboard_topic, 'format': 'image/jpeg'}])
         result['title'] = 'ALOHA Leader-Follower Tracking'
         return result
 
     def start(self):
+        from sensor_msgs.msg import CompressedImage
         from std_msgs.msg import String
 
         with self.lifecycle_lock:
@@ -114,6 +119,8 @@ class FollowConsistency:
             try:
                 publisher = node.create_publisher(String, self.topic, 10)
                 node.create_timer(0.2, lambda: self._publish(node, publisher, String))
+                dashboard = node.create_publisher(CompressedImage, self.dashboard_topic, 1)
+                node.create_timer(0.5, lambda: self._publish_dashboard(node, dashboard, CompressedImage))
                 self.ros2.executor_core.add_node(node)
             except Exception:
                 node.destroy_node()
@@ -190,6 +197,24 @@ class FollowConsistency:
             message = message_type()
             message.data = json.dumps(summary, allow_nan=False)
             publisher.publish(message)
+
+    def _publish_dashboard(self, node, publisher, message_type):
+        with self.lifecycle_lock:
+            if self.node is not node or publisher.get_subscription_count() == 0:
+                return
+            results = self._results()
+            logger = node.get_logger()
+        try:
+            jpeg = render_dashboard(results, self.tolerance, self.persistence, time.time())
+        except Exception as exc:
+            logger.error(f'Tracking dashboard render failed: {exc}', throttle_duration_sec=5.0)
+            return
+        with self.lifecycle_lock:
+            if self.node is node:
+                message = message_type()
+                message.header.stamp = node.get_clock().now().to_msg()
+                message.format, message.data = 'jpeg', jpeg
+                publisher.publish(message)
 
     def dispatch(self, action, args):
         if action == 'start':

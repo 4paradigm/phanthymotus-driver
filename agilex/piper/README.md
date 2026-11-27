@@ -87,6 +87,11 @@ sources must have fresh, alignable samples before a following verdict is shown.
 time limits are site settings for diagnosis. The lag is an estimate on a 10 ms
 grid for delays up to 250 ms and is unavailable during static or ambiguous motion.
 
+In **Monitor**, the **tracking_dashboard** tile shows each pair's state, peak and
+per-joint signed error, and the age of both inputs. It uses the Core's existing
+`image/jpeg` monitor and updates twice a second while subscribed. The JSON
+stream remains the first output for existing canvas connections.
+
 For a workcell with an existing PiPER deployment, the same image can be run with
 `python3 -m agilex.piper.follow_consistency` after sourcing ROS Humble. Set
 `CONFIG_PATH` to an explicit site YAML with `name: ALOHA Leader-Follower Tracking`,

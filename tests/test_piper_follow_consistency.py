@@ -10,6 +10,7 @@ from agilex.piper.follow_analysis import FEEDBACK_IDS, REFERENCE_IDS, FollowPair
 from agilex.piper.follow_consistency import (
     CAN_FRAME, CAN_MASK, KERNEL_TIMESPEC, NAME, SO_TIMESTAMPNS, FollowConsistency, receive_sample,
 )
+from agilex.piper.follow_dashboard import HEIGHT, WIDTH, render_dashboard
 from common.vendor_runtime import DriverBundle
 
 
@@ -101,9 +102,27 @@ def test_mcp_tool_has_read_only_actions_and_explicit_bus_mapping():
     plugin = FollowConsistency({'pairs': {'left': 'can0', 'right': 'can1'}}, 'test', None)
     bundle = DriverBundle([plugin])
     definition, = bundle.get_all_tools()
-    assert definition['topic_out'] == [{'topic': f'/test/{NAME}', 'format': 'data/json'}]
+    assert definition['topic_out'] == [{'topic': f'/test/{NAME}', 'format': 'data/json'},
+                                       {'topic': f'/test/{NAME}/tracking_dashboard', 'format': 'image/jpeg'}]
     assert definition['title'] == 'ALOHA Leader-Follower Tracking'
     assert definition['type'] == 'sensor'
     assert bundle.dispatch(NAME, {'action': 'info'})['state'] == 'idle'
     with pytest.raises(ValueError, match='only'):
         bundle.dispatch(NAME, {'action': 'move'})
+
+
+def test_dashboard_renders_valid_and_unavailable_pairs():
+    import cv2
+    import numpy as np
+
+    pair = FollowPair(3, 0.25, 0.35, 0.08)
+    send(pair, REFERENCE_IDS, 1)
+    send(pair, FEEDBACK_IDS, 1, -7)
+    active = dict(pair.snapshot(1.01), interface='can0')
+    unavailable = dict(pair.snapshot(2), interface='can1')
+    single = render_dashboard({'left': unavailable}, 3, 250, 1)
+    mixed = render_dashboard({'left': active, 'right': unavailable}, 3, 250, 1)
+    for jpeg in (single, mixed):
+        image = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+        assert image.shape == (HEIGHT, WIDTH, 3)
+    assert single != mixed
