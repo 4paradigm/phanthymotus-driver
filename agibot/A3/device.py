@@ -4341,8 +4341,8 @@ class ControlledSpatialPlugin:
                 _require(len(matches) == 1,
                          f"地图 {map_id} 中有多个名为 {name!r} 的点位，请按原生 ID 或坐标导航")
                 waypoint = matches[0]
+                _require(self._current_map_id() == map_id, "请切换到该点位所属地图并完成重定位")
                 if waypoint.get("source") == "recorded":
-                    _require(self._current_map_id() == map_id, "请切换到该点位所属地图并完成重定位")
                     return self._nav_dispatch(action, "PlanningNaviToPose2D", {
                         "task_id": 0, "map_id": map_id, "pose": waypoint["pose"],
                         "ackerman_mode": False})

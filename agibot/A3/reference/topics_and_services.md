@@ -72,6 +72,7 @@ copied from HDU `/agibot/software/v0/entry/cfg/`):
 | `/motion/control/arm_joint_state` | sensor_msgs/JointState | `joints` (`arm`) | mirrored to core as JSON |
 | `/motion/control/hand_joint_state` | sensor_msgs/JointState | `joints` (`hand`) | frame_id carries hand type |
 | `/motion/control/neck_joint_state` | sensor_msgs/JointState | `joints` (`neck`) | |
+| `/slam/localization/odometry` | `nav_msgs/Odometry` | `controlled_spatial` (`tag_place`) | Records a fresh robot pose in the map frame |
 | `/hal/neck_middle_livox_lidar/pointcloud` | sensor_msgs/PointCloud2 | `lidar_cloud` | neck Livox |
 | `/ros2/body_drive/pelvis_imu/data` | sensor_msgs/Imu | `imu` | pelvis IMU |
 | `/ros2/body_drive/torso_imu/data` | sensor_msgs/Imu | `imu` | torso IMU (merged into one card) |

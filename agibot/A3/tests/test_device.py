@@ -1946,6 +1946,18 @@ class RpcDispatchTests(unittest.TestCase):
         self.assertEqual(result["task_id"], 7)
         self.assertEqual(notify.call_args.args[:2], (result["action_id"], "completed"))
 
+    def test_controlled_spatial_rejects_native_waypoint_on_different_map(self):
+        spatial = find_plugin(self.plugins, "controlled_spatial")
+        self.transport.responses["MappingService/GetCurrentWorkingMap"] = {"data": {"map_id": "4"}}
+        self.transport.responses["LocalizationService/GetTopoMsgs"] = {"data": {"points": [
+            {"point_id": 1, "name": "展厅入口"},
+        ]}}
+
+        with patch.object(spatial, "_nav_worker"):
+            with self.assertRaisesRegex(ValueError, "请切换"):
+                spatial.dispatch("navi_to_waypoint", {"map_id": 3, "waypoint_name": "展厅入口"})
+        self.assertEqual(self.transport.calls_to("PncService", "PlanningNaviToGoal"), [])
+
     def test_controlled_spatial_rejects_missing_and_ambiguous_waypoint_names(self):
         spatial = find_plugin(self.plugins, "controlled_spatial")
         self.transport.responses["LocalizationService/GetTopoMsgs"] = {"data": {"points": [
