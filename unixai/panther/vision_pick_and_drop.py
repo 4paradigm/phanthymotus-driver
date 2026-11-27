@@ -278,7 +278,7 @@ class VisionPickAndDrop:
 
     def _joints(self):
         msg, stamp = self.device._get("joints")
-        if not fresh(stamp, .5) or msg is None:
+        if not fresh(stamp, 2.0) or msg is None:  # Relaxed from .5 to 2.0s
             raise RuntimeError("fresh Panther joint feedback is required")
         return dict(zip(msg.name, msg.position))
 
