@@ -9,10 +9,12 @@ import threading
 import time
 from pathlib import Path
 from uuid import UUID
+from spatial_client import NavigationStateUnavailable
 
 
 class BootRemote:
     WINDOW_S = 60.
+    CHASSIS_READ_WAIT_S = 20.
 
     def __init__(self, bundle, enabled=False):
         if type(enabled) is not bool:
@@ -139,7 +141,22 @@ class BootRemote:
             # to make the first remote command reach the chassis.
             b.upper_bridge.ensure()
             with b.spatial._native_lock:
-                observation = b.spatial.client.observe(required=('agvState', 'state'))
+                # The chassis web service may become ready after the controller.
+                # Retry only observation, inside this single claimed attempt;
+                # never replay a hold, enable, mux switch or release operation.
+                deadline = time.monotonic() + self.CHASSIS_READ_WAIT_S
+                while True:
+                    with b.tracker.lock:
+                        self._check(token)
+                    try:
+                        observation = b.spatial.client.observe(required=('agvState', 'state'))
+                        break
+                    except NavigationStateUnavailable:
+                        if time.monotonic() >= deadline:
+                            raise
+                        self.status = {'state': 'preparing', 'stage': 'waiting_for_chassis_feedback',
+                                       'motion_target_sent': False}
+                        self.closed.wait(.25)
                 b.spatial._check_chassis_faults(observation)
                 if (observation['agvState'].get('isMapping') is not False
                         or observation['agvState'].get('runningMode') != 'AUTO'

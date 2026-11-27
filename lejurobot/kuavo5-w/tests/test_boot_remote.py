@@ -39,6 +39,7 @@ class BootRemoteTests(fixtures.unittest.TestCase):
         self.node.destroy_subscription = lambda subscription: None
         self.bundle.spatial.client = self.client
         self.remote = self.bundle.boot_remote
+        self.read_unavailable = self.remote.attempt.__globals__['NavigationStateUnavailable']
         self.remote.enabled = True
         self.remote.status = {'state': 'waiting'}
         # The ordinary fixture disables automatic boot behavior; emulate the
@@ -99,6 +100,41 @@ class BootRemoteTests(fixtures.unittest.TestCase):
         self.assertEqual(self.remote.info()['state'], 'error')
         self.assertFalse(self.ros.sent_services)
         self.assertIsNone(self.bundle._upper_route_key)
+
+    def test_transient_chassis_read_failure_retries_before_control_writes(self):
+        original = self.client.observe
+        calls = []
+        def observe(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                self.assertFalse(self.ros.sent_services)
+                self.assertFalse(self.client.calls)
+                raise self.read_unavailable(('agvState', 'state'), 'connection')
+            return original(**kwargs)
+        with patch.object(self.client, 'observe', side_effect=observe), \
+                patch.object(self.remote.closed, 'wait', return_value=False):
+            self.remote.attempt()
+        self.assertEqual(self.remote.info()['state'], 'ready')
+        self.assertEqual(len(calls), 2)
+        self.assertEqual([c[0] for c in self.client.calls], ['soft_stop', 'remote_ready'])
+
+    def test_operator_stop_during_read_retry_prevents_enable(self):
+        def interrupted_wait(_):
+            self.remote.cancel('software_pause_requested')
+        with patch.object(self.client, 'observe', side_effect=self.read_unavailable(('state',), 'connection')), \
+                patch.object(self.remote.closed, 'wait', side_effect=interrupted_wait):
+            self.remote.attempt()
+        self.assertFalse(self.ros.sent_services)
+        self.assertFalse(self.client.calls)
+        self.assertNotEqual(self.remote.info()['state'], 'ready')
+
+    def test_chassis_read_retry_is_bounded_and_sends_no_control(self):
+        self.remote.CHASSIS_READ_WAIT_S = 0.
+        with patch.object(self.client, 'observe', side_effect=self.read_unavailable(('state',), 'connection')):
+            self.remote.attempt()
+        self.assertEqual(self.remote.info()['state'], 'error')
+        self.assertFalse(self.ros.sent_services)
+        self.assertFalse(self.client.calls)
 
     def test_container_restart_and_repeated_calls_never_replay_consumed_permit(self):
         self.remote.attempt()
