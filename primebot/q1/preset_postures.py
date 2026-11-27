@@ -1,6 +1,6 @@
 """Bumi-style action selector for Q1's documented factory motions.
 
-Hardware RPCs run in a short-lived, isolated vendor-DDS process. Starting the
+Hardware RPCs reuse an isolated vendor-DDS process. Starting the
 driver/canvas never sends a motion command. A service acknowledgement is not
 reported as physical completion.
 """
@@ -77,8 +77,12 @@ class PresetController:
 
     @staticmethod
     def _stable(info):
+        if info.get("state_consistent") is False:
+            raise ValueError("查询与实时运控状态不一致，可能正在切换；未发送后续动作")
         if info["status"] != 100 or not info["switch_ready"]:
             raise ValueError("运控正在切换或尚未就绪，未发送动作")
+        if info.get("is_fallen") or info.get("is_lifted"):
+            raise ValueError("运控报告摔倒或被提起，未发送动作")
 
     def execute(self, action):
         try:
@@ -97,13 +101,26 @@ class PresetController:
         t = self.transport
         info = t.query()
         if action == "info":
-            standing = t.upright()
+            posture = t.posture()
+            standing = posture["upright"]
             ready = (standing and info["value"] in STANDING_MODES
-                     and info["status"] == 100 and info["switch_ready"])
+                     and info["status"] == 100 and info["switch_ready"]
+                     and not any(info.get(k) for k in ("is_fallen", "is_lifted", "is_moving")))
+            reasons = []
+            if standing is None:
+                reasons.append("姿态数据缺失或过期，无法判断直立状态")
+            elif not standing:
+                reasons.append("姿态数据未满足直立条件")
+            if info["value"] not in STANDING_MODES:
+                reasons.append("当前模式不支持直接播放动作")
+            if info["status"] != 100 or not info["switch_ready"]:
+                reasons.append("运控未报告切换就绪")
+            if any(info.get(k) for k in ("is_fallen", "is_lifted", "is_moving")):
+                reasons.append("运控报告摔倒、被提起或仍在移动")
             return {"state": "ready" if ready else "not_ready", "current_action": info,
-                    "standing": standing, "services": t.services(),
+                    "standing": standing, "posture": posture, "services": t.services(),
                     "message": "状态查询，不发送运动指令" if ready else
-                               "当前未满足动作前置条件，请先确认机身稳定站立及运控就绪"}
+                               "；".join(reasons)}
         self._stable(info)
         mode = info["value"]
         if action == "reset":
@@ -121,6 +138,8 @@ class PresetController:
             return failure or self._accepted(action, t.last_response)
         if mode not in STANDING_MODES:
             raise ValueError("请先使用官方方式使机器人稳定站立；本卡不自动起身、解锁或退出保护模式")
+        if info.get("is_moving"):
+            raise ValueError("运控报告机器人仍在移动，未发送动作")
         if not t.upright():
             raise ValueError("未获得新鲜有效的直立 IMU 数据，未发送动作")
         target = 1005 if action in PRESETS else 1002
@@ -132,7 +151,7 @@ class PresetController:
         # Recheck immediately before the actual motion, including after a mode change.
         info = t.query()
         self._stable(info)
-        if info["value"] != target or not t.upright():
+        if info["value"] != target or info.get("is_moving") or not t.upright():
             raise ValueError("动作前模式或机身朝向已变化，取消后续指令")
         if action in PRESETS:
             failure = self._issue("preset", PRESETS[action][0], False)
@@ -172,6 +191,9 @@ class PresetPosturesCard:
         self._last = None
         self._status = None
         self._status_stamp = None
+        self._worker = None
+        self._worker_ready = False
+        self._worker_started = None
 
     def get_tool(self):
         actions = {name: ([], f"{label}。确认稳定站立、双脚着地且肢体活动范围内无人和障碍物。")
@@ -201,6 +223,49 @@ class PresetPosturesCard:
             if self._active:
                 self._active[0].set()
 
+    def close(self):
+        """Release the read-only idle worker on driver/test shutdown."""
+        self.stop()
+        with self._call_lock:
+            self._dispose_worker()
+
+    def _dispose_worker(self):
+        if self._worker is None:
+            return
+        process, channel, cancelled = self._worker
+        self._worker = None
+        self._worker_ready = False
+        cancelled.set()
+        try:
+            channel.send(None)
+        except (BrokenPipeError, OSError):
+            pass
+        process.join(timeout=1)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=2)
+        channel.close()
+
+    def _connection(self):
+        if self._worker is not None and not self._worker[0].is_alive():
+            self._dispose_worker()
+        if self._worker is None:
+            from preset_robot import run_worker
+            ctx = multiprocessing.get_context("spawn")
+            channel, peer = ctx.Pipe()
+            cancelled = ctx.Event()
+            process = ctx.Process(target=run_worker, args=(self.domain, peer, cancelled), daemon=True)
+            try:
+                process.start()
+            except Exception:
+                channel.close()
+                peer.close()
+                raise
+            peer.close()
+            self._worker = (process, channel, cancelled)
+            self._worker_started = time.monotonic()
+        return self._worker
+
     def dispatch(self, action, args):
         # Core polls info frequently with a short timeout. It must never wait
         # for DDS discovery or spawn a process; status is an explicit query.
@@ -211,6 +276,8 @@ class PresetPosturesCard:
                 return {"state": "ready" if self._enabled else "idle",
                         "status_snapshot": self._status, "status_age_s": age,
                         "status_fresh": age is not None and age <= 5,
+                        "connection_state": ("ready" if self._worker_ready else
+                                             "initializing" if self._worker else "idle"),
                         "last_request": self._last,
                         "message": "选择 status 刷新机身状态；卡片就绪不代表机器人已满足运动条件"}
         if action == "start":
@@ -224,21 +291,30 @@ class PresetPosturesCard:
         action = "info" if action == "status" else action
         if not self._call_lock.acquire(blocking=False):
             return {"state": "busy", "message": "已有请求处理中；本次请求未排队"}
-        process = receiver = sender = None
         progress = {"mode_request_sent": False, "motion_request_sent": False}
         try:
-            from preset_robot import run_request
-            ctx = multiprocessing.get_context("spawn")
-            receiver, sender = ctx.Pipe(duplex=False)
-            cancelled = ctx.Event()
-            process = ctx.Process(target=run_request,
-                                  args=(self.domain, action, sender, cancelled, time.monotonic() + 22))
             with self._state_lock:
                 if not self._enabled and action != "info":
                     return {"state": "idle", "message": "卡片已停止，请先启动画布"}
+                process, receiver, cancelled = self._connection()
+                if not self._worker_ready:
+                    if receiver.poll():
+                        packet = receiver.recv()
+                        if packet["event"] != "initialized":
+                            raise RuntimeError(packet.get("data", {}).get("message", "DDS 初始化失败"))
+                        self._worker_ready = True
+                    elif time.monotonic() - self._worker_started > 60:
+                        raise TimeoutError("DDS 初始化超时；本次未发送或排队任何动作")
+                    else:
+                        # ROS participant creation can exceed a request timeout
+                        # on the busy robot network. Never queue an action while
+                        # it initializes; the user must explicitly submit again.
+                        return {"state": "initializing", **progress,
+                                "execution_confirmed": False,
+                                "message": "正在建立机身连接；本次未发送或排队动作，请稍后重新执行"}
+                cancelled.clear()
                 self._active = (cancelled, process)
-                process.start()
-            sender.close()
+                receiver.send((action, time.monotonic() + 22))
             deadline = time.monotonic() + 25
             while time.monotonic() < deadline:
                 if receiver.poll(.1):
@@ -259,6 +335,7 @@ class PresetPosturesCard:
                     raise RuntimeError("动作请求进程退出，结果未确认")
             raise TimeoutError("动作请求超时；不自动重试")
         except (OSError, EOFError, RuntimeError, TimeoutError) as exc:
+            self._dispose_worker()
             result = {"state": "unknown", "execution_confirmed": False,
                       "message": str(exc), **progress}
             with self._state_lock:
@@ -270,12 +347,4 @@ class PresetPosturesCard:
                 if self._active:
                     self._active[0].set()
                 self._active = None
-            if process is not None and process.pid:
-                process.join(timeout=1)
-                if process.is_alive():
-                    process.terminate()
-                    process.join(timeout=2)
-            for channel in (receiver, sender):
-                if channel is not None:
-                    channel.close()
             self._call_lock.release()

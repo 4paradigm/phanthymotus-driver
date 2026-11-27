@@ -42,6 +42,7 @@ def build(args):
                      "preset_postures.py", "preset_robot.py", "config.yaml"):
             shutil.copyfile(DRIVER / name, context / name)
         (context / "deploy").mkdir()
+        shutil.copytree(DRIVER / "motion_msgs", context / "motion_msgs")
         shutil.copyfile(DEPLOY / "service.yml", context / "deploy/service.yml")
         command("docker", "build", "--platform", TARGET, "--build-arg",
                 f"ROS_BASE_IMAGE={args.base_image}", "-t", args.image, temp)

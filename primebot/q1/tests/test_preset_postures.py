@@ -2,13 +2,15 @@
 import os
 import sys
 import threading
+import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from preset_postures import MOTIONS, PRESETS, PresetController, PresetPosturesCard
-from preset_robot import upright_quaternion
+from preset_robot import (RobotTransport, upright_quaternion, select_posture, reconcile_action,
+                          FULL_IMU, TORSO_ORIENTATION, MC_STATE)
 
 
 class FakeRobot:
@@ -33,6 +35,9 @@ class FakeRobot:
 
     def upright(self):
         return self.is_upright
+
+    def posture(self):
+        return {"upright": self.is_upright, "source": TORSO_ORIENTATION, "age_s": 0}
 
     def pause(self, _):
         self.check()
@@ -118,6 +123,72 @@ class PresetTests(unittest.TestCase):
             result = PresetController(robot).execute("info")
             self.assertEqual(result["state"], "not_ready")
             self.assertEqual(robot.calls, [])
+
+    def test_missing_pose_is_unknown_not_nonstanding(self):
+        result = PresetController(FakeRobot(upright=None)).execute("info")
+        self.assertIsNone(result["standing"])
+        self.assertEqual(result["state"], "not_ready")
+        self.assertIn("数据缺失", result["message"])
+
+    def test_high_level_pose_fallback_and_freshness(self):
+        self.assertEqual(select_posture({TORSO_ORIENTATION: (10, True)}, 10.1)["upright"], True)
+        self.assertIsNone(select_posture({TORSO_ORIENTATION: (9, True)}, 10)["upright"])
+        self.assertIsNone(select_posture({TORSO_ORIENTATION: (11, True)}, 10)["upright"])
+        samples = {FULL_IMU: (10, None), TORSO_ORIENTATION: (10, True)}
+        self.assertEqual(select_posture(samples, 10)["source"], TORSO_ORIENTATION)
+        samples[FULL_IMU] = (10, False)
+        self.assertFalse(select_posture(samples, 10)["upright"])
+
+    def test_rpc_default_flag_requires_fresh_matching_native_state(self):
+        rpc = FakeRobot(ready=False).query()
+        state = {"action": FakeRobot().query(), "is_fallen": False,
+                 "is_lifted": False, "is_moving": False}
+        result = reconcile_action(rpc, (10, state), 10.1)
+        self.assertTrue(result["switch_ready"])
+        self.assertFalse(result["rpc_switch_ready"])
+        self.assertEqual(result["switch_ready_source"], MC_STATE)
+        for sample in (None, (9, state), (11, state)):
+            self.assertFalse(reconcile_action(rpc, sample, 10)["switch_ready"])
+        for key, value in (("value", 1005), ("status", 200)):
+            different = {**state, "action": {**state["action"], key: value}}
+            self.assertFalse(reconcile_action(rpc, (10, different), 10)["switch_ready"])
+        state["action"]["switch_ready"] = False
+        self.assertFalse(reconcile_action({**rpc, "switch_ready": True}, (10, state), 10)["switch_ready"])
+
+    def test_native_fall_lift_or_motion_prevents_command(self):
+        for key in ("is_fallen", "is_lifted", "is_moving"):
+            robot = FakeRobot()
+            original = robot.query
+            robot.query = lambda: {**original(), key: True}
+            self.assertEqual(PresetController(robot).execute("wave")["state"], "rejected")
+            self.assertEqual(robot.calls, [])
+
+    def test_only_readonly_rpc_timeout_is_retried(self):
+        from types import SimpleNamespace as NS
+        transport = RobotTransport.__new__(RobotTransport)
+        transport.types = {"GetMcAction": NS(Request=lambda: NS(request=NS(header=NS(stamp=None))))}
+        transport.node = Mock()
+        transport.pause = Mock()
+        transport.common = None
+        response = NS(header=NS(code=0), info=NS(current_action=NS(value=1002),
+                      status=NS(value=100), switch_ready=False, source="", action_desc="walk"))
+        transport.rpc = Mock(side_effect=[TimeoutError("first reply lost"), response])
+        self.assertEqual(transport.query()["value"], 1002)
+        self.assertEqual(transport.rpc.call_count, 2)
+        transport.rpc = Mock(side_effect=TimeoutError("motion reply lost"))
+        with self.assertRaises(TimeoutError):
+            transport._send("SetMcPresetMotion", object())
+        transport.rpc.assert_called_once()
+
+    def test_rpc_error_or_cancellation_is_not_retried(self):
+        from types import SimpleNamespace as NS
+        transport = RobotTransport.__new__(RobotTransport)
+        transport.types = {"GetMcAction": NS(Request=lambda: NS(request=NS(header=NS(stamp=None))))}
+        transport.node = Mock()
+        transport.rpc = Mock(side_effect=RuntimeError("cancelled"))
+        with self.assertRaises(RuntimeError):
+            transport.query()
+        transport.rpc.assert_called_once()
 
     def test_core_info_polling_is_immediate_and_never_starts_dds(self):
         card = PresetPosturesCard("test", None, 93)
@@ -225,6 +296,8 @@ class DdsPresetTests(unittest.TestCase):
         import rclpy
         from rclpy.qos import qos_profile_sensor_data
         from sensor_msgs.msg import Imu
+        from nav_msgs.msg import Odometry
+        from aimdk_msgs.msg import McCommonState
         from aimdk_msgs.srv import GetMcAction, SetMcAction, SetMcPresetMotion, SetMcMotion
 
         # Fixed non-production domain: test actuator services cannot reach the robot.
@@ -236,7 +309,7 @@ class DdsPresetTests(unittest.TestCase):
             response.header.code = 0
             response.info.current_action.value = mode[0]
             response.info.status.value = 100
-            response.info.switch_ready = True
+            response.info.switch_ready = False  # Firmware RPC omits this field.
             return response
 
         def command(kind):
@@ -255,13 +328,25 @@ class DdsPresetTests(unittest.TestCase):
                 return response
             return callback
 
-        for typ in (GetMcAction, SetMcAction, SetMcPresetMotion, SetMcMotion):
-            node.create_service(typ, "/aimdk_5Fmsgs/srv/" + typ.__name__,
-                                query if typ is GetMcAction else command(typ.__name__))
-        pub = node.create_publisher(Imu, "/aima/hal/imu/state", qos_profile_sensor_data)
-        sample = Imu()
-        sample.orientation.w = 1.
-        node.create_timer(.05, lambda: pub.publish(sample))
+        def create_services():
+            startup.cancel()
+            for typ in (GetMcAction, SetMcAction, SetMcPresetMotion, SetMcMotion):
+                node.create_service(typ, "/aimdk_5Fmsgs/srv/" + typ.__name__,
+                                    query if typ is GetMcAction else command(typ.__name__))
+        # Discovery slower than the old 3-second limit.
+        startup = node.create_timer(4, create_services)
+        pub = node.create_publisher(Odometry, TORSO_ORIENTATION, qos_profile_sensor_data)
+        sample = Odometry()
+        sample.pose.pose.orientation.w = 1.
+        state_pub = node.create_publisher(McCommonState, MC_STATE, qos_profile_sensor_data)
+        def publish():
+            state = McCommonState()
+            state.action_info.current_action.value = mode[0]
+            state.action_info.status.value = 100
+            state.action_info.switch_ready = True
+            state_pub.publish(state)
+            pub.publish(sample)
+        node.create_timer(.05, publish)
         stopping = threading.Event()
 
         def spin():
@@ -273,10 +358,32 @@ class DdsPresetTests(unittest.TestCase):
         card = PresetPosturesCard("test", None, 93)
         try:
             card.start()
+            first = card.dispatch("wave", {})
+            self.assertEqual(first["state"], "initializing")
+            self.assertFalse(first["motion_request_sent"])
+            self.assertFalse(first["mode_request_sent"])
+            def wait_for_status():
+                deadline = time.monotonic() + 25
+                while True:
+                    result = card.dispatch("status", {})
+                    if result["state"] != "initializing":
+                        return result
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(.2)
+            self.assertEqual(wait_for_status()["state"], "ready")
+            self.assertEqual(calls, [])  # The cold-start wave was never queued.
+            worker_pid = None
             for action in ("status", "wave", "reset", "boxing"):
                 result = card.dispatch(action, {})
                 self.assertEqual(result["state"], "ready" if action == "status" else "accepted", result)
+                pid = card._worker[0].pid
+                if worker_pid is not None:
+                    self.assertEqual(worker_pid, pid)
+                worker_pid = pid
                 if action == "status":
+                    self.assertEqual(result["posture"]["source"], TORSO_ORIENTATION)
+                    self.assertTrue(result["current_action"]["switch_ready"])
+                    self.assertFalse(result["current_action"]["rpc_switch_ready"])
                     cached = card.dispatch("info", {})
                     self.assertTrue(cached["status_fresh"])
                     self.assertEqual(cached["status_snapshot"]["current_action"]["value"], 1002)
@@ -288,8 +395,18 @@ class DdsPresetTests(unittest.TestCase):
             card.dispatch("stop", {})
             self.assertEqual(card.dispatch("wave", {})["state"], "idle")
             self.assertEqual(len(calls), 5)
+            card.start()
+            started = time.monotonic()
+            self.assertEqual(card.dispatch("status", {})["state"], "ready")
+            self.assertLess(time.monotonic() - started, 2)
+            self.assertEqual(card._worker[0].pid, worker_pid)
+            card._worker[0].terminate()
+            card._worker[0].join(timeout=2)
+            self.assertEqual(wait_for_status()["state"], "ready")
+            self.assertNotEqual(card._worker[0].pid, worker_pid)
+            self.assertEqual(len(calls), 5)  # Recovery never replays an action.
         finally:
-            card.stop()
+            card.close()
             stopping.set()
             thread.join(timeout=3)
             node.destroy_node()

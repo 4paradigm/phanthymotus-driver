@@ -10,6 +10,7 @@ RUN curl -fsSL --retry 2 --connect-timeout 10 --max-time 300 "$Q1_SDK_URL" -o /t
     echo "29d14627da375b30da308fc82c9fdd454e9393ab6b97ca8b51aa6229afffcae8  /tmp/q1-sdk.zip" | sha256sum -c - && \
     python3 -m zipfile -e /tmp/q1-sdk.zip /tmp/q1-sdk && mkdir -p src && \
     mv /tmp/q1-sdk/q1-sdk-v1.1.8.0/aimdk_msgs src/ && rm -rf /tmp/q1-sdk /tmp/q1-sdk.zip
+COPY motion_msgs/ src/aimdk_msgs/msg/
 RUN . /opt/ros/humble/setup.sh && MAKEFLAGS=-j3 colcon build --packages-select aimdk_msgs --event-handlers console_direct+ --cmake-args -DBUILD_TESTING=OFF && rm -rf build log
 WORKDIR /work
 COPY deploy/service.yml /deploy/service.yml
