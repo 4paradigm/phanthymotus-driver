@@ -153,6 +153,23 @@ class BootRemoteTests(fixtures.unittest.TestCase):
         self.assertFalse(self.client.calls)
         self.assertNotEqual(self.remote.info()['state'], 'ready')
 
+    def test_web_connection_failure_can_use_readonly_ros_preflight(self):
+        observation = self.client.observe()
+        with patch.object(self.client, 'observe', side_effect=self.read_unavailable(('state',), 'connection')), \
+                patch.object(self.client, 'observe_remote_chassis', return_value=observation, create=True) as fallback:
+            self.remote.attempt()
+        fallback.assert_called_once()
+        self.assertEqual(self.remote.info()['state'], 'ready')
+
+    def test_ros_fallback_failure_never_enables(self):
+        with patch.object(self.client, 'observe', side_effect=self.read_unavailable(('state',), 'connection')), \
+                patch.object(self.client, 'observe_remote_chassis',
+                             side_effect=RuntimeError('boot_remote_requires_healthy_idle_auto_chassis'), create=True):
+            self.remote.attempt()
+        self.assertEqual(self.remote.info()['state'], 'error')
+        self.assertFalse(self.ros.sent_services)
+        self.assertFalse(self.client.calls)
+
     def test_chassis_read_retry_is_bounded_and_sends_no_control(self):
         self.remote.CHASSIS_READ_WAIT_S = 0.
         with patch.object(self.client, 'observe', side_effect=self.read_unavailable(('state',), 'connection')):

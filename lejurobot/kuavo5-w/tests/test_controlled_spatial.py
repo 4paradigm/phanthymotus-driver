@@ -1541,6 +1541,19 @@ class NativePreparationTests(unittest.TestCase):
         self.assertTrue(result['stationary'])
         self.assertEqual(self.events, ['stationary'])
 
+    def test_remote_preflight_reads_health_and_stationarity_without_control_commands(self):
+        self.state.manual_mode = self.state.mapping = self.state.is_moving = False
+        self.state.driver_enable = True
+        result = self.call('remote_preflight')
+        self.assertEqual(result['agvState']['runningMode'], 'AUTO')
+        self.assertFalse(result['state']['driving'])
+        self.assertEqual(self.events, ['stationary'])
+        for field in ('manual_mode', 'mapping', 'is_moving', 'estop', 'bumper', 'driver_error'):
+            setattr(self.state, field, True)
+            with self.assertRaisesRegex(RuntimeError, 'healthy_idle_auto'):
+                self.call('remote_preflight')
+            setattr(self.state, field, False)
+
     def test_upper_handoff_selects_chassis_mux_before_release(self):
         self.state.manual_mode,self.state.mapping,self.state.driver_enable=False,False,True
         with patch.object(self.module,'remote_idle_guard',return_value=(lambda:None,lambda:None)) as guard, \

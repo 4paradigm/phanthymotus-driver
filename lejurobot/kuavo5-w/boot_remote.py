@@ -165,6 +165,13 @@ class BootRemote:
                         observation = b.spatial.client.observe(required=('agvState', 'state'))
                         break
                     except NavigationStateUnavailable:
+                        # The factory web UI may lag behind the actual chassis.
+                        # This fallback only reads ROS health and odometry; it
+                        # performs no mode, hold, enable or task mutation.
+                        fallback = getattr(b.spatial.client, 'observe_remote_chassis', None)
+                        if callable(fallback):
+                            observation = fallback()
+                            break
                         if time.monotonic() >= deadline:
                             raise
                         self.status = {'state': 'preparing', 'stage': 'waiting_for_chassis_feedback',

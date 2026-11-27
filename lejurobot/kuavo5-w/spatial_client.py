@@ -162,6 +162,10 @@ print(result.stdout, end='')
     def observe(self, required=None):
         return self._snapshot(required)[0]
 
+    def observe_remote_chassis(self):
+        """Read-only ROS fallback; G12 readiness does not need the map web UI."""
+        return self.native('remote_preflight')
+
     def _snapshot(self, required):
         fields = tuple(required or ('pose2d', 'agvState', 'state', 'localizationStatus'))
         if not self._ws_lock.acquire(timeout=5):

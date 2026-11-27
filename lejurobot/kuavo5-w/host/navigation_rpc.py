@@ -782,6 +782,22 @@ def main(request):
     from nav_msgs.msg import Odometry
     rospy.init_node('motus_navigation_rpc', anonymous=True, disable_signals=True,
                     disable_rosout=True, log_level=rospy.ERROR)
+    if request['operation'] == 'remote_preflight':
+        from jaten_msgs.msg import RobotChassisState
+        def read():
+            value = rospy.wait_for_message('/jaten_behavior_manager/robot_state', RobotChassisState, timeout=2.)
+            if (value.estop or value.bumper or value.driver_error or not value.driver_enable
+                    or value.manual_mode or value.mapping or value.is_moving):
+                raise RuntimeError('boot_remote_requires_healthy_idle_auto_chassis')
+            return value
+        read()
+        confirm_stationary(rospy, Odometry)
+        value = read()
+        return {'agvState': {'isMapping': value.mapping, 'runningMode': 'AUTO',
+                            'driverError': value.driver_error, 'estopButtonEvent': value.estop,
+                            'bumperEvent': value.bumper, 'isEnable': value.driver_enable},
+                'state': {'driving': value.is_moving},
+                'completion_basis': 'chassis_local_ros_health_and_fresh_stationary_odometry'}
     if request['operation'] == 'held_stationary':
         # Read-only settlement of a completed preparation, never a substitute
         # for cancelling a known/uncertain navigation submission.
