@@ -38,7 +38,7 @@ def setup(monkeypatch):
                           ReliabilityPolicy=enum, DurabilityPolicy=enum),
         "rclpy.exceptions": {"InvalidTopicNameException": TypeError},
         "rclpy.validate_full_topic_name": {"validate_full_topic_name": lambda topic: None},
-        "sensor_msgs.msg": dict(CompressedImage=NS, CameraInfo=NS, Image=NS),
+        "sensor_msgs.msg": dict(CompressedImage=NS, Image=NS),
         "std_msgs.msg": dict(String=NS, Bool=NS, UInt32MultiArray=NS),
         "bodyctrl_msgs.msg": dict(CmdSetMotorPosition=NS, SetMotorPosition=NS,
                                   MotorStatusMsg=NS, PowerBoardKeyStatus=NS),
@@ -176,34 +176,10 @@ def test_nearest_uses_registered_depth_and_rejects_stale_or_wrong_frame(setup):
     assert follow._nearest_face([large, nearer], (100, 80), rgb, depth, np) is None
 
 
-def test_speaker_keeps_lock_until_speech_ends(setup):
-    s = setup
-    s.feedback()
-    assert s.call("set_mode", mode="speaker")["mode"] == "speaker"
-    assert s.call("arm")["armed"]
-    s.follow._intrinsics = ((200, 200), 100, 100)
-    callback = s.follow._node.subscriptions[2][2]
-
-    def speech(active, bearing=None):
-        s.clock.advance(0.01)
-        callback(NS(data=json.dumps(dict(ts=s.clock.time(), active=active,
-                                         camera_bearing_deg=bearing))))
-
-    speech(True, -39)
-    s.send()
-    s.send()
-    assert len(s.commands) == 1
-
-    speech(True, 39)
-    s.send(offset=(-0.8, 0.8))
-    assert len(s.commands) == 1
-    speech(False)
-    speech(True, 39)
-    s.send(offset=(-0.8, 0.8))
-    s.feedback()
-    s.send(offset=(-0.8, 0.8))
-    assert len(s.commands) == 2
-    assert s.commands[-1].cmds[2].pos > 0
+def test_removed_speaker_mode_is_rejected(setup):
+    result = setup.call("set_mode", mode="speaker")
+    assert result["state"] == "error"
+    assert setup.call("info")["mode"] == "face"
 
 
 def test_object_mode_starts_vop_on_connected_camera(setup, monkeypatch):
