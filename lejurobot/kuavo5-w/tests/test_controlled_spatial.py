@@ -637,6 +637,28 @@ class SpatialTests(unittest.TestCase):
         self.assertFalse(self.plugin.unresolved())
         self.assertEqual([c[0] for c in self.client.calls if c[0] in ('navigate', 'cancel')], ['navigate', 'cancel'])
 
+    def test_confirmed_held_stop_clears_uncertain_task_and_persists_across_restart(self):
+        self.plugin._task = {'action_id': 'old', 'submission_started': True}
+        self.plugin._uncertain = True
+        self.plugin._persist()
+        original = self.client.native
+        def native(operation, **args):
+            if operation == 'cancel':
+                return {'success': True, 'stationary': True, 'software_estop': True,
+                        'older_release_fenced': True, 'tracker_pause_confirmed': False}
+            return original(operation, **args)
+        self.client.native = native
+        self.assertEqual(self.call('stop_nav')['state'], 'paused')
+        self.assertFalse(self.plugin.unresolved())
+        restored = ControlledSpatialPlugin(self.bundle, {'db_path': self.path}, self.client)
+        try:
+            self.assertFalse(restored.unresolved())
+            self.assertIsNone(restored.store.state('pending')['navigation'])
+            self.assertFalse(restored.store.state('pending')['uncertain'])
+            self.assertFalse(restored.store.state('last_navigation_stop')['result']['tracker_pause_confirmed'])
+        finally:
+            restored.close()
+
     def test_cancel_ack_without_stationary_is_unconfirmed(self):
         self.client.check = {'success': True, 'status': 1, 'arrived': False}
         self.navigate()
@@ -1613,6 +1635,24 @@ class NativePreparationTests(unittest.TestCase):
                 self.assertNotIn(1, self.events)
                 self.assertNotIn('mux', self.events)
                 self.assertTrue(self.state.soft_estop)
+
+    def test_cancel_uses_held_stationary_result_despite_tracker_pause_failure(self):
+        self.reject = 2
+        with patch.object(self.module, 'tracker_command', side_effect=RuntimeError('pause_unconfirmed')):
+            result = self.call('cancel')
+        self.assertTrue(result['success'])
+        self.assertTrue(result['older_release_fenced'])
+        self.assertTrue(result['software_estop'])
+        self.assertFalse(result['cancel_accepted'])
+        self.assertFalse(result['tracker_pause_confirmed'])
+        self.assertNotIn(1, self.events)
+        self.assertEqual(self.events, [0, 2, 0, 'stationary'])
+
+    def test_cancel_without_measured_rest_cannot_report_success(self):
+        with patch.object(self.module, 'confirm_stationary', side_effect=RuntimeError('not_stopped')):
+            with self.assertRaisesRegex(RuntimeError, 'not_stopped'):
+                self.call('cancel')
+        self.assertTrue(self.state.soft_estop)
 
     def test_mux_failure_never_submits_goal_and_retains_stop(self):
         with patch.object(self.module, 'select_navigation_source', side_effect=TimeoutError('mux')):

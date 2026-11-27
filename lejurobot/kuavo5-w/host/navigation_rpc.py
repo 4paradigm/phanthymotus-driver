@@ -1020,13 +1020,29 @@ def main(request):
         if not dispatch(control_mode=0).success:
             raise RuntimeError('native_navigation_soft_stop_rejected')
         confirm_software_stop(rospy, True)
-        response = proxy(control_mode=2)  # SetDispatchMode.CANCEL_CURRENT_TASK
-        if not response.success:
-            raise RuntimeError('native_navigation_cancel_rejected')
-        tracker_command(rospy, 3, request)
+        # Cancel the task producer, but judge STOP by held output and measured
+        # rest, not the factory tracker's sometimes-stale PAUSED state.
+        cancelled, tracker_paused = False, False
+        try:
+            cancelled = proxy(control_mode=2).success is True
+        except Exception:
+            pass
+        try:
+            tracker_command(rospy, 3, request)
+            tracker_paused = True
+        except Exception:
+            pass
+        # Retain the physical hold even if the factory still reports TRACKING.
+        # stop_epoch above prevents an older driver submit releasing it later.
+        if not dispatch(control_mode=0).success:
+            raise RuntimeError('native_navigation_soft_stop_rejected')
+        confirm_software_stop(rospy, True)
         confirm_stationary(rospy, Odometry)
-        return {'success': True, 'stationary': True,
-                'completion_basis': 'native_cancel_tracker_pause_and_fresh_stationary_odometry'}
+        confirm_software_stop(rospy, True)
+        return {'success': True, 'stationary': True, 'software_estop': True,
+                'older_release_fenced': True, 'cancel_accepted': cancelled,
+                'tracker_pause_confirmed': tracker_paused,
+                'completion_basis': 'held_output_stop_generation_and_fresh_stationary_odometry'}
     return {name: getattr(response, name) for name in response.__slots__}
 
 

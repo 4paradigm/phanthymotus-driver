@@ -741,6 +741,7 @@ class ControlledSpatialPlugin:
                     'archive': self.archive.snapshot() if self.archive else {'state': 'disabled'}}
                 result['last_map_operation'] = self.store.state('last_map_operation')
                 result['last_map_localization'] = self.store.state('last_map_localization')
+                result['last_navigation_stop'] = self.store.state('last_navigation_stop')
                 result['last_preparation_recovery'] = self.store.state('last_preparation_recovery')
                 result['last_preparation_failure'] = self.store.state('last_preparation_failure')
                 if self._map_pending and self._map_pending.get('stage_started_at'):
@@ -1020,9 +1021,13 @@ class ControlledSpatialPlugin:
                 raise RuntimeError('native_navigation_stop_unconfirmed')
             if not_submitted and response.get('software_estop') is not True:
                 raise RuntimeError('chassis_soft_stop_unconfirmed')
-            if uncertain:
+            if uncertain and not (response.get('older_release_fenced') is True
+                                  and response.get('software_estop') is True):
                 raise RuntimeError('older_navigation_submit_unresolved_stop_cannot_be_confirmed')
+            self.store.state('last_navigation_stop', {
+                'at': time.time(), 'task': self._task, 'result': response})
             self._task = None
+            self._uncertain = False
             self._persist()
 
     def _map_worker_active(self):

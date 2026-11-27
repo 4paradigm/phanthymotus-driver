@@ -926,6 +926,15 @@ complete acceptance/arrival/stop checks. These changes must not be described as
 a verified end-to-end navigation fix, and no automatic planner replacement or
 unconditional stop release is installed by the driver.
 
+`stop_nav` judges completion by a confirmed chassis output hold, fresh stationary
+odometry and a stop generation that prevents older driver requests releasing the
+hold. A missing factory `CAR_PAUSED` acknowledgement alone no longer leaves the
+driver task pending. Cancellation/pause are attempted, and their outcomes are
+retained in `info.last_navigation_stop`; successful physical stop clears the
+pending task in persistent storage. The output hold remains asserted after an
+explicit stop. A subsequent control action must prepare its own route; clearing
+metadata does not claim the factory tracker queue is empty or resume motion.
+
 ### 2026-11-20 camera/navi geometry verification
 
 Compared the shared camera/control contracts with Bumi, Tianyi 2.0, R1 and the
