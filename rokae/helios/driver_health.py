@@ -273,7 +273,7 @@ class HeliosDriverHealth:
             checks = {"chassis": chassis, "chassis_link": link, **streams}
             issues = [f"{name} {value['state']}" for name, value in checks.items()
                       if value["state"] != "running"]
-            return {
+            result = {
                 "state": "degraded" if issues else "running",
                 "health_summary": f"{len(checks) - len(issues)}/{len(checks)} 项正常",
                 "issues": issues,
@@ -282,5 +282,8 @@ class HeliosDriverHealth:
                 "streams": streams,
                 "timestamp_ms": time.time_ns() // 1_000_000,
             }
+            if issues:
+                result["recommendation"] = "建议先等待片刻后重新查询。若异常持续，请重启机器人后再查询。"
+            return result
         finally:
             self._sampling.release()

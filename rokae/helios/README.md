@@ -55,6 +55,8 @@
 
 在画布中执行 `driver_health` 的 `status`，约 4 秒采样后返回 JSON。结果包含正常项数、底盘 SDK 和厂家异常、内部网口载波与协商速率、两路雷达和里程计的 ROS 2 收帧状态。网口掉线计数是内核累计值。底盘异常字段按厂家上报显示，空值表示尚无报告。
 
+检查存在异常项时，结果会在 `recommendation` 中建议先等待片刻后重新查询，若异常持续则重启机器人后再查询。
+
 在拆分部署中，卡片通过本机 MCP 查询 `base_drive.info`、`lidar_cloud.status` 和 `loco_state.status`。端口分别由 `health_base_port`、`health_lidar_port`、`health_odometry_port` 指定，默认是 15782、15751、15749。设为 0 可关闭对应查询。可用容器环境变量 `HELIOS_HEALTH_BASE_PORT`、`HELIOS_HEALTH_LIDAR_PORT`、`HELIOS_HEALTH_ODOMETRY_PORT` 覆盖。主机网络下可用 `health_interface` 或 `HELIOS_HEALTH_INTERFACE` 选择连接底盘的物理网口，默认 `eth0`。
 
 采样只在执行查询时订阅两路原生 `PointCloud2` 和 `state/odom`。逐路显示发布者数量、收到帧数、接收帧率、距最后一帧的时间和原始时间戳推进。里程计分别检查位姿和速度来源。未发现发布者、等待首帧和时间戳停更有各自状态。源时间戳推进与接收跨度可用于排查积压，绝对采样延迟需另外校准时钟。

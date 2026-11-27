@@ -129,9 +129,26 @@ def test_status_card_reports_driver_input_separately_from_ros_output(monkeypatch
     assert result["state"] == "degraded"
     assert result["health_summary"] == "3/5 项正常"
     assert result["issues"] == ["chassis unavailable", "right_rear stale"]
+    assert result["recommendation"] == "建议先等待片刻后重新查询。若异常持续，请重启机器人后再查询。"
     assert result["chassis"]["state"] == "unavailable"
     assert result["streams"]["right_rear"]["driver_input"] == {"available": True}
     assert result["streams"]["odometry"]["driver_input"] == "里程计查询不可用"
+
+
+def test_healthy_status_has_no_recommendation(monkeypatch):
+    plugin = health.HeliosDriverHealth({}, "test", None)
+    monkeypatch.setattr(plugin, "_sample_streams", lambda: {
+        name: {"state": "running"} for name in ("left_front", "right_rear", "odometry")
+    })
+    monkeypatch.setattr(health, "chassis_health", lambda _: {"state": "running"})
+    monkeypatch.setattr(health, "_read_tool", lambda *args: {})
+    monkeypatch.setattr(health, "read_link", lambda _: {"state": "running"})
+
+    result = DriverBundle([plugin]).dispatch("driver_health", {"action": "status"})
+
+    assert result["state"] == "running"
+    assert result["issues"] == []
+    assert "recommendation" not in result
 
 
 def test_canvas_lifecycle_does_not_sample(monkeypatch):
