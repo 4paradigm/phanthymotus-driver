@@ -1,0 +1,30 @@
+services:
+  driver:
+    network_mode: container:${Q1_CORE_CONTAINER_ID}
+    ipc: container:${Q1_CORE_CONTAINER_ID}
+    volumes:
+      - "${Q1_STATE_DIR}/fastdds.xml:/q1-network.xml:ro"
+    environment:
+      Q1_FASTDDS_PROFILE: /q1-network.xml
+  ingress:
+    image: ${Q1_IMAGE}
+    platform: linux/arm64
+    restart: unless-stopped
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      motus.core.container: ${Q1_CORE_CONTAINER_ID}
+    command: ["/usr/bin/python3", "/link.py", "ingress", "--core", "${Q1_CORE_CONTAINER}"]
+    volumes:
+      - "${Q1_DDS_LINK}:/link.py:ro"
+    ports:
+      - "127.0.0.1:17812:17810/udp"
+      - "127.0.0.1:17813:17811/udp"
+    networks: [core]
+networks:
+  core:
+    external: true
+    name: ${Q1_DOCKER_NETWORK}
