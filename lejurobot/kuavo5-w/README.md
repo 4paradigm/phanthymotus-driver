@@ -73,7 +73,7 @@ Dashboard/PR镜像部署片段把宿主机 `/opt/phanthy-motus/drivers/lejurobot
 不会因此伪造传感数据或放开运动。
 
 默认ROS网络：上位机容器通过127.0.0.1登录本机，ROS_IP=192.168.26.12；
-控制下位机192.168.26.1/lab；独立底盘192.168.26.22/jt；ROS master为192.168.26.1:11311。
+控制下位机192.168.26.1/lab；独立底盘192.168.26.22/jt。控制器ROS master为192.168.26.1:11311；底盘原生导航、状态和键盘守护使用底盘自己的ROS master（SSH到底盘后为127.0.0.1:11311）。`provisioning.master`仍用于控制器/桥接；可用`provisioning.chassis.master`覆盖底盘原生主站，旧配置未提供该字段时也默认使用底盘本机。两套主站不混用：开机遥控释放前对上位机G12和`/move_base/base_cmd_vel`的检查从控制器发布者建立只读TCPROS连接，核对发布者及消息类型，不把这些话题转发或注册到底盘控制图中。
 `provisioning` 可覆盖master、每台机器的address/user/ros_ip/workspace及上位机head_workspace；
 地址/账号也可用 `KUAVO_<ROLE>_ADDRESS/USER/ROS_IP/WORKSPACE` 环境变量覆盖。
 自动发现对应用户及/home下的厂商应用/控制工作区，匹配不唯一就报错，不猜测另一份工作区。
@@ -156,6 +156,24 @@ controller/host/chassis分别报告checking/ready/blocked及错误，不传输�
 不抢占另一控制者。`boot_pause_confirmed`是开机历史结果，当前使能仍以独立新鲜反馈为准。
 开机状态超过3秒未更新会阻止运动。新运动动作在参数/限位通过后自动恢复，不恢复旧目标；
 相机、音频或基础遥测的start/info不会触发enable=true。
+
+`host_runtime.remote_ready_on_first_boot: true` 在上述初始化/暂停之后，允许驱动为本次下位机开机做 **一次** G12遥控交接。监管服务本身依然不请求恢复控制。交接要求开机完成时间在60秒内、G12转换器来自已核对的本机SDK进程、8轴/11键消息新鲜且摇杆回中/无按键、机型及全身暂停反馈可信，并且没有建图、导航、关节任务、待确认操作或用户控制请求。任一前置条件不足即保留暂停并报告原因，不用“先前进一下”探测。
+
+控制写入之前，底盘状态连接暂时不可用会在同一次交接内最多等待20秒，且仍受60秒开机窗口限制；等待期间每次重查停止、连接代次和控制权限。任意使能、软停或释放写入开始后均不自动重试整段交接。等待状态显示为 `preparing/waiting_for_chassis_feedback`。
+
+开机完成报告早于独立使能来源校验时，显示 `waiting/waiting_for_enable_verification`，在原60秒窗口内继续只读等待，不提前消费控制器交接许可。停止、用户动作、连接变更和窗口过期仍会终止交接。
+
+机器人型号参数发现尚未完成或校验已过期时同样先等待，显示 `waiting/waiting_for_robot_identity`。后台发现恢复后才允许继续；不绕过型号校验，不延长开机窗口。 G12来源/回中或开机心跳晚到也先等待，对应 `waiting_for_verified_neutral_g12` 和 `waiting_for_fresh_boot_feedback`。所有只读准备共享单调时钟截止时间，冻结的旧反馈不能延长等待；桥接握手后、首个控制写入前再次统一核对依赖。
+
+导航Web连接不可用时，遥控交接改用底盘本机ROS只读检查：两次健康/AUTO/非建图/非运动状态，中间核对新鲜且持续静止的里程计。该备用操作不发模式、使能、软停或任务命令；实际控制交接仍保留原有保护检查。
+
+遥控准备由容器后台执行，不依赖画布开启智能控制。交接先建立上下两块板之间的速度桥，成功后登记遥控路由；空闲时由G12控制，底盘控制卡执行时临时接管，正常完成后归还。显式停车、急停、故障或未确认结束的操作不会自动恢复遥控。已有 `/config/config.yaml` 不会随镜像升级覆盖，旧配置需在 `host_runtime` 下补上 `remote_ready_on_first_boot: true`；仅修改配置不会立即使能当前机器人。
+
+驱动先确认底盘软停、清理旧任务并暂停原生跟踪器，在软停保护下恢复全身BaseArm和上层速度通路。最终由底盘本机再次核对AUTO、非建图、健康/使能、连续零速度输出、新鲜G12回中及里程计停稳，确认`nav_mpc_move_base`来源后才解除软停；全程只发零速度，不发位移或关节目标。上位机Linux boot ID许可在MCP接收请求前消费，下位机boot ID许可在任何控制写入前原子消费，两者均存入现有持久化数据库；因此即使容器在收到下位机反馈前重启，也不能重新登记自动恢复。容器重启、失败、重连、用户停止都不重试；已经在运行的外部控制器也不会自动接管。删除持久化数据库会丢失该历史，因此不应把清库作为恢复遥控的办法。
+
+卡片生命周期start不取消/抢占这次启动准备；底盘卡只返回ready并说明准备已延后。遥控已就绪时，两张底盘卡start保留现有上层通路，`base_servo.start`只挂接输入并保持paused，需显式resume接管。任何运动、建图、导航或停止请求都会撤销尚未完成的自动交接；旧后台流程不能在任务开始后恢复遥控。建图仍走MANUAL网页键盘，上层速度关闭；原生导航走AUTO/`nav_mpc_path_track`，上层速度关闭；这两种任务不会因启动准备而被切回遥控。
+
+诊断见`base_drive.info.control_ownership.boot_remote`（以及其他含control_ownership的info）：`waiting/preparing/ready/skipped/error`是交接结果，当前使能仍看独立实时反馈。升级后必须让新的下位机监管服务在下次正常开机生效；旧服务不提供boot ID/G12校验信息时自动交接会跳过。仅只读使用可设置`remote_ready_on_first_boot: false`或`motion_enabled: false`。
 
 ### 数据桥接、相机和人工排障
 
@@ -262,7 +280,7 @@ rosmsg show kuavo_msgs/twoArmHandPoseCmd
 下位机已显式安装的开机服务负责初始化后暂停；驱动容器本身不创建硬件控制进程。
 普通执行动作会按需恢复控制并确认兼容MPC模式，已移除对外的 `switch_mode` 卡。
 `motion_enabled` 默认 `true`，未配置该字段时也默认开启；双臂/下肢关节动作还必须配置现场核验的限位，见下节。
-该开关仅允许处理运动请求，后台检查、读取传感器、卡片start/info不会触发恢复或发运动目标；原有运行时检查仍生效。
+该开关允许运动请求及上述显式配置的一次性开机遥控交接；传感器读取、卡片start/info不会触发恢复或发运动目标；原有运行时检查仍生效。
 如需只读运行，可在实际加载的配置文件中设置 `motion_enabled: false` 并重启驱动；此时拒绝运动、
 恢复控制及模式切换，仍允许状态/传感器/模型读取、软件暂停和 `stop_move`。该字段必须是 YAML 布尔值。
 `base_drive.info.feedback.motion_enabled` 与执行卡 `info.motion_enabled` 可确认当前配置。
@@ -324,7 +342,7 @@ sensor/actuator 卡片实现系统生命周期动作；`model` 为读取型 reso
 业务参数通过 `x-action-params` 分组并声明动作各自的 required；`dispatch()` 返回普通 dict，HTTP 层只包装一次 MCP content。
 `config.yaml` 的 `plugins.<card>.enabled` 决定卡片是否暴露。
 
-初始化流程等待实际BaseArm反馈（mode=3），再进入软件暂停；新的运动动作自动恢复控制。
+初始化流程等待实际BaseArm反馈（mode=3），再进入软件暂停；启用一次性开机遥控交接且全部保护通过时会准备G12，其他情况下保留暂停。新的运动动作仍可按需准备控制。
 不提供单独的模式切换/恢复卡，底盘、手臂等执行卡的 `stop_move` 和中断 hook 仍会全身软件暂停。
 底盘执行卡已从 `loco` 更名为 `base_drive`，动作、单位、ACP及`base`资源锁保持一致。
 旧部署配置的`plugins.loco`自动迁移为新名称；若同时指定`plugins.base_drive`，以新键为准。
@@ -343,8 +361,9 @@ sensor/actuator 卡片实现系统生命周期动作；`model` 为读取型 reso
 
 | 动作 | 参数 | 行为 |
 | --- | --- | --- |
-| `start_mapping` | `map_name` | 按厂商流程启动 Cartographer，随后恢复上位遥控器所需的 AUTO 速度通路；不覆盖已有同名地图 |
+| `start_mapping` | `map_name` | 按厂商流程在MANUAL启动Cartographer，保持网页键盘通路、关闭上位速度；不覆盖已有同名地图 |
 | `stop_mapping` | 无 | 保存地图/路网、重启厂商地图服务，载入并确认地图文件身份 |
+| `reconcile_mapping` | `map_name`、`confirm_abandon=true` | 仅在底盘已重启且旧任务不再可能运行时，放弃对应的失效建图记录；不保存、不删除文件/点位，不发运动或恢复控制 |
 | `tag_place` | `name`，可选 `description` | 保存当前 map 系 x/y/yaw；建图期间先绑定当前建图会话 |
 | `untag_place` / `list_tags` | `name` / 无 | 删除/列出当前地图语义点，列表含相对距离和方向 |
 | `list_maps` / `load_map` | 无 / `map_name` | 列出底盘和上位机归档地图 / 如有需要从归档恢复到底盘，再载入并切回自动模式 |
@@ -392,8 +411,20 @@ SSH RPC 辅助源码随镜像构建，每次在底盘执行固定操作，使用
 匹配明确时才向 Cartographer 发初始位姿，并用激光与回读位姿复核。
 如果起点匹配不明确，载图结果会提示定位未确认。回到起点附近、停稳后重新调用 `load_map`。
 旧地图没有建图起点记录时，继续使用厂商原有的定位流程。
-`base_drive`和`controlled_spatial`可以同时start；start共用准备结果，不因卡片都开启就占用运动锁。只有正在执行的动作互斥。建图前停止自动位姿/速度动作并暂停`base_servo`输入，松开遥控器；停稳检查使用连续新鲜原始`/odom`，不以网页残留的非零velocity误判。`start_mapping`在厂商MANUAL模式启动建图后切回AUTO，并同时确认建图仍有效和AUTO模式反馈；全身板G12遥控器经MPC使用底盘的自动速度源，若一直停留在MANUAL，输入会被底盘仲裁屏蔽。AUTO在这里表示速度输入通路，不代表自动探索，驱动不发送探索目标。全身软件暂停或底盘软急停仍会阻止遥控运动；切换底盘模式不会解除这两层暂停。驱动不关闭厂商遥控节点，但自动命令与遥控命令会共享厂商底盘控制链路，不能保证同时操作的结果；不要在自动动作期间拨动摇杆。`stop_move`是全身软件暂停，也会影响经过全身控制器的遥控输入，并非只取消MCP请求。
+`base_drive`和`controlled_spatial`可以同时start，共用底盘预检。已有建图会话时，两张卡的start只报告准备已延后，不取消任务、不切模式、不解除暂停；`base_servo.start`只连接输入并保持paused。厂商跟踪器队列为空且明确发布`FINISH_STOP`时可能不再发布速度；此时暂停确认使用底盘软停和新鲜静止里程计，不等待不存在的空闲零速流。已结清但遗留的`chassis_preparation.delivery_uncertain=false`记录，在无控制/地图/导航任务且两次新鲜网页反馈确认空闲时，可通过只读`held_stationary`再次确认软停、跟踪器结束和静止里程计后自动核销；不解除软停、不恢复运动。真正未确认的释放请求、导航提交和其他忙状态仍保留阻断。
+
+建图采用厂家网页的手动通路：`start_mapping`先关闭上位机速度输出、确认底盘软停并取消旧原生任务，在底盘MANUAL模式开始建图，之后保持MANUAL。无需G12遥控器，不再为遥控器恢复AUTO。全身BaseArm与底盘MANUAL是不同状态。`executing`仅表示操作已开始，ACP完成才确认建图就绪；若此期间打开`mapping_console`，面板自动等待同一次建图完成后再准备键盘，不发送方向或解除软停。停止、保存、断线、失焦或该次建图失败会取消等待，旧面板不会接管新建图会话。
+
+`start_mapping`是本次建图遥控授权，返回及完成ACP都会用英文提示调用`mapping_console`、不要使用G12遥控器。在15678画布执行`controlled_spatial.mapping_console`打开内嵌面板（`motus.workbench/1`）后，面板取得焦点即自动准备键盘控制，无需额外启用确认。键盘准备异步检查/停止旧任务，确认MANUAL建图和驱动使能，并收到首帧零速后才释放底盘软停；不调用全身使能，也不解除硬件急停/碰撞/故障。准备期间的方向输入被丢弃，就绪后必须重新按键。`keyboard_open/command/release/status`保留为工作台内部租约接口，不作为独立的画布/LLM动作；操作者只使用`mapping_console`。停止或ROS重连使旧页面授权失效，必须重新打开面板才能重新取得控制。
+
+按住Alt+W/S或I/K前后移动，Alt+A/D或J/L左右转向（不是平移）；也可按住方向按钮。上限0.15m/s、0.3rad/s，松开按键或Alt发送零速；面板失焦、页面隐藏或关闭会撤销控制。浏览器和底盘侧各有300ms心跳租约，底盘临时守护进程通过固定本机WebSocket `RobotMotion{vx,vy=0,vw}`发令，SSH断连/EOF、租约失效、MANUAL/建图/健康状态丢失时发零并请求底盘软停；这不是硬实时制动时延承诺。进程通过现有SSH流临时运行，不安装服务、不新增远程包或端口。
+
+整个建图会话禁止`base_drive`、`base_servo.resume`及原生导航接管，即使键盘暂时未按下。独立的arm/head/leg可在全身控制已就绪且无需共享使能/模式变更时并行；否则明确拒绝准备，不暗中改变控制状态。`stop_mapping`自动撤销面板授权、释放键盘并等待确认停稳，无需人工先点释放；停止未确认时不提交保存。键盘仍占用时载图、删除继续拒绝。确认停止失败会持久化阻塞标记，`stop_nav`经原生软停及里程计确认后才能清除。保存/载图保持底盘软停，服务重启后再次确认，地图流程不会恢复键盘或全身控制。结束建图后，上位机底盘动作重新预检，不能复用建图前的启动缓存。`stop_move`/`stop_nav`仍是全身暂停，并同时撤销键盘租约。外部厂家网页/遥控器不在本驱动内仲裁，不能与画布同时驾驶。
 建图、保存、载图和导航都返回 action_id 并通过 ACP 报终态。保存地图含厂商最终轨迹优化，可能耗时数分钟；保存响应最多等待25分钟，保存及随后的自动载图最多共30分钟。单独载图和启动建图最多150秒。HTTP调用立即返回executing，不等待优化结束；`info`在此期间显示saving及英文等待说明。保存期间缺少地图TF/定位帧不代表优化已失败，不要重启建图或重复提交保存。
+
+若进程/机器曾重启，数据库可能仍保留`saving / ChangeCartoMap`等未确认阶段。卡片启动、状态/地图查询及地图/导航操作遇到这类无本地工作线程的旧会话时，会自动核对并清理失效会话记录，无需人工执行恢复动作。清理要求底盘确实已在旧操作之后重启，连续两次新鲜状态均明确未建图、未行驶且三类任务列表为空，同时没有其他控制权或停止不确定性；任何信息缺失或变化都保留记录，后续请求间隔至少2秒再自动核查。新记录使用底盘boot ID区分开机；旧记录还要求底盘开机时间晚于旧命令、时钟一致。容器重启、地图列表出现文件、或者网页显示未建图，都不能单独证明旧保存请求已结束；不要为绕过检查而重启正在保存的底盘。自动清理只原子整理本地会话/转换记录，保留审计、地图和点位，不切模式、不恢复运动，也不清理导航/软停等其他保护。清理后继续原请求；若原请求是`stop_mapping`，则返回`completion_basis=obsolete_mapping_session_cleared`、`map_saved=false`，不声称保存成功。`info.mapping_cleanup`提供自动检查状态；`stop`/`stop_nav`不等待此检查。
+
+恢复后，`delete_map(map_name, confirm_delete=true)`可删除未被使用的残缺地图，包括0字节PGM或缺少部分配套文件的失败产物。删除按实际存在文件的大小、修改时间及SHA-256清单再次核对，不允许删除活动地图；备份和载入仍保留完整地图校验，不会把残缺文件当作有效地图。
 
 地图数据统一使用上位机持久目录 `/opt/phanthy-motus/data`（Compose 同路径挂载）：
 
@@ -408,16 +439,22 @@ SSH RPC 辅助源码随镜像构建，每次在底盘执行固定操作，使用
 保存建图成功后才把会话内的点绑定到最终地图身份。
 丢失提交/地图操作确认时不自动重试，也不因容器重启忘掉在途状态；`info` 可查看 pending。
 已知任务可再次 `stop_nav` 请求取消；提交去向、解除请求或地图变更仍不明时保持阻断，
-需要现场核对厂商状态后恢复，不提供“忽略错误继续运动”的复位入口。若`stop_mapping`已在SaveCartoMap阶段超时，可再次调用`stop_mapping`接续收尾：只读等待原保存生成完整文件（含在同步保存完成后写入的有效`.path`，且所有文件连续2秒不变），不会再次提交SaveCartoMap；随后载图并绑定原会话的语义点。保存未确认前`load_map`仍会拒绝，不能清除记录强行载图。地图转换与原生导航的阻断原因分别提示；被阻断的leg等运动请求不会发出目标或主动暂停机器人。`stop_nav`仍请求全身暂停，但不会把未确认的地图操作当作已完成。
+需要现场核对厂商状态后恢复，不提供“忽略错误继续运动”的复位入口。若`stop_mapping`已在SaveCartoMap阶段超时，可再次调用`stop_mapping`接续收尾：只读等待原保存生成完整文件（含在同步保存完成后写入的有效`.path`，且所有文件连续2秒不变），不会再次提交SaveCartoMap；随后绑定已保存文件的指纹和原会话语义点，不自动载图。保存未确认前`load_map`仍会拒绝，不能清除记录强行载图。地图转换与原生导航的阻断原因分别提示；被阻断的leg等运动请求不会发出目标或主动暂停机器人。`stop_nav`仍请求全身暂停，但不会把未确认的地图操作当作已完成。
 运行期间不要用另一客户端切换地图/改变坐标原点：周期核对不是原子的跨系统锁。
 
 离线测试覆盖任务ID、取消顺序、重启保留、地图指纹、语义点、地图转换和两卡互斥。
 已在真机只读确认服务同源、地图列表/PGM/YAML指纹及新鲜状态；
 已有现场建图、保存、载图和小范围导航/取消记录；这些不代表全场景运动验收，不能以单元测试替代现场验证。
 
+同一次建图可以反复打开 mapping_console：离开面板会释放控制并确认停车，执行 tag_place 后重新打开面板即可继续采图，地图会话和已打点不变。base_drive 与 controlled_spatial 可以同时 start，共享预检；执行时按底盘资源互斥。base_drive/base_servo 接管不能仅依据上位机 enable_vel_control 标志：还需在停车并暂停旧跟踪器、确认上位机零输出后，将底盘 mux 切为 nav_mpc_move_base 并核实反馈，再发布新目标。原生导航接管、地图流程、停止或重连后，上位机通路需重新确认。定时 move 的 ACP 仍仅表示发令持续时间和厂商看门狗窗口结束，不表示实测发生位移。
+
+键盘守护因租约等原因主动停车时，stopped 确认可能在驱动等待 ready 的读取中到达。当该帧确认厂商 RobotMotion 零速已发送且新鲜里程计已连续静止时记为键盘停车（兼容旧版软件急停停车确认），退出时保留该确认；不再等待第二帧后将连接关闭误报为停止未确认。真实未确认仍保留保护。面板在停止警告后每秒只读刷新 keyboard_status，收到 idle 且 busy=false 才清除旧警告，不自动重新接管。info.keyboard.last_failure 保留经过白名单过滤的失败原因，避免把所有错误归为同一条泛化信息。
+
+键盘SSH回复按块读取并保留未完成JSON行，避免逐字节读取超时后丢掉半帧及随后的停车确认。方向/状态请求回复期限仍为1.5秒，释放租约为12秒、全身停止为60秒；这只影响等待回复，不延长300ms运动租约。回复超时明确表示停止未确认，不能声称键盘已释放；键盘空闲状态也不能替代全身停止的独立确认。MANUAL 键盘松键只发送 RobotMotion 零速并保持会话，再按方向可继续；退出、断连或心跳超时发送零速并确认新鲜里程计静止，不要求 soft_estop=true，不反复切换调度软停。孤立会话的停止恢复使用同一零速链路。此修改尚未完成真机运动验收。
+
 #### 厂商保存与载图耗时
 
-`SaveCartoMap` 是同步的地图收尾调用，包含 Cartographer 最终优化及地图输出，并非只写一张 PGM 图片。现场 2026-11-20 的一次保存从约 00:31:59 持续到 00:51:08；期间仍有优化进度和剩余工作项，约19分钟主要发生在厂商内部。该实例不能作为正常固定耗时；轨迹、约束积压和计算资源都会影响保存，驱动不通过中断优化或改厂商SLAM参数来假装加速。保存之后仍按厂商流程重启地图服务、载入栅格/路网并确认模式。
+`SaveCartoMap` 是同步的地图收尾调用，包含 Cartographer 最终优化及地图输出，并非只写一张 PGM 图片。现场 2026-11-20 的一次保存从约 00:31:59 持续到 00:51:08；期间仍有优化进度和剩余工作项，约19分钟主要发生在厂商内部。该实例不能作为正常固定耗时；轨迹、约束积压和计算资源都会影响保存，驱动不通过中断优化或改厂商SLAM参数来假装加速。保存之后收尾建图服务并保持停车；载入栅格/路网和重定位由显式 load_map 执行。
 
 驱动减少了可避免的开销：模式已由新鲜反馈确认时不重复切换；载图等待使用轻量地图名查询，完成时再核对完整地图指纹；同一张内容未变、此前已确认载入且仍定位初始化的地图，重复 `load_map` 不再重载 Cartographer/路网，保留当前定位。内容变化、定位未初始化或无法证明状态时仍走完整载图流程。模式切换始终等待实际反馈，不能仅凭命令应答跳过前置条件。
 `info.map_transition.stage`、`map_stage_elapsed_s` 和 `last_map_operation`，以及地图ACP中的 `timing`，给出当前阶段/累计耗时和各命令阶段耗时（含模式确认），用于区分厂商优化、重启、加载与通信等待。它们是实测耗时，不是预计完成百分比。
@@ -563,11 +600,11 @@ python3 -c "import hashlib,rospy; print(hashlib.sha256(rospy.get_param('/humanoi
 
 | 卡片/操作 | 实际执行者与通路 | 控制模式 | 组合规则 |
 | --- | --- | --- | --- |
-| `base_drive.move/move_relative` | 驱动定时/里程计闭环 → `/cmd_vel` → 上位机MPC → 底盘 | BaseArm；上位机速度输出开启 | 独占base；可并行arm/head/leg；显式命令会暂停base_servo |
-| `base_servo` | ActuCore navi速度流 → ControlSink → `/cmd_vel` → 上位机MPC → 底盘 | BaseArm；上位机速度输出开启 | 独占base；可并行arm/head/leg；显式底盘/导航命令优先，之后须resume并发送新帧 |
+| `base_drive.move/move_relative` | 驱动定时/里程计闭环 → `/cmd_vel` → 上位机MPC → 底盘 | BaseArm（3）、底盘AUTO；上位机速度输出开启 | 独占base；可并行arm/head/leg；显式命令会暂停base_servo |
+| `base_servo` | ActuCore navi速度流 → ControlSink → `/cmd_vel` → 上位机MPC → 底盘 | BaseArm（3）、底盘AUTO；上位机速度输出开启 | 独占base；可并行arm/head/leg；显式底盘/导航命令优先，之后须resume并发送新帧 |
 | `controlled_spatial.navigate_*` | 厂商MoveToTarget → 原生路径规划/跟踪 → `nav_mpc_path_track` | BaseArm、底盘AUTO；上位机速度输出关闭 | 独占base；目标已确认且任务正常时可并行arm/head/leg；不与遥控器/其它底盘动作同时控制 |
-| `controlled_spatial.start_mapping` | 厂商Cartographer；遥控采图走G12 → 上位机MPC | 全身保持BaseArm；建图切换后确认底盘AUTO及上位机速度输出开启 | 建图转换期间占用base；采图时只选一个底盘输入，遥控器与自动速度流不要同时发令 |
-| `controlled_spatial.stop_mapping/load_map` | 厂商地图服务 | 只在底盘停稳后切换底盘MANUAL，结束恢复AUTO；不改全身BaseArm | 地图转换独占base；未确认的转换不能被新底盘运动覆盖 |
+| `controlled_spatial.start_mapping/mapping_console` | 厂商Cartographer；画布键盘 → 底盘临时看门狗 → RobotMotion | 底盘MANUAL；上位机速度输出关闭；面板不使能全身 | 建图会话独占底盘通路；启动其它卡不抢权；独立关节仅在共享状态已就绪时并行 |
+| `controlled_spatial.stop_mapping/load_map` | 厂商地图服务 | 先释放键盘并确认停稳；按当前模式选择MANUAL零速/AUTO调度停车，再确认MANUAL；保存后回AUTO并停车、不会载图，load_map独立载图和定位；不改全身BaseArm | 地图转换独占base；未确认的转换不能被新底盘运动覆盖 |
 | `arm` | `/kuavo_arm_traj` → 厂商全身控制器 | BaseArm；不修改底盘速度开关 | 独占arms，与base/head/leg独立 |
 | `head` | `/robot_head_motion_data` → 厂商头部控制 | BaseArm；不修改底盘速度开关 | 独占head，与base/arms/leg独立 |
 | `leg` | 下肢关节轨迹/躯干位姿 → 厂商MPC/WBC | BaseArm；不修改底盘速度开关 | 独占lower_body，包含腰；与base/arms/head独立 |
@@ -817,27 +854,94 @@ requires fresh `/enable_vel_control_state` feedback after changing it. This
 state is latched, not a periodic heartbeat: a confirmed value is retained within
 the same bridge connection and invalidated on reconnect. Otherwise upper MPC output
 can select `nav_mpc_move_base` and override the native navigation velocity.
-After confirming the upper velocity switch, the goal RPC calls the chassis
-`SetDispatchMode.STATUS_IDLE` to return control to the factory dispatcher. It
-submits `MoveToTarget` only after that call succeeds. If the chassis still reports
+After confirming the upper velocity switch, the goal RPC holds the chassis
+software stop, cancels the dispatch task, and pauses the actual LQR tracker via
+`/path_track_request_service` (`OP_PAUSE`). It requires fresh paused/empty-task
+feedback, at least 0.3 s of zero tracker output, and fresh stationary odometry.
+The factory `MotionState` header holds the last event timestamp even while
+publishing continuously; tracker feedback is checked using new nonlatched
+messages from `/lqr_path_track`, rather than rejecting that event timestamp.
+`SetDispatchMode.STATUS_IDLE` returns control to the dispatcher but does **not**
+select a mux velocity source. The driver explicitly requests
+`nav_mpc_path_track` on `/twist_mux_new/in/switch/nav_source` and waits for a new
+acknowledgement from `/twist_mux_new/out/nav_source_used`; an old latched value
+does not count. Only then does it submit `MoveToTarget`. After acceptance, it
+requires new nonlatched `map`-frame tracking-path messages whose endpoint matches
+the requested goal (within 0.1 m, stable across at least three samples over
+0.2 s). This prevents resuming a different old path while new planning is pending.
+It then resumes the tracker, rechecks source ownership, and releases the software stop.
+Any unresolved step retains/reasserts the stop and reports its stage; an uncertain
+goal delivery remains blocked until reconciled. If the chassis still reports
 `nav_mpc_move_base` five seconds after accepting the goal, the driver stops and
 cancels the task.
 `navigate_to_pose` and `navigate_to_tag` accept a 0.05–0.5 m/s linear speed
 limit (default 0.15 m/s). The factory planner and obstacle handling determine
 the actual speed.
-`base_drive` and `base_servo` restore this switch before publishing; starting
-mapping restores the upper MPC remote-control route without resuming motors.
-Stops retain the software stop and require native cancellation plus fresh
-stationary odometry. Factory historical task queries can retain status 1 after
+`base_drive` and `base_servo` restore this switch before publishing. Mapping
+keeps the chassis in MANUAL with upper MPC velocity disabled; canvas keyboard
+commands use the guarded factory RobotMotion route instead.
+Stops retain the software stop and require native dispatch cancellation, a
+confirmed LQR pause/zero output, and fresh stationary odometry. The factory's
+dispatch cancellation can leave a direct LQR point task active; its path DELETE
+also rejects the currently executing edge. The driver therefore holds that task
+paused until a new goal is accepted, rather than claiming the path was deleted.
+Factory historical task queries can retain status 1 after
 a goal has been replaced; that history alone does not prove it is still active.
 
-On the commissioned robot, a supervised `navigate_to_pose` test with a 0.2 m
+In an earlier commissioned-robot validation, a supervised `navigate_to_pose` test with a 0.2 m
 forward target and 0.1 m/s requested speed kept `nav_mpc_path_track` selected.
 Map feedback recorded approximately 0.150 m displacement and 0.050 m remaining
 error; native status changed from 1 to 2 and the driver completed after its
 stationary check. The factory request uses a 0.1 m position threshold. The test
 ended with confirmed whole-body disable and chassis software stop. This checks
 the short navigation/control-ownership path, not long-route or obstacle trials.
+
+On 2026-11-25, a new 0.2 m trial did not move meaningfully: the installed
+`mcrp_global_planner/MCRPlanner` crashed in
+`PathOptimizer::objectiveFunction()` during global planning. The driver held the
+software stop when it could not confirm a replacement path. Under operator
+authorization, changing only the planner plugin and its startup-config reference
+to a private copy using the factory-listed, installed `navfn/NavfnROS` produced
+a seven-pose map-frame plan in approximately 85 ms, with the requested endpoint.
+The original factory YAML, costmaps, footprint, obstacle settings and speed
+parameters were unchanged. This was a planning-only check, not a successful
+motion test. A subsequent power cycle restored the factory MCR selection; the
+private config and rollback record remain under
+`~/.motus/navfn-validation-20261125/` on the chassis. No persistent planner
+override has been installed, and motion validation of the fallback is pending.
+
+On 2026-11-27 the MCR optimizer failed again during the reported P1 request
+(02:22:20); the LQR process respawned and the driver could not confirm the new
+path. The driver now detects a changed LQR URI/PID during path confirmation and
+reports the specific failure. `load_map` also reports an error completion when
+localization remains unconfirmed, retaining its detailed result in
+`info.last_map_localization`. Relocalization uses the chassis-local software
+hold and fresh odometry; `/enable_control_state` belongs to the other ROS master.
+Its TF listener waits for a scan covered by its actual timestamp history.
+
+A blocked native submission must not delay the physical stop request. Stop now
+requests an independent chassis hold before waiting for submission ordering.
+A chassis-local stop generation prevents an older navigation/preparation helper
+from subsequently releasing that hold. Cancellation and stationary confirmation
+are still required before clearing the unresolved-task record; a zero command
+on the upper-MPC route cannot cancel a native tracker on another mux input.
+
+The current vendor binaries still need investigation: a held Navfn `GetPlan`
+diagnostic blocked in `GlobalPlannerService::makePlanServiceCallback()` calling
+`makePlan()` on the same mutex; tracker pause/cancel replies also did not always
+produce the requested runtime state. Small navigation trials did not pass the
+complete acceptance/arrival/stop checks. These changes must not be described as
+a verified end-to-end navigation fix, and no automatic planner replacement or
+unconditional stop release is installed by the driver.
+
+`stop_nav` judges completion by a confirmed chassis output hold, fresh stationary
+odometry and a stop generation that prevents older driver requests releasing the
+hold. A missing factory `CAR_PAUSED` acknowledgement alone no longer leaves the
+driver task pending. Cancellation/pause are attempted, and their outcomes are
+retained in `info.last_navigation_stop`; successful physical stop clears the
+pending task in persistent storage. The output hold remains asserted after an
+explicit stop. A subsequent control action must prepare its own route; clearing
+metadata does not claim the factory tracker queue is empty or resume motion.
 
 ### 2026-11-20 camera/navi geometry verification
 
@@ -988,3 +1092,106 @@ The candidate was reverted after validation; this is not a full live container
 upgrade. Native IMU silence was reproduced even in an independent SDK reader as
 root, then recovered by a camera-only device soft reboot. See the spatial input
 audit for timing, geometry limitations and deployment status.
+
+键盘SSH确认等待与运动租约分开：运行中允许最多1秒接收回复，底盘本地300ms失联零速保护不变，不重发旧方向。帧按80ms起点间隔发送，通信耗时计入周期，不在回复后额外等待80ms；`info.keyboard.last_roundtrip_ms/max_roundtrip_ms` 显示当前会话通信耗时，供定位抖动。该修改需部署后再进行现场持续操作验证。
+
+`stop_mapping` 在 MANUAL 中用厂商 RobotMotion 零速和新鲜里程计静止完成保存预检，不要求调度软急停反馈；退出建图后用 AUTO 调度停车，不自动载入地图或按建图起点重定位。地图命令尚未发送时的预检失败会保留原建图会话并清除本次过渡记录，允许重试，不要求重启底盘。
+
+保存与载图分离：`stop_mapping` 返回 `map_loaded:false`，按保存文件的实际指纹绑定语义点并触发上位机同步；`spatial_map` 列表与底盘/本地地图并集一致，选择地图时校验同步预览副本，不改变底盘当前地图、模式或定位。文件同步失败明确报告 `map_preview_sync_failed`，不再将尚未同步的底盘地图误报为不存在。
+
+上位机底盘控制的模式切换：`base_drive/base_servo` 需要 AUTO；从已退出建图的 MANUAL 接管时，先确认无建图/键盘占用和新鲜静止，发送厂商 MANUAL 零速、关闭上位机速度输出，确认原生跟踪器已结束及上位机持续零输出，再切 AUTO 并等待实际反馈，之后才取消旧任务、核对速度源及解除调度停车并发送目标。`controlled_spatial` 建图键盘用 MANUAL，原生导航用 AUTO；卡片生命周期 start 不等于申请建图控制权。模式转换与运动共用停止世代和控制锁，停止可抢占，转换未确认不发目标。
+
+执行模式核对：所有全身运动卡（base_drive、base_servo、arm、leg、head、原生导航）共同使用上位机 BaseArm=3，不把底盘的 MANUAL/AUTO 当成同一个模式枚举。每次新的底盘执行都读取实际模式；缓存的上位机通路若遇到 MANUAL 或不同 mux 选择会重新交接，避免仅凭旧缓存发目标。原生导航在自动准备前允许“已定位但仍MANUAL/调度停车”，准备后再次核对AUTO再发目标；硬件急停、碰撞、驱动故障、未初始化定位和当前图不匹配仍拒绝。模式改变不会替代载图或重定位。
+
+`info.control_ownership.execution_modes` 提供各卡/地图动作的只读模式要求。arm/leg/head 的执行只准备 BaseArm，不改变底盘模式或速度源；tag_place/get_pose/list_maps/delete_map、spatial_map预览、speaker及传感器不为了读取或显示而切运动模式。已有任务/建图占用时不能用另一张卡的执行隐式抢权，须先结束占用；停止请求不会为了“满足模式”而恢复使能。
+
+键盘故障停车分两路：正常松键保留会话并发 RobotMotion 零速；释放/断连/看门狗退出先用同一厂商连接发零速并确认新鲜里程计静止。如果 WebSocket 已坏、零速写失败或静止不能确认，底盘本地守护改走独立 ROS SetDispatchMode(control_mode=0)，要求软停反馈为真、里程计静止、再核对软停仍为真，才返回已停车。故障兜底不解除软停、不切模式、不发非零目标。两条路径均未确认时返回 keyboard_fallback_stop_unconfirmed 并保留持久化阻断；不能以idle或进程已退出证明真机停住。MANUAL下厂商ROS软停曾有不确认记录，此兜底是否有效仍需真机故障场景验证，单元测试不替代该验证。
+
+已结束的MANUAL准备失败恢复：显式start的共享预检可处理仅有`chassis_preparation.delivery_uncertain:false`的残留记录。要求全身及上位机速度输出均已关闭、无活动任务/地图操作/键盘或未确认写入，随后请求厂商零速（失败时走独立ROS停车兜底）、确认原生跟踪器FINISH_STOP及新鲜里程计静止，再清理该准备记录。此过程不切AUTO、不使能、不解除停车，AUTO交接仍留到实际运动执行；恢复证据记录在`info.last_preparation_recovery`。info本身保持只读，不会为恢复而发停车或运动请求。
+
+上位机速度关闭时，实测 `/move_base/base_cmd_vel` 只保留一帧零速，不连续发布。仅对非G12的AUTO/上位机交接，检查同时订阅经过唯一发布者、类型和MD5核验的 `/enable_vel_control_state`：关闭反馈为false、最终速度为零、两条连接持续有效且观察窗口满300ms时，可确认关闭输出通路的静止；任何非零、使能回调或连接失败立即撤销。没有关闭反馈时仍要求至少三帧持续零速；G12仍要求持续新鲜零速和中立遥控输入。MANUAL→AUTO的只读预检前，已确认停车与关闭输出会记为`delivery_uncertain:false, stage:observe_manual_auto_guard`，只读检查失败不再伪装成模式命令投递未确认。
+
+准备记录按实际动作阶段持久化：初始状态读取和MANUAL静止检查均为delivery_uncertain:false；只有即将发送AUTO切换或原生prepare/upper_handoff时才标为true，并记录operation/stage；已收回的失败响应保留厂商stage/error_code及确定的投递状态。info.last_preparation_failure保留最初失败及当时记录，避免后续“需要先stop”覆盖根因。只读预检失败不会制造新的运动命令投递不确定性；真实未确认的模式/解除命令仍保留阻断。
+
+底盘键盘接收端按SSH连接持有JSON行缓冲，分片跨解析读取超时不会丢弃，合并到达的后续帧也保留；改为有界按块读取，单帧仍限制1024字节。解析缓冲不延长运动授权：守护的300ms租约一旦超时仍请求停车并退出，不重用迟到方向帧，不在旧会话中自动恢复运动。
+
+### 上位机速度到原生底盘的跨板连接
+
+`base_drive` 与main分支保持同一路径：`/cmd_vel`→厂商MPC/WBC→上位机`/move_base/base_cmd_vel`，不绕过MPC直接把卡片目标发给电机。现场发现控制器192.168.26.1与底盘192.168.26.22各自的ROS Master之间没有厂商wheel_bridge，导致接管和命令持续时间都能确认，但底盘收不到速度。驱动现在在首次上位机底盘动作前，经既有SSH通道创建底盘临时跨板连接；每个Master分别初始化真实ROS节点，转发MPC输出并反向转发厂商BaseCmdVelStatus，使用板子已有Noetic和生成消息，不安装依赖、不启动厂商控制进程、不修改原厂源码或launch。
+
+非零转发需要当前base任务为base_drive/base_servo、无控制转换、相同stop世代和连接、已验证upper mux、全身/速度使能为真、底盘AUTO且无建图/急停/软停/故障、速度输入不超过200ms且底盘反馈不超过300ms。速度仍受0.8m/s与1rad/s上限约束。驱动每40ms发送带随机nonce与递增seq的许可，底盘本地300ms超时发零速并确认静止；零速无法确认时请求独立ROS软停。观察子进程随父进程退出，底盘文件锁阻止重复桥接。
+
+切换为原生导航/建图或退出base任务时，撤销许可、发一次零速，然后停止向该底盘输入持续注入速度；原生导航仍选nav_mpc_path_track，键盘仍走MANUAL RobotMotion。交接前先关闭旧上位机速度输出再恢复全身，交接完成才为新任务开启速度。info.control_ownership.upper_velocity_bridge显示连接状态与非零转发帧数。定时move的completed仍是命令时长完成；实际位移须以底盘里程计确认。
+
+2026-11-27已授权现场验证：0.1m/s前向目标持续1秒，底盘输入、mux输入/输出均记录非零且峰值约0.1m/s，里程计约0.13米（含MPC减速尾段）；随后全身暂停、底盘软停与新鲜里程计静止均确认。另已验证零许可连接和断连停车。此次未重复真机导航或建图运动，跨卡片隔离由离线回归覆盖；不将此短程测试视为全部导航验收。
+
+### 执行卡与G12遥控的交接
+
+底盘空闲且已使能时交给G12；base_drive/base_servo实际执行期间切到卡片来源，controlled_spatial导航、建图和地图转换期间阻断遥控底盘输入。卡片仅start不永久占用底盘。使用ROS subscriber的publisherUpdate接口临时选择MPC两处消费者的/cmd_vel和/cmd_vel_world来源：卡片只允许/rosbridge_websocket，遥控只允许原厂两个joy command节点，hold不接收这两条速度输入。核对旧TCPROS连接已退出后才确认交接。遥控节点和/joy、/stop_robot通路不被停止或重映射，原厂文件和launch不改。断开驱动时恢复Master中当前注册的原输入连接。
+
+base_drive正常完成或base_servo释放数据租约后，先等经核验的G12输入连续回中300ms，再接回遥控来源并重新等待MPC零输出300ms，才允许底盘速度；杆未回中不会沿用旧方向。原生导航完成后，在现有全身使能仍为true、无活动任务/未确认操作时自动准备上位机速度通路，再执行同样的遥控交还。显式全身stop、故障、未知写入、建图未结束时不自动使能或解除阻断；之后若操作员明确重新使能控制器，则可在新停止世代内重新准备遥控，仍需回中。info.control_ownership.upper_velocity_bridge.remote_state显示blocked/waiting_for_neutral/ready，remote_return_error显示交还失败。
+
+2026-11-27已在全身关闭状态下真机核对hold/card/remote三种MPC输入连接均生效且能恢复原连接；随后在旁站授权下恢复遥控，操作员确认能正常移动、回中停止。另执行1秒全零base_drive任务，期间remote_state=blocked、完成后无额外恢复调用即回到ready；测试期间非零转发计数不变。未执行额外原生导航或建图运动，相关隔离和导航完成交还由离线回归覆盖。
+
+### First-boot handoff verification boundary
+
+The boot handoff prepares read-only dependencies before any control write,
+retains a single persistent permit, and never replays writes after failure.
+Transient web/SSH state-read failures may retry within the original bounded
+window. Explicit chassis health/mode rejection remains terminal. Stop, operator
+motion, reconnect and boot identity changes invalidate the attempt.
+
+The final `ready` result now requires the velocity bridge's actual remote-input
+acknowledgement after route setup; controller enable and mux release alone are
+insufficient. A failed final bridge check pauses again and reports its stage
+and `control_writes_attempted` for diagnosis. The bridge holds its exclusive
+process lock until shutdown, and its SSH payload is assembled per module before
+embedding the navigation source literal.
+
+Offline tests cover dependencies arriving in sequence, stale identity during
+bridge handshake, frozen feedback deadlines, read-only transport recovery,
+operator cancellation, process-lock exclusivity, executable payload assembly
+and failure of the final remote acknowledgement. These checks do not establish
+successful physical cold-boot behavior or resolve the separate vendor EtherCAT
+initialization race; a complete real reboot validation remains required.
+
+### 坐标导航的厂家入口
+
+`navigate_to_pose` / `navigate_to_tag` 使用厂家直接坐标规划入口
+`/path_sequence_executor/dispatch_direct_move_target`，避免路网入口的 PRE_MOVE 阶段把坐标目标
+先引向无关或被障碍阻挡的路网点。仍经 `/move_base/move_to_target` 包装层取得任务 ID，
+并沿用 `check_arrived`、取消任务、避障、限速和真实里程计停车确认。
+导航准备在取消旧任务、确认底盘保持停车后，核实服务类型/ABI/所有者，并按需重启唯一的
+`leju_node` 包装节点以使下游参数生效；不修改厂家文件，不重启电机、定位、规划器或遥控节点。
+绑定确认与 ROS 启动 ID、包装进程 PID/URI 关联，重启后由下次导航重新核验；开机遥控及
+`base_drive` 不运行这段配置流程。`info.last_navigation_completion` 保留正常到达的任务 ID、
+动作 ID、位置/朝向误差和完成时间，便于区分正常完成与后续人工停止。
+
+双主站桥接的 `BaseCmdVelStatus` 仅在上身已取得速度控制权且控制/速度均使能时转发，
+并丢弃交接或使能前排队的状态。底盘原生导航期间的 `move_to_target is executing`
+属于拒绝上身速度输入的预期反馈，不能送入上身控制器触发其 `/stop_robot` 退出逻辑；
+上身实际控制期间仍转发真实拒绝，不伪造成功状态。SSH 辅助脚本使用标准库 zlib 压缩传输，
+避免组合脚本超过 Linux 单个命令参数 128 KiB 限制而无法启动桥接。
+
+2026-11-27 真机回归：整机重启后自动遥控 ready；最高 0.1 m/s 从距 P1 约 0.25 m
+位置导航至 P1，厂家任务 `1795784161.618845` 自动到达，驱动核对地图位姿和新鲜静止里程计后
+正常完成，位置误差约 0.045 m、朝向误差约 0.0013 rad；未调用测试收尾 `stop_nav`。
+完成后遥控自动回到 ready，上身仍使能、底盘 softwareEstop=false，无残余任务或交接错误。
+离线组件回归 803 项，1 项跳过。该验证覆盖本机该地图短程工况，不代表所有地图/障碍工况。
+
+建图键盘输入短暂中断时，驱动在300ms输入过期后持续向厂家发送零速，保留当前连接；
+第一帧恢复输入只清零并提示重新按键，不沿用旧方向，不因浏览器心跳延迟反复重做停车准备。
+松键发送零速、下一次按键继续同一连接。机器人状态反馈独立使用1秒新鲜度预算：
+2026-11-27建图只读采样6秒、56帧中有两次间隔超过300ms，最长351ms，不能把状态广播
+抖动误判成键盘指令失联。底盘SSH指令租约仍为300ms，SSH失联仍零速并确认停车。
+`start_mapping`完成前先确认MANUAL建图、零RobotMotion和实际静止，再解除过渡软停；
+不等打开面板才做此准备。这个过程不发送非零方向，也不恢复G12或上身速度通路。
+
+保存地图时，`AgvSystemRestart` 可能在回复前关闭自己的连接。驱动不重复保存或重启，
+而是只读确认完整地图文件至少稳定2秒、厂家已退出建图并回到AUTO、任务已清空、
+底盘保持停车且新鲜里程计确认静止；无需等待整机重启。确认后在同一数据库事务中
+绑定建图点位、保存起始锚点并清除会话和切换记录，避免保存成功却一直卡在saving。
+`info.last_map_save` 区分已保存与已加载；保存收尾不会自动加载地图或假设机器人仍在起点。
+地图路网指纹兼容底盘Python 3.8，不依赖其不支持的`hashlib.md5`关键字参数。
+2026-11-27真机只读恢复已确认`test2`保存成功、会话清空，原地图文件和点位保留；
+未重复保存、重启底盘服务、加载地图或发送移动目标。键盘流畅性改动仍需实际操作验证。

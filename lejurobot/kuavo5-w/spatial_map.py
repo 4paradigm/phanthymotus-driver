@@ -149,14 +149,14 @@ class SpatialMap:
     def tool(self):
         return {
             'name': 'spatial_map', 'type': 'actuator', 'multiInstance': False,
-            'description': '预览上位机已归档的底盘地图和点位；可选择历史地图。',
+            'description': '预览底盘地图和点位；自动同步预览所需文件，不载图或改变定位。',
             'inputSchema': {'type': 'object', 'properties': {
                 'action': {'type': 'string', 'enum': ['list_maps', 'select_map']},
                 'map_name': {'type': 'string'},
             }, 'required': ['action'], 'x-resource': 'spatial_map',
                 'x-completion': {'actions': []}, 'x-action-params': {
-                'list_maps': {'params': [], 'required': [], 'description': 'List archived maps.'},
-                'select_map': {'params': ['map_name'], 'required': ['map_name'], 'description': 'Select an archived map for display.'},
+                'list_maps': {'params': [], 'required': [], 'description': 'List chassis and locally available maps.'},
+                'select_map': {'params': ['map_name'], 'required': ['map_name'], 'description': 'Sync and preview a map without loading it on the chassis.'},
             }},
             'topic_out': self.output,
         }
@@ -181,7 +181,12 @@ class SpatialMap:
 
     def dispatch(self, action, args):
         if action in ('list_maps', 'select_map'):
-            maps = sorted(self.snapshots())
+            local = self.snapshots()
+            try:
+                remote = {safe_name(Path(item['fileName']).stem) for item in self.archive.client.maps()} if self.archive else set()
+            except Exception as exc:
+                return {'state': 'error', 'error': 'map_list_unavailable', 'error_type': type(exc).__name__}
+            maps = sorted(set(local) | remote)
             if action == 'list_maps':
                 return {'state': 'ready', 'maps': maps}
             try:
@@ -189,7 +194,12 @@ class SpatialMap:
             except ValueError as exc:
                 return {'state': 'error', 'error': str(exc)}
             if name not in maps:
-                return {'state': 'error', 'error': 'archived_map_not_found'}
+                return {'state': 'error', 'error': 'map_not_found'}
+            if name in remote:
+                try:
+                    self.archive.sync(name)
+                except Exception as exc:
+                    return {'state': 'error', 'error': 'map_preview_sync_failed', 'error_type': type(exc).__name__}
             with self.lock:
                 self.selected = name
                 self.current = self.error = None

@@ -53,9 +53,17 @@ class JatenClient:
         target = manager._target('chassis')
         secrets = load_secrets(os.environ.get('KUAVO_SSH_SECRETS', str(manager.state_dir / 'ssh-secrets.json')))
         request = {'operation': operation, 'args': args, 'ros_ip': target['ros_ip'],
-                   'master': manager.settings.get('master', 'http://192.168.26.1:11311')}
+                   'master': target.get('master', 'http://127.0.0.1:11311'),
+                   'upper_master': manager.settings.get('master', 'http://192.168.26.1:11311')}
         source = self._source
-        timeout = 45 if operation in ('prepare', 'soft_stop') else 25 if operation == 'cancel' else 15
+        if operation in ('manual_stop', 'manual_mapping_ready'):
+            helper = (Path(__file__).parent/'host/manual_keyboard.py').read_text()
+            source = ('import json,sys\nNAMESPACE={"__name__":"manual_stop_rpc", "NAVIGATION_SOURCE":'
+                      + repr(self._source) + '}\nexec(compile(' + repr(helper)
+                      + ',"manual_keyboard.py","exec"),NAMESPACE)\n'
+                      + 'try:\n print(json.dumps({"ok":True,"result":NAMESPACE["manual_zero_stop"](json.load(sys.stdin))}))\n'
+                      + 'except Exception:\n print(json.dumps({"ok":False,"error":"keyboard_manual_stop_unconfirmed"}))\n')
+        timeout = 45 if operation in ('prepare', 'remote_ready', 'upper_handoff', 'soft_stop', 'navigate') else 25 if operation == 'cancel' else 15
         if operation == 'relocalize':
             helper = (Path(__file__).parent / 'host/map_relocalize.py').read_text()
             # Load the same ROS libraries as the factory Cartographer process.
@@ -72,6 +80,10 @@ print(result.stdout, end='')
         if not isinstance(result, dict):
             raise RuntimeError('invalid_native_navigation_response')
         return result
+
+    def keyboard_stream(self):
+        from mapping_keyboard import FactoryKeyboardStream
+        return FactoryKeyboardStream(self)
 
     def http(self, path, body=None):
         request = urllib.request.Request(self.base + path, data=body,
@@ -107,6 +119,15 @@ print(result.stdout, end='')
             raise RuntimeError('map_changed_during_identity_read')
         return before['mapId'], fingerprint + ':' + before['mapMd5']
 
+    def saved_map_identity(self, name):
+        value = self.native('map_identity', map_name=name, include_road_md5=True)
+        grid, road = value.get('sha256'), value.get('road_md5')
+        if any(not isinstance(v, str) or len(v) != size or
+               any(c not in '0123456789abcdef' for c in v)
+               for v, size in ((grid, 64), (road, 32))):
+            raise RuntimeError('saved_map_identity_unavailable')
+        return name, grid + ':' + road
+
     @staticmethod
     def _frame(raw):
         if not isinstance(raw, str) or len(raw) > 2_000_000:
@@ -140,6 +161,10 @@ print(result.stdout, end='')
 
     def observe(self, required=None):
         return self._snapshot(required)[0]
+
+    def observe_remote_chassis(self):
+        """Read-only ROS fallback; G12 readiness does not need the map web UI."""
+        return self.native('remote_preflight')
 
     def _snapshot(self, required):
         fields = tuple(required or ('pose2d', 'agvState', 'state', 'localizationStatus'))

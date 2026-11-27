@@ -5,6 +5,7 @@ Installed explicitly on the commissioned ROS1 controller host, not in the
 driver container. Never sends enable_control=true or retries initialization.
 """
 import argparse
+import ast
 import json
 import math
 import os
@@ -20,6 +21,66 @@ EXPECTED_DOF = {'robot_type': 1, 'armRealDof': 14, 'headRealDof': 2,
                 'legRealDof': 4, 'waistRealDof': 0}
 CONTROLLER_NODES = {'/nodelet_manager', '/nodelet_controller',
                     '/mobile_manipulator_sqp_mpc_node'}
+
+
+def g12_neutral(message, owner):
+    """Verified v63 H12-to-Joy mapping; triggers 2/5 are not stick axes."""
+    header = getattr(message, '_connection_header', {}) or {}
+    axes, buttons = getattr(message, 'axes', ()), getattr(message, 'buttons', ())
+    return (bool(owner) and header.get('callerid') == owner and header.get('latching') == '0'
+            and len(axes) == 8 and len(buttons) == 11
+            and all(type(v) in (int, float) and math.isfinite(v) and abs(v) <= 1.05 for v in axes)
+            and all(abs(axes[i]) <= .03 for i in (0, 1, 3, 4, 6, 7))
+            and all(type(v) is int and v == 0 for v in buttons))
+
+
+def g12_owner(system_state, master, workspace):
+    """Trust only the actual local SDK converter process, never a node-name guess."""
+    publishers = dict(system_state[0]).get('/joy', [])
+    if len(publishers) != 1:
+        return None
+    owner = publishers[0]
+    code, _, uri = master.lookupNode('/kuavo5w_controller_boot', owner)
+    if code != 1:
+        return None
+    with xmlrpc.client.ServerProxy(uri, transport=TimeoutTransport()) as node:
+        code, _, pid = node.getPid('/kuavo5w_controller_boot')
+    if code != 1 or type(pid) is not int or pid <= 0:
+        return None
+    root = Path(workspace).resolve()
+    source = root / 'src/humanoid-control/h12pro_controller_node/src/h12pro_node'
+    expected = {(source / name).resolve() for name in
+                ('h12ChannelToJoymsg.py', 'ocs2_h12pro_node.py')}
+    args = Path(f'/proc/{pid}/cmdline').read_bytes().decode().split('\0')
+    for arg in args:
+        if not arg.startswith('/'):
+            continue
+        path = Path(arg).resolve()
+        if path in expected:
+            return owner
+        # Catkin installs an executable Python relay, not necessarily a symlink.
+        # Accept only its exact generated AST and an allowlisted source target.
+        if (root / 'devel') not in path.parents or path.name not in {p.name for p in expected}:
+            continue
+        try:
+            tree = ast.parse(path.read_text())
+            first = tree.body[0]
+            if (not isinstance(first, ast.Assign) or len(first.targets) != 1
+                    or not isinstance(first.targets[0], ast.Name) or first.targets[0].id != 'python_script'
+                    or not isinstance(first.value, ast.Constant) or not isinstance(first.value.value, str)
+                    or Path(first.value.value).resolve() not in expected):
+                continue
+            template = """python_script = TARGET
+with open(python_script, 'r') as fh:
+    context = {'__builtins__': __builtins__, '__doc__': None, '__file__': python_script,
+               '__name__': __name__, '__package__': None}
+    exec(compile(fh.read(), python_script, 'exec'), context)
+""".replace('TARGET', repr(first.value.value))
+            if ast.dump(tree) == ast.dump(ast.parse(template)):
+                return owner
+        except (OSError, SyntaxError, ValueError):
+            continue
+    return None
 
 
 def check_no_controller(system_state):
@@ -61,9 +122,16 @@ class BootSequence:
         self.initialization_accepted = False
         self.pause_confirmed = False
         self.initial_mode = None
+        try:
+            self.boot_id = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+        except OSError:
+            self.boot_id = None  # No first-boot permit on an unsupported host.
+        self.ready_at = None
 
     def status(self):
         return {'state': self.state, 'error': self.error, 'robot_version': self.version,
+                'boot_id': self.boot_id,
+                'ready_age_s': None if self.ready_at is None else max(0., time.monotonic()-self.ready_at),
                 'initialization_requested': self.initialization_requested,
                 'initialization_accepted': self.initialization_accepted,
                 'boot_pause_confirmed': self.pause_confirmed,
@@ -90,6 +158,7 @@ class BootSequence:
                         and sample.get('enabled') is False
                         and 0 <= now - sample.get('enabled_at', float('-inf')) <= 2):
                     self.pause_confirmed, self.state, self.error = True, 'complete', None
+                    self.ready_at = time.monotonic()
                 else:
                     self.error = 'existing_controller_not_initialized_and_paused'
                 return
@@ -123,6 +192,7 @@ class BootSequence:
               and 0 <= now - sample['enabled_at'] <= 2):
             self.pause_confirmed = True
             self.state, self.error = 'complete', None
+            self.ready_at = time.monotonic()
 
 
 class Pending:
@@ -143,6 +213,22 @@ class TimeoutTransport(xmlrpc.client.Transport):
         connection = super().make_connection(host)
         connection.timeout = 2
         return connection
+
+
+def persist_status(status):
+    STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary = STATUS_PATH.with_suffix('.tmp')
+    temporary.write_text(json.dumps(status) + '\n')
+    temporary.replace(STATUS_PATH)
+
+
+def record_controller_exit(sequence, exit_code):
+    sequence.state, sequence.error = 'failed', 'controller_process_exited'
+    status = dict(sequence.status(), controller_exit_code=exit_code)
+    # ROS may have gone away with the child. Persist the terminal diagnostic
+    # before publishing or raising, so startup cannot look ready/waiting later.
+    persist_status(status)
+    return status
 
 
 def wait_for_master(stop, timeout=180, adopt_existing=False):
@@ -179,6 +265,7 @@ def run(version, adopt_existing=False):
     from std_msgs.msg import Bool, Int8, String
     from std_srvs.srv import Trigger, SetBool
     from kuavo_msgs.msg import sensorsData
+    from sensor_msgs.msg import Joy
     rospy.init_node('kuavo5w_controller_boot', disable_signals=True)
     pub = rospy.Publisher('/kuavo5w/controller_boot_state', String, queue_size=1, latch=True)
     lock, measured = threading.Lock(), {}
@@ -189,7 +276,29 @@ def run(version, adopt_existing=False):
         q = msg.joint_data.joint_q
         valid = len(q) == 20 and all(math.isfinite(v) for v in q)
         update(raw_valid=valid, raw_at=time.monotonic())
+    def joy(msg):
+        with lock:
+            owner = measured.get('g12_owner')
+        update(g12_neutral=g12_neutral(msg, owner), g12_at=time.monotonic())
+    def monitor_g12_owner():
+        # This optional XMLRPC/process probe must never stall the 5Hz boot
+        # heartbeat or turn a joystick-node timeout into a controller fault.
+        while not stop.is_set():
+            try:
+                with xmlrpc.client.ServerProxy(os.environ['ROS_MASTER_URI'], transport=TimeoutTransport()) as master:
+                    code, _, system_state = master.getSystemState('/kuavo5w_g12_readonly')
+                    owner = g12_owner(system_state, master,
+                        os.environ.get('KUAVO_ROS_CONTROL_WS_PATH', '')) if code == 1 else None
+            except Exception:
+                owner = None
+            with lock:
+                if measured.get('g12_owner') != owner:
+                    measured['g12_neutral'] = False
+                measured.update(g12_owner=owner, g12_owner_at=time.monotonic())
+            stop.wait(1.)
+    threading.Thread(target=monitor_g12_owner, daemon=True, name='g12-source-probe').start()
     subscriptions = [
+        rospy.Subscriber('/joy', Joy, joy, queue_size=1, tcp_nodelay=True),
         rospy.Subscriber('/sensors_data_raw', sensorsData, raw, queue_size=1, tcp_nodelay=True),
         rospy.Subscriber('/mobile_manipulator/lb_mpc_control_mode', Int8,
             lambda msg: update(mode=msg.data, mode_at=time.monotonic()), queue_size=1),
@@ -211,16 +320,19 @@ def run(version, adopt_existing=False):
     try:
         while not stop.is_set() and not rospy.is_shutdown():
             now = time.monotonic()
-            if child is not None and child.poll() is not None:
-                sequence.state, sequence.error = 'failed', 'controller_process_exited'
-                pub.publish(String(data=json.dumps(sequence.status())))
+            exit_code = child.poll() if child is not None else None
+            if exit_code is not None:
+                status = record_controller_exit(sequence, exit_code)
+                print('[controller-boot] ' + json.dumps(status), flush=True)
+                pub.publish(String(data=json.dumps(status)))
                 raise RuntimeError('controller_process_exited_no_restart')
             if now >= next_params and sequence.state != 'failed':
                 try:
                     candidate = {k: rospy.get_param('/' + k, None) for k in (*EXPECTED_DOF, 'robot_version')}
                     candidate.update(is_ready=rospy.get_param('/hardware/is_ready', None),
                                   ready_to_start=rospy.get_param('/hardware/ready_to_start', None))
-                    services = dict(rosgraph.Master(rospy.get_name()).getSystemState()[2])
+                    system_state = rosgraph.Master(rospy.get_name()).getSystemState()
+                    services = dict(system_state[2])
                     candidate['pause_service_valid'] = services.get('/enable_control') == ['/nodelet_manager']
                     candidate['services_valid'] = all(services.get(name) == ['/nodelet_manager'] for name in
                         ('/enable_control', '/humanoid_controller/real_initial_start'))
@@ -239,10 +351,13 @@ def run(version, adopt_existing=False):
             if sequence.state == 'failed' and child is not None and failure_pause is None:
                 failure_pause = request('pause')  # Best effort, never report this as confirmed.
             status = sequence.status()
-            STATUS_PATH.parent.mkdir(parents=True, exist_ok=True)
-            temporary = STATUS_PATH.with_suffix('.tmp')
-            temporary.write_text(json.dumps(status) + '\n')
-            temporary.replace(STATUS_PATH)
+            with lock:
+                age = max(0., now-measured['g12_at']) if 'g12_at' in measured else None
+                status.update(g12_owner=measured.get('g12_owner'), g12_age_s=age,
+                    g12_neutral=bool(measured.get('g12_owner')) and measured.get('g12_neutral') is True
+                        and age is not None and age <= .3
+                        and 0 <= now-measured.get('g12_owner_at', 0) <= 3.)
+            persist_status(status)
             pub.publish(String(data=json.dumps(status)))
             state = (sequence.state, sequence.error)
             if state != last_state:

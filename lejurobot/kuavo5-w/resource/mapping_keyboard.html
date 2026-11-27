@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><style>
+body{margin:0;padding:24px;background:#f6f8fa;color:#18232d;font:15px system-ui,sans-serif}
+h1{font-size:22px;margin:0 0 12px}p{line-height:1.6}.muted{color:#516171}
+button{font:inherit;padding:12px 18px;border:1px solid #b5c4d1;border-radius:8px;background:white;cursor:pointer}
+button:disabled{opacity:.5;cursor:default}button:focus-visible{outline:3px solid #2478c2}
+#stop{background:#a22626;color:white}
+.keys{display:grid;grid-template-columns:repeat(3,110px);gap:10px;margin:24px 0}
+.keys button{height:72px;touch-action:none}.pressed{background:#c5e2fa}
+#state{padding:14px;background:white;border-left:4px solid #15639d;min-height:48px;white-space:pre-wrap}
+</style></head><body tabindex="0">
+<h1>Mapping keyboard control</h1>
+<p><strong>Limits: 0.15 m/s forward/reverse · 0.3 rad/s turning · 300 ms heartbeat timeout.</strong></p>
+<p class="muted">Start mapping first. This panel uses the factory MANUAL RobotMotion route.
+Use this console instead of the G12 remote controller. Keyboard control prepares automatically;
+the robot moves only while you hold a direction after preparation.</p>
+<p><button id="release" disabled>Release control</button>
+<button id="stop">Stop all motion</button></p>
+<div class="keys" aria-label="Hold a button to drive">
+<span></span><button data-code="KeyW" disabled>Forward<br>Alt+W / I</button><span></span>
+<button data-code="KeyA" disabled>Turn left<br>Alt+A / J</button><button data-code="KeyS" disabled>Reverse<br>Alt+S / K</button><button data-code="KeyD" disabled>Turn right<br>Alt+D / L</button>
+</div>
+<p>Keep this panel focused. Hold Alt and a direction, or hold a direction button.
+Release the key/button to stop. Switching tabs or leaving this panel releases control.
+After preparation completes, release all keys and press again.</p>
+<p id="state" role="status">Waiting for the canvas connection…</p>
+<p class="muted">Saving mapping automatically releases keyboard control and confirms the stop first.
+A hardware emergency stop remains independent of this panel.</p>
+<script>
+let port=null,serial=0,session=null,seq=0,ready=false,inflight=false,opening=false,releasing=false,suspended=false,generation=0,statusChecking=false,wholeStopPending=false,wholeStopConfirmed=false;
+const pending=new Map(),pressed=new Set(),state=document.getElementById('state');
+const release=document.getElementById('release');
+const aliases={KeyI:'KeyW',KeyK:'KeyS',KeyJ:'KeyA',KeyL:'KeyD',KeyW:'KeyW',KeyS:'KeyS',KeyA:'KeyA',KeyD:'KeyD'};
+function paint(message){
+ state.textContent=message;
+ release.disabled=!session;document.querySelectorAll('[data-code]').forEach(b=>{
+  b.disabled=!ready;b.classList.toggle('pressed',pressed.has(b.dataset.code));
+ });
+}
+function call(action,args={}){
+ return new Promise((resolve,reject)=>{
+  if(!port){reject(new Error('Canvas disconnected'));return;}
+  const timeout=action==='stop'?60000:action==='keyboard_release'?12000:1500;
+  const id=String(++serial),timer=setTimeout(()=>{pending.delete(id);reject(new Error('Canvas reply timed out. Stop is not confirmed.'));},timeout);
+  pending.set(id,{resolve,reject,timer});port.postMessage({id,method:'call',args:{action,...args}});
+ });
+}
+function focused(){return !document.hidden&&document.hasFocus();}
+async function disarm(message='Keyboard released. Refocus this panel to continue.'){
+ ++generation;
+ const previous=session;session=null;ready=false;pressed.clear();releasing=!!previous;paint(message);
+ if(previous){
+  try{const r=await call('keyboard_release',{session_id:previous});
+   if(!r.busy){releasing=false;paint('Stopped. Keyboard control released.');return;}
+   paint('Stopping; wait for confirmed stop before saving.');
+  }catch(e){paint(e.message+'. Checking the chassis watchdog stop.');}
+  for(let i=0;i<40;i++){
+   await new Promise(resolve=>setTimeout(resolve,200));
+   try{const r=await call('keyboard_status');
+    if(!r.busy){releasing=false;paint('Stopped. Keyboard control released.');return;}
+    if(r.state==='stop_unconfirmed')break;
+   }catch(e){break;}
+  }
+  paint('Stop not yet confirmed. Use Stop all motion and inspect card info before continuing.');
+ }
+}
+window.addEventListener('message',event=>{
+ if(port||event.source!==parent||event.data?.protocol!=='motus.workbench/1'||!event.ports[0])return;
+ port=event.ports[0];port.onmessage=event=>{
+  const r=event.data,p=pending.get(r?.id);if(!p)return;pending.delete(r.id);clearTimeout(p.timer);
+  r.error?p.reject(new Error(r.error)):r.result?.state==='error'?p.reject(new Error(r.result.error||'Keyboard request failed')):p.resolve(r.result);
+ };port.start();window.focus();paint('Connected. Preparing mapping keyboard control.');arm();
+});
+async function arm(){
+ if(!port||session||opening||releasing||suspended||!focused())return;
+ opening=true;const attempt=++generation;pressed.clear();paint('Preparing keyboard control; no direction will be retained.');
+ try{const r=await call('keyboard_open');
+  if(r.mapping_state==='starting'){
+   paint('Mapping is starting. Waiting for completion before preparing keyboard control.');
+   const deadline=Date.now()+150000;
+   while(attempt===generation&&focused()&&!suspended&&Date.now()<deadline){
+    await new Promise(resolve=>setTimeout(resolve,500));
+    if(attempt!==generation||!focused()||suspended)return;
+    const status=await call('keyboard_status');
+    if(!status.console_authorized)throw new Error('Mapping session changed or stopped. Reopen mapping_console after mapping is ready.');
+    if(status.mapping_state==='mapping'){
+     opening=false;return await arm();
+    }
+   }
+   if(attempt===generation&&focused()&&!suspended)throw new Error('Mapping has not completed. Check the start_mapping result.');
+   return;
+  }
+  if(!r.session_id)throw new Error('No keyboard lease returned');
+  session=r.session_id;seq=0;ready=false;
+  if(attempt!==generation||!focused()||suspended){await disarm('Preparation cancelled; keyboard released.');return;}
+  paint('Checking chassis and stopping old tasks in background. Please wait.');
+ }catch(e){if(attempt===generation)paint(e.message);}finally{opening=false;paint(state.textContent);}
+}
+release.onclick=()=>disarm();
+document.getElementById('stop').onclick=async()=>{
+ if(wholeStopPending)return;
+ wholeStopPending=true;wholeStopConfirmed=false;
+ suspended=true;++generation;session=null;ready=false;releasing=true;pressed.clear();paint('Stopping all motion; waiting for confirmation.');
+ try{const stopped=await call('stop');wholeStopConfirmed=stopped.state==='idle'||stopped.state==='paused';
+  const r=await call('keyboard_status');
+  releasing=!!r.busy;paint(releasing?'Stop still pending; inspect card info.':wholeStopConfirmed?'All motion stopped.':'Keyboard stopped. Whole-body stop is not confirmed; inspect card info.');
+ }catch(e){paint(e.message+' Inspect card info for stop confirmation.');}
+ finally{wholeStopPending=false;}
+};
+window.addEventListener('keydown',e=>{
+ const code=aliases[e.code];if(!code||!e.altKey||!ready||e.repeat)return;
+ e.preventDefault();pressed.add(code);paint('Keyboard active. Release the direction key or Alt to stop.');
+});
+window.addEventListener('keyup',e=>{
+ if(e.code==='AltLeft'||e.code==='AltRight')pressed.clear();
+ else if(aliases[e.code])pressed.delete(aliases[e.code]);
+ paint(state.textContent);
+});
+document.querySelectorAll('[data-code]').forEach(b=>{
+ b.onpointerdown=e=>{if(!ready)return;e.preventDefault();b.setPointerCapture(e.pointerId);pressed.add(b.dataset.code);paint(state.textContent);};
+ for(const name of ['pointerup','pointercancel','lostpointercapture'])b.addEventListener(name,()=>{pressed.delete(b.dataset.code);paint(state.textContent);});
+});
+window.addEventListener('focus',()=>arm());
+document.addEventListener('pointerdown',()=>{if(!ready)arm();});
+window.addEventListener('blur',()=>{if(session||opening)disarm('Panel lost focus. Keyboard released.');});
+document.addEventListener('visibilitychange',()=>{if(document.hidden&&(session||opening))disarm('Tab hidden. Keyboard released.');else if(!document.hidden)arm();});
+window.addEventListener('pagehide',()=>{suspended=true;if(session||opening)disarm('Panel closed.');});
+setInterval(async()=>{
+ if(!session||inflight)return;const current=session;inflight=true;
+ if(!focused()){await disarm('Panel lost focus. Keyboard released.');inflight=false;return;}
+ const vx=(Number(pressed.has('KeyW'))-Number(pressed.has('KeyS')))*.15;
+ const vw=(Number(pressed.has('KeyA'))-Number(pressed.has('KeyD')))*.3;
+ try{
+  const r=await call('keyboard_command',{session_id:current,seq:++seq,values:ready?[vx,vw]:[0,0]});
+  if(session!==current)return;
+  if(r.input_expired){pressed.clear();ready=r.state==='ready';paint('Input paused; stopped. Release the keys, then press a direction again.');}
+  else if(r.state==='ready'&&!ready){pressed.clear();ready=true;paint('Ready. Release all keys, then hold Alt + a direction.');}
+  else if(r.state==='error'||r.state==='idle'||r.state==='stopping'){await disarm(r.error||r.last_error||'Keyboard stopped. Reopen mapping_console to continue.');}
+ }catch(e){if(session===current){
+  pressed.clear();
+  if(e.message.startsWith('Canvas reply timed out')){
+   paint('Input delayed; direction cleared. Checking the existing connection.');
+  }else await disarm(e.message);
+ }}finally{inflight=false;}
+},80);
+setInterval(async()=>{
+ if(!port||session||opening||!releasing||statusChecking)return;
+ statusChecking=true;
+ try{const result=await call('keyboard_status');
+  if(!result.busy&&result.state==='idle'){
+   releasing=false;pressed.clear();ready=false;
+   paint(suspended?(wholeStopConfirmed?'All motion stopped.':wholeStopPending?'Keyboard stopped. Waiting for whole-body stop confirmation.':'Keyboard stopped. Whole-body stop is not confirmed; inspect card info.'):'Stopped. Keyboard control released. Refocus this panel to continue mapping.');
+  }
+ }catch(e){/* Keep the stop warning until a positive status arrives. */}
+ finally{statusChecking=false;}
+},1000);
+</script></body></html>

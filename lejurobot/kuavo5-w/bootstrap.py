@@ -4,6 +4,7 @@ Private overrides come from environment or a mode-0600 file, never argv.
 OpenSSH pins first-use host keys in the driver's persistent configuration directory.
 """
 import base64
+import zlib
 import json
 import os
 from pathlib import Path
@@ -80,8 +81,12 @@ class SshTransport:
             command += ['-o', 'BatchMode=yes']
         if key:
             command += ['-i', key, '-o', 'IdentitiesOnly=yes']
-        encoded = base64.b64encode(source.encode()).decode()
-        launcher = "import base64; BOOTSTRAP_SOURCE=base64.b64decode(%r).decode(); exec(compile(BOOTSTRAP_SOURCE,'bootstrap_remote.py','exec'))" % encoded
+        # Linux limits each argv string to 128 KiB independently of ARG_MAX.
+        # Bridge helpers embed navigation code; plain base64 can exceed it.
+        encoded = base64.b64encode(zlib.compress(source.encode())).decode()
+        launcher = "import base64,zlib; BOOTSTRAP_SOURCE=zlib.decompress(base64.b64decode(%r)).decode(); exec(compile(BOOTSTRAP_SOURCE,'bootstrap_remote.py','exec'))" % encoded
+        if len(launcher.encode()) > 120_000:
+            raise ProvisionError('ssh_helper_payload_too_large')
         command += [f'{user}@{address}', 'python3 -c ' + shlex.quote(launcher)]
         payload = dict(request, _sudo_password=sudo_password)
         return command, env, payload

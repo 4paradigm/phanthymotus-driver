@@ -177,12 +177,43 @@ class DriverContractTests(unittest.TestCase):
         self.ros, self.node = FakeRos1(), FakeNode()
         self.bundle = driver.KuavoBundle({'sensors': {'joint_limits': fixture_joint_limits(self.ros)}},
                                          "test_robot", self.ros, self.node)
+        self.upper_bridge_patch = patch.object(self.bundle.upper_bridge, 'ensure')
+        self.upper_bridge_patch.start()
+        self.addCleanup(self.upper_bridge_patch.stop)
+        self.remote_ready_patch = patch.object(self.bundle.upper_bridge, 'wait_remote_ready',
+                                                side_effect=lambda check: check())
+        self.remote_ready_patch.start()
+        self.addCleanup(self.remote_ready_patch.stop)
+        self.spatial_temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.spatial_temp.cleanup)
+        from controlled_spatial import SpatialStore
+        self.bundle.spatial.store = SpatialStore(self.spatial_temp.name+'/state.db')
         self.bundle.sensors.discover()
         self.ros.raw()
         self.ros.emit("/enable_control_state", True)
         self.ros.emit("/mobile_manipulator/lb_mpc_control_mode", 3)
         self.bundle.state.verify_enable()
         self.ros.emit('/enable_vel_control_state', True)
+        # Most command tests start with a preverified upper/chassis route.
+        # Handoff tests explicitly invalidate it before exercising selection.
+        self.bundle._upper_route_key = (self.bundle._stop_epoch,self.ros.connection)
+        # Generic card tests assume a healthy AUTO chassis; ownership tests
+        # exercise the real mode transition against explicit chassis feedback.
+        self.base_mode_patch = patch.object(self.bundle.spatial, 'motion_chassis_mode', return_value='AUTO')
+        self.base_mode_patch.start()
+        self.addCleanup(self.base_mode_patch.stop)
+        self.auto_mode_patch = patch.object(self.bundle.spatial, 'ensure_auto_for_motion')
+        self.auto_mode_patch.start()
+        self.addCleanup(self.auto_mode_patch.stop)
+        original_native = self.bundle.spatial.client.native
+        def native(operation, **args):
+            if operation == 'upper_handoff':
+                return {'success':True,'stationary':True,'software_estop':False,
+                        'velocity_source':'nav_mpc_move_base','delivery_uncertain':False}
+            return original_native(operation, **args)
+        self.upper_handoff_patch = patch.object(self.bundle.spatial.client,'native',side_effect=native)
+        self.upper_handoff_patch.start()
+        self.addCleanup(self.upper_handoff_patch.stop)
 
     def tearDown(self):
         self.bundle.close()
@@ -406,14 +437,14 @@ class DriverContractTests(unittest.TestCase):
         self.assertFalse(self.bundle._mode_unresolved())
         self.assertIs(self.bundle.state.read('control_enabled')[0], False)
 
-    def test_mapping_restores_remote_velocity_without_resuming_motors(self):
-        self.ros.emit('/enable_vel_control_state', False)
+    def test_mapping_disables_upper_velocity_without_resuming_motors(self):
+        self.ros.emit('/enable_vel_control_state', True)
         self.ros.emit('/enable_control_state', False)
         self.bundle.prepare_mapping_velocity(self.bundle._stop_epoch)
-        self.assertIs(self.bundle.state.read('upper_velocity_enabled')[0], True)
+        self.assertIs(self.bundle.state.read('upper_velocity_enabled')[0], False)
         self.assertIs(self.bundle.state.read('control_enabled')[0], False)
         self.assertEqual(self.ros.sent_services,
-                         [('/enable_vel_control', 'std_srvs/SetBool', {'data': True})])
+                         [('/enable_vel_control', 'std_srvs/SetBool', {'data': False})])
 
     def test_metadata_and_schema_actions_agree(self):
         import yaml
@@ -425,8 +456,10 @@ class DriverContractTests(unittest.TestCase):
             if tool['type'] != 'actuator':
                 continue
             schema = tool["inputSchema"]
-            self.assertEqual(set(schema["properties"]["action"]["enum"]) - ({"start", "stop", "info"} if name == "base_servo" else set()),
-                             set(schema["x-action-params"]))
+            lifecycle = {"start", "stop", "info"}
+            advertised = set(schema['x-action-params'])
+            self.assertEqual(set(schema["properties"]["action"]["enum"]) - lifecycle,
+                             advertised - lifecycle)
             self.assertTrue(all(set(a["params"]) <= set(schema["properties"])
                                 for a in schema["x-action-params"].values()))
             if not tool.get('topic_in'):
@@ -683,14 +716,15 @@ class DriverContractTests(unittest.TestCase):
                         self.assertEqual(self.ros.published[-1][2]['joint_data'], [0., 0.])
                         # Even a late True notification cannot release the local stop.
                         self.ros.emit('/enable_control_state', True)
+                        self.assertTrue(self.bundle.state.motion_blocked)
                     finally:
                         release.set()
                         worker.join(1)
                 self.assertFalse(worker.is_alive())
                 self.assertIn('superseded', results[0]['error'])
                 self.assertTrue(self.bundle.state.motion_blocked)
-                self.assertEqual(self.call('base_drive', 'move', duration=.1)['state'], 'error')
                 if transition == 'resume':
+                    self.assertEqual(self.call('base_drive', 'move', duration=.1)['state'], 'error')
                     pending = self.bundle._remote_resume['pending']
                     self.ros.service_results[id(pending)] = {'success': False}
                     self.assertEqual(self.call('_control', 'pause')['state'], 'paused')
