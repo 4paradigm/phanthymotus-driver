@@ -52,3 +52,5 @@ cards:
   - { name: ext_mic,            type: sensor }
   - { name: light,              type: actuator }
   - { name: vision_capture,     type: actuator }
+  - { name: weigh,              type: actuator }
+  - { name: weigh_state,        type: sensor }
