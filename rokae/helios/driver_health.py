@@ -180,7 +180,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class HeliosDriverHealth:
-    NAME = "driver_health"
+    PREFIX = "driver_health"
 
     def __init__(self, config, namespace, ros2):
         self._ros2 = ros2
@@ -208,7 +208,7 @@ class HeliosDriverHealth:
         }, {})
         schema["x-completion"] = {"actions": ["status"], "timeout": COMPLETION_TIMEOUT}
         return tool(
-            self.NAME, "actuator",
+            self.PREFIX, "actuator",
             "按需查看底盘 SDK、机身网口、双路雷达和里程计的数据状态。",
             schema,
         )
@@ -276,7 +276,7 @@ class HeliosDriverHealth:
                 if self._active_id:
                     return {"state": "sampling", "action_id": self._active_id}
                 return self._latest or {"state": "waiting", "message": "请先执行 status。"}
-        if action not in (self.NAME, "status"):
+        if action not in (self.PREFIX, "status"):
             raise ValueError(f"Unsupported driver health action: {action}")
 
         with self._state_lock:
@@ -318,7 +318,7 @@ class HeliosDriverHealth:
         endpoint = os.getenv("AGENT_CORE_URL", "https://localhost:15678").rstrip("/")
         payload = json.dumps({
             "action_id": action_id, "status": status, "result": result,
-            "tool": self.NAME, "ts": time.time(),
+            "tool": self.PREFIX, "ts": time.time(),
         }, ensure_ascii=False).encode()
         failure = None
         try:
