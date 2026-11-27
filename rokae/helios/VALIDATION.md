@@ -1,6 +1,19 @@
 # 验证范围
 
+## 三维地图与导航（2026-11-26）
+
+在 Helios ARM64 主机使用本驱动 Dockerfile 构建镜像。正式 Core `release.261118.56edda4` 的原地图卡与新增控制卡均发布 `sensor/mapping`。通过正式 Core 的画布 WebSocket 解码了两条独立的数据流。
+
+| 正式画布话题 | 地图 | XYZ 点数 | 高度范围（米） |
+| --- | --- | ---: | --- |
+| `/rokae_helios/state/spatial_map` | helioslab | 50,733 | −2.261 至 10.728 |
+| `/rokae_helios/controlled_spatial/map` | helioslab | 50,733 | −2.261 至 10.728 |
+
+Edge 监控页为两路话题创建了带跟随视角切换的 MAPPING 面板，可见黑底、按高度着色的点云。两路点数及高度范围与现场地图包中的原厂 `lidmap/helioslab/map.pcd` 一致。正式画布保存了两张卡片和既有连线。通过控制卡查询，机载地图共 13 张，当前地图为 `helioslab`，导航状态为 `idle`。
+
 ## 自动验证
+
+60 项 Helios 本地测试通过，覆盖 PCD 解包、点云坐标与定位时差、按图保存标签、建图和加载地图。模拟 VMR 通过卡片入口执行导航，本机 HTTP 接收端核对了与 `action_id` 对应的到达、失败、取消以及 SDK 进程退出时的错误回调。关闭控制卡时，已受理的导航仍能回传取消结果。SDK 进程退出后，控制卡可正常停止；另一张地图卡在线时继续持有共享订阅，最后一张卡停止时释放订阅和数据库。回归用例验证了建图、切换地图和导航所需的布尔确认参数，以及可直接调用的停止导航。正式服务清单通过 `scripts/check_service_yml.py rokae/helios` 检查。
 
 2026-11-19，初版关节、电池、力矩回归共 37 项通过；本次另增加运行时模型发现、大小限制、同源检查及错误模型回归，`scripts/check_service_yml.py rokae/helios` 通过。执行命令见 README。测试使用本地模拟 WebSocket、固定协议样本和真实 Driver 代码，不需要连接或移动机器人。
 
