@@ -16,7 +16,7 @@ def replace_once(source, old, new):
 
 def patch_canvas(source):
     if "data-helios-follow-execute" in source:
-        return source
+        return restore_mode_fields(source)
     source = replace_once(source,
         "btn.classList.toggle('locked', !_projectRunning);",
         "btn.classList.toggle('locked', !_projectRunning && !btn.hasAttribute('data-helios-follow-execute'));")
@@ -46,7 +46,21 @@ def patch_canvas(source):
   }
 
   _logActivity('mcp_call', `${toolName} @ ${mcpId}`);""")
-    return source
+    return restore_mode_fields(source)
+
+
+def restore_mode_fields(source):
+    if "args.action ||= standaloneAction;" in source:
+        return source
+    source = replace_once(source,
+        "const fieldsHtml = standaloneFollow ? '' : Object.entries(props).map(([key, def]) => {",
+        "const fieldsHtml = Object.entries(props).map(([key, def]) => {")
+    source = replace_once(source, "args.action = standaloneAction;", "args.action ||= standaloneAction;")
+    source = replace_once(source, 'title="再次点击停止随动"', 'title="执行当前选择的随动操作"')
+    return replace_once(source, "const actionParams = schema?.['x-action-params'];",
+        """const actionParams = standaloneFollow
+      ? { ...schema?.['x-action-params'], toggle_person_follow: { params: [] } }
+      : schema?.['x-action-params'];""")
 
 
 def main():

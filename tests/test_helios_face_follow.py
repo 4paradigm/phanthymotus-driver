@@ -221,7 +221,13 @@ def test_canvas_lifecycle_and_object_mode(monkeypatch):
     result = card.dispatch("toggle_person_follow", {"input_topic": body_rgb})
     assert result["state"] == "running" and "no navigation device" in result["启动说明"]
     assert base.camera_ok
+    assert card.dispatch("pause_follow", {})["follow_paused"]
+    assert not card.dispatch("resume_follow", {})["follow_paused"]
     assert card.dispatch("toggle_person_follow", {})["state"] == "idle"
+    assert card.dispatch("set_target", {"object_name": "bottle"})["mode"] == "object"
+    assert card.dispatch("follow_status", {})["object_name"] == "bottle"
+    schemas = card.get_tools()[0]["inputSchema"]["x-action-params"]
+    assert schemas["set_mode"]["required"] == ["mode"] and "toggle_person_follow" not in schemas
     assert camera_calls == ["info", "start", "stop"]
 
 

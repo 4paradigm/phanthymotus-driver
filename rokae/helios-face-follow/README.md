@@ -34,6 +34,10 @@ Helios 画布的独立「执行」入口由 `deploy/install_canvas_execute.py` �
 覆盖文件。点击后只启动已连线的胸部相机与人体随动卡，再次点击停止随动。画布项目
 停止时也可使用这个入口。脚本只修改声明该入口的 Helios 卡，保存原画布代码用于回退。
 
+同一张卡也可以从动作下拉框选择模式、目标、暂停、恢复和状态。把 Decision Core 的执行器
+端口连到本卡后，Decision 可调用 `set_mode`、`set_target`、`pause_follow`、
+`resume_follow`、`follow_status`。暂停保留检测和目标，恢复从新观测重新选择目标。
+
 ## 车身朝向
 
 在本机部署配置中将 `HELIOS_BASE_FOLLOW_ENABLED` 设为 `1`，重启卡片服务，在画布将

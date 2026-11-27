@@ -61,6 +61,7 @@ class HeliosFaceFollow:
         self.subscriptions = []
         self.session = None
         self.manual_camera = None
+        self.follow_paused = False
         self.topics = {}
         self.policy = FollowPolicy("person", "person")
         self.depth_frames = deque(maxlen=8)
@@ -92,6 +93,9 @@ class HeliosFaceFollow:
                          "toggle_person_follow": (["input_topic"], "开始或停止持续人体随动"),
                          "set_mode": (["mode", "object_name"], "切换模式"),
                          "set_target": (["object_name"], "跟踪指定的 VOP 物体类别"),
+                         "pause_follow": ([], "暂停底盘随动，保留检测与目标设置"),
+                         "resume_follow": ([], "恢复已启动的卡片的底盘随动"),
+                         "follow_status": ([], "查询卡片模式、检测目标和底盘随动状态"),
                          "stop": ([], "结束跟踪"),
                          "info": ([], "查看目标、输入和朝向控制状态"),
                      }, {
@@ -104,6 +108,9 @@ class HeliosFaceFollow:
                      }), topic_in=[{"format": "image/jpeg", "desc": "Helios RGB"}],
                      topic_out=self.output)
         entry["inputSchema"]["x-helios-canvas-execute"] = "toggle_person_follow"
+        del entry["inputSchema"]["x-action-params"]["toggle_person_follow"]
+        entry["inputSchema"]["x-action-params"]["set_mode"]["required"] = ["mode"]
+        entry["inputSchema"]["x-action-params"]["set_target"]["required"] = ["object_name"]
         return [entry]
 
     def dispatch(self, action, args):
@@ -127,9 +134,19 @@ class HeliosFaceFollow:
                             return {**self.info(), "启动说明": f"人体检测已启动，底盘接口暂未就绪：{error}"}
             elif action == "stop":
                 self.stop()
-            elif action in ("set_mode", "set_target"):
+            elif action == "pause_follow":
+                self.follow_paused = True
+                if self.motion.halt("paused") is False:
+                    return {**self.info(), "error": "底盘未确认停止，请查看运动状态"}
+                if self.session is not None:
+                    self.publish()
+            elif action == "resume_follow":
                 if self.session is None:
-                    return {"state": "error", "error": "Start the card before selecting a mode"}
+                    return {**self.info(), "error": "请先从画布启动随动卡"}
+                if self.follow_paused:
+                    self.follow_paused = False
+                    self.emit(None, "waiting_for_" + self.policy.mode)
+            elif action in ("set_mode", "set_target"):
                 mode = args.get("mode") if action == "set_mode" else "object"
                 name = args.get("object_name", self.policy.label if self.policy.mode == "object" else "")
                 if mode not in MODES or not isinstance(name, str) or (mode == "object" and not name.strip()):
@@ -137,14 +154,15 @@ class HeliosFaceFollow:
                 stopped = self.motion.halt("waiting_for_target")
                 if stopped is False:
                     return {"state": "error", "error": "Could not cancel the active base turn"}
-                if mode in VOP_MODES:
+                if mode in VOP_MODES and self.session is not None:
                     self.ensure_vop(self.topics)
-                else:
+                elif mode not in VOP_MODES:
                     self.detector = self.detector or _Detector()
                 label = "person" if mode == "person" else name.strip().casefold() if mode == "object" else ""
                 self.policy = FollowPolicy(mode, label)
-                self.emit(None, "waiting_for_" + mode)
-            elif action != "info":
+                if self.session is not None:
+                    self.emit(None, "waiting_for_" + mode)
+            elif action not in ("info", "follow_status"):
                 raise ValueError(f"unsupported action {action}")
             return self.info()
 
@@ -222,6 +240,7 @@ class HeliosFaceFollow:
                 raise
         self.topics = topics
         self.session = session
+        self.follow_paused = False
         self.motion.reset()
         cameras = args.get("camera_info")
         camera = cameras.get(rgb) if isinstance(cameras, dict) else None
@@ -248,7 +267,7 @@ class HeliosFaceFollow:
             self.depth_frames.clear()
             self.person_depth = self.rgb_size = None
             self.topics = {}
-            self.policy = FollowPolicy("person", "person")
+            self.policy = FollowPolicy(self.policy.mode, self.policy.label)
             if self.manual_camera:
                 instance, self.manual_camera = self.manual_camera, None
                 try:
@@ -261,6 +280,7 @@ class HeliosFaceFollow:
     def info(self):
         return {
             "state": "running" if self.session is not None else "idle",
+            "follow_paused": self.follow_paused,
             "mode": self.policy.mode, "object_name": self.policy.label,
             "reason": self.reason, "target": self.result, "head_feedback": self.fresh_head(),
             "motion_available": self.motion.state == "controlling", "motion": self.motion.status(), "topic_in": (
@@ -291,6 +311,10 @@ class HeliosFaceFollow:
             if self.session is None:
                 if self.base is not None and self.base.action_id:
                     self.base.halt("idle")
+                return
+            if self.follow_paused:
+                if self.base is not None and self.base.action_id:
+                    self.base.halt("paused")
                 return
             if not self.motion_enabled:
                 return
