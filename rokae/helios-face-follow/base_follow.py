@@ -48,10 +48,12 @@ class BaseFollower:
         self.candidate = None
         self.retry_after = 0.0
         self.wait_detail = None
+        self.target_x = None
 
     def status(self):
         return {"backend": "base", "state": self.state, "error": self.error,
                 "detail": self.wait_detail,
+                "target_x": self.target_x, "centered": self.state == "centered",
                 "action_id": self.action_id, "yaw_rate_deg_s": self.yaw_rate}
 
     def reset(self):
@@ -60,6 +62,7 @@ class BaseFollower:
         self.camera_ok = False
         self.retry_after = 0.0
         self.wait_detail = None
+        self.target_x = None
 
     def halt(self, state):
         self.candidate = None
@@ -90,6 +93,10 @@ class BaseFollower:
         return not status.get("building") and isinstance(navigation, dict) and navigation.get("state") == "idle"
 
     def step(self, target, sample, valid_until):
+        if target is not None and self.clock() < valid_until:
+            self.target_x = target["offset"][0]
+        else:
+            self.target_x = None
         if self.error:
             if self.action_id:
                 self.halt("fault")
@@ -97,10 +104,10 @@ class BaseFollower:
         if not self.camera_ok:
             self.halt("waiting_for_chest_rgb")
             return
-        if target is None or self.clock() >= valid_until:
+        if self.target_x is None:
             self.halt("waiting_for_target")
             return
-        x = target["offset"][0]
+        x = self.target_x
         threshold = START_OFFSET if self.state == "centered" else CENTER_OFFSET
         if abs(x) <= threshold:
             self.halt("centered")
@@ -117,8 +124,6 @@ class BaseFollower:
                         self.error = "base turn did not finish within the supervision window"
                 elif candidate != self.candidate or not self._navigation_idle():
                     self.halt("waiting_for_target")
-                elif abs(self.yaw_rate) > abs(rate) + 2:
-                    self.halt("settling")
                 else:
                     info = self._base("info")
                     if "active_move" not in info:
@@ -128,7 +133,7 @@ class BaseFollower:
                         failed = (isinstance(last, dict) and last.get("action_id") == self.action_id
                                   and last.get("status") == "error")
                         self.action_id, self.yaw_rate = None, 0.0
-                        self.candidate = None
+                        self.last_sample = sample
                         self.state = "fault" if failed else "settling"
                         if failed:
                             self.error = last.get("error") or "base turn failed"
@@ -163,7 +168,7 @@ class BaseFollower:
             if now >= valid_until:
                 self.halt("waiting_for_target")
                 return
-            duration = min(1.2, max(0.35, 1.8 * abs(x)))
+            duration = min(1.8, max(0.35, 2.4 * abs(x)))
             requesting_move = True
             reply = self._base("move", vx=0.0, vy=0.0, vyaw=rate, duration_s=duration)
             action_id = reply.get("action_id")
