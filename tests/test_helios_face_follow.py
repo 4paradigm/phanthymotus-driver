@@ -102,7 +102,10 @@ def test_canvas_lifecycle_and_object_mode(monkeypatch):
     spec = importlib.util.spec_from_file_location("helios_follow_driver", FILE.with_name("main.py"))
     driver = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(driver)
-    monkeypatch.setattr(driver, "_Detector", lambda: NS())
+    def unexpected_face_detector():
+        raise AssertionError("VOP modes should not initialize the face detector")
+
+    monkeypatch.setattr(driver, "_Detector", unexpected_face_detector)
     calls, subscriptions, publications = [], {}, []
     monkeypatch.setattr(driver, "start_vop", calls.append)
     clock = NS(monotonic=lambda: 10, time=lambda: 100)
@@ -114,7 +117,7 @@ def test_canvas_lifecycle_and_object_mode(monkeypatch):
 
     node = NS(create_publisher=lambda *_: NS(publish=publications.append),
               create_subscription=subscribe, destroy_subscription=subscriptions.pop,
-              create_timer=lambda *_: None, count_publishers=lambda _: 0)
+              create_timer=lambda *_: None, count_publishers=lambda topic: int(topic.removesuffix("/objects") in calls))
     motion_calls = []
 
     def request(operation, **fields):
@@ -125,7 +128,13 @@ def test_canvas_lifecycle_and_object_mode(monkeypatch):
     bundle = driver.DriverBundle([card])
     rgb = "/test/rgb"
     name = "helios_face_follow"
-    assert bundle.dispatch(name, {"action": "start", "input_topic": rgb})["state"] == "running"
+    started = bundle.dispatch(name, {"action": "start", "input_topic": rgb})
+    assert started["state"] == "running" and started["mode"] == "person"
+    subscriptions[rgb](frame(stamp=100))
+    subscriptions[rgb + "/objects"](NS(data=json.dumps({"timestamp": 100, "objects": [
+        {"name": "person", "position": [-0.55, 0.25], "confidence": 0.9},
+        {"name": "cup", "position": [0.02, 0.01], "confidence": 0.9}]})))
+    assert card.info()["target"]["offset"] == (-0.55, 0.25)
     assert bundle.dispatch(name, {"action": "set_target", "object_name": "Cup"})["mode"] == "object"
     assert calls == [rgb]
     subscriptions[rgb](frame(stamp=100))

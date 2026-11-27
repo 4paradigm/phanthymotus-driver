@@ -17,7 +17,8 @@ from head_control import CONTROL_PERIOD, HEAD_JOINTS, SAMPLE_AGE, HeadFollower, 
 from tracking import MAX_AGE, FollowPolicy, _Detector, finite, image_stamp
 
 DRIVER_ID = "rokae-helios-face-follow"
-MODES = ("nearest_face", "speaker", "object")
+MODES = ("person", "nearest_face", "speaker", "object")
+VOP_MODES = ("person", "object")
 DEFAULT_DEPTH = "/rokae_helios/camera/depth/visual_depth"
 DEFAULT_SPEECH = "/rokae_helios/speech/localized"
 JOINTS = "/rokae_helios/state/joints"
@@ -49,7 +50,7 @@ class HeliosFaceFollow:
         self.subscriptions = []
         self.session = None
         self.topics = {}
-        self.policy = FollowPolicy("nearest_face")
+        self.policy = FollowPolicy("person", "person")
         self.depth_frames = deque(maxlen=8)
         self.head = None
         self.base = base
@@ -71,7 +72,7 @@ class HeliosFaceFollow:
 
     def get_tools(self):
         return [tool("helios_face_follow", "processor",
-                     "Helios 目标随动，输出目标位置、深度和朝向控制状态。",
+                     "Helios 目标随动，默认通过 RGB 跟踪人体，输出目标位置和朝向控制状态。",
                      action_schema({
                          "start": (["input_topic", "depth_topic", "speech_topic", "object_topic"], "连接输入"),
                          "set_mode": (["mode", "object_name"], "切换模式"),
@@ -83,7 +84,7 @@ class HeliosFaceFollow:
                          "depth_topic": {"type": "string", "description": "配准至 RGB 的 640×480 毫米深度话题"},
                          "speech_topic": {"type": "string", "description": "相机坐标下的说话人事件"},
                          "object_topic": {"type": "string", "description": "同一相机的 VOP 检测话题"},
-                         "mode": {"type": "string", "enum": list(MODES)},
+                         "mode": {"type": "string", "enum": list(MODES), "default": "person"},
                          "object_name": {"type": "string", "description": "指定 VOP 类别"},
                      }), topic_in=[{"format": "image/jpeg", "desc": "Helios RGB"}],
                      topic_out=self.output)]
@@ -98,25 +99,30 @@ class HeliosFaceFollow:
                 if self.session is None:
                     return {"state": "error", "error": "Start the card before selecting a mode"}
                 mode = args.get("mode") if action == "set_mode" else "object"
-                name = args.get("object_name", self.policy.label)
+                name = args.get("object_name", self.policy.label if self.policy.mode == "object" else "")
                 if mode not in MODES or not isinstance(name, str) or (mode == "object" and not name.strip()):
                     return {"state": "error", "error": "Invalid mode or missing object_name"}
                 stopped = self.motion.halt("waiting_for_target")
                 if stopped is False:
                     return {"state": "error", "error": "Could not cancel the active base turn"}
-                # An explicitly wired topic belongs to its producer. For the
-                # default topic, reuse a live VOP instance or start shared VOP.
-                if (mode == "object" and self.topics["objects"] == self.topics["rgb"] + "/objects"
-                        and self.node.count_publishers(self.topics["objects"]) == 0):
-                    try:
-                        start_vop(self.topics["rgb"])
-                    except (OSError, ValueError, KeyError, IndexError, TypeError) as error:
-                        return {"state": "error", "error": f"Cannot start VOP: {error}"}
-                self.policy = FollowPolicy(mode, name.strip().casefold() if mode == "object" else "")
+                if mode in VOP_MODES:
+                    self.ensure_vop(self.topics)
+                else:
+                    self.detector = self.detector or _Detector()
+                label = "person" if mode == "person" else name.strip().casefold() if mode == "object" else ""
+                self.policy = FollowPolicy(mode, label)
                 self.emit(None, "waiting_for_" + mode)
             elif action != "info":
                 raise ValueError(f"unsupported action {action}")
             return self.info()
+
+    def ensure_vop(self, topics):
+        # An explicit topic belongs to its producer. Otherwise request VOP for this RGB feed.
+        if topics["objects"] == topics["rgb"] + "/objects" and self.node.count_publishers(topics["objects"]) == 0:
+            try:
+                start_vop(topics["rgb"])
+            except (OSError, ValueError, KeyError, IndexError, TypeError) as error:
+                raise ValueError(f"Cannot start VOP: {error}") from error
 
     def start(self, args):
         from rclpy.validate_full_topic_name import validate_full_topic_name
@@ -137,7 +143,7 @@ class HeliosFaceFollow:
             return
         for topic in topics.values():
             validate_full_topic_name(topic)
-        self.detector = self.detector or _Detector()
+        self.ensure_vop(topics)
         session = object()
         for key, callback, kind in (
             ("rgb", self.on_rgb, CompressedImage), ("depth", self.on_depth, CompressedImage),
@@ -173,7 +179,7 @@ class HeliosFaceFollow:
             self.subscriptions.clear()
             self.depth_frames.clear()
             self.topics = {}
-            self.policy = FollowPolicy("nearest_face")
+            self.policy = FollowPolicy("person", "person")
             if was_active:
                 self.emit(None, "idle")
 
@@ -275,7 +281,7 @@ class HeliosFaceFollow:
     def on_objects(self, session, message):
         with self.lock:
             now = time.monotonic()
-            if session is self.session and self.policy.mode == "object" and now - self.last_rgb <= MAX_AGE:
+            if session is self.session and self.policy.mode in VOP_MODES and now - self.last_rgb <= MAX_AGE:
                 payload = self.parse(message)
                 wall = time.time()
                 target, reason = self.policy.objects(payload, wall, now)
@@ -291,7 +297,7 @@ class HeliosFaceFollow:
             if self.motion_enabled:
                 age = time.time() - image_stamp(message)
                 self.motion_rgb_until = now + SAMPLE_AGE - age if 0 <= age <= SAMPLE_AGE else 0
-            if self.policy.mode == "object" or now - self.last_sample < 0.12:
+            if self.policy.mode in VOP_MODES or now - self.last_sample < 0.12:
                 return
             self.last_sample = now
             policy = self.policy

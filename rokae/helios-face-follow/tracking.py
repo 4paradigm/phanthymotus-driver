@@ -225,4 +225,4 @@ class FollowPolicy:
                     and finite(confidence) and 0.5 <= confidence <= 1):
                 points.append(tuple(point))
         target = self.tracker.update_points(points, now)
-        return target, "tracking" if target else "waiting_for_object"
+        return target, "tracking" if target else f"waiting_for_{self.mode}"
