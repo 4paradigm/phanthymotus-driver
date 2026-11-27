@@ -1,8 +1,8 @@
 """Per-camera lens undistortion for the S10 Pro RTSP cameras.
 
 Each camera card carries an `undistort` option (on by default). The per-camera
-calibration is the built-in table below. When undistortion is active the lane's
-FFmpeg command gains a `remap` stage, so the JPEG published on the camera topic
+calibration is packaged in resource/calibration/s10_pro_camera_intrinsics.json.
+When undistortion is active the lane's FFmpeg command gains a `remap` stage, so the JPEG published on the camera topic
 is already rectified and the card declares the rectified geometry (`pinhole`, the
 calibrated K, zero D). Downstream cards need nothing extra: they read K from the
 declaration as they would for any camera.
@@ -34,51 +34,8 @@ DEFAULT_CONFIG_PATH = "/opt/phanthy-motus/data/s10_pro/camera_undistort.json"
 DEFAULT_MAP_DIR = "/tmp/s10_pro_undistort"
 PIPELINE_STAGE = "deeprobotics/s10_pro/undistort"
 
-# Chessboard calibrations of the four S10 Pro cameras, keyed on camera id.
-#
-# Calibrated on the 1024x576 RTSP streams (10x13 inner corners, 18 mm squares,
-# robot standing) with tools/calibrate_chessboard.py and scaled to the 640x360
-# the driver publishes (K x 0.625, D unchanged). The id is per model, not per
-# unit, so these are the calibration used for every S10 Pro. A new measurement
-# replaces a row here (tools/calibrate_chessboard.py writes one).
-CALIBRATIONS = {
-    "deeprobotics/s10_pro/camera_front": {
-        "id": "deeprobotics/s10_pro/camera_front",
-        "width": 640, "height": 360, "distortion_model": "plumb_bob",
-        "K": [314.963248, 0, 336.650604, 0, 314.934089, 182.285271, 0, 0, 1],
-        "D": [-0.264916006540722, 0.08280010720226033, -0.00018047856465669117,
-              3.14558084286742e-05, -0.013244463692919645],
-        "measured_on": "2026-11-07", "unit": "S10 Pro CD1 (host CA9B_NO.0)",
-        "source_resolution": [1024, 576], "frames_used": 103, "rms_px": 0.213,
-    },
-    "deeprobotics/s10_pro/camera_rear": {
-        "id": "deeprobotics/s10_pro/camera_rear",
-        "width": 640, "height": 360, "distortion_model": "plumb_bob",
-        "K": [312.750288, 0, 308.919092, 0, 312.683048, 183.364774, 0, 0, 1],
-        "D": [-0.2622894409938081, 0.08153733337528488, 0.00012089478431258563,
-              0.00040150868161954143, -0.013044993729573065],
-        "measured_on": "2026-11-08", "unit": "S10 Pro CD1 (host CA9B_NO.0)",
-        "source_resolution": [1024, 576], "frames_used": 103, "rms_px": 0.208,
-    },
-    "deeprobotics/s10_pro/camera_left": {
-        "id": "deeprobotics/s10_pro/camera_left",
-        "width": 640, "height": 360, "distortion_model": "plumb_bob",
-        "K": [314.208908, 0, 311.686392, 0, 314.175661, 192.549502, 0, 0, 1],
-        "D": [-0.25929876926166817, 0.07786005715673677, 0.00035419731549147994,
-              0.0005598844289782525, -0.011875881953120242],
-        "measured_on": "2026-11-08", "unit": "S10 Pro CD1 (host CA9B_NO.0)",
-        "source_resolution": [1024, 576], "frames_used": 106, "rms_px": 0.222,
-    },
-    "deeprobotics/s10_pro/camera_right": {
-        "id": "deeprobotics/s10_pro/camera_right",
-        "width": 640, "height": 360, "distortion_model": "plumb_bob",
-        "K": [314.351144, 0, 327.541354, 0, 314.28902, 177.870404, 0, 0, 1],
-        "D": [-0.2617530191348165, 0.0801398926074851, 9.564678897937886e-05,
-              -0.0001381378356953391, -0.012449424682861728],
-        "measured_on": "2026-11-08", "unit": "S10 Pro CD1 (host CA9B_NO.0)",
-        "source_resolution": [1024, 576], "frames_used": 98, "rms_px": 0.219,
-    },
-}
+# Packaged model values retain their original CD1 measurement provenance.
+BUNDLED_INTRINSICS = Path(__file__).with_name("resource") / "calibration" / "s10_pro_camera_intrinsics.json"
 
 
 def camera_id(lane):
@@ -127,6 +84,29 @@ def validate(calibration, lane=None):
         raise ValueError("source_resolution must be [width, height] of the RTSP stream")
     cal["source_resolution"] = [int(source[0]), int(source[1])]
     return cal
+
+
+def _load_calibrations(path):
+    record = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(record, dict) or type(record.get("version")) is not int or record["version"] != 1:
+        raise ValueError("expected a version 1 camera intrinsics object")
+    rows = record.get("cameras")
+    lanes = ("camera_front", "camera_rear", "camera_left", "camera_right")
+    if not isinstance(rows, dict) or set(rows) != {camera_id(lane) for lane in lanes}:
+        raise ValueError("camera intrinsics must contain all four S10 Pro cameras")
+    try:
+        return {camera_id(lane): validate(rows[camera_id(lane)], lane) for lane in lanes}
+    except OverflowError as exc:
+        raise ValueError("camera intrinsics numbers exceed the supported finite range") from exc
+
+
+# A damaged camera resource must not stop unrelated sensors from importing.
+try:
+    CALIBRATIONS = _load_calibrations(BUNDLED_INTRINSICS)
+    _CALIBRATION_ERROR = None
+except (OSError, ValueError, UnicodeError) as exc:
+    CALIBRATIONS = {}
+    _CALIBRATION_ERROR = f"cannot load camera intrinsics {BUNDLED_INTRINSICS}: {exc}"
 
 
 def half_fov(k, width, height):
@@ -284,31 +264,35 @@ def write_maps(cal, directory):
     return str(xpath), str(ypath), invalid
 
 
-def raw_command(url):
+def _converter_input():
+    # Y4M carries frame dimensions. Limit input buffering when remap also has
+    # two static map inputs; a converter catching up should consume live video.
     return ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
-            "-rtsp_transport", "tcp", "-fflags", "nobuffer", "-flags", "low_delay",
-            "-i", str(url), "-an", "-vf", "fps=15,scale='min(640,iw)':-2",
-            "-q:v", "5", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"]
+            "-thread_queue_size", "1", "-probesize", "32", "-fpsprobesize", "0",
+            "-f", "yuv4mpegpipe", "-i", "pipe:0"]
 
 
-def remap_command(url, xpath, ypath, source_resolution, output_size=OUTPUT_SIZE):
-    """Raw command with a remap stage: fps first (remap only what is published),
-    force the calibrated source size, remap, then scale to the published size."""
+def raw_command():
+    return [*_converter_input(), "-an", "-vf", "scale='min(640,iw)':-2",
+            "-vsync", "0", "-q:v", "5", "-f", "image2pipe", "-vcodec", "mjpeg",
+            "-threads", "1", "pipe:1"]
+
+
+def remap_command(xpath, ypath, source_resolution, output_size=OUTPUT_SIZE):
+    """Remap decoded frames at the calibrated source size before downscaling."""
     src_w, src_h = source_resolution
     out_w, out_h = output_size
-    graph = (f"[0:v]fps=15,scale={src_w}:{src_h},format=gbrp[src];"
+    graph = (f"[0:v]scale={src_w}:{src_h},format=gbrp[src];"
              f"[src][1:v][2:v]remap,scale={out_w}:{out_h}[out]")
-    return ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
-            "-rtsp_transport", "tcp", "-fflags", "nobuffer", "-flags", "low_delay",
-            "-i", str(url), "-i", str(xpath), "-i", str(ypath),
-            "-filter_complex", graph, "-map", "[out]", "-an",
-            "-q:v", "5", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"]
+    return [*_converter_input(), "-i", str(xpath), "-i", str(ypath),
+            "-filter_complex", graph, "-map", "[out]", "-an", "-vsync", "0",
+            "-q:v", "5", "-f", "image2pipe", "-vcodec", "mjpeg", "-threads", "1", "pipe:1"]
 
 
 class CameraUndistortion:
     """Settings, persistence and runtime state of undistortion for all lanes.
 
-    `rtsp_command` is the MediaWorkers hook; `configure`,
+    `converter_command` is the MediaWorkers hook; `configure`,
     `status` and `declaration` serve the camera cards. `on_change(lane)` is
     called after a setting changes so the lane can reconnect with its new
     command.
@@ -404,13 +388,16 @@ class CameraUndistortion:
         with self._lock:
             return self._generations[lane]
 
-    def publish_if_current(self, lane, generation, publish):
+    def publish_if_current(self, lane, generation, publish, *, clear_error=True):
         # Configuration and publication cannot interleave: an old FFmpeg pipe
         # may still contain a complete JPEG after terminate() was requested.
         with self._lock:
             if self._generations[lane] == generation:
                 publish()
-                self._runtime[lane]["last_error"] = None
+                # Derived streams can share the geometry guard without
+                # acknowledging recovery of the camera's own RTSP pipeline.
+                if clear_error:
+                    self._runtime[lane]["last_error"] = None
 
     def record_error(self, lane, generation, text):
         with self._lock:
@@ -421,8 +408,8 @@ class CameraUndistortion:
         """(calibration, source) or (None, reason)."""
         row = CALIBRATIONS.get(camera_id(lane))
         if row is None:
-            return None, f"no calibration for {camera_id(lane)}"
-        return validate(row, lane), f"table:{camera_id(lane)}"
+            return None, _CALIBRATION_ERROR or f"no calibration for {camera_id(lane)}"
+        return validate(row, lane), f"bundled:{BUNDLED_INTRINSICS}"
 
     def active(self, lane):
         """Whether the lane is (or is about to be) serving rectified frames."""
@@ -435,12 +422,16 @@ class CameraUndistortion:
 
     # ── MediaWorkers hooks ─────────────────────────────────────────────────
 
-    def rtsp_command(self, lane, url):
-        if not self.active(lane):
+    def converter_command(self, lane):
+        with self._lock:
+            enabled = self._settings[lane]["undistort"]
+        if not enabled:
             with self._lock:
                 self._runtime[lane]["mode"] = "raw"
-            return raw_command(url)
-        cal, _ = self.calibration(lane)
+            return raw_command()
+        cal, source = self.calibration(lane)
+        if cal is None:
+            raise ValueError(source)
         try:
             xpath, ypath, invalid = write_maps(cal, self.map_dir)
         except (OSError, ValueError) as exc:
@@ -450,7 +441,7 @@ class CameraUndistortion:
             raise ValueError(f"cannot prepare undistortion maps for {lane}: {exc}") from exc
         with self._lock:
             self._runtime[lane].update(mode="undistort", invalid_fraction=invalid)
-        return remap_command(url, xpath, ypath, cal["source_resolution"])
+        return remap_command(xpath, ypath, cal["source_resolution"])
 
     # ── card views ─────────────────────────────────────────────────────────
 

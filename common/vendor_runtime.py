@@ -208,7 +208,10 @@ class DriverBundle:
         return None
 
 
-def make_handler(bundle_getter: Callable[[], DriverBundle], server_name: str, driver_id: str):
+def make_handler(
+    bundle_getter: Callable[[], DriverBundle], server_name: str, driver_id: str,
+    *, config_error_tools: frozenset[str] = frozenset(),
+):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
             msg = fmt % args
@@ -276,9 +279,14 @@ def make_handler(bundle_getter: Callable[[], DriverBundle], server_name: str, dr
                     ok({"tools": bundle.get_all_tools()})
                 elif method == "tools/call":
                     name = params.get("name", "")
-                    result = bundle.dispatch(name, params.get("arguments") or {})
+                    args = params.get("arguments") or {}
+                    result = bundle.dispatch(name, args)
                     if result is None:
                         error(-32601, f"Unknown tool: {name}")
+                    elif (name in config_error_tools and isinstance(args, dict) and args.get("action") == "config"
+                          and (result.get("ok") is False or result.get("state") == "error")):
+                        # Canvas startup checks the JSON-RPC error before sending start.
+                        error(-32000, result.get("message") or f"{name} configuration failed")
                     else:
                         ok({"content": [{"type": "text", "text": json.dumps(jsonable(result), ensure_ascii=False)}]})
                 else:
@@ -354,6 +362,8 @@ def run_driver(
     driver_id: str,
     server_name: str,
     build_plugins: Callable[[dict, str, DualDomainROS2], Iterable[Any]],
+    *,
+    config_error_tools: frozenset[str] = frozenset(),
 ) -> None:
     # Every driver routed through this helper gets the atomic line writer, so a
     # noisy plugin cannot tear a Docker log record. Idempotent if main.py already
@@ -378,7 +388,8 @@ def run_driver(
     bundle = DriverBundle(build_plugins(config, namespace, ros2))
     bundle.start_all()
     start_registration(port, config, driver_id)
-    server = ThreadingHTTPServer(("", port), make_handler(lambda: bundle, server_name, driver_id))
+    handler = make_handler(lambda: bundle, server_name, driver_id, config_error_tools=config_error_tools)
+    server = ThreadingHTTPServer(("", port), handler)
     stopping = threading.Event()
 
     def shutdown(signum, _frame):

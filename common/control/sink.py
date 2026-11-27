@@ -167,6 +167,9 @@ class ControlSink:
             holding an arm in the air indefinitely while the agent believes the
             action is still running.
         escalate_after: consecutive watchdog periods before escalating.
+        hold_on_command_expiry: for velocity sinks, also call on_watchdog when
+            the applied command or its observation expires. These holds do not
+            count toward the command-loss watchdog escalation.
         clock: `() -> int` milliseconds, monotonic — 内部计时（看门狗、速度）。
             Injected for tests.
         wall_clock: `() -> int` Unix 毫秒 —— **只**用来和消息里的 `stamp_ms` /
@@ -187,6 +190,7 @@ class ControlSink:
         on_watchdog=None,
         on_abort=None,
         escalate_after: int = 5,
+        hold_on_command_expiry: bool = False,
         clock=None,
         wall_clock=None,
         max_ttl_ms: float | None = None,
@@ -219,6 +223,7 @@ class ControlSink:
         self._on_watchdog = on_watchdog
         self._on_abort = on_abort if on_abort is not None else on_watchdog
         self._escalate_after = escalate_after
+        self._hold_on_command_expiry = hold_on_command_expiry
         self._clock = clock or _monotonic_ms
         # **故意不回退到 `clock`。** 「只注入 clock 就让两个时钟合一」正是让这个
         # bug 活下来的那个条件：测试于是永远在「stamp 和 now 同一个纪元」的前提下
@@ -234,6 +239,7 @@ class ControlSink:
         # for the velocity check.
         self._last_values: tuple[float, ...] | None = None
         self._last_apply_ms: int | None = None
+        self._command_expires_ms: float | None = None
         # Highest-priority source seen recently, and the last seq per source.
         self._holder: str | None = None
         self._holder_priority: int = 0
@@ -265,7 +271,8 @@ class ControlSink:
         if outcome is not None:
             return self._count(outcome)
 
-        freshness = self._check_freshness(message, self._wall_clock())
+        hold_on_expiry = self._hold_on_command_expiry and any(message["values"])
+        freshness = self._check_freshness(message, self._wall_clock(), hold_on_expiry=hold_on_expiry)
         if isinstance(freshness, Outcome):
             return self._count(freshness)
         expires_at_ms = now + freshness
@@ -292,6 +299,7 @@ class ControlSink:
 
         self._last_values = values
         self._last_apply_ms = now
+        self._command_expires_ms = expires_at_ms if hold_on_expiry else None
         self._active = True
         self._holding = False
         # A command that passed every check is the evidence the silence is over,
@@ -307,10 +315,10 @@ class ControlSink:
                                    expires_at_ms=expires_at_ms))
 
     def tick(self) -> Outcome | None:
-        """Drive the watchdog. Call periodically — at least once per watchdog_ms.
+        """Drive the watchdog and, when enabled, the applied command deadline.
 
-        Returns an `Outcome` on the tick that fires the watchdog or escalates,
-        `None` otherwise. Idle before the first command is not a watchdog
+        Returns an `Outcome` when a command expires, the watchdog fires, or it
+        escalates. Idle before the first command is not a watchdog
         condition: nothing has been promised yet, and firing here would mean
         every card reports a fault before it is used.
         """
@@ -323,7 +331,14 @@ class ControlSink:
         now = self._clock()
         since = now - (self._last_apply_ms or now)
         if since < self.descriptor.watchdog_ms:
+            if self._command_expires_ms is not None and now >= self._command_expires_ms:
+                self._command_expires_ms = None
+                self._holding = True
+                if self._on_watchdog is not None:
+                    self._on_watchdog()
+                return self._count(Outcome(Verdict.DROPPED, "applied command or observation expired; holding"))
             return None
+        self._command_expires_ms = None
 
         # One strike per elapsed watchdog period, not one per tick — otherwise
         # the escalation threshold would depend on how often the caller ticks.
@@ -412,6 +427,7 @@ class ControlSink:
         """
         self._last_values = None
         self._last_apply_ms = None
+        self._command_expires_ms = None
         self._holder = None
         self._holder_priority = 0
         self._holder_seen_ms = 0
@@ -516,7 +532,7 @@ class ControlSink:
             return Outcome(Verdict.REJECTED, "source is required and must be a string")
         return None
 
-    def _check_freshness(self, message: dict, now: float) -> Outcome | float:
+    def _check_freshness(self, message: dict, now: float, *, hold_on_expiry: bool) -> Outcome | float:
         """2. Age and ordering. Return the remaining output lease on success.
 
         A command can be freshly generated and still act on an 800 ms old
@@ -536,6 +552,9 @@ class ControlSink:
         if self._min_stamp_ms is not None and stamp < self._min_stamp_ms:
             return Outcome(Verdict.REJECTED, "command predates the current start/resume")
 
+        ttl_cap = self.descriptor.max_command_ttl_ms
+        if ttl_cap is not None:
+            ttl = min(ttl, ttl_cap)
         age = now - stamp
         obs_stamp = message.get("obs_stamp_ms")
         if (self._require_observation or obs_stamp is not None) and not _finite_number(obs_stamp):
@@ -566,6 +585,13 @@ class ControlSink:
         last = self._seq_by_source.get(source)
         if last is not None and seq <= last:
             return Outcome(Verdict.DROPPED, f"seq {seq} not newer than {last}")
+        if hold_on_expiry:
+            # Clock skew must not extend the lifetime of an applied command.
+            remaining = min(remaining, ttl)
+            if max_obs_age is not None and obs_age is not None:
+                remaining = min(remaining, max_obs_age)
+            if remaining <= 0:
+                return Outcome(Verdict.DROPPED, "expired: no remaining command or observation lifetime")
         return min(remaining, self.descriptor.watchdog_ms)
 
     def _check_arbitration(self, message: dict, now: int) -> Outcome | None:

@@ -366,6 +366,22 @@ def test_descriptor_round_trips():
     assert d.has_force_torque is False
 
 
+@pytest.mark.parametrize("cap", [None, 600])
+def test_descriptor_accepts_an_optional_command_ttl_cap(cap):
+    raw = descriptor_dict()
+    if cap is not None:
+        raw["rate"]["max_command_ttl_ms"] = cap
+    assert parse_descriptor(raw).max_command_ttl_ms == cap
+
+
+@pytest.mark.parametrize("cap", [0, -1, True, "600", math.nan, math.inf, -math.inf])
+def test_descriptor_rejects_invalid_command_ttl_caps(cap):
+    raw = descriptor_dict()
+    raw["rate"]["max_command_ttl_ms"] = cap
+    with pytest.raises(DescriptorError, match="rate.max_command_ttl_ms"):
+        parse_descriptor(raw)
+
+
 @pytest.mark.parametrize("mutate, fragment", [
     (lambda d: d.pop("mode"), "mode"),
     (lambda d: d.update(mode="waltz"), "waltz"),
@@ -457,6 +473,25 @@ def test_command_inside_ttl_is_applied():
     assert apply.last == (0.1, 0.1)
 
 
+@pytest.mark.parametrize(("cap", "ttl", "age", "verdict"), [
+    (600, 1000, 600, Verdict.APPLIED),
+    (600, 1000, 601, Verdict.DROPPED),
+    (600, 200, 201, Verdict.DROPPED),
+    (None, 1000, 601, Verdict.APPLIED),
+])
+def test_command_ttl_uses_the_lower_of_producer_ttl_and_optional_cap(cap, ttl, age, verdict):
+    clock, apply = FakeClock(), Recorder()
+    raw = descriptor_dict()
+    if cap is not None:
+        raw["rate"]["max_command_ttl_ms"] = cap
+    sink = make_sink(clock, apply, raw)
+    cmd = message(clock, [0.1, 0.1], ttl_ms=ttl)
+    clock.advance(age)
+
+    assert sink.submit(cmd).verdict is verdict
+    assert bool(apply.calls) == (verdict is Verdict.APPLIED)
+
+
 def test_stale_observation_is_dropped_even_when_the_command_is_fresh():
     """A command generated just now can still be acting on an old picture."""
     clock, apply = FakeClock(), Recorder()
@@ -487,6 +522,30 @@ def test_accepted_command_exposes_a_monotonic_lease(ttl, observation_age, expect
                                   obs_stamp_ms=wall.now - observation_age))
     assert outcome.applied
     assert outcome.expires_at_ms == mono.now + expected_lease
+
+
+@pytest.mark.parametrize("observation_stamp, lease_ms", [(None, 120), (1020, 80)])
+def test_active_expiry_uses_reported_lease_without_extending_future_stamps(observation_stamp, lease_ms):
+    wall, mono, apply = FakeClock(1000), FakeClock(4000), Recorder()
+    raw = _twist_descriptor()
+    raw["rate"].update(max_command_ttl_ms=120, max_obs_age_ms=80)
+    holds = []
+    sink = ControlSink(raw, apply, clock=mono, wall_clock=wall, max_ttl_ms=160,
+                       future_tolerance_ms=50, hold_on_command_expiry=True,
+                       on_watchdog=lambda: holds.append(mono.now))
+    msg = message(wall, [0.1, 0.1], mode="twist", ttl_ms=150,
+                  stamp_ms=1030, obs_stamp_ms=observation_stamp)
+
+    outcome = sink.submit(msg)
+    assert outcome.applied
+    assert outcome.expires_at_ms == 4000 + lease_ms
+    mono.advance(lease_ms - 1)
+    assert sink.tick() is None
+    mono.advance(1)
+    assert sink.tick().verdict is Verdict.DROPPED
+    assert sink.tick() is None
+    assert holds == [outcome.expires_at_ms]
+    assert sink.stats()["watchdog_strikes"] == 0
 
 
 @pytest.mark.parametrize(

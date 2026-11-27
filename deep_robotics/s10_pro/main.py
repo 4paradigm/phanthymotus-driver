@@ -18,6 +18,9 @@ from common.vendor_runtime import run_driver
 from device import build_plugins
 
 
+CONFIG_ERROR_TOOLS = frozenset({"loco_servo", "camera_front_depth"})
+
+
 def _interface_ipv4(interface):
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         request = struct.pack("256s", interface.encode())
@@ -140,4 +143,5 @@ if __name__ == "__main__":
     config_path = Path(os.environ.get("CONFIG_PATH", Path(__file__).with_name("config.yaml")))
     with config_path.open(encoding="utf-8") as config_file:
         configure_fastdds_profile(yaml.safe_load(config_file) or {})
-    run_driver(__file__, "deep-robotics-s10-pro-driver", "deep-robotics-s10-pro-device-bundle", build_plugins)
+    run_driver(__file__, "deep-robotics-s10-pro-driver", "deep-robotics-s10-pro-device-bundle",
+               build_plugins, config_error_tools=CONFIG_ERROR_TOOLS)

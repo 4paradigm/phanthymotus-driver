@@ -2,18 +2,56 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from functools import partial
 import multiprocessing as mp
 import queue
 import subprocess
 import threading
 import time
 
+from deep_robotics.s10_pro.undistortion import raw_command
+
 
 def _rtsp_command(url):
+    # Select one actual decoded frame per 15 Hz time bin. The fps filter fills
+    # missing timestamps with copies of the previous frame.
+    select = "select='isnan(prev_selected_t)+not(eq(floor(t*15),floor(prev_selected_t*15)))'"
     return ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
             "-rtsp_transport", "tcp", "-fflags", "nobuffer", "-flags", "low_delay",
-            "-i", str(url), "-an", "-vf", "fps=15,scale='min(640,iw)':-2",
-            "-q:v", "5", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"]
+            "-i", str(url), "-map", "0:v:0", "-vf", select, "-vsync", "0",
+            "-c:v", "wrapped_avframe", "-pix_fmt", "yuv420p", "-f", "fifo",
+            "-fifo_format", "yuv4mpegpipe", "-queue_size", "2", "-drop_pkts_on_overflow", "1",
+            "-format_opts", "flush_packets=1", "pipe:1"]
+
+
+@contextmanager
+def _camera_process(command, stdin, report_error):
+    process = subprocess.Popen(command, stdin=stdin, stdout=subprocess.PIPE, bufsize=0,
+                               stderr=subprocess.PIPE if report_error else subprocess.DEVNULL)
+    reader = None
+    try:
+        if report_error:
+            def drain_errors():
+                for line in process.stderr:
+                    text = line.decode("utf-8", errors="replace").strip()
+                    if text:
+                        report_error(text)
+            reader = threading.Thread(target=drain_errors, daemon=True)
+            reader.start()
+        yield process
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        process.stdout.close()
+        if reader:
+            reader.join()
+            process.stderr.close()
 
 
 class MediaWorkers:
@@ -44,58 +82,38 @@ class MediaWorkers:
 
     def restart_rtsp_camera(self, lane):
         """Reconnect only this lane after its camera settings change."""
-        process = self._rtsp_processes.get(lane)
-        if process is not None and process.poll() is None:
-            process.terminate()
+        for process in self._rtsp_processes.get(lane, ()):
+            if process.poll() is None:
+                process.terminate()
 
     def _rtsp_loop(self, lane, url):
         while not self._closed:
-            process = None
-            errors_thread = None
             try:
                 controller = getattr(self, "camera_undistortion", None)
                 generation = controller.generation(lane) if controller else None
-                command = controller.rtsp_command(lane, url) if controller else _rtsp_command(url)
-                process = subprocess.Popen(command, stdout=subprocess.PIPE,
-                                            stderr=subprocess.PIPE if controller else subprocess.DEVNULL,
-                                            bufsize=0)
-                self._rtsp_processes[lane] = process
-                if controller:
-                    def drain_errors(proc=process, version=generation):
-                        # Drain continuously so ffmpeg cannot block on stderr.
-                        # Keep diagnostics bounded; camera info exposes the last error.
-                        for line in iter(proc.stderr.readline, b""):
-                            text = line.decode("utf-8", errors="replace").strip()
-                            if text:
-                                controller.record_error(lane, version, text)
-                    errors_thread = threading.Thread(target=drain_errors, daemon=True,
-                                                     name=f"s10-ffmpeg-errors-{lane}")
-                    errors_thread.start()
-                if controller and generation != controller.generation(lane):
-                    process.terminate()
-                self._read_mjpeg(lane, process.stdout, generation)
+                command = controller.converter_command(lane) if controller else raw_command()
+                report = partial(controller.record_error, lane, generation) if controller else None
+
+                # Only decoded frames may be discarded: the RTSP reader must
+                # keep consuming H.264 reference frames even when remap is slow.
+                with _camera_process(_rtsp_command(url), None, report) as capture:
+                    with _camera_process(command, capture.stdout, report) as converter:
+                        capture.stdout.close()
+                        self._rtsp_processes[lane] = (capture, converter)
+                        if self._closed or (controller and generation != controller.generation(lane)):
+                            self.restart_rtsp_camera(lane)
+                        else:
+                            self._read_mjpeg(lane, converter.stdout, generation)
+                if not self._closed:
+                    for stage, process in (("capture", capture), ("converter", converter)):
+                        if process.returncode not in (0, -15):
+                            print(f"[rtsp] {lane} {stage} exited with {process.returncode}; reconnecting",
+                                  flush=True)
             except (OSError, ValueError) as exc:
                 print(f"[rtsp] {lane} pull failed: {exc}", flush=True)
             finally:
                 self._rtsp_processes.pop(lane, None)
-                if process is not None:
-                    if process.poll() is None:
-                        process.terminate()
-                    try:
-                        process.wait(timeout=1)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait(timeout=1)
-                    if process.stdout:
-                        process.stdout.close()
-                    if errors_thread is not None:
-                        errors_thread.join(timeout=1)
-                        if process.stderr:
-                            process.stderr.close()
             if not self._closed:
-                if process is not None and process.returncode not in (None, 0, -15):
-                    print(f"[rtsp] {lane} ffmpeg exited with {process.returncode}; reconnecting",
-                          flush=True)
                 time.sleep(1)
 
     def _read_mjpeg(self, lane, stream, generation=None):
@@ -135,9 +153,10 @@ class MediaWorkers:
                         print(f"[rtsp] {lane} frame publish failed count={count}: {exc}", flush=True)
 
     def rtsp_alive(self, lane):
-        process = self._rtsp_processes.get(lane)
+        processes = self._rtsp_processes.get(lane)
         thread = self._rtsp_threads.get(lane)
-        return bool(thread and thread.is_alive() and process and process.poll() is None)
+        return bool(thread and thread.is_alive() and processes
+                    and all(p.poll() is None for p in processes))
 
     def _add(self, lane, kind):
         # Media is a live view: never queue historical frames.  A single slot
@@ -193,17 +212,15 @@ class MediaWorkers:
 
     def close(self):
         self._closed = True
-        for process in self._rtsp_processes.values():
-            if process.poll() is None:
-                process.terminate()
-        for thread in self._rtsp_threads.values():
+        for lane in list(self._rtsp_processes):
+            self.restart_rtsp_camera(lane)
+        for lane, thread in self._rtsp_threads.items():
             thread.join(timeout=2)
-        for lane, process in list(self._rtsp_processes.items()):
-            if process.poll() is None:
-                process.kill()
-                process.wait(timeout=1)
-            if process.stdout:
-                process.stdout.close()
+            if thread.is_alive():
+                for process in self._rtsp_processes.get(lane, ()):
+                    if process.poll() is None:
+                        process.kill()
+                thread.join(timeout=1)
         self._rtsp_threads.clear()
         self._rtsp_processes.clear()
         for jobs in self._jobs.values():

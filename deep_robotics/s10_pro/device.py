@@ -24,6 +24,7 @@ from loco_servo import S10LocoServoPlugin
 from spatial import S10ControlledSpatialPlugin
 from common.odom import build_interface, build_sample
 from common.camera_info import build as build_camera_info
+from deep_robotics.s10_pro.front_depth import FrontDepthPlugin
 
 CAMERA_LANES = ("camera_rear", "camera_left", "camera_front", "camera_right")
 CAMERA_MOUNTS = {
@@ -128,6 +129,7 @@ class S10Nodes:
         from std_msgs.msg import String
 
         self.json = json
+        self._ros2 = ros2
         self.robot = Node("s10_pro_driver_robot", context=ros2.ctx_robot)
         ros2.executor_robot.add_node(self.robot)
         self.bridge = CoreBridge(os.environ.get("S10_CORE_FASTDDS_PROFILE", "/tmp/s10-pro-core-fastdds.xml"),
@@ -166,6 +168,7 @@ class S10Nodes:
             for lane in CAMERA_LANES
         }
         self.media_workers = None
+        self._front_camera_frame = None
         self.camera_undistortion = CameraUndistortion(CAMERA_LANES)
         if config.get("media_workers", False):
             self.media_workers = MediaWorkers(self._handle_media_result)
@@ -247,6 +250,9 @@ class S10Nodes:
         for lane, url in self._rtsp_sources.items():
             self.media_workers.add_rtsp_camera(lane, url)
             print(f"[rtsp] pulling {lane} from {url}", flush=True)
+
+    def robot_executor_status(self):
+        return self._ros2.s10_robot_executor.status()
 
     def _scan_media_topics(self):
         """Discover PointCloud2 inputs as robot nodes start; cameras use RTSP."""
@@ -395,9 +401,9 @@ class S10Nodes:
         header = values.get("header", {}) if isinstance(values, dict) else {}
         stamp = header.get("stamp", {}) if isinstance(header, dict) else {}
         if isinstance(stamp, dict):
-            for key in ("sec", "nanosec"):
-                if key in stamp:
-                    payload[key] = stamp[key]
+            sec, nanosec = stamp.get("sec"), stamp.get("nanosec")
+            if type(sec) is int and type(nanosec) is int and 0 <= nanosec < 1_000_000_000:
+                payload.update(sec=sec, nanosec=nanosec)
         for key, value in (values.items() if isinstance(values, dict) else ()):
             if key not in {"header", "orientation", "angular_velocity", "linear_acceleration"}:
                 payload[key] = value
@@ -589,7 +595,13 @@ class S10Nodes:
             output.format = "jpeg"
             output.data = packet
             self.camera_publishers[lane].publish(output)
+            if lane == 'camera_front' and len(packet) <= 2 * 1024 * 1024:
+                self._front_camera_frame = (self.camera_undistortion.generation(lane),
+                                            time.monotonic(), bytes(packet))
         self._record_stream(lane, "published")
+
+    def front_camera_frame(self):
+        return self._front_camera_frame
 
     @staticmethod
     def _pointcloud_packet(msg):
@@ -1569,10 +1581,13 @@ class S10ChargePlugin:
 
 
 def build_plugins(config, namespace=None, ros2=None):
+    if ros2 is not None:
+        from deep_robotics.s10_pro.ros_runtime import install_robot_executor_guard
+        install_robot_executor_guard(ros2)
     native = BasicServerClient(config)
     nodes = S10Nodes(config, namespace or "", ros2) if ros2 is not None else None
     motion = S10MotionPlugin(native, nodes)
-    servo = S10LocoServoPlugin(native, ros2, motion)
+    servo = S10LocoServoPlugin(native, ros2, motion, config=config.get("loco_servo", {}))
     motion.attach_servo(servo)
     navigation = (S10NavigationPlugin(native)
                   if str(config.get("model_variant", "standard")).lower() == "pro" else None)
@@ -1587,5 +1602,6 @@ def build_plugins(config, namespace=None, ros2=None):
     if str(config.get("model_variant", "standard")).lower() == "pro":
         from audio import S10MicPlugin, S10SpeakerPlugin
         plugins.extend([S10ControlledSpatialPlugin(config, navigation),
-                        S10MicPlugin(config, namespace or "", nodes), S10SpeakerPlugin(config)])
+                        S10MicPlugin(config, namespace or "", nodes), S10SpeakerPlugin(config),
+                        FrontDepthPlugin(config, namespace or "", nodes)])
     return plugins

@@ -1,5 +1,4 @@
-"""Offline end-to-end monitor contracts using fake vendor subscriptions."""
-import ast
+"""Offline monitor contracts for the standalone reader and the deployed Pro bundle."""
 import importlib.util
 import json
 import struct
@@ -7,38 +6,33 @@ import sys
 import threading
 import urllib.request
 from http.server import ThreadingHTTPServer
-from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
 
-ROOT = Path(__file__).resolve().parents[1]
-SOURCE = ROOT / 'deep_robotics/s10_pro'
-sys.path.insert(0, str(SOURCE))
-from device import build_plugins
-from reader import DEFAULT_SOURCES, SubscriptionReader, LatestEventWriter, normalize_control
-from pointcloud import convert_pointcloud
 from common.vendor_runtime import DriverBundle, make_handler
+from deep_robotics.s10_pro.pointcloud import convert_pointcloud
+from deep_robotics.s10_pro.reader import DEFAULT_SOURCES, SubscriptionReader, LatestEventWriter, normalize_control
+from test_s10_pro_control import DRIVER as SOURCE, FakeNative, s10_ros
 
 
-class Bridge:
-    def __init__(self):
-        self.owners = set()
-        self.age = 0.01
+@pytest.fixture
+def pro_bundle(s10_ros, monkeypatch, tmp_path):
+    device, ros2 = s10_ros
+    ros2.rclpy = SimpleNamespace(ok=lambda **_kwargs: True)
+    monkeypatch.setenv('S10_FRONT_DEPTH_CONFIG', str(tmp_path / 'front_depth.json'))
+    config = yaml.safe_load((SOURCE / 'config.yaml').read_text())
+    native = FakeNative(config)
+    closed = []
+    monkeypatch.setattr(native, 'close', lambda: closed.append(True), raising=False)
+    monkeypatch.setattr(device, 'BasicServerClient', lambda _config: native)
+    bundle = DriverBundle(device.build_plugins(config, 'test', ros2))
+    state = next(plugin for plugin in bundle.plugins if isinstance(plugin, device.S10StatePlugin))
+    yield SimpleNamespace(bundle=bundle, device=device, nodes=state.nodes, closed=closed)
+    if not closed:
+        bundle.stop_all()
 
-    def acquire(self, name, sources, settings):
-        assert set(sources) <= set(DEFAULT_SOURCES)
-        self.owners.add(name)
-
-    def release(self, name):
-        self.owners.discard(name)
-
-    def snapshot(self, source):
-        return {'data': {'data': [{'battery_level': 80}]}, 'age_s': self.age,
-                'fresh': True, 'sequence': 1}
-
-    def status(self):
-        return {'reader_running': bool(self.owners)}
 
 
 class Node:
@@ -83,23 +77,26 @@ def test_newest_record_replaces_pending_backlog():
     writer.close()
 
 
-def test_card_stop_releases_only_its_lease_and_stale_data_is_not_live():
-    bridge = Bridge()
-    cards = build_plugins({}, 'test', bridge, lambda *args: None)
-    try:
-        cards[0].start()
-        cards[3].start()
-        assert bridge.owners == {'battery', 'imu'}
-        assert cards[0].status()['fresh']
-        bridge.age = 60
-        assert not cards[0].status()['fresh']
-        assert cards[0].status()['status'] == 'stale'
-        cards[0].stop()
-        assert bridge.owners == {'imu'}
-        assert not cards[0].status()['connected']
-    finally:
-        for card in cards:
-            card.stop()
+def test_monitor_card_stop_keeps_the_shared_pro_streams_live(pro_bundle, monkeypatch):
+    bundle, nodes = pro_bundle.bundle, pro_bundle.nodes
+    monkeypatch.setattr(pro_bundle.device.time, 'time', lambda: 1000.)
+    for name in ('battery', 'imu'):
+        assert bundle.dispatch(name, {'action': 'start'})['state'] == 'running'
+    nodes.robot.subscriptions['/BATTERY_DATA']({'data': [{'battery_level': 80}]})
+    nodes.robot.subscriptions['/IMU']({'linear_acceleration': {'z': 9.8}})
+    assert nodes.stream_status()['battery']['last_published'] == 1000.
+
+    monkeypatch.setattr(pro_bundle.device.time, 'time', lambda: 1060.)
+    assert bundle.dispatch('battery', {'action': 'stop'})['state'] == 'idle'
+    nodes.robot.subscriptions['/IMU']({'linear_acceleration': {'z': 9.7}})
+    status = nodes.stream_status()
+    assert status['battery']['published'] == 1 and status['battery']['last_published'] == 1000.
+    assert status['imu']['published'] == 2 and status['imu']['last_published'] == 1060.
+    assert not pro_bundle.closed
+
+    bundle.stop_all()
+    assert pro_bundle.closed == [True]
+    assert not nodes.robot.subscriptions
 
 
 def test_cloud_preserves_axes_and_limits_valid_points():
@@ -117,27 +114,29 @@ def test_cloud_preserves_axes_and_limits_valid_points():
     assert info['frame_id'] == 'lidar_link'
 
 
-def test_standalone_entrypoint_and_build_inputs_are_complete():
-    spec = importlib.util.spec_from_file_location('s10_monitor_entrypoint', SOURCE / 'main.py')
+@pytest.fixture
+def pro_entrypoint(pro_bundle, monkeypatch):
+    monkeypatch.setitem(sys.modules, 'device', pro_bundle.device)
+    from common import logsafe
+    monkeypatch.setattr(logsafe, 'install', lambda: None)
+    spec = importlib.util.spec_from_file_location('s10_pro_entrypoint', SOURCE / 'main.py')
     main = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(main)
-    assert [p.name for p in main.build_runtime_plugins({}, 'test', Bridge(), lambda *args: None)] == [
-        'battery', 'joints', 'lidar_cloud', 'imu']
+    return main
+
+
+def test_pro_entrypoint_and_build_inputs_are_complete(pro_bundle, pro_entrypoint):
+    assert pro_entrypoint.build_plugins is pro_bundle.device.build_plugins
     manifest = yaml.safe_load((SOURCE / 'driver.yaml').read_text())
-    assert {c['name'] for c in manifest['cards']} == {'battery', 'joints', 'model', 'lidar_cloud', 'imu'}
-    for file in SOURCE.glob('*.py'):
-        tree = ast.parse(file.read_text())
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom):
-                assert not (node.module or '').startswith(('motion', 'acp', 'operator_authorization', 'loco'))
-    assert not list(SOURCE.glob('*motion*'))
+    cards = {c['name']: c['type'] for c in manifest['cards']}
+    tools = {t['name']: t['type'] for t in pro_bundle.bundle.get_all_tools()}
+    assert tools == {**cards, 'odom': 'sensor'}
     for line in (SOURCE / 'Dockerfile').read_text().splitlines():
         if line.startswith('COPY ') and '--from=' not in line:
             for name in line.split()[1:-1]:
                 if '${' not in name and name != 'common/':
                     assert (SOURCE / name).exists(), name
-    # Every local vendor field type is included in the minimal interface subset.
-    vendor = next((SOURCE / 'vendor').glob('deep-*'))
+    vendor = SOURCE / 'resource' / 'deep-robotics-msg'
     names = {file.stem for file in (vendor / 'msg').glob('*.msg')}
     for file in (vendor / 'msg').glob('*.msg'):
         for line in file.read_text().splitlines():
@@ -148,10 +147,11 @@ def test_standalone_entrypoint_and_build_inputs_are_complete():
                     assert kind in names
 
 
-def test_http_mcp_lists_only_monitor_tools_and_starts_sensor():
-    bridge = Bridge()
-    bundle = DriverBundle(build_plugins({}, 'test', bridge, lambda *args: None))
-    server = ThreadingHTTPServer(('127.0.0.1', 0), make_handler(lambda: bundle, 's10-monitors', 's10'))
+@pytest.fixture
+def pro_rpc(pro_bundle, pro_entrypoint):
+    handler = make_handler(lambda: pro_bundle.bundle, 's10-pro', 'deep-robotics-s10-pro-driver',
+                           config_error_tools=pro_entrypoint.CONFIG_ERROR_TOOLS)
+    server = ThreadingHTTPServer(('127.0.0.1', 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     def rpc(method, params):
@@ -161,13 +161,56 @@ def test_http_mcp_lists_only_monitor_tools_and_starts_sensor():
         with urllib.request.urlopen(request, timeout=2) as response:
             return json.load(response)
     try:
-        tools = rpc('tools/list', {})['result']['tools']
-        assert {tool['name'] for tool in tools} == {'battery', 'joints', 'model', 'lidar_cloud', 'imu'}
-        result = rpc('tools/call', {'name': 'battery', 'arguments': {}})
-        assert 'error' not in result
-        assert bridge.owners == {'battery'}
+        yield rpc
     finally:
-        bundle.stop_all()
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+def test_http_mcp_lists_pro_tools_and_starts_a_monitor(pro_rpc):
+    tools = pro_rpc('tools/list', {})['result']['tools']
+    assert {'battery', 'joints', 'model', 'lidar_cloud', 'imu', 'odom',
+            'camera_front_depth', 'loco_servo'} <= {tool['name'] for tool in tools}
+    result = pro_rpc('tools/call', {'name': 'battery', 'arguments': {'action': 'start'}})
+    state = json.loads(result['result']['content'][0]['text'])
+    assert state == {'state': 'running', 'topic_out': [{'topic': '/test/battery', 'format': 'data/json'}]}
+
+
+@pytest.mark.parametrize('tool, config, message', [
+    ('loco_servo', {'speed_preset': 'invalid'}, 'speed_preset'),
+    ('loco_servo', {'dry_run': False}, 'S10_MOTION_ENABLED'),
+    ('camera_front_depth', {'camera_optical_from_cloud': [[1]]}, 'camera_optical_from_cloud'),
+])
+def test_http_mcp_rejects_invalid_saved_config(pro_rpc, monkeypatch, tool, config, message):
+    monkeypatch.setenv('S10_MOTION_ENABLED', '0')
+    response = pro_rpc('tools/call', {'name': tool, 'arguments': {'action': 'config', 'config': config}})
+    assert 'result' not in response, response
+    assert response['id'] == 1
+    assert response['error']['code'] == -32000
+    assert message in response['error']['message']
+
+
+def test_http_mcp_preserves_successful_config_payloads(pro_rpc):
+    result = pro_rpc('tools/call', {'name': 'loco_servo',
+                                    'arguments': {'action': 'config', 'speed_preset': 'slow'}})
+    config = json.loads(result['result']['content'][0]['text'])
+    assert config['ok'] is True and config['speed_preset'] == 'slow'
+    result = pro_rpc('tools/call', {'name': 'loco_servo', 'arguments': {'action': 'info'}})
+    info = json.loads(result['result']['content'][0]['text'])
+    assert info['control_interface']['limits']['upper'][0] == .3
+
+    result = pro_rpc('tools/call', {'name': 'camera_front_depth',
+                                    'arguments': {'action': 'config', 'rate_hz': 4}})
+    config = json.loads(result['result']['content'][0]['text'])
+    assert config['state'] == 'configured' and config['restart_required'] is True
+    assert config['config']['rate_hz'] == 4
+
+
+@pytest.mark.parametrize('tool, arguments', [
+    ('camera_front', {'action': 'config', 'undistort': 'invalid'}),
+    ('loco_servo', {'action': 'start'}),
+])
+def test_http_mcp_preserves_other_errors(pro_rpc, tool, arguments):
+    result = pro_rpc('tools/call', {'name': tool, 'arguments': arguments})
+    assert json.loads(result['result']['content'][0]['text'])['state'] == 'error'

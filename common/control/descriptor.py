@@ -147,6 +147,7 @@ class Descriptor:
     # can therefore distinguish a measurement from a vendor claim or estimate.
     response: dict = field(default_factory=dict)
     raw: dict = field(default_factory=dict, repr=False)
+    max_command_ttl_ms: float | None = None
 
     @property
     def has_force_torque(self) -> bool:
@@ -369,6 +370,11 @@ def parse_descriptor(raw: dict) -> Descriptor:
         if isinstance(max_obs_age, bool) or not isinstance(max_obs_age, (int, float)) or max_obs_age <= 0:
             raise DescriptorError("descriptor.rate.max_obs_age_ms must be a positive number")
         max_obs_age = int(max_obs_age)
+    max_command_ttl = rate.get("max_command_ttl_ms")
+    if max_command_ttl is not None:
+        if (isinstance(max_command_ttl, bool) or not isinstance(max_command_ttl, (int, float))
+                or not 0 < max_command_ttl < float("inf")):
+            raise DescriptorError("descriptor.rate.max_command_ttl_ms must be a finite positive number")
 
     # `force_torque` must be present, even as null. Omitting it is how a robot
     # ends up assumed to have a protection it does not have.
@@ -437,6 +443,7 @@ def parse_descriptor(raw: dict) -> Descriptor:
         zero_immediate=zero_immediate,
         response=response,
         raw=dict(raw),
+        max_command_ttl_ms=max_command_ttl,
     )
 
 
