@@ -913,3 +913,22 @@ It uses pyalsaaudio when a working one is installed and otherwise captures
 through `arecord`, so PC1 needs no pip install and no internet. If its capture
 fails, the process exits rather than keep an empty port open, and the next
 health check restarts it.
+
+## Head follow card
+
+Add `head_face_follow`, call `start`, configure the mode, and call `arm`
+to enable head motion. `info` reports the selected mode and the reason
+the head is waiting. `stop` releases head control. The built-in face detector
+uses Haar cascades via `cv2.CascadeClassifier`, which was absent in the
+OpenCV 5 wheel tested for this card. The driver keeps its existing
+`opencv-python-headless` dependency on the OpenCV 4 series.
+
+- `set_mode(mode="nearest_face")` measures the median depth of the inner face
+  region and follows the closest visible target with a valid measurement.
+  It uses the built-in head camera and requires matching optical frame IDs,
+  matching dimensions, and RGB/depth timestamps within 85 ms.
+- `set_target(object_name="cup")` follows a class from Perception's VOP
+  vocabulary. The card starts VOP on port 15720 when the camera's objects
+  topic has no publisher. The Perception service must be running. The card consumes normalized
+  object positions and confidences from VOP. Use `set_mode(mode="face")` to return to the original
+  anonymous tracking mode.

@@ -325,9 +325,11 @@ class TianyiDeviceBundle:
             self._plugins.append(StatePlugin(state_cfg, namespace, ros2))
             print("[bundle] StatePlugin loaded")
 
+        camera = None
         if plugins_cfg.get("camera", {}).get("enabled", False):
             from device import CameraPlugin
-            self._plugins.append(CameraPlugin(plugins_cfg["camera"], namespace, ros2))
+            camera = CameraPlugin(plugins_cfg["camera"], namespace, ros2)
+            self._plugins.append(camera)
             print("[bundle] CameraPlugin loaded")
 
         if plugins_cfg.get("camera_snapshot", {}).get("enabled", False):
@@ -395,11 +397,18 @@ class TianyiDeviceBundle:
             self._plugins.append(HeadPlugin(plugins_cfg["head"], namespace, ros2))
             print("[bundle] HeadPlugin loaded")
 
-        if plugins_cfg.get("head_gesture", {}).get("enabled", False):
+        self._head_follow = None
+        follow_enabled = plugins_cfg.get("head_face_follow", {}).get("enabled", False)
+        if plugins_cfg.get("head_gesture", {}).get("enabled", False) or follow_enabled:
             from device import HeadGesturePlugin
-            self._plugins.append(HeadGesturePlugin(
-                plugins_cfg["head_gesture"], namespace, ros2))
-            print("[bundle] HeadGesturePlugin loaded")
+            head_gesture = HeadGesturePlugin(plugins_cfg.get("head_gesture", {}), namespace, ros2)
+            if plugins_cfg.get("head_gesture", {}).get("enabled", False):
+                self._plugins.append(head_gesture)
+            if follow_enabled:
+                from head_face_follow import HeadFaceFollowPlugin
+                head_gesture.start()
+                self._head_follow = HeadFaceFollowPlugin(ros2, head_gesture, namespace, camera)
+                self._plugins.append(self._head_follow)
 
         if plugins_cfg.get("arm", {}).get("enabled", False):
             from device import ArmPlugin
@@ -496,6 +505,7 @@ class TianyiDeviceBundle:
         # Keep this arbitration in the bundle; existing card implementations
         # and the shared navigation client remain unchanged.
         import threading as _threading
+        self._head_command_lock = _threading.Lock()
         self._base_command_lock = _threading.RLock()
         self._base_owner = ""
         self._loco_servo = None
@@ -552,6 +562,14 @@ class TianyiDeviceBundle:
         return tools
 
     def dispatch(self, tool_name: str, args: dict) -> dict | None:
+        follow = getattr(self, "_head_follow", None)
+        if follow is not None and tool_name in ("head", "head_gesture", "head_face_follow"):
+            with self._head_command_lock:
+                action = args.get("action", "start")
+                if (tool_name != "head_face_follow" and follow.owns_head()
+                        and action not in ("start", "info", "stop", "cancel")):
+                    return {"state": "error", "error": "Stop head_face_follow before moving the head"}
+                return self._dispatch(tool_name, args)
         servo = self._loco_servo
         motions = {"nav": {"move_to", "move_by", "rotate", "rotate_to"},
                    "home": {"go_home"}, "chassis_raw": {"move", "rotate"}}

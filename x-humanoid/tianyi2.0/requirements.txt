@@ -1,6 +1,7 @@
 pyyaml
 numpy
-opencv-python-headless
+# Head following uses the Haar CascadeClassifier API from OpenCV 4.
+opencv-python-headless<5
 phonemizer
 pyalsaaudio
 sounddevice
