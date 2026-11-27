@@ -98,6 +98,7 @@ def test_canvas_lifecycle_and_object_mode(monkeypatch):
         vars(module).update(attrs)
         monkeypatch.setitem(sys.modules, name, module)
     monkeypatch.setitem(sys.modules, "tracking", tracking)
+    monkeypatch.syspath_prepend(str(FILE.parent))
     spec = importlib.util.spec_from_file_location("helios_follow_driver", FILE.with_name("main.py"))
     driver = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(driver)
@@ -114,19 +115,36 @@ def test_canvas_lifecycle_and_object_mode(monkeypatch):
     node = NS(create_publisher=lambda *_: NS(publish=publications.append),
               create_subscription=subscribe, destroy_subscription=subscriptions.pop,
               create_timer=lambda *_: None, count_publishers=lambda _: 0)
-    card = driver.HeliosFaceFollow(node)
+    motion_calls = []
+
+    def request(operation, **fields):
+        motion_calls.append((operation, fields))
+        return {"ok": True, "camera_topic": fields.get("camera_topic"), "axes": AXES}
+
+    card = driver.HeliosFaceFollow(node, NS(request=request))
     bundle = driver.DriverBundle([card])
     rgb = "/test/rgb"
     name = "helios_face_follow"
     assert bundle.dispatch(name, {"action": "start", "input_topic": rgb})["state"] == "running"
     assert bundle.dispatch(name, {"action": "set_target", "object_name": "Cup"})["mode"] == "object"
     assert calls == [rgb]
-    subscriptions[rgb](NS())
+    subscriptions[rgb](frame(stamp=100))
+    subscriptions[driver.JOINTS](NS(data=json.dumps({"available": True, "received_at_ms": 100000,
+        "joints": [{"name": joint, "q": 0} for joint in driver.HEAD_JOINTS]})))
     vop = subscriptions[rgb + "/objects"]
     vop(NS(data=json.dumps({"timestamp": 100, "objects": [
         {"name": "cup", "position": [0.25, 0], "confidence": 0.9}]})))
     assert bundle.dispatch(name, {"action": "info"})["target"]["offset"] == (0.25, 0)
     assert json.loads(publications[-1].data)["available"]
+    card.move_head()
+    assert [op for op, _ in motion_calls] == ["acquire", "position"]
+    assert bundle.dispatch(name, {"action": "info"})["motion_available"]
+    card.move_head()
+    assert len(motion_calls) == 2
+    clock.monotonic = lambda: 10.4
+    card.move_head()
+    assert motion_calls[-1][0] == "halt"
+    assert not bundle.dispatch(name, {"action": "info"})["motion_available"]
     clock.monotonic = lambda: 11
     card.expire()
     assert not json.loads(publications[-1].data)["available"]
@@ -134,3 +152,65 @@ def test_canvas_lifecycle_and_object_mode(monkeypatch):
     assert set(subscriptions) == {driver.JOINTS}
     vop(NS(data="{}"))
     assert card.info()["reason"] == "idle"
+
+
+AXES = {
+    "head_joint_1": dict(image_axis="x", image_sign=-1, lower_rad=-0.5, upper_rad=0.5, max_rad_s=0.2),
+    "head_joint_2": dict(image_axis="y", image_sign=1, lower_rad=-0.2, upper_rad=0.2, max_rad_s=0.1),
+}
+
+
+def test_head_bridge_limits_faults_and_stop(monkeypatch, tmp_path):
+    import json
+    import socketserver
+    import sys
+    import threading
+
+    import pytest
+
+    monkeypatch.setitem(sys.modules, "tracking", tracking)
+    monkeypatch.syspath_prepend(str(FILE.parent))
+    import head_control
+
+    requests = []
+
+    class Handler(socketserver.StreamRequestHandler):
+        def handle(self):
+            request = json.loads(self.rfile.readline())
+            requests.append(request)
+            reject = request["operation"] == "position" and len(requests) == 3
+            self.wfile.write(json.dumps({"version": 1, "ok": not reject,
+                "camera_topic": request.get("camera_topic"), "axes": AXES}).encode() + b"\n")
+
+    # macOS AF_UNIX paths have a 104-byte limit.
+    path = str(tmp_path.resolve() / "h")
+    if len(path.encode()) >= 104:
+        monkeypatch.chdir(tmp_path)
+        path = "h"
+    with socketserver.UnixStreamServer(path, Handler) as server:
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        try:
+            controller = head_control.HeadFollower(head_control.UnixHeadBridge(path))
+            target = {"track_id": 1, "offset": (1, 0.8)}
+            feedback = {"head_joint_1": -0.498, "head_joint_2": 0.1}
+            controller.step("/head/rgb", target, feedback, 1, 1.0, 1.3)
+            position = requests[-1]
+            assert position["positions_rad"] == pytest.approx({"head_joint_1": -0.5, "head_joint_2": 0.108})
+            assert position["max_rad_s"] == {"head_joint_1": 0.15, "head_joint_2": 0.1}
+            assert position["valid_until_monotonic_ns"] == 1300000000
+            assert position["ttl_ms"] == 250
+            controller.step("/head/rgb", target, feedback, 2, 1.1, 1.3)
+            assert [r["operation"] for r in requests] == ["acquire", "position", "position", "halt"]
+            assert requests[0]["lease"] == requests[-1]["lease"]
+            assert controller.status()["state"] == "fault"
+            controller.step("/head/rgb", target, feedback, 3, 2.1, 2.3)
+            assert len(requests) == 4
+            controller.reset()
+            controller.step("/head/rgb", target, feedback, 4, 2.2, 2.4)
+            controller.step("/head/rgb", target, None, 5, 2.3, 2.4)
+            assert requests[-1]["operation"] == "halt"
+            assert controller.status()["state"] == "waiting_for_feedback"
+        finally:
+            server.shutdown()
+            worker.join()

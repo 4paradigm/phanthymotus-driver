@@ -18,10 +18,41 @@
   相机，默认检测话题是 RGB 话题后缀 `/objects`。默认话题无发布者时，
   卡片请求 Perception 启动 VOP。大脑可用 `set_target` 切换类别。
 
-卡片输出像素框、归一化偏差及新鲜的头部关节反馈。当前 Helios MCP 驱动
-只提供头部反馈。状态中的 `motion_available` 始终为 false。
+卡片输出目标、归一化偏差及头部关节反馈。`motion.state` 显示头部控制状态。
+`motion_available` 表示最近一次位置指令已获控制后端确认。
 在这台机器上，RGB 卡的默认预览报告 640×400，深度为 640×480 原生光学图。
 两路没有可用的配准声明，最近人脸模式需要已验证的 RGB-D 配准输入。当前机器的麦克风服务尚未
 确认能够发布逐句、相机坐标下的说话人位置。
 
 独立镜像通过构建目标 `rokae/helios-face-follow` 生成。
+
+## 头部控制接口
+
+卡片最多每 100 ms 用一次新目标和最近的关节反馈生成双轴绝对位置。归一化偏差
+在中心死区内时释放控制。出界反馈、目标丢失、RGB 或关节数据超过 350 ms、切换
+模式或停止卡片时释放控制。软件速度上限为 0.15 rad/s，并且遵守适配器返回的
+更严格的限速和软限位。适配器拒绝位置或无法确认停止时，`motion.state` 报告
+`fault`。停止并重新启动卡片可清除已经确认释放的故障。
+
+默认部署仅跟踪目标。完成 iNex SDK 适配后，在部署配置中只读挂载包含 socket 的
+目录，并将 `HELIOS_HEAD_CONTROL_SOCKET` 设为容器内的绝对 socket 路径。例如将
+`/run/helios-head-follow` 挂载到容器的同一路径，并设置
+`HELIOS_HEAD_CONTROL_SOCKET=/run/helios-head-follow/control.sock`。
+Socket 目录应由适配器管理，只允许授权的本机客户端连接。
+
+适配器协议使用 Unix stream socket。每条连接接收一条以换行结尾的 UTF-8 JSON，
+并在 50 ms 内返回一条以换行结尾、最多 4096 字节的 JSON。每条消息都带
+`version: 1`。操作失败时返回 `ok: false`。
+
+| `operation` | 请求字段 | 成功响应与语义 |
+| --- | --- | --- |
+| `acquire` | `lease`（卡片生成的唯一 ID）、`camera_topic`、`ttl_ms` | `ok: true`、`camera_topic` 和 `axes`。适配器核对已标定的相机话题、厂商控制权限及头部状态，保留独占租约。 |
+| `position` | `lease`、`ttl_ms`、`valid_until_monotonic_ns`、`positions_rad`、`max_rad_s` | 适配器在 SDK 接受限速位置请求后返回 `ok: true`。使用同一 Linux 单调时钟，应在有效期前处理，并令控制在采样有效期和租约到期两者中的较早时刻失效。 |
+| `halt` | `lease` | 停止该租约的运动并释放控制，返回 `ok: true`。已到期或已释放的租约也须能重复确认，且该操作不能影响其他租约。 |
+
+`axes` 以 `head_joint_1`、`head_joint_2` 为键，每轴提供 `lower_rad`、
+`upper_rad`、`max_rad_s`、`image_axis`（`x` 或 `y`）和 `image_sign`
+（`1` 或 `-1`）。图像 x 向右、y 向下为正，适配器提供实机标定后的关节映射。
+适配器必须独立执行急停、控制权、命令有效期、限位和失联停止，并保留厂商联锁。
+当前真机只有已验证的 iNex 关节反馈，仍需用适用于该固件的厂商 SDK 实现并验证
+上述适配器，才能启用电机随动。

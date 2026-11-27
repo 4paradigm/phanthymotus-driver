@@ -135,7 +135,10 @@ def nearest_face(boxes, size, rgb, depth, np):
 
 
 def finite(value):
-    return type(value) in (float, int) and math.isfinite(value)
+    try:
+        return type(value) in (float, int) and math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 class FollowPolicy:

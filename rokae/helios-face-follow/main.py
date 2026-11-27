@@ -1,6 +1,7 @@
 """Single-card target tracking for Helios cameras and Perception VOP."""
 
 import json
+import os
 import signal
 import threading
 import time
@@ -11,6 +12,7 @@ from urllib.request import Request, urlopen
 from common.vendor_runtime import (
     DriverBundle, action_schema, load_config, make_handler, start_registration, tool,
 )
+from head_control import CONTROL_PERIOD, HEAD_JOINTS, SAMPLE_AGE, HeadFollower, UnixHeadBridge
 from tracking import MAX_AGE, FollowPolicy, _Detector, finite, image_stamp
 
 DRIVER_ID = "rokae-helios-face-follow"
@@ -18,7 +20,6 @@ MODES = ("nearest_face", "speaker", "object")
 DEFAULT_DEPTH = "/rokae_helios/camera/depth/visual_depth"
 DEFAULT_SPEECH = "/rokae_helios/speech/localized"
 JOINTS = "/rokae_helios/state/joints"
-HEAD_JOINTS = ("head_joint_1", "head_joint_2")
 
 
 def start_vop(topic):
@@ -35,7 +36,7 @@ def start_vop(topic):
 
 
 class HeliosFaceFollow:
-    def __init__(self, node):
+    def __init__(self, node, head_bridge=None):
         from rclpy.qos import QoSProfile, ReliabilityPolicy
         from std_msgs.msg import String
 
@@ -50,6 +51,9 @@ class HeliosFaceFollow:
         self.policy = FollowPolicy("nearest_face")
         self.depth_frames = deque(maxlen=8)
         self.head = None
+        self.motion = HeadFollower(head_bridge)
+        self.motion_rgb_until = self.motion_target_until = 0.0
+        self.target_sample = 0
         self.last_rgb = 0
         self.last_sample = -1
         self.result = None
@@ -60,10 +64,11 @@ class HeliosFaceFollow:
         self.publisher = node.create_publisher(String, self.output[0]["topic"], 1)
         node.create_subscription(String, JOINTS, self.on_joints, self.qos)
         node.create_timer(0.2, self.expire)
+        node.create_timer(CONTROL_PERIOD, self.move_head)
 
     def get_tools(self):
         return [tool("helios_face_follow", "processor",
-                     "Helios 目标随动，输出目标位置和深度。当前为视觉预览。",
+                     "Helios 目标随动，输出目标位置、深度和头部控制状态。",
                      action_schema({
                          "start": (["input_topic", "depth_topic", "speech_topic", "object_topic"], "连接输入"),
                          "set_mode": (["mode", "object_name"], "切换模式"),
@@ -93,6 +98,7 @@ class HeliosFaceFollow:
                 name = args.get("object_name", self.policy.label)
                 if mode not in MODES or not isinstance(name, str) or (mode == "object" and not name.strip()):
                     return {"state": "error", "error": "Invalid mode or missing object_name"}
+                self.motion.halt("waiting_for_target")
                 # An explicitly wired topic belongs to its producer. For the
                 # default topic, reuse a live VOP instance or start shared VOP.
                 if (mode == "object" and self.topics["objects"] == self.topics["rgb"] + "/objects"
@@ -141,6 +147,8 @@ class HeliosFaceFollow:
                 raise
         self.topics = topics
         self.session = session
+        self.motion.reset()
+        self.motion_rgb_until = 0.0
         self.last_rgb = 0
         self.last_sample = -1
         self.emit(None, "waiting_for_rgb")
@@ -149,6 +157,7 @@ class HeliosFaceFollow:
         with self.lock:
             was_active = self.session is not None
             self.session = None
+            self.motion.reset()
             for sub in self.subscriptions:
                 self.node.destroy_subscription(sub)
             self.subscriptions.clear()
@@ -163,7 +172,7 @@ class HeliosFaceFollow:
             "state": "running" if self.session is not None else "idle",
             "mode": self.policy.mode, "object_name": self.policy.label,
             "reason": self.reason, "target": self.result, "head_feedback": self.fresh_head(),
-            "motion_available": False, "topic_in": (
+            "motion_available": self.motion.state == "controlling", "motion": self.motion.status(), "topic_in": (
                 [{"topic": self.topics["rgb"], "format": "image/jpeg"}] if self.topics else []
             ), "auxiliary_inputs": {k: v for k, v in self.topics.items() if k != "rgb"},
             "topic_out": self.output,
@@ -172,13 +181,35 @@ class HeliosFaceFollow:
     def fresh_head(self):
         return self.head[1] if self.head and time.monotonic() - self.head[0] <= MAX_AGE else None
 
-    def emit(self, target, reason):
+    def emit(self, target, reason, observation_time=None):
         self.reason, self.result = reason, target
+        self.target_sample += 1
+        self.motion_target_until = 0.0 if observation_time is None else observation_time + SAMPLE_AGE
         if target is not None:
             self.last_target = time.monotonic()
+        self.publish()
+
+    def publish(self):
         result = self.info()
-        result.update(timestamp=time.time(), available=target is not None)
+        result.update(timestamp=time.time(), available=self.result is not None)
         self.publisher.publish(self.message_type(data=json.dumps(result, allow_nan=False)))
+
+    def move_head(self):
+        with self.lock:
+            if self.session is None or self.motion.bridge is None:
+                return
+            before = self.motion.status()
+            now = time.monotonic()
+            target_until = min(self.motion_rgb_until, self.motion_target_until)
+            target = self.result if now < target_until else None
+            feedback = None
+            feedback_until = self.head[2] if self.head else 0.0
+            if now < feedback_until:
+                feedback = self.head[1]
+            self.motion.step(self.topics["rgb"], target, feedback, self.target_sample, now,
+                             min(target_until, feedback_until))
+            if self.motion.status() != before:
+                self.publish()
 
     def expire(self):
         with self.lock:
@@ -202,12 +233,17 @@ class HeliosFaceFollow:
         payload = self.parse(message)
         joints = payload.get("joints")
         if payload.get("available") is not True or not isinstance(joints, list):
+            with self.lock:
+                self.head = None
             return
         positions = {j["name"]: j["q"] for j in joints if isinstance(j, dict)
                      and j.get("name") in HEAD_JOINTS and finite(j.get("q"))}
-        if len(positions) == len(HEAD_JOINTS):
-            with self.lock:
-                self.head = (time.monotonic(), positions)
+        with self.lock:
+            received = payload.get("received_at_ms")
+            age = time.time() - received / 1000 if finite(received) else float("inf")
+            now = time.monotonic()
+            self.head = ((now, positions, now + SAMPLE_AGE - age if 0 <= age <= SAMPLE_AGE else 0)
+                         if len(positions) == len(HEAD_JOINTS) else None)
 
     def on_depth(self, session, message):
         with self.lock:
@@ -225,7 +261,11 @@ class HeliosFaceFollow:
         with self.lock:
             now = time.monotonic()
             if session is self.session and self.policy.mode == "object" and now - self.last_rgb <= MAX_AGE:
-                self.emit(*self.policy.objects(self.parse(message), time.time(), now))
+                payload = self.parse(message)
+                wall = time.time()
+                target, reason = self.policy.objects(payload, wall, now)
+                observation = now - (wall - payload["timestamp"]) - payload.get("latency_ms", 0) / 1000 if target else None
+                self.emit(target, reason, observation)
 
     def on_rgb(self, session, message):
         now = time.monotonic()
@@ -233,11 +273,15 @@ class HeliosFaceFollow:
             if session is not self.session:
                 return
             self.last_rgb = now
+            if self.motion.bridge is not None:
+                age = time.time() - image_stamp(message)
+                self.motion_rgb_until = now + SAMPLE_AGE - age if 0 <= age <= SAMPLE_AGE else 0
             if self.policy.mode == "object" or now - self.last_sample < 0.12:
                 return
             self.last_sample = now
             policy = self.policy
             rgb_stamp = image_stamp(message)
+            observation = now - (time.time() - rgb_stamp)
             depth = min(self.depth_frames, key=lambda frame: abs(image_stamp(frame) - rgb_stamp),
                         default=None)
         try:
@@ -249,7 +293,8 @@ class HeliosFaceFollow:
             return
         with self.lock:
             if session is self.session and policy is self.policy and time.monotonic() - now <= MAX_AGE:
-                self.emit(*policy.faces(boxes, size, message, depth, self.detector.np, now, time.time()))
+                target, reason = policy.faces(boxes, size, message, depth, self.detector.np, now, time.time())
+                self.emit(target, reason, observation if target and observation <= now else None)
 
 
 def main():
@@ -262,7 +307,8 @@ def main():
     node = rclpy.create_node("helios_face_follow")
     executor = SingleThreadedExecutor()
     executor.add_node(node)
-    plugin = HeliosFaceFollow(node)
+    socket_path = os.environ.get("HELIOS_HEAD_CONTROL_SOCKET", "")
+    plugin = HeliosFaceFollow(node, UnixHeadBridge(socket_path) if socket_path else None)
     bundle = DriverBundle([plugin])
     server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(lambda: bundle, DRIVER_ID, DRIVER_ID))
 
