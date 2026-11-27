@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 from uuid import UUID
 from spatial_client import NavigationStateUnavailable
+from bootstrap import ProvisionError
 
 
 class BootRemote:
@@ -26,6 +27,8 @@ class BootRemote:
         self.status = {'state': 'waiting' if enabled else 'disabled'}
         self.token = None
         self.connection = None
+        self.deadline = None
+        self.stage = 'waiting_for_controller_boot'
         self.enrolled = not enabled
         if enabled:
             # Bind the automatic attempt before MCP starts accepting requests,
@@ -77,6 +80,7 @@ class BootRemote:
         if (self.permit(boot) != token['boot_id'] or boot['age_s'] > 1.
                 or type(boot.get('ready_age_s')) not in (int, float)
                 or not 0 <= boot['ready_age_s'] <= self.WINDOW_S
+                or (self.deadline is not None and time.monotonic() > self.deadline)
                 or not isinstance(boot.get('g12_owner'), str) or not boot['g12_owner'].startswith('/')
                 or boot.get('g12_neutral') is not True
                 or type(boot.get('g12_age_s')) not in (int, float) or not 0 <= boot['g12_age_s'] <= .3
@@ -84,6 +88,42 @@ class BootRemote:
                 or b.spatial._task is not None or b.spatial._keyboard_pending
                 or b.tracker._active):
             raise RuntimeError('boot_remote_guard_changed')
+
+    def _readiness(self, boot):
+        """All asynchronous read-only dependencies share the same boot window."""
+        if boot['age_s'] > 1.:
+            return 'waiting_for_fresh_boot_feedback'
+        try:
+            self.bundle.state.confirmed_enable()
+        except RuntimeError:
+            return 'waiting_for_enable_verification'
+        try:
+            self.bundle.sensors.require_profile()
+        except RuntimeError:
+            return 'waiting_for_robot_identity'
+        if (not isinstance(boot.get('g12_owner'), str) or not boot['g12_owner'].startswith('/')
+                or type(boot.get('g12_age_s')) not in (int, float)
+                or not 0 <= boot['g12_age_s'] <= .3 or boot.get('g12_neutral') is not True):
+            return 'waiting_for_verified_neutral_g12'
+        return None
+
+    def _await_prewrite(self, token):
+        b = self.bundle
+        while True:
+            with b.tracker.lock:
+                b._check_transition(token)
+                if self.closed.is_set() or self.cancelled:
+                    raise InterruptedError('boot_remote_preparation_cancelled')
+                boot = b.state.snapshot()['controller_boot']
+                if (self.permit(boot) != token['boot_id'] or self.deadline is None
+                        or time.monotonic() > self.deadline):
+                    raise RuntimeError('boot_remote_prewrite_window_expired_or_boot_changed')
+                stage = self._readiness(boot)
+                if stage is None:
+                    self._check(token)
+                    return
+                self.status = {'state': 'preparing', 'stage': stage, 'motion_target_sent': False}
+            self.closed.wait(.2)
 
     def attempt(self):
         """Return False only while waiting for the first terminal boot report."""
@@ -105,25 +145,20 @@ class BootRemote:
                     return True
                 return False
             age = boot.get('ready_age_s')
+            if type(age) in (int, float) and 0 <= age <= self.WINDOW_S:
+                proposed = time.monotonic() + self.WINDOW_S - age
+                self.deadline = proposed if self.deadline is None else min(self.deadline, proposed)
             # The boot report and enable-verification probe are independent
             # subscribers. Receiving COMPLETE first is not a failed handoff.
             # Keep waiting read-only without consuming the controller permit.
             if (not self.cancelled and not self.closed.is_set()
                     and type(age) in (int, float) and 0 <= age <= self.WINDOW_S
+                    and (self.deadline is None or time.monotonic() <= self.deadline)
                     and b._transition is None and not b.spatial.unresolved()
                     and not b.spatial.mapping_active() and not b.tracker._active):
-                try:
-                    b.state.confirmed_enable()
-                except RuntimeError:
-                    self.status = {'state': 'waiting', 'stage': 'waiting_for_enable_verification',
-                                   'motion_target_sent': False}
-                    return False
-                try:
-                    b.sensors.require_profile()
-                except RuntimeError:
-                    # Discovery refreshes independently after rosapi timeouts.
-                    # Never consume the boot permit while identity is unknown.
-                    self.status = {'state': 'waiting', 'stage': 'waiting_for_robot_identity',
+                stage = self._readiness(boot)
+                if stage:
+                    self.status = {'state': 'waiting', 'stage': stage,
                                    'motion_target_sent': False}
                     return False
             # An INSERT OR IGNORE transaction claims BEFORE all control writes.
@@ -133,6 +168,7 @@ class BootRemote:
                 return True
             if (self.cancelled or self.closed.is_set() or type(age) not in (int, float)
                     or not 0 <= age <= self.WINDOW_S or boot['age_s'] > 1.
+                    or (self.deadline is not None and time.monotonic() > self.deadline)
                     or b._transition is not None or b.spatial.unresolved()
                     or b.spatial.mapping_active() or b.tracker._active):
                 self.status = {'state': 'skipped', 'reason': 'boot_window_expired_or_control_already_used'}
@@ -160,15 +196,17 @@ class BootRemote:
             # The two ROS masters have no native velocity link. Establish the
             # held bridge before enabling; lifecycle start must not be needed
             # to make the first remote command reach the chassis.
+            self.stage = 'establish_velocity_bridge'
+            self.status.update(stage=self.stage)
             b.upper_bridge.ensure()
+            self._await_prewrite(token)
             with b.spatial._native_lock:
                 # The chassis web service may become ready after the controller.
                 # Retry only observation, inside this single claimed attempt;
                 # never replay a hold, enable, mux switch or release operation.
                 deadline = time.monotonic() + self.CHASSIS_READ_WAIT_S
                 while True:
-                    with b.tracker.lock:
-                        self._check(token)
+                    self._await_prewrite(token)
                     try:
                         observation = b.spatial.client.observe(required=('agvState', 'state'))
                         break
@@ -178,8 +216,17 @@ class BootRemote:
                         # performs no mode, hold, enable or task mutation.
                         fallback = getattr(b.spatial.client, 'observe_remote_chassis', None)
                         if callable(fallback):
-                            observation = fallback()
-                            break
+                            try:
+                                observation = fallback()
+                                break
+                            except (NavigationStateUnavailable, ProvisionError) as exc:
+                                # Only transport/read readiness failures retry.
+                                # Explicit health/mode rejection is terminal.
+                                if (isinstance(exc, ProvisionError) and str(exc) not in
+                                        ('ssh_operation_timeout', 'ssh_auth_host_key_or_remote_access_failed')):
+                                    raise
+                                if time.monotonic() >= deadline:
+                                    raise
                         if time.monotonic() >= deadline:
                             raise
                         self.status = {'state': 'preparing', 'stage': 'waiting_for_chassis_feedback',
@@ -190,9 +237,11 @@ class BootRemote:
                         or observation['agvState'].get('runningMode') != 'AUTO'
                         or observation['state'].get('driving') is not False):
                     raise RuntimeError('boot_remote_requires_idle_auto_nonmapping_chassis')
+                self._await_prewrite(token)
                 with b.tracker.lock:
                     self._check(token)
                     writes_attempted = True
+                    self.stage = 'hold_and_cancel_old_chassis_task'
                     b.spatial._preparation = {'delivery_uncertain': True, 'owner': 'boot_remote_ready'}
                     b.spatial._persist()
                 held = b.spatial.client.native('soft_stop')
@@ -201,18 +250,22 @@ class BootRemote:
                     raise RuntimeError('boot_remote_chassis_hold_unconfirmed')
                 with b.tracker.lock:
                     self._check(token)
+                self.stage = 'disable_upper_velocity'
                 b.confirm_control(token, '/enable_vel_control', 'std_srvs/SetBool',
                     {'data': False}, 'success', 'upper_velocity_enabled', False)
                 with b.tracker.lock:
                     self._check(token)
                     b.twist('/cmd_vel')
                 issued = time.monotonic()
+                self.stage = 'enable_initialized_controller'
                 b.confirm_control(token, '/enable_control', 'std_srvs/SetBool',
                     {'data': True}, 'success', 'control_enabled', True)
+                self.stage = 'confirm_base_arm_mode'
                 if b.wait_mode_feedback(token, issued) != 3:
                     raise RuntimeError('boot_remote_requires_initialized_base_arm')
                 with b.tracker.lock:
                     self._check(token)
+                self.stage = 'enable_upper_velocity'
                 b.confirm_control(token, '/enable_vel_control', 'std_srvs/SetBool',
                     {'data': True}, 'success', 'upper_velocity_enabled', True)
                 with b.tracker.lock:
@@ -221,6 +274,7 @@ class BootRemote:
                 # Chassis-local checks gate the FINAL release: AUTO, no mapping,
                 # fresh stationary odometry, zero upper output and fresh G12.
                 # This RPC shares the native lock with stop/map/navigation.
+                self.stage = 'verify_neutral_zero_and_release_chassis'
                 result = b.spatial.client.native('remote_ready',
                     g12_owner=b.state.snapshot()['controller_boot'].get('g12_owner'))
                 if not (result.get('success') is True and result.get('stationary') is True
@@ -235,6 +289,16 @@ class BootRemote:
                     b.spatial._persist()
                     b.spatial.base_preparation_required = False
                     b._upper_route_key = (b._stop_epoch, b.ros1.connection)
+                self.stage = 'confirm_remote_input_and_velocity_bridge'
+                def check_remote_ready():
+                    with b.tracker.lock:
+                        self._check(token)
+                        if (b.state.confirmed_enable() is not True
+                                or b.state.read('upper_velocity_enabled')[0] is not True):
+                            raise RuntimeError('boot_remote_control_feedback_changed')
+                b.upper_bridge.wait_remote_ready(check_remote_ready)
+                with b.tracker.lock:
+                    check_remote_ready()
                     self.status = {'state': 'ready', 'controller': 'g12_upper_mpc', 'motion_target_sent': False}
         except Exception as exc:
             if writes_attempted:
@@ -242,7 +306,8 @@ class BootRemote:
             with b.tracker.lock:
                 if not writes_attempted and b._transition is token:
                     b.state.motion_blocked = token['was_blocked']
-                self.status = {'state': 'error', 'error': str(exc)[:200], 'automatic_retry': False}
+                self.status = {'state': 'error', 'stage': self.stage, 'control_writes_attempted': writes_attempted,
+                               'error': str(exc)[:200], 'automatic_retry': False}
         finally:
             with b.tracker.lock:
                 b._end_control(token)

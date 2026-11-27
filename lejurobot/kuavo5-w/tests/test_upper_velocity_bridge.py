@@ -8,7 +8,7 @@ import types
 import unittest
 from unittest.mock import patch, Mock
 
-from mapping_keyboard import UpperVelocityBridge
+from mapping_keyboard import UpperVelocityBridge, stream_source
 
 spec=importlib.util.spec_from_file_location('upper_bridge_remote',Path(__file__).resolve().parents[1]/'host/upper_velocity_bridge.py')
 remote=importlib.util.module_from_spec(spec);spec.loader.exec_module(remote)
@@ -18,6 +18,56 @@ remote.math=math
 
 
 class BridgeGateTests(unittest.TestCase):
+    def test_ready_wait_checks_current_control_and_actual_bridge_ack(self):
+        b = types.SimpleNamespace()
+        bridge = UpperVelocityBridge(b)
+        bridge.thread = Mock()
+        bridge.thread.is_alive.return_value = True
+        bridge.remote_state = 'blocked'
+        check = Mock()
+        def progress(_):bridge.remote_state = 'ready'
+        with patch.object(bridge.closed, 'wait', side_effect=progress):
+            bridge.wait_remote_ready(check)
+        self.assertGreaterEqual(check.call_count, 2)
+        bridge.remote_state = 'ready'
+        with self.assertRaisesRegex(RuntimeError, 'operator_stop'):
+            bridge.wait_remote_ready(Mock(side_effect=RuntimeError('operator_stop')))
+        bridge.error = 'disconnected'
+        with self.assertRaisesRegex(RuntimeError, 'bridge_failed'):
+            bridge.wait_remote_ready(lambda:None)
+
+    def test_actual_assembled_payload_defines_every_bridge_dependency(self):
+        navigation = (Path(__file__).resolve().parents[1]/'host/navigation_rpc.py').read_text()
+        # An embedded main guard, including a different quote style, must not
+        # truncate any of the protocol helpers in the outer payload.
+        for text in (navigation, navigation.replace("'__main__'", '"__main__"')):
+            namespace = {'__name__': 'assembled_payload_test'}
+            exec(compile(stream_source(text, bridge=True), 'bridge_payload.py', 'exec'), namespace)
+            self.assertEqual(namespace['NAVIGATION_SOURCE'], text)
+            for name in ('receive', 'dispatch_proxy', 'run_bridge', 'upper_observer', 'UpperInputGate'):
+                self.assertTrue(callable(namespace.get(name)), name)
+
+    def test_bridge_keeps_exclusive_lock_after_creating_shared_ownership_state(self):
+        import tempfile
+        import fcntl
+        with tempfile.TemporaryDirectory() as directory:
+            lock_path = str(Path(directory)/'bridge.lock')
+            builtin_open = open
+            def redirect(path, *args, **kwargs):
+                return builtin_open(lock_path if path == '/tmp/motus-upper-velocity-bridge.lock' else path,
+                                    *args, **kwargs)
+            def start():
+                with builtin_open(lock_path, 'a') as other:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                raise RuntimeError('test_stop_before_ros')
+            context = Mock()
+            context.Process.return_value.start.side_effect = start
+            with patch('builtins.open', side_effect=redirect), \
+                    patch.object(remote.multiprocessing, 'get_context', return_value=context):
+                with self.assertRaisesRegex(RuntimeError, 'test_stop_before_ros'):
+                    remote.run_bridge({})
+
     def state(self):
         return types.SimpleNamespace(manual_mode=False,mapping=False,soft_estop=False,
             estop=False,bumper=False,driver_error=False,driver_enable=True)

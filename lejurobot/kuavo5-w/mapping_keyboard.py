@@ -36,18 +36,26 @@ def guard_error(reply):
         'factory_keyboard_guard_failed'} else 'factory_keyboard_guard_failed'
 
 
+def stream_source(navigation_source, bridge=False):
+    root = Path(__file__).parent / 'host'
+    manual = (root / 'manual_keyboard.py').read_text()
+    if bridge:
+        # Strip the module entry point before embedding other source literals.
+        manual = manual.rsplit("if __name__ == '__main__':", 1)[0]
+    source = 'NAVIGATION_SOURCE = ' + repr(navigation_source) + '\n' + manual
+    if bridge:
+        source += '\n' + (root / 'upper_input_gate.py').read_text()
+        source += '\n' + (root / 'upper_velocity_bridge.py').read_text()
+    return source
+
+
 class FactoryKeyboardStream:
     def __init__(self, client, bridge=False):
         self.stop_lock = threading.Lock()
         self._read_buffer = bytearray()
         manager = client.provisioner
         target = manager._target('chassis')
-        source = ('NAVIGATION_SOURCE = ' + repr(client._source) + '\n' +
-                  (Path(__file__).parent/'host/manual_keyboard.py').read_text())
-        if bridge:
-            source = (source.split("if __name__ == '__main__':")[0] + '\n'
-                      + (Path(__file__).parent/'host/upper_input_gate.py').read_text() + '\n'
-                      + (Path(__file__).parent/'host/upper_velocity_bridge.py').read_text())
+        source = stream_source(client._source, bridge)
         self.process = manager.transport.open_stream('chassis', target,
             {'master': target.get('master', 'http://127.0.0.1:11311'),
              'ros_ip': target['ros_ip'],
@@ -382,6 +390,17 @@ class UpperVelocityBridge:
         if not self.ready.wait(15) or self.error:
             raise RuntimeError('upper_velocity_bridge_not_ready')
 
+    def wait_remote_ready(self, check, timeout=5.):
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            check()
+            if self.error or self.thread is None or not self.thread.is_alive():
+                raise RuntimeError('upper_velocity_bridge_failed_during_remote_handoff')
+            if self.remote_state == 'ready':
+                return
+            self.closed.wait(.05)
+        raise RuntimeError('upper_bridge_remote_ready_unconfirmed')
+
     def allowed(self):
         with self.bundle.tracker.lock:
             active = self.bundle.tracker._active.get('base')
@@ -397,7 +416,10 @@ class UpperVelocityBridge:
             b=self.bundle
             active=b.tracker._active.get('base')
             transition=b._transition
-            if transition is not None:
+            boot_final = (transition is not None and transition.get('tool') == 'boot_remote_ready'
+                          and not b.state.motion_blocked
+                          and b._upper_route_key == (b._stop_epoch,b.ros1.connection))
+            if transition is not None and not boot_final:
                 return 'card' if transition.get('tool') in ('base_drive','base_servo','remote_control') else 'hold'
             if active:
                 return 'card' if active[1] in ('base_drive','base_servo') else 'hold'

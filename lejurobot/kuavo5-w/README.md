@@ -163,7 +163,7 @@ controller/host/chassis分别报告checking/ready/blocked及错误，不传输�
 
 开机完成报告早于独立使能来源校验时，显示 `waiting/waiting_for_enable_verification`，在原60秒窗口内继续只读等待，不提前消费控制器交接许可。停止、用户动作、连接变更和窗口过期仍会终止交接。
 
-机器人型号参数发现尚未完成或校验已过期时同样先等待，显示 `waiting/waiting_for_robot_identity`。后台发现恢复后才允许继续；不绕过型号校验，不延长开机窗口。
+机器人型号参数发现尚未完成或校验已过期时同样先等待，显示 `waiting/waiting_for_robot_identity`。后台发现恢复后才允许继续；不绕过型号校验，不延长开机窗口。 G12来源/回中或开机心跳晚到也先等待，对应 `waiting_for_verified_neutral_g12` 和 `waiting_for_fresh_boot_feedback`。所有只读准备共享单调时钟截止时间，冻结的旧反馈不能延长等待；桥接握手后、首个控制写入前再次统一核对依赖。
 
 导航Web连接不可用时，遥控交接改用底盘本机ROS只读检查：两次健康/AUTO/非建图/非运动状态，中间核对新鲜且持续静止的里程计。该备用操作不发模式、使能、软停或任务命令；实际控制交接仍保留原有保护检查。
 
@@ -1132,3 +1132,25 @@ audit for timing, geometry limitations and deployment status.
 base_drive正常完成或base_servo释放数据租约后，先等经核验的G12输入连续回中300ms，再接回遥控来源并重新等待MPC零输出300ms，才允许底盘速度；杆未回中不会沿用旧方向。原生导航完成后，在现有全身使能仍为true、无活动任务/未确认操作时自动准备上位机速度通路，再执行同样的遥控交还。显式全身stop、故障、未知写入、建图未结束时不自动使能或解除阻断；之后若操作员明确重新使能控制器，则可在新停止世代内重新准备遥控，仍需回中。info.control_ownership.upper_velocity_bridge.remote_state显示blocked/waiting_for_neutral/ready，remote_return_error显示交还失败。
 
 2026-11-27已在全身关闭状态下真机核对hold/card/remote三种MPC输入连接均生效且能恢复原连接；随后在旁站授权下恢复遥控，操作员确认能正常移动、回中停止。另执行1秒全零base_drive任务，期间remote_state=blocked、完成后无额外恢复调用即回到ready；测试期间非零转发计数不变。未执行额外原生导航或建图运动，相关隔离和导航完成交还由离线回归覆盖。
+
+### First-boot handoff verification boundary
+
+The boot handoff prepares read-only dependencies before any control write,
+retains a single persistent permit, and never replays writes after failure.
+Transient web/SSH state-read failures may retry within the original bounded
+window. Explicit chassis health/mode rejection remains terminal. Stop, operator
+motion, reconnect and boot identity changes invalidate the attempt.
+
+The final `ready` result now requires the velocity bridge's actual remote-input
+acknowledgement after route setup; controller enable and mux release alone are
+insufficient. A failed final bridge check pauses again and reports its stage
+and `control_writes_attempted` for diagnosis. The bridge holds its exclusive
+process lock until shutdown, and its SSH payload is assembled per module before
+embedding the navigation source literal.
+
+Offline tests cover dependencies arriving in sequence, stale identity during
+bridge handshake, frozen feedback deadlines, read-only transport recovery,
+operator cancellation, process-lock exclusivity, executable payload assembly
+and failure of the final remote acknowledgement. These checks do not establish
+successful physical cold-boot behavior or resolve the separate vendor EtherCAT
+initialization race; a complete real reboot validation remains required.

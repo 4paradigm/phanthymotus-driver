@@ -180,6 +180,10 @@ class DriverContractTests(unittest.TestCase):
         self.upper_bridge_patch = patch.object(self.bundle.upper_bridge, 'ensure')
         self.upper_bridge_patch.start()
         self.addCleanup(self.upper_bridge_patch.stop)
+        self.remote_ready_patch = patch.object(self.bundle.upper_bridge, 'wait_remote_ready',
+                                                side_effect=lambda check: check())
+        self.remote_ready_patch.start()
+        self.addCleanup(self.remote_ready_patch.stop)
         self.spatial_temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.spatial_temp.cleanup)
         from controlled_spatial import SpatialStore

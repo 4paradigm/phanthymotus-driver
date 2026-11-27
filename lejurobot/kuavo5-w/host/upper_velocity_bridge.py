@@ -151,13 +151,17 @@ def bridge_values(sample, chassis, allowed, now):
 
 
 def run_bridge(request):
-    import secrets
     import fcntl
-    ownership = open('/tmp/motus-upper-velocity-bridge.lock', 'a')
-    try:
-        fcntl.flock(ownership, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        raise RuntimeError('upper_bridge_already_owned') from None
+    with open('/tmp/motus-upper-velocity-bridge.lock', 'a') as ownership_lock:
+        try:
+            fcntl.flock(ownership_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError('upper_bridge_already_owned') from None
+        return run_owned_bridge(request)
+
+
+def run_owned_bridge(request):
+    import secrets
     for path in ('/opt/ros/noetic/lib/python3/dist-packages','/opt/jaten/lib/python3/dist-packages'):
         sys.path.insert(0, path)
     # Fork BEFORE either process initializes rospy: one node per real master.

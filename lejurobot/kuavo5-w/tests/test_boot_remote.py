@@ -187,6 +187,18 @@ class BootRemoteTests(fixtures.unittest.TestCase):
         self.assertFalse(self.ros.sent_services)
         self.assertFalse(self.client.calls)
 
+    def test_web_and_ssh_readiness_delays_retry_without_replaying_control(self):
+        observation = self.client.observe()
+        transport_error = self.remote.attempt.__globals__['ProvisionError']('ssh_operation_timeout')
+        with patch.object(self.client, 'observe', side_effect=self.read_unavailable(('state',), 'connection')), \
+                patch.object(self.client, 'observe_remote_chassis',
+                             side_effect=[transport_error, observation], create=True) as fallback, \
+                patch.object(self.remote.closed, 'wait', return_value=False):
+            self.remote.attempt()
+        self.assertEqual(fallback.call_count, 2)
+        self.assertEqual(self.remote.info()['state'], 'ready')
+        self.assertEqual([c[0] for c in self.client.calls], ['soft_stop', 'remote_ready'])
+
     def test_chassis_read_retry_is_bounded_and_sends_no_control(self):
         self.remote.CHASSIS_READ_WAIT_S = 0.
         with patch.object(self.client, 'observe', side_effect=self.read_unavailable(('state',), 'connection')):
@@ -289,6 +301,78 @@ class BootRemoteTests(fixtures.unittest.TestCase):
         self.assertEqual(self.client.calls, [])
         self.assertEqual(self.ros.sent_services, [])
         self.assertIsNone(self.bundle._transition)
+
+    def test_all_readiness_dependencies_can_arrive_in_sequence_before_single_handoff(self):
+        # Model the real boot ordering, rather than a fixture with everything
+        # already ready: boot -> enable probe -> identity -> G12 -> fresh boot.
+        for waiting in ('enable', 'identity', 'g12', 'boot_freshness'):
+            with self.subTest(waiting=waiting):
+                self.feedback(g12_owner=None if waiting == 'g12' else '/actual_sdk_converter')
+                if waiting == 'boot_freshness':
+                    self.bundle.state._controller_boot_at = time.monotonic()-2.
+                target = self.bundle.state if waiting == 'enable' else self.bundle.sensors
+                method = 'confirmed_enable' if waiting == 'enable' else 'require_profile'
+                if waiting in ('enable', 'identity'):
+                    with patch.object(target, method, side_effect=RuntimeError('not ready')):
+                        self.assertFalse(self.remote.attempt())
+                else:
+                    self.assertFalse(self.remote.attempt())
+                self.assertIsNone(self.bundle.spatial.store.state('boot_remote:' + self.boot['boot_id']))
+                self.assertFalse(self.ros.sent_services)
+                self.assertFalse(self.client.calls)
+        self.feedback(g12_owner='/actual_sdk_converter', g12_neutral=True)
+        self.assertTrue(self.remote.attempt())
+        self.assertEqual(self.remote.info()['state'], 'ready')
+        self.assertEqual([c[0] for c in self.client.calls], ['soft_stop', 'remote_ready'])
+
+    def test_prewrite_probe_can_expire_during_bridge_handshake_then_recover(self):
+        pending = [False]
+        original = self.bundle.sensors.require_profile
+        def profile():
+            if pending[0]:raise RuntimeError('identity refresh in progress')
+            return original()
+        def ensure():pending[0] = True
+        with patch.object(self.bundle.sensors, 'require_profile', side_effect=profile), \
+                patch.object(self.bundle.upper_bridge, 'ensure', side_effect=ensure), \
+                patch.object(self.remote.closed, 'wait', side_effect=lambda _: pending.__setitem__(0, False)):
+            self.remote.attempt()
+        self.assertEqual(self.remote.info()['state'], 'ready')
+
+    def test_frozen_boot_age_cannot_extend_monotonic_wait_window(self):
+        self.feedback(g12_neutral=False)
+        self.assertFalse(self.remote.attempt())
+        self.remote.deadline = time.monotonic()-1.
+        self.assertTrue(self.remote.attempt())
+        self.assertEqual(self.remote.info()['state'], 'skipped')
+        self.assertFalse(self.ros.sent_services)
+
+    def test_stop_after_bridge_setup_never_reaches_first_control_write(self):
+        with patch.object(self.bundle.upper_bridge, 'ensure',
+                          side_effect=lambda: self.remote.cancel('operator_stop')):
+            self.remote.attempt()
+        self.assertFalse(self.client.calls)
+        self.assertFalse(self.ros.sent_services)
+
+    def test_final_bridge_confirmation_failure_repauses_and_is_not_replayed(self):
+        with patch.object(self.bundle.upper_bridge, 'wait_remote_ready',
+                          side_effect=RuntimeError('upper_bridge_remote_ready_unconfirmed')):
+            self.remote.attempt()
+        result = self.remote.info()
+        self.assertEqual(result['state'], 'error')
+        self.assertEqual(result['stage'], 'confirm_remote_input_and_velocity_bridge')
+        self.assertTrue(result['control_writes_attempted'])
+        self.assertIs(self.ros.latched['/enable_control_state'], False)
+        before = list(self.ros.sent_services)
+        self.remote.attempt()
+        self.assertEqual(self.ros.sent_services, before)
+
+    def test_health_rejection_is_terminal_and_not_a_transport_retry(self):
+        with patch.object(self.client, 'observe', side_effect=self.read_unavailable(('state',), 'connection')), \
+                patch.object(self.client, 'observe_remote_chassis',
+                    side_effect=RuntimeError('boot_remote_requires_healthy_idle_auto_chassis'), create=True) as fallback:
+            self.remote.attempt()
+        fallback.assert_called_once()
+        self.assertFalse(self.ros.sent_services)
 
     def test_active_mapping_navigation_or_any_joint_reservation_blocks_boot_handoff(self):
         for kind in ('mapping', 'navigation', 'arm'):
@@ -412,6 +496,42 @@ class BootRemoteTests(fixtures.unittest.TestCase):
         count = len(self.ros.sent_services)
         BootRemote(self.bundle, True).attempt()
         self.assertEqual(len(self.ros.sent_services), count)
+
+
+class HandoffFailureMatrixTests(fixtures.unittest.TestCase):
+    def test_each_control_write_failure_is_terminal_and_never_replayed(self):
+        stages = (
+            ('/enable_vel_control', False, 'disable_upper_velocity'),
+            ('/enable_control', True, 'enable_initialized_controller'),
+            ('/enable_vel_control', True, 'enable_upper_velocity'),
+        )
+        for service, value, stage in stages:
+            with self.subTest(stage=stage):
+                case = BootRemoteTests()
+                case.setUp()
+                try:
+                    original = case.bundle.confirm_control
+                    failed = [False]
+                    def confirm(token, name, kind, args, *rest):
+                        if name == service and args.get('data') is value and not failed[0]:
+                            failed[0] = True
+                            raise TimeoutError('accepted_but_feedback_unconfirmed')
+                        return original(token, name, kind, args, *rest)
+                    with patch.object(case.bundle, 'confirm_control', side_effect=confirm):
+                        case.remote.attempt()
+                    result = case.remote.info()
+                    self.assertEqual(result['state'], 'error')
+                    self.assertEqual(result['stage'], stage)
+                    self.assertTrue(result['control_writes_attempted'])
+                    self.assertIs(case.ros.latched['/enable_control_state'], False)
+                    before = list(case.ros.sent_services), list(case.client.calls)
+                    case.remote.attempt()
+                    self.assertEqual((case.ros.sent_services, case.client.calls), before)
+                finally:
+                    try:
+                        case.tearDown()
+                    finally:
+                        case.doCleanups()
 
 
 class G12GuardTests(fixtures.unittest.TestCase):
