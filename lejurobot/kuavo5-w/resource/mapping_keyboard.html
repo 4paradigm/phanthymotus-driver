@@ -133,9 +133,15 @@ setInterval(async()=>{
  try{
   const r=await call('keyboard_command',{session_id:current,seq:++seq,values:ready?[vx,vw]:[0,0]});
   if(session!==current)return;
-  if(r.state==='ready'&&!ready){pressed.clear();ready=true;paint('Ready. Release all keys, then hold Alt + a direction.');}
+  if(r.input_expired){pressed.clear();ready=r.state==='ready';paint('Input paused; stopped. Release the keys, then press a direction again.');}
+  else if(r.state==='ready'&&!ready){pressed.clear();ready=true;paint('Ready. Release all keys, then hold Alt + a direction.');}
   else if(r.state==='error'||r.state==='idle'||r.state==='stopping'){await disarm(r.error||r.last_error||'Keyboard stopped. Reopen mapping_console to continue.');}
- }catch(e){if(session===current)await disarm(e.message);}finally{inflight=false;}
+ }catch(e){if(session===current){
+  pressed.clear();
+  if(e.message.startsWith('Canvas reply timed out')){
+   paint('Input delayed; direction cleared. Checking the existing connection.');
+  }else await disarm(e.message);
+ }}finally{inflight=false;}
 },80);
 setInterval(async()=>{
  if(!port||session||opening||!releasing||statusChecking)return;

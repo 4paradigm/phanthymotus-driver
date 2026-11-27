@@ -200,19 +200,23 @@ class MappingKeyboardTests(unittest.TestCase):
         self.assertFalse(self.stream.sent)
         self.assertFalse(self.bundle.tracker._active)
 
-    def test_zero_activation_and_browser_timeout_hold_and_release_resource(self):
+    def test_browser_timeout_zeros_without_closing_and_next_press_can_continue(self):
         self.open()
         self.assertEqual(self.stream.sent[0]['values'], [0., 0.])
         self.assertTrue(self.spatial.unresolved())
         self.assertEqual(self.bundle.tracker._active['base'][1], 'mapping_keyboard')
         self.assertEqual(self.send([.15, -.3])['state'], 'ready')
         self.assertTrue(wait_until(lambda: any(v['values'] == [.15, -.3] for v in self.stream.sent)))
-        self.assertTrue(wait_until(lambda: self.keyboard.session is None, timeout=2))
-        self.assertTrue(self.stream.stopping)
-        self.assertFalse(self.spatial.unresolved())
-        self.assertNotIn('base', self.bundle.tracker._active)
-        self.assertTrue(self.spatial.mapping_active())  # watchdog never ends SLAM
-        self.assertEqual(self.send([.15, 0])['state'], 'error')
+        time.sleep(.4)
+        self.assertIsNotNone(self.keyboard.session)
+        self.assertEqual(self.stream.sent[-1]['values'], [0., 0.])
+        self.assertFalse(self.stream.stopping)
+        self.assertTrue(self.spatial.mapping_active())
+        self.assertTrue(self.send([.15, 0])['input_expired'])
+        self.assertEqual(self.keyboard.session['values'], [0., 0.])
+        self.assertFalse(self.send([0., 0])['input_expired'])
+        self.assertEqual(self.send([0., -.3])['state'], 'ready')
+        self.assertTrue(wait_until(lambda:self.stream.sent[-1]['values']==[0., -.3]))
 
     def test_replayed_expired_wrong_session_and_nonfinite_commands_are_rejected(self):
         self.open()
@@ -352,9 +356,10 @@ class MappingKeyboardTests(unittest.TestCase):
         self.assertEqual(self.send([.15, 0])['state'], 'loading')
         time.sleep(.33)
         gate.set()
-        self.assertTrue(wait_until(lambda: self.keyboard.session is None))
-        self.assertFalse(self.stream.sent)
-        self.assertTrue(self.stream.stopping)
+        self.assertTrue(wait_until(lambda: self.keyboard.info()['state'] == 'ready'))
+        self.assertTrue(self.stream.sent)
+        self.assertFalse(any(any(frame['values']) for frame in self.stream.sent))
+        self.assertFalse(self.stream.stopping)
 
 
 class MappingCardCoexistenceTests(unittest.TestCase):
@@ -598,6 +603,55 @@ class ChassisGuardTests(unittest.TestCase):
         self.assertTrue(confirmed_stop(dict(reply, state='stopped')))
         self.assertTrue(reply['manual_zero_sent'])
         self.assertEqual(events, ['zero', 'rest', ('dispatch', 0), 'held', 'rest', 'held'])
+
+    def test_feedback_jitter_does_not_extend_keyboard_command_lease(self):
+        state = types.SimpleNamespace(manual_mode=True, mapping=True, estop=False,
+            bumper=False, driver_error=False, driver_enable=True)
+        self.assertIs(remote.manual_feedback([state, 10.], 10.351), state)
+        self.assertEqual(remote.LEASE_S, .3)
+        with self.assertRaisesRegex(RuntimeError, 'feedback_is_stale'):
+            remote.manual_feedback([state, 10.], 11.01)
+        state.bumper = True
+        with self.assertRaisesRegex(RuntimeError, 'healthy_manual_mapping'):
+            remote.manual_feedback([state, 10.], 10.1)
+
+    def test_mapping_prepares_zero_and_rest_before_releasing_soft_stop(self):
+        for failure in (None, 'not_mapping', 'release_rejected'):
+            with self.subTest(failure=failure):
+                state = types.SimpleNamespace(manual_mode=True, mapping=failure!='not_mapping',
+                    soft_estop=True, estop=False, bumper=False, driver_error=False, driver_enable=True)
+                events = []
+                def command(control_mode):
+                    events.append(('dispatch', control_mode))
+                    if failure == 'release_rejected' and control_mode == 1:
+                        return types.SimpleNamespace(success=False)
+                    state.soft_estop = control_mode == 0
+                    return types.SimpleNamespace(success=True)
+                fixture = types.ModuleType('manual_ready_fixture')
+                fixture.stop_epoch = lambda: 3
+                fixture.guarded_navigation_release = lambda epoch, release: release()
+                fixture.confirm_stationary = lambda *a: events.append(('rest',))
+                fixture.confirm_software_stop = lambda ros, expected, **kw: self.assertIs(state.soft_estop, expected)
+                ros = types.SimpleNamespace(ERROR=40, init_node=lambda *a, **kw: None,
+                    wait_for_message=lambda *a, **kw: state)
+                ws = types.SimpleNamespace(send=lambda message: events.append(('zero',)), close=lambda: None)
+                modules = {'manual_ready_fixture':fixture, 'rospy':ros,
+                    'jaten_msgs.msg':types.SimpleNamespace(RobotChassisState=object),
+                    'nav_msgs.msg':types.SimpleNamespace(Odometry=object)}
+                with patch.dict(sys.modules, modules), patch.dict(os.environ), \
+                        patch.object(remote, 'NAVIGATION_SOURCE', 'from manual_ready_fixture import *', create=True), \
+                        patch.object(remote, 'dispatch_proxy', return_value=command), \
+                        patch.object(remote, 'FactorySocket', return_value=ws):
+                    request={'master':'unused','ros_ip':'unused','operation':'manual_mapping_ready'}
+                    if failure:
+                        with self.assertRaises(RuntimeError):remote.manual_zero_stop(request)
+                        self.assertTrue(state.soft_estop)
+                    else:
+                        reply=remote.manual_zero_stop(request)
+                        self.assertFalse(reply['software_estop'])
+                        self.assertTrue(reply['manual_zero_sent'])
+                        self.assertEqual(events[:3],[('zero',),('rest',),('dispatch',1)])
+                        self.assertEqual(events[3:],[('zero',),('rest',)])
 
     def test_manual_stop_sends_zero_before_confirming_rest_without_soft_estop(self):
         for failure in (None, 'send', 'rest'):

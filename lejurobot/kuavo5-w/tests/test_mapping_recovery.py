@@ -64,6 +64,47 @@ class ReconciliationTests(unittest.TestCase):
         self.assertFalse(self.bundle.pauses)
         self.assertTrue(self.plugin.base_preparation_required)
 
+    def test_saved_restart_reply_loss_settles_same_boot_without_resending_commands(self):
+        self.transition.update(stage='AgvSystemRestart',
+            chassis_boot_id='00000000-0000-0000-0000-000000000001')
+        self.plugin._map_pending = copy.deepcopy(self.transition)
+        self.plugin._persist()
+        self.client.feedback['agvState']['softwareEstop'] = True
+        result = self.plugin.dispatch('stop_mapping', {})
+        self.assertEqual(result['state'], 'completed')
+        self.assertTrue(result['map_saved'])
+        self.assertFalse(result['map_loaded'])
+        self.assertIsNone(self.plugin._map_pending)
+        self.assertIsNone(self.plugin.store.state('mapping'))
+        self.assertEqual(len(self.plugin.store.tags(('failed','grid-new:road-new'))), 1)
+        self.assertFalse(self.client.commands)
+        self.assertFalse(any(op in ('soft_stop','prepare','manual_stop') for op, _ in self.client.calls))
+
+    def test_save_settlement_keeps_pending_when_files_or_chassis_are_unconfirmed(self):
+        self.transition['stage'] = 'AgvSystemRestart'
+        self.plugin._map_pending = copy.deepcopy(self.transition)
+        self.plugin._persist()
+        self.pending = self.plugin.store.state('pending')
+        for fault in ('files', 'mapping', 'moving', 'unheld', 'stationary'):
+            self.client.feedback['agvState'].update(isMapping=fault=='mapping',softwareEstop=fault!='unheld')
+            self.client.feedback['state']['driving'] = fault=='moving'
+            self.client.stationary = fault!='stationary'
+            original = self.client.native
+            def native(op, **args):
+                if fault=='files' and op=='map_save_status':return {'complete':False}
+                return original(op, **args)
+            def bounded(predicate, cancelled, timeout, **kwargs):
+                for _ in range(2):
+                    if predicate():return
+                raise TimeoutError('unconfirmed')
+            with patch.object(self.client,'native',side_effect=native), \
+                    patch.object(self.plugin,'_wait',side_effect=bounded):
+                self.assertIsNone(self.plugin._auto_reconcile_mapping())
+            self.assertEqual(self.plugin.store.state('mapping'),self.mapping)
+            self.assertEqual(self.plugin._map_pending,self.transition)
+            self.plugin._mapping_cleanup_retry_at=0
+        self.assertFalse(self.client.commands)
+
     def test_confirmation_and_exact_session_name_are_required(self):
         for args in ({'confirm_abandon': False}, {'map_name': 'different'}):
             self.assertEqual(self.call(**args)['state'], 'error')

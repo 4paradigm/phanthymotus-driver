@@ -166,6 +166,9 @@ class Client:
         if operation == 'manual_stop':
             return {'success':True,'stationary':True,'manual_zero_sent':True,
                     'completion_basis':'factory_manual_zero_and_fresh_stationary_odometry'}
+        if operation == 'manual_mapping_ready':
+            self.feedback['agvState']['softwareEstop'] = False
+            return {'success':True,'stationary':True,'manual_zero_sent':True,'software_estop':False}
         if operation == 'upper_handoff':
             return {'success':True,'stationary':True,'software_estop':False,
                     'velocity_source':'nav_mpc_move_base','delivery_uncertain':False}
@@ -732,6 +735,26 @@ class SpatialTests(unittest.TestCase):
         wait(lambda: not self.plugin._workers)
         self.assertFalse(self.plugin.unresolved())
 
+    def test_restart_lost_reply_completes_from_saved_files_and_fresh_stopped_auto(self):
+        self.call('start_mapping',map_name='new')
+        self.assertEqual(self.completed()[0],'completed')
+        original=self.client.command
+        def command(method, params, timeout):
+            original(method,params,timeout)
+            if method=='AgvSystemRestart':
+                self.client.feedback['agvState'].update(runningMode='AUTO',softwareEstop=True)
+                raise ConnectionError('reply lost during restart')
+        self.client.command=command
+        self.bundle.tracker.events.clear()
+        self.call('stop_mapping')
+        wait(lambda: bool(self.bundle.tracker.events), timeout=5)
+        status,result=self.completed()
+        self.assertEqual(status,'completed')
+        self.assertTrue(result['map_saved'])
+        self.assertIsNone(self.plugin.store.state('mapping'))
+        self.assertIsNone(self.plugin._map_pending)
+        self.assertEqual(sum(method=='AgvSystemRestart' for method,_ in self.client.commands),1)
+
     def test_map_workflow_is_async_and_rebinds_provisional_tags(self):
         started = self.call('start_mapping', map_name='new')
         self.assertEqual(started['state'], 'executing')
@@ -744,7 +767,9 @@ class SpatialTests(unittest.TestCase):
         self.assertEqual(self.client.commands, [
             ('ChangeMode', {'mode': 'MANUAL'}), ('StartCartoMapping', {})])
         self.assertEqual(self.client.feedback['agvState']['runningMode'], 'MANUAL')
-        self.assertTrue(self.client.feedback['agvState']['softwareEstop'])
+        self.assertFalse(self.client.feedback['agvState']['softwareEstop'])
+        self.assertIn(('manual_mapping_ready', {}), self.client.calls)
+        self.assertFalse(reply['software_stop'])
         self.assertEqual(self.navigate()['state'], 'error')
         self.call('tag_place', name='entry')
         self.bundle.tracker.events.clear()
@@ -1926,6 +1951,16 @@ class NativeIdentityTests(unittest.TestCase):
                 first = module.main(request)['sha256']
                 (root / 'map.yaml').write_text('resolution: 0.10')
                 self.assertNotEqual(first, module.main(request)['sha256'])
+                import hashlib
+                original_md5 = hashlib.md5
+                def python38_md5(*args, **kwargs):
+                    if kwargs:
+                        raise TypeError('unsupported keyword')
+                    return original_md5(*args)
+                (root / 'map.path').write_bytes(b'{}')
+                request['args']['include_road_md5'] = True
+                with patch.object(module.hashlib, 'md5', side_effect=python38_md5):
+                    self.assertEqual(module.main(request)['road_md5'], original_md5(b'{}').hexdigest())
                 with self.assertRaises(ValueError):
                     module.main({'operation': 'map_identity', 'args': {'map_name': '../escape'}})
 

@@ -56,7 +56,7 @@ class JatenClient:
                    'master': target.get('master', 'http://127.0.0.1:11311'),
                    'upper_master': manager.settings.get('master', 'http://192.168.26.1:11311')}
         source = self._source
-        if operation == 'manual_stop':
+        if operation in ('manual_stop', 'manual_mapping_ready'):
             helper = (Path(__file__).parent/'host/manual_keyboard.py').read_text()
             source = ('import json,sys\nNAMESPACE={"__name__":"manual_stop_rpc", "NAVIGATION_SOURCE":'
                       + repr(self._source) + '}\nexec(compile(' + repr(helper)

@@ -19,6 +19,7 @@ import struct
 import threading
 
 LEASE_S = .3
+FEEDBACK_TIMEOUT_S = 1.
 LINEAR_LIMIT, ANGULAR_LIMIT = .15, .3
 
 
@@ -141,6 +142,18 @@ def validate_frame(frame, nonce, last_seq):
     return values
 
 
+def manual_feedback(latest, now):
+    state, received = latest
+    # State broadcasts are ~10Hz and can jitter past the 300ms command lease.
+    # Keep their freshness budget separate; this never renews a motion command.
+    if state is None or not 0 <= now-received <= FEEDBACK_TIMEOUT_S:
+        raise RuntimeError('keyboard_chassis_feedback_is_stale')
+    if (state.manual_mode is not True or state.mapping is not True
+            or state.estop or state.bumper or state.driver_error or not state.driver_enable):
+        raise RuntimeError('keyboard_requires_healthy_manual_mapping')
+    return state
+
+
 def receive(stream, timeout, data):
     # The caller owns this buffer for the entire connection. A parser timeout
     # must not discard a fragmented line, nor extend the motion lease.
@@ -213,6 +226,7 @@ def manual_zero_stop(request):
     """Factory MANUAL stop: zero RobotMotion plus fresh physical rest."""
     namespace = {'__name__': 'motus_keyboard_navigation'}
     exec(compile(NAVIGATION_SOURCE, 'navigation_rpc.py', 'exec'), namespace)
+    epoch = namespace['stop_epoch']() if request.get('operation') == 'manual_mapping_ready' else None
     # A stop must reach RobotMotion even when the chassis is still moving.
     os.environ['ROS_MASTER_URI'] = request['master']
     os.environ['ROS_IP'] = request['ros_ip']
@@ -233,7 +247,34 @@ def manual_zero_stop(request):
     except Exception:
         ws = None
     try:
-        return confirm_manual_stop(ws, namespace, rospy, Odometry)
+        stopped = confirm_manual_stop(ws, namespace, rospy, Odometry)
+        if request.get('operation') != 'manual_mapping_ready':
+            return stopped
+        dispatch = dispatch_proxy(namespace, rospy)
+        def healthy():
+            state = rospy.wait_for_message('/jaten_behavior_manager/robot_state', RobotChassisState, timeout=2.)
+            if (not state.manual_mode or not state.mapping or state.estop or state.bumper
+                    or state.driver_error or not state.driver_enable):
+                raise RuntimeError('keyboard_requires_healthy_manual_mapping')
+            return state
+        try:
+            state = healthy()
+            if ws is None or getattr(ws, 'failed', threading.Event()).is_set():
+                raise RuntimeError('factory_websocket_disconnected')
+            if state.soft_estop:
+                namespace['confirm_software_stop'](rospy, True, require_healthy=True)
+                if not namespace['guarded_navigation_release'](epoch,
+                        lambda: dispatch(control_mode=1)).success:
+                    raise RuntimeError('keyboard_release_rejected')
+            namespace['confirm_software_stop'](rospy, False, require_healthy=True)
+            stopped = confirm_manual_stop(ws, namespace, rospy, Odometry, dispatch)
+            if stopped.get('manual_zero_sent') is not True or healthy().soft_estop:
+                raise RuntimeError('keyboard_initial_stop_unconfirmed')
+            return dict(stopped, software_estop=False)
+        except Exception:
+            dispatch(control_mode=0)
+            namespace['confirm_software_stop'](rospy, True)
+            raise
     finally:
         if ws is not None:
             ws.close()
@@ -256,16 +297,11 @@ def run(request):
     latest = [None, 0.]
     def feedback(state):
         latest[:] = [state, time.monotonic()]
-    subscription = rospy.Subscriber('/jaten_behavior_manager/robot_state', RobotChassisState, feedback, queue_size=1)
+    subscription = rospy.Subscriber('/jaten_behavior_manager/robot_state', RobotChassisState, feedback,
+                                    queue_size=1, tcp_nodelay=True)
     feedback(rospy.wait_for_message('/jaten_behavior_manager/robot_state', RobotChassisState, timeout=2.))
     def manual():
-        state, received = latest
-        if time.monotonic()-received > LEASE_S:
-            raise RuntimeError('keyboard_chassis_feedback_is_stale')
-        if (state.manual_mode is not True or state.mapping is not True
-                or state.estop or state.bumper or state.driver_error or not state.driver_enable):
-            raise RuntimeError('keyboard_requires_healthy_manual_mapping')
-        return state
+        return manual_feedback(latest, time.monotonic())
 
     def emit(value):
         print(json.dumps(value), flush=True)

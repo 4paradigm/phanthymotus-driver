@@ -864,7 +864,12 @@ def main(request):
             road = (root / (name + '.path')).resolve()
             if road.parent != root or not 0 < road.stat().st_size <= 32_000_000:
                 raise RuntimeError('invalid_road_map_file')
-            road_digest = hashlib.md5(usedforsecurity=False)
+            try:
+                road_digest = hashlib.md5(usedforsecurity=False)
+            except TypeError:
+                # Factory Ubuntu 20.04 Python 3.8 predates this keyword.
+                # MD5 is a vendor map identity, never authentication/security.
+                road_digest = hashlib.md5()
             with road.open('rb') as stream:
                 for chunk in iter(lambda: stream.read(65536), b''):
                     road_digest.update(chunk)

@@ -123,6 +123,21 @@ class SpatialStore:
             for key, value in (('last_mapping_reconciliation', evidence), ('mapping', None), ('pending', updated)):
                 db.execute('INSERT OR REPLACE INTO state VALUES (?,?)', (key, json.dumps(value)))
 
+    def complete_mapping(self, mapping, identity, pending, result):
+        """Bind saved POIs and clear both recovery records atomically."""
+        with self.lock, self.db() as db:
+            row = db.execute("SELECT value FROM state WHERE key='mapping'").fetchone()
+            if not row or json.loads(row[0]) != mapping:
+                raise RuntimeError('mapping_changed_before_save_completion')
+            db.execute('UPDATE tags SET map_id=?,fingerprint=? WHERE map_id=? AND fingerprint=?',
+                       (*identity, mapping['name'], mapping['token']))
+            if mapping.get('start_pose') is not None:
+                db.execute('INSERT OR REPLACE INTO state VALUES (?,?)',
+                           (self.anchor_key(identity), json.dumps(mapping['start_pose'])))
+            for key, value in (('mapping', None), ('pending', dict(pending, map_transition=None)),
+                               ('last_map_save', dict(result, completed_at=time.time()))):
+                db.execute('INSERT OR REPLACE INTO state VALUES (?,?)', (key, json.dumps(value)))
+
     @staticmethod
     def anchor_key(identity):
         return 'mapping_anchor:' + json.dumps(identity, ensure_ascii=False)
@@ -695,6 +710,8 @@ class ControlledSpatialPlugin:
                           'navigate_to_pose', 'navigate_to_tag'):
                 cleanup = self._auto_reconcile_mapping()
                 if action == 'stop_mapping' and cleanup is not None:
+                    if cleanup.get('map_saved') is True:
+                        return cleanup
                     return {**cleanup, 'completion_basis': 'obsolete_mapping_session_cleared',
                             'map_saved': False,
                             'message': 'Obsolete mapping session cleared automatically. No new save was requested.'}
@@ -734,6 +751,7 @@ class ControlledSpatialPlugin:
                     'factory_maps': '/home/jt/jmap_config/jmaps',
                     'archive': self.archive.snapshot() if self.archive else {'state': 'disabled'}}
                 result['last_map_operation'] = self.store.state('last_map_operation')
+                result['last_map_save'] = self.store.state('last_map_save')
                 result['last_map_localization'] = self.store.state('last_map_localization')
                 result['last_navigation_stop'] = self.store.state('last_navigation_stop')
                 result['last_navigation_completion'] = self.store.state('last_navigation_completion')
@@ -1194,8 +1212,29 @@ class ControlledSpatialPlugin:
             self._mapping_cleanup_key = key
             self._mapping_cleanup = {'state': 'checking', 'map_name': recovery['map_name']}
             try:
-                result = self._reconcile_mapping({'map_name': recovery['map_name'],
-                                                   'confirm_abandon': True}, automatic=True)
+                if (recovery['operation'] == 'stop_mapping' and recovery['phase'] == 'saving'
+                        and recovery['stage'] in ('AgvSystemRestart', 'ChangeMode')):
+                    with self._native_lock:
+                        mapping = self.store.state('mapping')
+                        transition = dict(self._map_pending)
+                        epoch, connection = self.bundle._stop_epoch, self.bundle.ros1.connection
+                        if (self.bundle.tracker._active or self.bundle._transition is not None
+                                or self._task or self._uncertain or self._preparation
+                                or self.keyboard.session or self._keyboard_pending):
+                            raise RuntimeError('mapping_save_settlement_busy')
+                        self._confirm_saved_exit(mapping['name'], threading.Event())
+                        identity = self.client.saved_map_identity(mapping['name'])
+                        with self.bundle.tracker.lock:
+                            if (mapping != self.store.state('mapping') or transition != self._map_pending
+                                    or epoch != self.bundle._stop_epoch or connection != self.bundle.ros1.connection
+                                    or not connection[0] or self._closed.is_set()):
+                                raise RuntimeError('mapping_save_settlement_state_changed')
+                            result = self._finish_saved_mapping(mapping, identity)
+                            self._map_pending = None
+                            self._persist()
+                else:
+                    result = self._reconcile_mapping({'map_name': recovery['map_name'],
+                                                       'confirm_abandon': True}, automatic=True)
             except Exception as exc:
                 # Unknown/lost feedback is not proof that a save ended. Retry
                 # only these reads on a later request, without asking the user
@@ -1560,6 +1599,48 @@ class ControlledSpatialPlugin:
         if result.get('success') is not True or result.get('stationary') is not True:
             raise RuntimeError('fresh_stationary_odometry_required_before_changing_map')
 
+    def _confirm_saved_exit(self, name, cancelled):
+        """Read-only settlement of a lost restart reply, never another restart."""
+        previous = [None, None]
+        def complete():
+            status = self.client.native('map_save_status', map_name=name)
+            signature = status.get('files') if status.get('complete') is True else None
+            now = time.monotonic()
+            if signature is None:
+                previous[:] = [None, None]
+                return False
+            if signature != previous[0]:
+                previous[:] = [signature, now]
+                return False
+            if now-previous[1] < 2.:
+                return False
+            observation = self.client.observe(required=('agvState', 'state'))
+            agv, state = observation['agvState'], observation['state']
+            if (agv.get('isMapping') is not False or agv.get('runningMode') != 'AUTO'
+                    or agv.get('softwareEstop') is not True or state.get('driving') is not False
+                    or any(state.get(k) for k in ('nodeStates', 'edgeStates', 'actionStates'))):
+                return False
+            result = self.client.native('stationary')
+            return result.get('success') is True and result.get('stationary') is True
+        self._wait(complete, cancelled, 45, independent=True)
+
+    def _finish_saved_mapping(self, mapping, identity=None):
+        # Do not load/relocalize at the mapping origin: the robot may be elsewhere.
+        if identity is None:
+            identity = self.client.saved_map_identity(mapping['name'])
+        result = {'state': 'completed', 'map_name': identity[0], 'map_fingerprint': identity[1],
+                  'mapping_start_pose': mapping.get('start_pose'), 'map_loaded': False, 'map_saved': True,
+                  'basis': 'saved_files_and_confirmed_mapping_exit',
+                  'message': 'Map saved. Preview it with spatial_map. Use load_map separately when ready to localize.'}
+        self.store.complete_mapping(mapping, identity, self.store.state('pending') or {}, result)
+        previous = self.store.state('last_map_operation') or {}
+        if previous.get('operation') == 'stop_mapping':
+            self.store.state('last_map_operation', dict(previous, state='completed',
+                recovered=True, completion_basis=result['basis']))
+        if self.archive is not None:
+            self.archive.schedule()
+        return result
+
     def _mutate_map(self, action, args, mapping, cancelled):
         recovering_save = action == 'stop_mapping' and mapping and mapping['phase'] == 'saving'
         if not recovering_save:
@@ -1591,6 +1672,11 @@ class ControlledSpatialPlugin:
                 state = self.client.observe()['agvState']
                 return state.get('isMapping') is True and state.get('runningMode') == 'MANUAL'
             self._wait(mapping_remote_ready, cancelled)
+            manual_ready = self.client.native('manual_mapping_ready')
+            if (manual_ready.get('success') is not True or manual_ready.get('manual_zero_sent') is not True
+                    or manual_ready.get('stationary') is not True
+                    or manual_ready.get('software_estop') is not False):
+                raise RuntimeError('mapping_manual_zero_ready_unconfirmed')
             try:
                 self._require_stationary()
                 start_pose, sample = self._observation()
@@ -1602,7 +1688,7 @@ class ControlledSpatialPlugin:
             self.store.state('mapping', mapping)
             return {'state': 'mapping', 'map_name': name,
                     'remote_control_route': 'factory_RobotMotion', 'chassis_mode': 'MANUAL',
-                    'keyboard_control': 'open_mapping_console', 'software_stop': hold.get('software_estop') is True,
+                    'keyboard_control': 'open_mapping_console', 'software_stop': False,
                     'message': 'Mapping started. Please call mapping_console for remote control. Use this console instead of the G12 remote controller.'}
         if action == 'stop_mapping':
             if not mapping or mapping['phase'] not in ('mapping', 'saving'):
@@ -1628,21 +1714,21 @@ class ControlledSpatialPlugin:
                 self._wait(saved, cancelled, 1500)
             self._wait(lambda: mapping['name'] in [Path(m.get('fileName', '')).stem
                                                    for m in self.client.maps()], cancelled, 1500)
-            self._command('AgvSystemRestart', {}, cancelled)
+            try:
+                self._command('AgvSystemRestart', {}, cancelled)
+            except Exception:
+                if cancelled.is_set():
+                    raise
+                # Restart tears down its own reply channel. Do not resend it:
+                # confirm the saved files and actual postcondition instead.
+                self._confirm_saved_exit(mapping['name'], cancelled)
+                return self._finish_saved_mapping(mapping)
             self._wait(lambda: self.client.observe()['agvState'].get('isMapping') is False, cancelled, 60)
             self._command('ChangeMode', {'mode': 'AUTO'}, cancelled)
             hold = self.client.native('soft_stop')
             if hold.get('software_estop') is not True or hold.get('stationary') is not True:
                 raise RuntimeError('post_restart_software_stop_unconfirmed')
-            # Saving a map never assumes the robot is at its starting anchor.
-            # Bind POIs to the saved files without loading or relocalizing.
-            new_identity = self.client.saved_map_identity(mapping['name'])
-            self.store.bind_mapping((mapping['name'], mapping['token']), new_identity,
-                                    mapping.get('start_pose'))
-            self.store.state('mapping', None)
-            return {'state': 'completed', 'map_name': new_identity[0], 'map_fingerprint': new_identity[1],
-                    'mapping_start_pose': mapping.get('start_pose'), 'map_loaded': False,
-                    'message': 'Map saved. Preview it with spatial_map. Use load_map separately when ready to localize.'}
+            return self._finish_saved_mapping(mapping)
         if action == 'load_map':
             if mapping:
                 raise RuntimeError('finish_or_reconcile_mapping_before_loading')
@@ -1770,8 +1856,10 @@ class ControlledSpatialPlugin:
         self.store.state('loaded_map_identity', list(identity))
         return identity
 
-    def _wait(self, predicate, cancelled, timeout=30):
-        end = min(time.monotonic() + timeout, self._map_deadline)
+    def _wait(self, predicate, cancelled, timeout=30, independent=False):
+        end = time.monotonic() + timeout
+        if not independent:
+            end = min(end, self._map_deadline)
         while not cancelled.is_set() and time.monotonic() < end:
             try:
                 if predicate():

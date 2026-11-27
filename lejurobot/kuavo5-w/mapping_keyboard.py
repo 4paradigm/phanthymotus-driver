@@ -126,6 +126,7 @@ class MappingKeyboard:
                     'last_failure': self.last_failure,
                     'last_roundtrip_ms': self.last_roundtrip_ms,
                     'max_roundtrip_ms': self.max_roundtrip_ms,
+                    'input_expired': bool(s and time.monotonic()-s['last_at'] > LEASE_S),
                     'linear_limit_m_s': LINEAR_LIMIT, 'angular_limit_rad_s': ANGULAR_LIMIT,
                     'watchdog_ms': int(LEASE_S*1000), 'route': 'factory_RobotMotion_MANUAL'}
 
@@ -178,11 +179,12 @@ class MappingKeyboard:
         with self.lock:
             s = self.session
             if (s is None or args.get('session_id') != s['id'] or s['stop'].is_set()
-                    or seq <= s['seq'] or time.monotonic()-s['last_at'] > LEASE_S):
+                    or seq <= s['seq']):
                 raise RuntimeError('keyboard_lease_expired_or_replayed_reopen_panel')
+            expired = time.monotonic()-s['last_at'] > LEASE_S
             s['seq'], s['last_at'] = seq, time.monotonic()
-            s['values'] = list(values) if s['phase'] == 'ready' else [0., 0.]
-            return self.info()
+            s['values'] = list(values) if s['phase'] == 'ready' and not expired else [0., 0.]
+            return dict(self.info(), input_expired=expired)
 
     def invalidate(self):
         """No IO; called inside the common whole-body stop lock."""
@@ -215,8 +217,7 @@ class MappingKeyboard:
                 and s['connection'][0] and s['connection'] == self.bundle.ros1.connection
                 and self.bundle.tracker.current('base', s['action_id'])
                 and mapping.get('token') == s['mapping_token'] and mapping.get('phase') == 'mapping'
-                and self.bundle.state.read('upper_velocity_enabled')[0] is False
-                and time.monotonic()-s['last_at'] <= LEASE_S)
+                and self.bundle.state.read('upper_velocity_enabled')[0] is False)
 
     def _run(self, s):
         stream, stopped = None, False
@@ -238,7 +239,10 @@ class MappingKeyboard:
                 with self.lock:
                     if not self._valid(s):
                         break
-                    values = list(s['values']) if activated else [0., 0.]
+                    fresh = time.monotonic()-s['last_at'] <= LEASE_S
+                    values = list(s['values']) if activated and fresh else [0., 0.]
+                    if not fresh:
+                        s['values'] = [0., 0.]
                     # Nonblocking single-frame write under the publication lock:
                     # a stop epoch cannot be overtaken by an older direction.
                     stream.send({'nonce': reply['nonce'], 'seq': seq, 'values': values})
