@@ -1,12 +1,13 @@
-# ROKAE Helios-2.1 状态卡片
+# ROKAE Helios-2.1 驱动卡片
 
-通过现有 iNex 和底盘 WebSocket 读取 20 轴关节及双电池状态。两张传感器卡可独立开始、停止，不提供运动、使能、模式切换或充放电控制。
+通过现有 iNex 和底盘 WebSocket 读取 20 轴关节及双电池状态（两张传感器卡可独立开始、停止）；`base_drive` 执行器卡经厂家底盘 SDK 做限时、低速的底盘移动，默认关闭，需部署时显式开启（见下文“底盘移动”）。不提供关节运动、使能、模式切换或充放电控制。
 
 | 工具 | 类型 | 输出 |
 |---|---|---|
 | `joints` | sensor | 关节骨架和逐轴状态，默认 10 Hz |
 | `battery` | sensor | 两块电池状态，默认 1 Hz |
 | `model` | resource | 运行时读取本机 iNex 的 URDF，骨架渲染器自动调用 |
+| `base_drive` | actuator | 底盘限时低速移动（前进/后退/旋转）与立即停车，见 [CHASSIS_MOVE_INTERFACE.md](CHASSIS_MOVE_INTERFACE.md) |
 
 ## 数据与单位
 
@@ -50,6 +51,22 @@
 
 关节默认 1 秒、电池默认 3 秒无有效报文即过期。断线、无效、过期或停止时清空相应数据；无关报文不刷新有效期。关节流的 `received_at_ms` 是 Driver 接收时间；`timestamp_ms` 是发布时刻。没有厂家采样时间，无法仅凭接收计数排除控制器内部数据冻结。
 
+## 底盘移动 `base_drive`
+
+与 AgileX Bunker 的 `base_drive` 同一契约：`move(vx, vy, vyaw, duration_s)` 必须给时长，到时自动停车；`stop_move` 立即停车（画布可见；Core 会隐藏系统动作 `stop`，`stop` 仍保留供项目停止时调用）；`info` 返回限速、SDK 连接与底盘异常等级。`x-completion` 经 Agent Core ACP 回报 completed / cancelled / error，`x-resource: base`。默认上限 0.2 m/s、15°/s、10 s（代码硬上限 0.5 m/s、30°/s，配置不能超过）；横移 `vy` 默认关闭，部署时用 `HELIOS_CHASSIS_ALLOW_LATERAL=1` 开启（与运动开关传法相同，例如 `curl -fsSL https://motus.phanthy.com/run-pr-image.sh | sudo HELIOS_CHASSIS_MOTION_ENABLED=1 HELIOS_CHASSIS_ALLOW_LATERAL=1 bash -s -- <镜像>`），开启后卡片才显示 VY。
+
+速度经厂家 VMR AMR SDK 的第三方控速下发（`set_third_speed_ctrl` → 50 Hz `send_third_expected_speed` → 零速 → `close_third_speed_ctrl`），在独立 worker 进程内运行：每次移动自带截止时间，Driver 退出或 worker 被杀时底盘因收不到速度指令自动停车（厂家示例说明）。`info` 与每次移动结果附带里程计实测位移（前进/左移/转角）。
+
+厂家 SDK 只有 CPython 3.12 版，而 ROS Humble 是 3.10，所以 SDK 在独立的 3.12 worker 进程中运行。厂家 SDK 和它的 Python 3.12 都不进 Git、不进镜像：与 Helios 里程计、地图卡相同，安装在机器人本体上，由 `deploy/service.yml` 只读挂载到 `/opt/vmr-sdk` 和 `/opt/sdk-python`（宿主机路径用 `HELIOS_VMR_SDK_DIR` / `HELIOS_SDK_PYTHON_DIR` 设置，默认 `/home/admin/helios-dev/native-odom-runtime/{vmr-sdk,sdk-python}`）。未挂载时镜像照常启动，卡片照常注册，`info` 显示 SDK 不可用，`move` 明确报错，其他卡不受影响。
+
+**默认关闭**：移动功能需部署时显式开启（`HELIOS_CHASSIS_MOTION_ENABLED=1`；bot 测试脚本用 `curl -fsSL https://motus.phanthy.com/run-pr-image.sh | sudo HELIOS_CHASSIS_MOTION_ENABLED=1 bash -s -- <镜像>`，网页控制台部署则写入 `/opt/phanthy-motus/.env`），未开启时 `move` 被拒绝。底盘异常状态未知（worker 启动后尚未收到首条异常上报，或 SDK 无异常设备）时同样拒绝移动。
+
+**舵轮转向**：底盘为舵轮，换方向时先转轮再行驶。`duration_s` 从里程计显示底盘沿指令方向实际走出 1 cm（或转过 1.5°）时计时（最多等 5 s，用于底盘休息后唤醒电机和舵轮转向；转轮时的速度尖峰不算），结果中 `start_delay_s` 为转向等待时间。
+
+**休息唤醒**：底盘空闲后休息（`2/7`），唤醒时电机依次报 `2/1`（非使能）、`2/2`（刹车，短暂 1 级）再全部清除；仅在开始运动前、且只有这些电机状态时，最多容忍 2 s，其余情况照常停车。每次移动结果含 `diagnostics`，`info.last_move` 可查最近一次。
+
+**前提**：底盘须在厂家界面建图、应用地图并重定位成功，且处于自动模式（非手动模式）。未定位时底盘刹车并报异常（311/4/2），`move` 会被拒绝并返回异常列表；手动模式下 SDK 速度被忽略。2026-11-24 已在现场看护下用本地预览镜像实测前进、后退、左右转、横移与 `stop_move`，详见接口文档。
+
 ## 画布与 Core 前端
 
 在卡片共享配置中保存状态地址，再将 `joints` 和 `battery` 加入画布并启动。`model` 无需单独运行；首次请求时读取同一 iNex 地址的 `/api/robot_3d_model` 及其同源 `urdf_url`，核对 20 轴名称后在进程内缓存。没有把厂家模型打入镜像。模型服务暂不可用时明确返回错误，不影响关节和电池订阅启动。监控页从 `joints` 自动生成骨架。
@@ -66,14 +83,14 @@
 
 默认读取上身 `ws://192.168.0.161:8888/ws` 及底盘 `ws://192.168.0.100/ws/AGVInfo`。可通过共享配置 `state_url` / `battery_state_url`，或环境变量 `HELIOS_STATE_URL` / `HELIOS_BATTERY_STATE_URL` 覆盖。地址字段声明为敏感配置，避免打包 Solution 时公开私有地址。
 
-`config.yaml` 控制发布、过期、连接和重连时间。MCP 仅监听 `127.0.0.1:15747`，ROS domain 42，复用 `common/vendor_runtime.py` 注册到 Core。WebSocket 只读订阅，不安装或运行厂家运动 SDK。
+`config.yaml` 控制发布、过期、连接和重连时间。MCP 仅监听 `127.0.0.1:15747`，ROS domain 42，复用 `common/vendor_runtime.py` 注册到 Core。关节和电池通过 WebSocket 只读订阅。镜像不包含厂家 SDK；`base_drive` 的 worker 进程运行从机器人本体只读挂载的底盘 SDK（见上文移动卡说明），未挂载时仅该卡不可用。
 
 ## 本地验证
 
 仓库根目录安装本 Driver 的 requirements 及 pytest 后执行：
 
 ```bash
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=. python -m pytest -q tests/test_helios_joints.py tests/test_helios_battery.py tests/test_helios_torque.py tests/test_helios_model.py
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=. python -m pytest -q tests/test_helios_joints.py tests/test_helios_battery.py tests/test_helios_torque.py tests/test_helios_model.py tests/test_helios_chassis_move.py
 python scripts/check_service_yml.py rokae/helios
 ```
 
