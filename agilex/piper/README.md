@@ -64,6 +64,37 @@ those fixes for the complete canvas experience. A `trigger` activity label is
 presentation; Get status is a synchronous query and its completion does not
 change the previous movement result.
 
+## ALOHA follow consistency
+
+The optional `piper_follow_consistency` sensor compares six external joint
+targets with the measured follower joint angles of each configured SocketCAN
+bus. It accepts standard PiPER `155`–`157` reference and `2A5`–`2A7` feedback
+frames (hexadecimal, milli-degrees), assembled into independent complete
+samples. The receipt timestamps come from the Linux kernel. The socket rejects
+frames sent by a process on this host. The device installation must establish
+that the external sender on each bus is its physical leader. PiPER CAN control
+frames do not carry sender identity or independent encoder measurements of the
+leader. This card is an advisory diagnostic and does not transmit CAN frames,
+switch modes or acquire control.
+
+In a site config set `follow_consistency.enabled: true` and map one or two
+verified physical pairs in `follow_consistency.pairs` (for example
+`{left: can0, right: can1}`). `info` reports each joint's signed deviation and
+duration above `tolerance_deg`, and an estimated lag when the motion window is
+unambiguous. `data/json` publishes the per-pair summary to the canvas. Both
+sources must have fresh, alignable samples before a following verdict is shown.
+`persistence_ms` sets the duration for a sustained deviation. Tolerance and
+time limits are site settings for diagnosis. The lag is an estimate on a 10 ms
+grid for delays up to 250 ms and is unavailable during static or ambiguous motion.
+
+For a workcell with an existing PiPER deployment, the same image can be run with
+`python3 -m agilex.piper.follow_consistency` after sourcing ROS Humble. Set
+`CONFIG_PATH` to an explicit site YAML with a unique `mcp_port`, `ros_namespace`
+and the `follow_consistency` settings above. The standalone service uses its own
+Agent Core registration and starts only this passive card. It uses the existing
+host SocketCAN and Core DDS network. It needs no device mounts or extra Linux
+capabilities.
+
 ## Build and packaging
 
 ```bash

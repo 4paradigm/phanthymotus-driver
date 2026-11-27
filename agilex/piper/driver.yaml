@@ -15,3 +15,4 @@ cards:
   - { name: piper_camera_live, type: sensor }
   - { name: piper_photo, type: actuator }
   - { name: model, type: resource }
+  - { name: piper_follow_consistency, type: sensor }
