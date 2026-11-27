@@ -8,7 +8,7 @@ import threading
 import time
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from controlled_spatial import ControlledSpatialPlugin, SpatialStore
@@ -1617,8 +1617,45 @@ class NativePreparationTests(unittest.TestCase):
 
     def test_rejected_cancel_never_releases(self):
         self.reject = 2
-        with self.assertRaises(RuntimeError): self.call()
+        with patch.object(self.module, 'confirm_empty_held_tracker',
+                          side_effect=RuntimeError('native_tracker_cancel_rejected_and_not_empty')):
+            with self.assertRaises(RuntimeError): self.call()
         self.assertEqual(self.events, [0, 2])
+
+    def test_rejected_cancel_with_verified_empty_tracker_can_prepare(self):
+        self.reject = 2
+        with patch.object(self.module, 'confirm_empty_held_tracker') as empty:
+            result = self.call()
+        empty.assert_called_once()
+        self.assertTrue(result['old_task_cancelled'])
+        self.assertEqual(self.events, [0, 2, 'stationary', 1, 'stationary'])
+
+    def test_soft_stop_accepts_rejected_cancel_only_when_empty_hold_is_verified(self):
+        self.reject = 2
+        with patch.object(self.module, 'confirm_empty_held_tracker') as empty:
+            self.assertTrue(self.call('soft_stop')['software_estop'])
+        empty.assert_called_once()
+        self.assertNotIn(1, self.events)
+
+    def test_empty_cancel_remote_handoff_still_requires_final_guard(self):
+        self.reject = 2
+        self.state.manual_mode, self.state.mapping, self.state.driver_enable = False, False, True
+        for accepted in (True, False):
+            with self.subTest(accepted=accepted):
+                self.events.clear()
+                self.state.soft_estop = True
+                guard = Mock(side_effect=None if accepted else RuntimeError('neutral_unconfirmed'))
+                with patch.object(self.module, 'confirm_empty_held_tracker'), \
+                        patch.object(self.module, 'remote_idle_guard', return_value=(guard, lambda: None)), \
+                        patch.object(self.module, 'select_navigation_source'):
+                    if accepted:
+                        self.assertTrue(self.call('remote_ready')['old_task_cancelled'])
+                        self.assertIn(1, self.events)
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, 'neutral_unconfirmed'):
+                            self.call('remote_ready')
+                        self.assertNotIn(1, self.events)
+                        self.assertTrue(self.state.soft_estop)
 
     def test_missing_stationary_samples_never_releases(self):
         with patch.object(self.module, 'confirm_stationary', side_effect=TimeoutError()):

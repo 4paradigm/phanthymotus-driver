@@ -146,6 +146,66 @@ class TrackerFeedbackTests(unittest.TestCase):
         self.command.assert_not_called()
 
 
+class EmptyHeldTrackerTests(unittest.TestCase):
+    def setUp(self):
+        self.module = helper()
+        connection = {'callerid': '/lqr_path_track', 'latching': '0'}
+        self.path = types.SimpleNamespace(num_edge_remain=0, edges_remain=[],
+                                          _connection_header=connection.copy())
+        self.motion = types.SimpleNamespace(motion_type=2, _connection_header=connection.copy())
+        self.ros = types.SimpleNamespace(wait_for_message=Mock(
+            side_effect=lambda topic, *a, **kw: self.path if topic.endswith('path_track_state') else self.motion))
+        p = patch.dict(sys.modules, {'jaten_msgs.msg': types.SimpleNamespace(
+            PathTrackState=object, MotionState=object)})
+        p.start(); self.addCleanup(p.stop)
+        self.held = patch.object(self.module, 'confirm_software_stop').start()
+        self.stationary = patch.object(self.module, 'confirm_stationary').start()
+        self.addCleanup(patch.stopall)
+
+    def check(self):
+        self.module.confirm_empty_held_tracker(self.ros, object)
+
+    def test_empty_finished_feedback_requires_hold_and_fresh_rest(self):
+        self.check()
+        self.assertEqual(self.held.call_count, 2)
+        self.stationary.assert_called_once_with(self.ros, object)
+        self.assertEqual(self.ros.wait_for_message.call_count, 4)
+
+    def test_pending_edges_or_unfinished_motion_are_rejected(self):
+        for field, value in (( 'num_edge_remain', 1), ('edges_remain', [object()])):
+            with self.subTest(field=field):
+                setattr(self.path, field, value)
+                with self.assertRaisesRegex(RuntimeError, 'not_empty'):
+                    self.check()
+                setattr(self.path, field, 0 if field == 'num_edge_remain' else [])
+        self.motion.motion_type = 1
+        with self.assertRaisesRegex(RuntimeError, 'not_empty'):
+            self.check()
+
+    def test_retained_or_untrusted_samples_are_rejected(self):
+        for message in (self.path, self.motion):
+            for connection in ({'callerid': '/other', 'latching': '0'},
+                               {'callerid': '/lqr_path_track', 'latching': '1'}, {}):
+                original = message._connection_header
+                message._connection_header = connection
+                with self.assertRaisesRegex(RuntimeError, 'not_empty'):
+                    self.check()
+                message._connection_header = original
+
+    def test_new_task_during_stationarity_check_is_rejected(self):
+        self.stationary.side_effect = lambda *a: setattr(self.path, 'num_edge_remain', 1)
+        with self.assertRaisesRegex(RuntimeError, 'not_empty'):
+            self.check()
+
+    def test_missing_feedback_hold_or_motion_failure_stays_blocked(self):
+        for target in (self.held, self.stationary, self.ros.wait_for_message):
+            original = target.side_effect
+            target.side_effect = RuntimeError('unconfirmed')
+            with self.assertRaisesRegex(RuntimeError, 'unconfirmed'):
+                self.check()
+            target.side_effect = original
+
+
 class MuxAcknowledgementTests(unittest.TestCase):
     def run_switch(self, acknowledgement):
         module = helper()

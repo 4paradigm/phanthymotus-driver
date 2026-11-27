@@ -460,6 +460,23 @@ def tracker_live_message(message):
     return header.get('callerid') == '/lqr_path_track' and header.get('latching') == '0'
 
 
+def confirm_empty_held_tracker(rospy, Odometry):
+    """A rejected cancel is idempotent only with an empty, finished tracker."""
+    from jaten_msgs.msg import PathTrackState, MotionState
+    confirm_software_stop(rospy, True)
+    def empty():
+        path = rospy.wait_for_message('/mpc_path_track/path_track_state', PathTrackState, timeout=2.)
+        motion = rospy.wait_for_message('/mpc_path_track/motion_state', MotionState, timeout=2.)
+        if (not tracker_live_message(path) or not tracker_live_message(motion)
+                or path.num_edge_remain != 0 or list(path.edges_remain)
+                or motion.motion_type != 2):
+            raise RuntimeError('native_tracker_cancel_rejected_and_not_empty')
+    empty()
+    confirm_stationary(rospy, Odometry)
+    empty()
+    confirm_software_stop(rospy, True)
+
+
 def confirm_software_stop(rospy, expected, require_healthy=False):
     from jaten_msgs.msg import RobotChassisState
     end = time.monotonic() + 3.
@@ -876,7 +893,7 @@ def main(request):
         proxy = rospy.ServiceProxy(names['cancel'], types['cancel'])
         def state():
             return rospy.wait_for_message('/jaten_behavior_manager/robot_state', RobotChassisState, timeout=2.)
-        def command(mode):
+        def command(mode, allow_empty_cancel=False):
             request['_command_unresolved'] = True
             try:
                 response = proxy(control_mode=mode)
@@ -885,7 +902,11 @@ def main(request):
                 raise
             request['_command_unresolved'] = False
             if not response.success:
+                if mode == 2 and allow_empty_cancel:
+                    confirm_empty_held_tracker(rospy, Odometry)
+                    return False
                 raise RuntimeError('chassis_preparation_command_rejected')
+            return True
         def healthy(value):
             if value.estop or value.bumper or value.driver_error:
                 raise RuntimeError('chassis_hardware_stop_or_fault_active')
@@ -893,8 +914,8 @@ def main(request):
             command(0)
             confirm_software_stop(rospy, True)
             if operation == 'soft_stop':
-                command(2)
-                tracker_command(rospy, 3, request)
+                if command(2, allow_empty_cancel=True):
+                    tracker_command(rospy, 3, request)
             confirm_stationary(rospy, Odometry)
             if not state().soft_estop:
                 raise RuntimeError('chassis_soft_stop_unconfirmed')
@@ -905,9 +926,10 @@ def main(request):
         command(0)
         confirm_software_stop(rospy, True)
         request['_preparation_stage'] = 'cancel_old_task'
-        command(2)  # Cancel old tasks BEFORE releasing a software stop.
+        cancelled = command(2, allow_empty_cancel=True)
         request['_preparation_stage'] = 'pause_old_tracker'
-        tracker_command(rospy, 3, request)
+        if cancelled:
+            tracker_command(rospy, 3, request)
         request['_preparation_stage'] = 'confirm_cancel_stationary'
         confirm_stationary(rospy, Odometry)
         current = state()
