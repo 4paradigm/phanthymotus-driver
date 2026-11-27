@@ -260,14 +260,15 @@ def acp_transport(monkeypatch):
     return transport
 
 
-@pytest.mark.parametrize("endpoint,ca_file", [
-    ("https://localhost:15678", None),
-    ("https://127.0.0.1:15678", None),
-    ("https://[::1]:15678", None),
-    ("https://core.example.test:15678", "core-test.pem"),
+@pytest.mark.parametrize("endpoint,ca_file,check_hostname", [
+    ("https://localhost:15678", None, False),
+    ("https://127.0.0.1:15678", None, False),
+    ("https://[::1]:15678", None, False),
+    ("https://127.0.0.1:15678", "core-test.pem", False),
+    ("https://core.example.test:15678", "core-test.pem", True),
 ])
-def test_acp_completion_uses_hostname_verification_for_remote_core(
-    monkeypatch, capsys, acp_transport, endpoint, ca_file,
+def test_acp_completion_tls_policy(
+    monkeypatch, capsys, acp_transport, endpoint, ca_file, check_hostname,
 ):
     monkeypatch.setenv("AGENT_CORE_URL", endpoint)
     if ca_file:
@@ -279,7 +280,7 @@ def test_acp_completion_uses_hostname_verification_for_remote_core(
 
     tls_handler, = [handler for handler in acp_transport.handlers if isinstance(handler, urllib_request.HTTPSHandler)]
     assert acp_transport.cafile == ca_file
-    assert tls_handler._context.check_hostname is bool(ca_file)
+    assert tls_handler._context.check_hostname is check_hostname
     assert tls_handler._context.verify_mode == (ssl.CERT_REQUIRED if ca_file else ssl.CERT_NONE)
     assert acp_transport.request.full_url == f"{endpoint}/api/acp/complete"
     assert acp_transport.request.get_method() == "POST"
