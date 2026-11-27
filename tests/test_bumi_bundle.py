@@ -77,6 +77,29 @@ class FakeVisionTfPlugin:
         pass
 
 
+class FakeVisualFacingPlugin:
+    def __init__(self, plugin_config, namespace, executor, high_ctrl,
+                 loco_plugin=None, loco_servo_plugin=None):
+        self.plugin_config = plugin_config
+        self.namespace = namespace
+        self.executor = executor
+        self.high_ctrl = high_ctrl
+        self.loco = loco_plugin
+        self.servo = loco_servo_plugin
+
+    def get_tool(self):
+        return {"name": "visual_facing", "type": "actuator"}
+
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+    def dispatch(self, action, _args):
+        return {"state": action}
+
+
 @pytest.fixture
 def bundle_module(monkeypatch):
     """Load the real bundle and servo card with hardware imports replaced."""
@@ -96,6 +119,10 @@ def bundle_module(monkeypatch):
     fake_vision_tf = types.ModuleType("vision_tf_card")
     fake_vision_tf.VisionTfPlugin = FakeVisionTfPlugin
     monkeypatch.setitem(sys.modules, "vision_tf_card", fake_vision_tf)
+
+    fake_facing = types.ModuleType("visual_facing_card")
+    fake_facing.VisualFacingPlugin = FakeVisualFacingPlugin
+    monkeypatch.setitem(sys.modules, "visual_facing_card", fake_facing)
 
     monkeypatch.syspath_prepend(str(BUMI))
     previous_loco_servo = sys.modules.pop("loco_servo", None)
@@ -257,4 +284,37 @@ def test_bundle_source_has_no_standalone_tf_registration(bundle_module):
     assert "VisionTfPlugin" not in source
     assert "TfTreePlugin" not in source
     assert "vision_tf_card" not in source
+
+
+def test_visual_facing_registers_with_both_chassis_peers_when_enabled(bundle_module):
+    config = _config()
+    config["plugins"]["visual_facing"] = {"enabled": True}
+    high_ctrl = FakeHighCtrl()
+
+    bundle = bundle_module.BumiDeviceBundle(
+        config, "bumi_test", object(), high_ctrl, None)
+    loco, servo, facing = bundle._plugins
+
+    assert [tool["name"] for tool in bundle.get_all_tools()] == [
+        "loco", "loco_servo", "visual_facing"]
+    assert isinstance(facing, FakeVisualFacingPlugin)
+    assert facing.high_ctrl is high_ctrl
+    assert facing.loco is loco and facing.servo is servo
+
+
+def test_visual_facing_is_skipped_when_disabled(bundle_module):
+    config = _config()
+    config["plugins"]["visual_facing"] = {"enabled": False}
+    bundle = bundle_module.BumiDeviceBundle(
+        config, "bumi_test", object(), FakeHighCtrl(), None)
+    assert [tool["name"] for tool in bundle.get_all_tools()] == [
+        "loco", "loco_servo"]
+
+
+def test_visual_facing_cannot_register_without_a_controller(bundle_module):
+    config = _config(loco=False, loco_servo=False)
+    config["plugins"]["visual_facing"] = {"enabled": True}
+    bundle = bundle_module.BumiDeviceBundle(
+        config, "bumi_test", object(), None, None)
+    assert bundle.get_all_tools() == []
 

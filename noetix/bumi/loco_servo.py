@@ -583,6 +583,10 @@ class LocoServoPlugin:
     def stop(self):
         self._stop()
 
+    def is_streaming(self):
+        """Read-only chassis ownership query for other actuator cards."""
+        return bool(self._running and not self._paused)
+
     # ── actions ──────────────────────────────────────────────────────────────
 
     def _start(self, args: dict):

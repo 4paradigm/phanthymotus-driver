@@ -90,6 +90,31 @@ plugins:
       urdf_path: /work/resource/bumi_model.urdf
       publish_rate_hz: 10        # status 话题频率；/tf 由关节样本与视觉位姿驱动
       max_joint_age_s: 0.5       # 超过此时长判定 joints_stale，不再当作新位姿
+  # 目标注视转身（actuator）：只发 publish_cmd(0,0,z)，不平移。默认关闭：
+  # start 只订阅、不会动；还必须显式 enable(confirm=true) 才获得短时授权。
+  visual_facing:
+    enabled: false
+    target_id: ""               # 空 = 输入里必须只有一个有效目标；多目标请填 marker_id
+    units: m                    # m / mm；不按数值大小猜单位
+    yaw_sign: 1                 # +z = 左转；首次真机用 ±30° ArUco 核对，必要时改 -1
+    center_tolerance_deg: 5.0   # 进入这个角度即停（画面中心容差）
+    exit_tolerance_deg: 12.0    # 停着时超过这个角度才重新转（滞回，必须大于上行）
+    settle_ticks: 2             # 连续 N 帧在容差内才确认居中，防单帧抖动
+    target_ttl_ms: 500          # 观测时间戳超过此年龄即视为目标丢失
+    max_future_ms: 500          # 未来时间戳超过此值拒收
+    control_hz: 20.0            # 控制/状态循环频率；SDK 指令间隔由卡内保证 ≥2 ms
+    kp: 1.2                     # 归一化 z = clamp(kp × 误差弧度, min_z, max_z)
+    min_z: 0.45                 # 高于 ~0.40 的腿式静区，低速用占空比而不是缩小 z
+    max_z: 0.70
+    fine_duty: 0.4              # 滞回细调区的速度占空比
+    auth_window_s: 8.0          # 短时授权窗口；enable 可续期，过期立即停
+    max_turn_s: 12.0            # 单次连续转身上限，超时需重新 enable
+    # estop 来自软件急停锁存卡的 /{ns}/state/estop（data/json 的 latched 字段）。
+    # 默认只听不强制：没有该卡时状态报 unknown；要求必须看到 estop 才允许转向
+    # 时把 require_estop 设为 true（未接入或数据过期都会阻止运动）。
+    estop_topic: ""
+    require_estop: false
+    estop_ttl_ms: 1000
   motion_state:
     enabled: true
     # 2 Hz: sufficient for Agent-facing motion telemetry without excessive DDS reads.

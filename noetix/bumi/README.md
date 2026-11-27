@@ -685,3 +685,62 @@ assume two same-physical frame names coincide.
 Configuration for the embedded tree is under
 `plugins.visual_odometry.tf`: `enabled` (false), `urdf_path`,
 `publish_rate_hz`, `max_joint_age_s`.
+
+## `visual_facing` — turn toward a visual target (actuator)
+
+This card turns "I see a target" into "I am looking at the target". It consumes
+a vision card's `data/json` pose and emits **only** `publish_cmd(0, 0, z)` —
+x/y are always exactly zero. It is not a replacement for #536 (sound facing)
+or #511 (region presence / framing guidance): those cards report or turn
+toward sound / give guidance, while this one closes a yaw loop on a visual
+target.
+
+**No camera extrinsic is involved.** The error is optical-frame bearing
+`atan2(-x_optical, z_optical)`; `vision_tf_spec.camera_to_body_point` maps
+optical `(x, y, z)` to body `(z, -x, -y)`, so that angle is the target's body
+yaw. A camera-mount correction (A5 / #562) therefore does not require a
+recalibration of this card. `yaw_sign` is the only axis calibration and must be
+confirmed once on the robot with an ArUco marker at ±30°.
+
+Input (`topic_in`, wired to a vision card on the canvas) accepts a single
+target or a `transforms` / `targets` list with `tvec`, `position` or
+`translation` (array or `{x,y,z}`). `stamp_ms` is used verbatim; stale
+(`target_ttl_ms`, default 500 ms) and future-dated observations are rejected.
+Multiple valid targets require an explicit `target_id` (or unique confidence);
+an ambiguous input never moves the robot.
+
+Lifecycle and safety:
+
+1. `start` (with `input_topic`) only opens the subscription. The robot stays
+   still; no motion on container restart.
+2. `enable` with `confirm=true` opens a short authorisation window
+   (`auth_window_s`, default 8 s). Repeated `enable` renews it.
+3. Each control tick re-checks target freshness, `workmode == 2`, estop state,
+   chassis ownership and the authorisation deadline. Any failure publishes a
+   zero immediately. `workmode == 26` (protection) is always a stop.
+4. Hysteresis: while turning, stop at `center_tolerance_deg` (default 5°) for
+   `settle_ticks`; while stopped, do not restart until `exit_tolerance_deg`
+   (default 12°). Fine-band motion uses a duty cycle above the measured
+   stiction floor rather than a too-small `z`.
+5. `disable`, `stop`, interrupt hooks and a `turn_timeout` all revoke
+   authorisation and publish a zero. A zero edge is sent exactly once so the
+   chassis cannot keep the last velocity.
+
+The estop latch from #423 (`/{ns}/state/estop`, `latched`) is subscribed
+opportunistically. When `require_estop: true`, an absent/stale/unreadable estop
+frame also blocks motion (fail closed); the default reports `estop: unknown`
+when that card is not deployed. The card declares `x-resource: ["base"]` and
+refuses to arm while `loco` or `loco_servo` owns the chassis.
+
+Status is on `/{ns}/visual_facing/status` (`data/json`, flat scalars):
+`state`, `yaw_error_deg`, `z_cmd`, `target_id`, `target_age_ms`, `authorized`,
+`auth_remaining_ms`, `workmode`, `estop`, `stop_reason`, `received`, `turns`.
+`info` returns the same fields plus the effective thresholds and topic wiring.
+
+Hardware acceptance (not performed by CI): with the robot on its hoist and the
+chassis free, place an ArUco at +30° and -30°, `enable` and confirm the robot
+turns until `yaw_error_deg` is within ±5°; slide the marker and confirm it
+follows; occlude the marker and confirm `stop_reason: no_fresh_target` with a
+single zero command; let the authorisation expire mid-turn and confirm the
+same stop; repeat after the #562 camera-mount branch is deployed. Any step not
+actually run must be reported as "未验证".

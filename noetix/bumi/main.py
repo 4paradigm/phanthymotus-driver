@@ -148,16 +148,32 @@ class BumiDeviceBundle:
             self._plugins.append(loco_plugin)
             print("[bundle] LocoPlugin loaded")
 
+        servo_plugin = None
         if (plugins_cfg.get("loco_servo", {}).get("enabled", False)
                 and high_ctrl is not None):
             from loco_servo import LocoServoPlugin
-            self._plugins.append(LocoServoPlugin(
+            servo_plugin = LocoServoPlugin(
                 plugins_cfg["loco_servo"], namespace, executor, high_ctrl,
                 # When the call-shaped card is enabled, both paths share its
                 # lock/rate limiter and explicit actions preempt the stream.
                 loco_plugin=loco_plugin,
-            ))
+            )
+            self._plugins.append(servo_plugin)
             print("[bundle] LocoServoPlugin loaded")
+
+        # visual_facing writes the same chassis as loco / loco_servo: gate on
+        # the controller and hand it both peers so it can refuse to arm while
+        # another card owns the base.
+        if plugins_cfg.get("visual_facing", {}).get("enabled", False):
+            if high_ctrl is None:
+                print("[bundle] VisualFacingPlugin skipped: HighController unavailable")
+            else:
+                from visual_facing_card import VisualFacingPlugin
+                self._plugins.append(VisualFacingPlugin(
+                    plugins_cfg["visual_facing"], namespace, executor, high_ctrl,
+                    loco_plugin=loco_plugin, loco_servo_plugin=servo_plugin,
+                ))
+                print("[bundle] VisualFacingPlugin loaded")
 
         if plugins_cfg.get("mic", {}).get("enabled", False) and media_ctrl is not None:
             from device import MicPlugin
