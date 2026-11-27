@@ -50,8 +50,8 @@ def _convert_person(person, size):
             raise ValueError("missing_person_position")
         center = (min(xs) + max(xs)) / 2
     x = 2 * center / size[0] - 1
-    # bbox 可以合法越界；clamp 而不是 raise，避免整帧丢弃。
-    x = max(-1.0, min(1.0, x))
+    if not -1.0 <= x <= 1.0:
+        raise ValueError("position_out_of_range")
     return {"id": person_id, "position": [x, 0]}
 
 
@@ -64,13 +64,8 @@ def pose2d_to_follow_frame(payload, received_at):
             not _finite_number(size[1]) or size[1] <= 0 or
             not isinstance(persons, list)):
         raise ValueError("invalid_pose2d")
-    converted = []
-    for person in persons:
-        try:
-            converted.append(_convert_person(person, size))
-        except ValueError:
-            # 单个 person 解析失败不影响整帧。
-            continue
+    # 不能跳过坏的 person，否则多人画面可能被误判为单人。
+    converted = [_convert_person(person, size) for person in persons]
     return {"timestamp": received_at, "persons": converted}
 
 
@@ -151,11 +146,11 @@ class FollowCard:
         self.last_command = vyaw
         self.reason = "following"
         return {"command": "move", "vx": 0.0, "vy": 0.0,
-                "vyaw": vyaw, "duration": .12, "reason": self.reason,
+                "vyaw": vyaw, "duration": .25, "reason": self.reason,
                 "target_id": self.target_id}
 
     def tick(self, age_s):
-        if self.enabled and age_s > .3:
+        if self.enabled and age_s > .3 and self.reason != "pose_timeout":
             return self.pause("pose_timeout")
         return {"command": "none", "reason": self.reason}
 
@@ -308,16 +303,16 @@ class StationaryFollowPlugin:
             result = None
             if decision.get("command") == "move":
                 if self._motion is None:
-                    # 没有运动接口时不要发布 move。
-                    decision = {"command": "none", "reason": "motion_unavailable"}
+                    decision = {"command": "stop_move", "reason": "motion_unavailable"}
                     result = {"error": "motion_unavailable"}
+                elif self._owned and time.monotonic() - self._last_motion_at < .30:
+                    # 等上一条有限时长命令及底盘状态自然恢复为空闲。
+                    result = {"status": "lease_active", "max_remaining_s": .30}
                 else:
-                    motion_failed = False
-                    base_ok = False
+                    self._owned = False
                     with self._base_lock:
                         if self._shutdown.is_set():
                             break
-                        state = {}
                         try:
                             ready = self._admission() if self._admission else {"admitted": False}
                             state = self._motion.get_state()
@@ -325,34 +320,34 @@ class StationaryFollowPlugin:
                                 break
                             if (ready.get("admitted") is not True or
                                     state.get("base_available") is not True):
-                                result = {"error": "base_not_available_or_locomotion_not_ready"}
-                                base_ok = state.get("base_available") is True
+                                # 模式未就绪或底盘正忙是暂态，不永久停用卡片。
+                                decision = {"command": "stop_move", "reason": "base_not_ready"}
+                                result = {"status": "waiting_for_base",
+                                          "admitted": ready.get("admitted"),
+                                          "admission_reason": ready.get("reason"),
+                                          "base_available": state.get("base_available")}
                             else:
-                                result = self._motion.move(0.0, 0.0, decision["vyaw"], .12)
-                                with self._lock:
-                                    self._owned = result.get("ret") == 0
-                                    if self._owned:
-                                        self._last_motion_at = time.monotonic()
+                                result = self._motion.move(0.0, 0.0, decision["vyaw"], .25)
+                                if result.get("ret") == 0:
+                                    self._owned = True
+                                    self._last_motion_at = time.monotonic()
+                                else:
+                                    with self._lock:
+                                        self._last_decision = self._controller.stop("motion_error")
+                                    decision = dict(self._last_decision)
                         except Exception as exc:
                             result = {"error": str(exc)}
-                            base_ok = state.get("base_available") is True
-                        motion_failed = bool(result.get("error")) or result.get("ret", 0) != 0
-                    if motion_failed and base_ok:
-                        with self._lock:
-                            self._last_decision = self._controller.stop("motion_error")
-                        decision = dict(self._last_decision)
-                    elif motion_failed:
-                        # base 不可用时降级为 stop_move，不要发布 move。
-                        decision = {"command": "stop_move",
-                                    "reason": "base_not_available"}
+                            with self._lock:
+                                self._last_decision = self._controller.stop("motion_error")
+                            decision = dict(self._last_decision)
             else:
                 with self._lock:
                     owned = self._owned
                     if owned:
                         self._owned = False
                 if owned:
-                    # 0.12 s lease 内不再发新命令，等它自然过期。
-                    result = {"status": "bounded_motion_expiry", "max_remaining_s": .12}
+                    # 已发送命令有 .25 s 的硬截止时间，不额外发送阻塞式 stop RPC。
+                    result = {"status": "bounded_motion_expiry", "max_remaining_s": .25}
             self._publish(decision, result)
 
     def _stop(self):
@@ -385,7 +380,7 @@ class StationaryFollowPlugin:
             try:
                 if worker is not None and worker.is_alive():
                     worker.join(timeout=2)
-                remaining = self._last_motion_at + .15 - time.monotonic()
+                remaining = self._last_motion_at + .30 - time.monotonic()
                 if remaining > 0:
                     time.sleep(remaining)
                 if node is not None:
