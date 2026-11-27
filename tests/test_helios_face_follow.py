@@ -136,13 +136,13 @@ def test_canvas_lifecycle_and_object_mode(monkeypatch):
         {"name": "cup", "position": [0.25, 0], "confidence": 0.9}]})))
     assert bundle.dispatch(name, {"action": "info"})["target"]["offset"] == (0.25, 0)
     assert json.loads(publications[-1].data)["available"]
-    card.move_head()
+    card.move_motion()
     assert [op for op, _ in motion_calls] == ["acquire", "position"]
     assert bundle.dispatch(name, {"action": "info"})["motion_available"]
-    card.move_head()
+    card.move_motion()
     assert len(motion_calls) == 2
     clock.monotonic = lambda: 10.4
-    card.move_head()
+    card.move_motion()
     assert motion_calls[-1][0] == "halt"
     assert not bundle.dispatch(name, {"action": "info"})["motion_available"]
     clock.monotonic = lambda: 11
@@ -153,11 +153,96 @@ def test_canvas_lifecycle_and_object_mode(monkeypatch):
     vop(NS(data="{}"))
     assert card.info()["reason"] == "idle"
 
+    turn_calls = []
+    base = NS(camera_ok=False, action_id=None, state="idle", status=lambda: {}, reset=lambda: None,
+              halt=lambda _: True, step=lambda target, *_: turn_calls.append(target))
+    card = driver.HeliosFaceFollow(node, base=base)
+    clock.monotonic = lambda: 20
+    camera = {rgb: {"topic": rgb, "id": driver.CHEST_CAMERA}}
+    card.start({"input_topic": rgb, "camera_info": camera})
+    assert base.camera_ok
+    card.dispatch("set_target", {"object_name": "cup"})
+    subscriptions[rgb](frame(stamp=100))
+    subscriptions[rgb + "/objects"](NS(data=json.dumps({"timestamp": 100, "objects": [
+        {"name": "cup", "position": [-0.25, 0], "confidence": 0.9}]})))
+    card.move_motion()
+    assert turn_calls[-1]["offset"] == (-0.25, 0)
+    clock.monotonic = lambda: 20.4
+    card.move_motion()
+    assert turn_calls[-1] is None
+    card.stop()
+    card.start({"input_topic": rgb, "camera_info": {rgb: {"topic": rgb, "id": "head"}}})
+    assert not base.camera_ok
+    card.stop()
+
 
 AXES = {
     "head_joint_1": dict(image_axis="x", image_sign=-1, lower_rad=-0.5, upper_rad=0.5, max_rad_s=0.2),
     "head_joint_2": dict(image_axis="y", image_sign=1, lower_rad=-0.2, upper_rad=0.2, max_rad_s=0.1),
 }
+
+
+def test_base_turns_in_place_with_fresh_targets_and_respects_existing_motion(monkeypatch):
+    import sys
+
+    monkeypatch.setitem(sys.modules, "tracking", tracking)
+    monkeypatch.syspath_prepend(str(FILE.parent))
+    from base_follow import BaseFollower
+
+    clock = NS(now=10.0)
+    drive = NS(active=None, nav="idle", level=0, calls=[])
+
+    def call(port, tool, action, **params):
+        drive.calls.append((port, tool, action, params))
+        if tool == "controlled_spatial":
+            return {"navigation": {"state": drive.nav}}
+        if action == "info":
+            return {"state": "ready", "motion_enabled": True, "sdk_available": True, "worker_running": True,
+                    "chassis_exception_level": drive.level, "active_move": drive.active,
+                    "odometry": {"age_s": 0.2, "vx": 0.0, "vy": 0.0, "w": 0.0}}
+        if action == "move":
+            drive.active = "our-turn"
+            return {"state": "running", "action_id": drive.active}
+        active, drive.active = drive.active, None
+        return {"stopped": True, "cancelled_move": active}
+
+    base = BaseFollower(call, lambda: clock.now)
+    target = {"track_id": 1, "offset": (0.9, -0.5)}
+    base.step(target, 1, 10.3)
+    assert base.state == "waiting_for_chest_rgb" and drive.calls == []
+    base.camera_ok = True
+    base.step(target, 1, 10.3)
+    base.step(target, 1, 10.3)
+    assert drive.calls == []
+    drive.nav = "moving"
+    base.step(target, 2, 10.3)
+    assert base.state == "base_busy"
+    drive.nav, drive.active = "idle", "a-manual-move"
+    base.step(target, 3, 10.3)
+    base.halt("idle")
+    assert drive.active == "a-manual-move"
+    drive.active, drive.level = None, 1
+    base.step(target, 4, 10.3)
+    base.step(target, 5, 10.3)
+    assert base.state == "waiting_for_base"
+    drive.level = 0
+    base.step(target, 6, 9.9)
+    assert base.state == "waiting_for_target"
+    base.step(target, 7, 10.3)
+    base.step(target, 8, 10.3)
+    assert drive.calls[-1] == (15782, "base_drive", "move",
+                                {"vx": 0.0, "vy": 0.0, "vyaw": -6.0, "duration_s": 0.2})
+    assert base.state == "controlling"
+    base.step(None, 9, 10.3)
+    assert drive.calls[-1][2] == "stop_move" and base.state == "waiting_for_target"
+
+    other_side = {"track_id": 1, "offset": (-0.4, 0)}
+    base.step(other_side, 10, 10.3)
+    base.step(other_side, 11, 10.3)
+    assert drive.calls[-1][3]["vyaw"] == 4.0
+    clock.now = 10.81
+    base.step(other_side, 12, 11.1)
+    assert drive.calls[-1][2] == "stop_move" and base.state == "fault" and base.error
 
 
 def test_head_bridge_limits_faults_and_stop(monkeypatch, tmp_path):

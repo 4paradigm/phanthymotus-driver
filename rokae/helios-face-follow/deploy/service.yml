@@ -19,6 +19,7 @@ rokae-helios-face-follow:
     - RCUTILS_COLORIZED_OUTPUT=0
     - AGENT_CORE_URL=${HELIOS_AGENT_CORE_URL:-https://127.0.0.1:15678}
     - HELIOS_HEAD_CONTROL_SOCKET=${HELIOS_HEAD_CONTROL_SOCKET:-}
+    - HELIOS_BASE_FOLLOW_ENABLED=${HELIOS_BASE_FOLLOW_ENABLED:-0}
   logging:
     driver: local
     options:
