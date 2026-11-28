@@ -56,6 +56,7 @@ class ThreeViewCapture:
             )
         ]
         schema["x-is-dangerous"] = False
+        schema["x-manual-execution"] = True
         definition = tool(
             TOOL_NAME, "actuator", "Monitor three live ALOHA cameras and capture synchronized stills.",
             schema, topic_out=self._topic_out(),

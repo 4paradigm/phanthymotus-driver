@@ -53,7 +53,8 @@ as soon as the driver starts receiving JPEGs. These panels update on incoming
 frames and remain live when the canvas project is stopped. They use the existing
 `image/jpeg` stream format for ROS compressed images.
 
-Choose **Capture** on the canvas. The card selects the closest group
+Choose **Capture** on the canvas. This manual action is available while the
+canvas project is stopped. The card selects the closest group
 from the recent frames. A successful capture reports `ready`, the three
 timestamps and their maximum difference. The three still panels, `front_jpeg`,
 `left_wrist_jpeg`, and `right_wrist_jpeg`, show the last successful capture.

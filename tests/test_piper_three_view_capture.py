@@ -76,6 +76,7 @@ class ThreeViewCaptureTests(unittest.TestCase):
         self.assertEqual(definition["title"], "Three-View Capture")
         self.assertEqual(definition["type"], "actuator")
         self.assertFalse(definition["inputSchema"]["x-is-dangerous"])
+        self.assertTrue(definition["inputSchema"]["x-manual-execution"])
         self.assertIn("capture", definition["inputSchema"]["properties"]["action"]["enum"])
         self.assertEqual([port["topic"] for port in definition["topic_out"]], [
             "/piper_test/piper/three_view/front_jpeg",
