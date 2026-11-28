@@ -96,8 +96,11 @@ class UnifiedTests(unittest.TestCase):
         import yaml
         from pathlib import Path
         definition = yaml.safe_load((Path(__file__).resolve().parents[1] / 'agilex/piper/driver.yaml').read_text())
+        config = {**self.config, 'three_view_capture': {'enabled': True}}
+        bundle = DriverBundle(build_plugins(config, 'piper_arm1', None))
+        self.addCleanup(bundle.stop_all)
         self.assertEqual({(card['name'], card['type']) for card in definition['cards']},
-                         {(tool['name'], tool['type']) for tool in self.bundle.get_all_tools()})
+                         {(tool['name'], tool['type']) for tool in bundle.get_all_tools()})
 
     def test_start_status_and_default_selection_are_passive(self):
         self.call('start')

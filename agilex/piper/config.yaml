@@ -42,6 +42,9 @@ camera:
   device: ""
   warmup_seconds: 3
   min_contrast: 8
+# Enable on ALOHA workstations with the front, left and right JPEG bridge topics.
+three_view_capture:
+  enabled: false
 ros:
   robot_domain_id: 42
   core_domain_id: 42
