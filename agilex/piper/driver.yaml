@@ -8,7 +8,7 @@ port: 15741
 mcp_url: "http://localhost:15741/mcp"
 description: >-
   PiPER Arm control, independent Joints and On camera sensor cards,
-  and optional ALOHA three-view capture.
+  and optional ALOHA three-view live video.
 build_context_extras:
   - ../../common
 cards:
@@ -16,5 +16,5 @@ cards:
   - { name: joints, type: sensor }
   - { name: piper_camera_live, type: sensor }
   - { name: piper_photo, type: actuator }
-  - { name: piper_three_view_capture, type: actuator }
+  - { name: piper_three_view_capture, type: sensor }
   - { name: model, type: resource }

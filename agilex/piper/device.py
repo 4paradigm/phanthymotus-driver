@@ -235,7 +235,7 @@ def build_plugins(config, namespace, ros2):
     plugins = add_intent_monitor([UnifiedControlPlugin(config, namespace, ros2)], config, ros2, joints_card=True)
     plugins = add_camera_live(plugins, config, ros2, sensor_card=True)
     if config.get('three_view_capture', {}).get('enabled', False):
-        from agilex.piper.three_view_card import ThreeViewCapture
+        from agilex.piper.three_view_card import ThreeViewLive
 
-        plugins.append(ThreeViewCapture(namespace, ros2))
+        plugins.append(ThreeViewLive(namespace, ros2))
     return plugins

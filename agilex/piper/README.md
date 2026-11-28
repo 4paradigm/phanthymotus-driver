@@ -41,27 +41,17 @@ limit. Reset is a trajectory, not firmware reset, zero calibration or error
 clearing; its target and source appear in Get status. Physical return paths and
 stopping latency require separate supervised acceptance.
 
-## Three-view capture on ALOHA
+## Three-view live video on ALOHA
 
 Set `enabled` to `true` under `three_view_capture` in the PiPER driver
-configuration to expose **Three-View Capture** (`piper_three_view_capture`). The card reads
+configuration to expose **Three-View Live** (`piper_three_view_capture`). The card reads
 `/aloha_lab/camera/{front,left,right}/jpeg` from the existing ALOHA camera
 bridge. Keep JPEG forwarding enabled on all three source cameras.
 
 The monitor shows `front_live`, `left_wrist_live`, and `right_wrist_live`
-as soon as the driver starts receiving JPEGs. These panels update on incoming
-frames and remain live when the canvas project is stopped. They use the existing
-`image/jpeg` stream format for ROS compressed images.
-
-Choose **Capture** on the canvas. This manual action is available while the
-canvas project is stopped. The card selects the closest group
-from the recent frames. A successful capture reports `ready`, the three
-timestamps and their maximum difference. The three still panels, `front_jpeg`,
-`left_wrist_jpeg`, and `right_wrist_jpeg`, show the last successful capture.
-If a view has no frame
-within the two-second age limit, the response lists it in `missing_views`.
-A group more than 100 ms apart
-returns `out_of_sync`. The capture uses only image data.
+as soon as the driver receives frames. The three feeds use the standard
+`image/jpeg` format for continuous ROS compressed images and stay live when
+the canvas project is stopped.
 
 ## Monitoring and ACP
 
