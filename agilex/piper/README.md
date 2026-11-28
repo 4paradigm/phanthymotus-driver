@@ -46,12 +46,18 @@ stopping latency require separate supervised acceptance.
 Set `enabled` to `true` under `three_view_capture` in the PiPER driver
 configuration to expose **Three-View Capture** (`piper_three_view_capture`). The card reads
 `/aloha_lab/camera/{front,left,right}/jpeg` from the existing ALOHA camera
-bridge. Start forwarding on all three camera cards before capturing.
+bridge. Keep JPEG forwarding enabled on all three source cameras.
+
+The monitor shows `front_live`, `left_wrist_live`, and `right_wrist_live`
+as soon as the driver starts receiving JPEGs. These panels update on incoming
+frames and remain live when the canvas project is stopped. They use the existing
+`image/jpeg` stream format for ROS compressed images.
 
 Choose **Capture** on the canvas. The card selects the closest group
 from the recent frames. A successful capture reports `ready`, the three
-timestamps and their maximum difference. The monitor shows the captured images
-as `front_jpeg`, `left_wrist_jpeg`, and `right_wrist_jpeg`. If a view has no frame
+timestamps and their maximum difference. The three still panels, `front_jpeg`,
+`left_wrist_jpeg`, and `right_wrist_jpeg`, show the last successful capture.
+If a view has no frame
 within the two-second age limit, the response lists it in `missing_views`.
 A group more than 100 ms apart
 returns `out_of_sync`. The capture uses only image data.

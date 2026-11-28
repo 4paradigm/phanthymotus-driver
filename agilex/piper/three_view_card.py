@@ -1,4 +1,4 @@
-"""Capture a time-matched JPEG from each of the three existing ALOHA streams."""
+"""Relay the ALOHA camera streams and capture time-matched still images."""
 
 from collections import deque
 from itertools import product
@@ -22,23 +22,32 @@ class ThreeViewCapture:
         self.outputs = {
             view: f"/{namespace}/piper/three_view/{name}" for view, name in OUTPUT_NAMES.items()
         }
+        self.live_outputs = {
+            view: f"/{namespace}/piper/three_view/{name.removesuffix('_jpeg')}_live"
+            for view, name in OUTPUT_NAMES.items()
+        }
         self.node_name = f"piper_three_view_{namespace}"
         self._lock = RLock()
         self._node = None
         self._publishers = {}
+        self._live_publishers = {}
         self._frames = {view: deque(maxlen=12) for view in self.sources}
         self._last_capture = {}
 
-    def _ports(self):
-        return [{"topic": topic, "format": "image/jpeg", "description": view}
-                for view, topic in self.outputs.items()]
+    @staticmethod
+    def _ports(outputs, label):
+        return [{"topic": topic, "format": "image/jpeg", "description": f"{view} {label}"}
+                for view, topic in outputs.items()]
+
+    def _topic_out(self):
+        return self._ports(self.outputs, "snapshot") + self._ports(self.live_outputs, "live")
 
     def get_tool(self):
         schema = action_schema({
             "capture": ([], "Capture time-matched JPEGs from the front and both wrist cameras."),
             "info": ([], "Show capture status."),
             "start": ([], "Subscribe to the three camera streams."),
-            "stop": ([], "Unsubscribe and clear the capture preview."),
+            "stop": ([], "Clear the still preview while keeping the live streams running."),
         }, {})
         schema["properties"]["action"]["default"] = "capture"
         schema["properties"]["action"]["oneOf"] = [
@@ -47,8 +56,10 @@ class ThreeViewCapture:
             )
         ]
         schema["x-is-dangerous"] = False
-        definition = tool(TOOL_NAME, "actuator", "Capture synchronized JPEGs from the three ALOHA cameras.",
-                          schema, topic_out=self._ports())
+        definition = tool(
+            TOOL_NAME, "actuator", "Monitor three live ALOHA cameras and capture synchronized stills.",
+            schema, topic_out=self._topic_out(),
+        )
         definition["title"] = "Three-View Capture"
         return definition
 
@@ -65,6 +76,7 @@ class ThreeViewCapture:
                 preview_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                                          durability=DurabilityPolicy.TRANSIENT_LOCAL)
                 publishers = {}
+                live_publishers = {}
                 for view, source in self.sources.items():
                     node.create_subscription(
                         CompressedImage, source,
@@ -72,6 +84,9 @@ class ThreeViewCapture:
                         qos_profile_sensor_data,
                     )
                     publishers[view] = node.create_publisher(CompressedImage, self.outputs[view], preview_qos)
+                    live_publishers[view] = node.create_publisher(
+                        CompressedImage, self.live_outputs[view], qos_profile_sensor_data,
+                    )
                 node.create_timer(1.0, lambda: self._preview(node))
                 self.ros2.executor_core.add_node(node)
             except BaseException:
@@ -79,11 +94,13 @@ class ThreeViewCapture:
                 raise
             self._node = node
             self._publishers = publishers
+            self._live_publishers = live_publishers
 
     def stop(self):
         with self._lock:
             node, self._node = self._node, None
             self._publishers = {}
+            self._live_publishers = {}
             self._last_capture = {}
             for frames in self._frames.values():
                 frames.clear()
@@ -97,13 +114,15 @@ class ThreeViewCapture:
         stamp = message.header.stamp
         timestamp_ms = stamp.sec * 1000 + stamp.nanosec // 1_000_000
         data = message.data
-        if timestamp_ms <= 0 or not 4 <= len(data) <= MAX_JPEG_BYTES:
+        age_ms = time_ns() // 1_000_000 - timestamp_ms
+        if timestamp_ms <= 0 or not -MAX_SKEW_MS <= age_ms <= MAX_AGE_MS or not 4 <= len(data) <= MAX_JPEG_BYTES:
             return
         if bytes(data[:2]) != b"\xff\xd8" or bytes(data[-2:]) != b"\xff\xd9":
             return
         with self._lock:
             if self._node is node:
                 self._frames[view].append((timestamp_ms, message))
+                self._live_publishers[view].publish(message)
 
     def _preview(self, node):
         with self._lock:
@@ -146,7 +165,7 @@ class ThreeViewCapture:
                 self._last_capture = {view: frame[1] for view, frame in matches.items()}
                 self._publish_capture()
                 result["status"] = "ready"
-                result["topic_out"] = self._ports()
+                result["topic_out"] = self._ports(self.outputs, "snapshot")
             return result
 
     def dispatch(self, action, args):
@@ -155,13 +174,15 @@ class ThreeViewCapture:
         if action == "start":
             self.start()
         elif action == "stop":
-            self.stop()
+            # The canvas stops the capture action. The driver owns the live feeds.
+            with self._lock:
+                self._last_capture = {}
         elif action != "info":
             return None
         active_state = "ready" if action == "start" else "running"
         with self._lock:
             return {
-                "state": active_state if self._node is not None else "idle",
+                "state": active_state if self._node is not None and action != "stop" else "idle",
                 "sources": self.sources,
-                "topic_out": self._ports(),
+                "topic_out": self._topic_out(),
             }

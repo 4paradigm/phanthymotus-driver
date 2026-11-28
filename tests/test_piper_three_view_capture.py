@@ -5,7 +5,7 @@ import sys
 import tempfile
 from types import ModuleType, SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import yaml
 
@@ -45,8 +45,11 @@ class ThreeViewCaptureTests(unittest.TestCase):
         clock.start()
         self.addCleanup(clock.stop)
         self.publishers = {view: Mock() for view in ("front", "left", "right")}
-        self.node.create_publisher.side_effect = list(self.publishers.values())
+        self.live_publishers = {view: Mock() for view in self.publishers}
         self.plugin = ThreeViewCapture("piper_test", self.ros2)
+        by_topic = {self.plugin.outputs[view]: publisher for view, publisher in self.publishers.items()}
+        by_topic.update({self.plugin.live_outputs[view]: publisher for view, publisher in self.live_publishers.items()})
+        self.node.create_publisher.side_effect = lambda message_type, topic, qos: by_topic[topic]
         self.bundle = DriverBundle([self.plugin])
         self.addCleanup(self.bundle.stop_all)
 
@@ -78,6 +81,9 @@ class ThreeViewCaptureTests(unittest.TestCase):
             "/piper_test/piper/three_view/front_jpeg",
             "/piper_test/piper/three_view/left_wrist_jpeg",
             "/piper_test/piper/three_view/right_wrist_jpeg",
+            "/piper_test/piper/three_view/front_live",
+            "/piper_test/piper/three_view/left_wrist_live",
+            "/piper_test/piper/three_view/right_wrist_live",
         ])
         self.assertTrue(all(port["format"] == "image/jpeg" for port in definition["topic_out"]))
         manifest = yaml.safe_load(PIPER_MANIFEST.read_text(encoding="utf-8"))
@@ -92,9 +98,23 @@ class ThreeViewCaptureTests(unittest.TestCase):
         self.assertEqual(self.node.create_subscription.call_count, 3)
         self.assertEqual(self.call("stop")["state"], "idle")
         self.assertEqual(self.call("stop")["state"], "idle")
+        self.assertEqual(self.call("info")["state"], "running")
+        self.ros2.executor_core.remove_node.assert_not_called()
+
+        self.bundle.stop_all()
         self.assertEqual(self.call("capture")["status"], "inactive")
         self.ros2.executor_core.remove_node.assert_called_once_with(self.node)
         self.node.destroy_node.assert_called_once()
+
+    def test_live_updates_before_capture_and_after_canvas_stop(self):
+        self.bundle.start_all()
+        first = {view: self.feed(view, -100) for view in self.publishers}
+        self.assertEqual(self.call("stop")["state"], "idle")
+        second = {view: self.feed(view, -40) for view in self.publishers}
+
+        for view, publisher in self.live_publishers.items():
+            self.assertEqual(publisher.publish.call_args_list, [call(first[view]), call(second[view])])
+            self.publishers[view].publish.assert_not_called()
 
     def test_unsupported_action_returns_none(self):
         self.assertIsNone(self.call("unsupported_action"))
@@ -118,6 +138,7 @@ class ThreeViewCaptureTests(unittest.TestCase):
 
         result = self.call("capture")
         self.assertEqual(result["status"], "ready")
+        self.assertEqual([port["topic"] for port in result["topic_out"]], list(self.plugin.outputs.values()))
         self.assertEqual(result["skew_ms"], 20)
         self.assertEqual(result["timestamps_ms"], {
             "front": NOW_MS - 90, "left": NOW_MS - 80, "right": NOW_MS - 70,
@@ -152,6 +173,8 @@ class ThreeViewCaptureTests(unittest.TestCase):
         result = self.call("capture")
         self.assertEqual(result["status"], "missing_frames")
         self.assertEqual(result["missing_views"], ["front", "left"])
+        self.live_publishers["front"].publish.assert_not_called()
+        self.live_publishers["left"].publish.assert_not_called()
 
 
 class ThreeViewBundleRegistrationTests(unittest.TestCase):
